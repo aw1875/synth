@@ -17,12 +17,14 @@ const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
 const Timing = @import("core/timing.zig");
 const Project = @import("core/project.zig");
+const skill = @import("core/skill.zig");
 const headless = @import("headless.zig");
 const prompt_dump = @import("prompt_dump.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
 const Provider = @import("provider/provider.zig");
 const mcp_tools = @import("tools/mcp.zig");
+const skill_tool = @import("tools/skill.zig");
 const tui_app = @import("tui/app.zig");
 const Model = @import("tui/model.zig");
 const tui_commands = @import("tui/commands.zig");
@@ -112,6 +114,10 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     var project = try Project.detect(allocator, io, cwd);
     defer project.deinit(allocator);
 
+    var skills = try skill.load(allocator, io, project.root, config.skill_paths, init.environ_map.get("HOME"));
+    defer skills.deinit();
+    timing.mark("skills");
+
     const home = init.environ_map.get("HOME") orelse "";
     const cwd_display = if (home.len > 0 and std.mem.startsWith(u8, path, home))
         try std.fmt.allocPrint(allocator, "~{s}", .{path[home.len..]})
@@ -180,12 +186,15 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         });
     }
 
+    try skill_tool.install(&model.registry, &skills);
+
     model.pending_model_check = options.model == null;
     timing.mark("mcp start");
 
     model.loop.auto_approve_safe = config.auto_approve_safe_commands;
     if (config.system_prompt) |text| model.loop.system_prompt = text;
     model.loop.project = &project;
+    model.loop.skills = skills.skills;
     try model.loop.useAgent(agents.default_id);
     try model.loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");

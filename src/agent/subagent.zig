@@ -73,6 +73,7 @@ pub fn run(
     defer child.deinit();
 
     child.project = parent.project;
+    child.skills = parent.skills;
     child.system_prompt = parent.system_prompt;
     // Nothing it may call needs a decision, so nothing may auto-approve one.
     child.auto_approve_safe = false;

@@ -12,6 +12,7 @@ const agents = @import("agent.zig");
 const Context = @import("context.zig");
 const base_prompt = @import("prompt.zig");
 const Project = @import("../core/project.zig");
+const skill = @import("../core/skill.zig");
 const tool = @import("../tools/tool.zig");
 const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
@@ -153,6 +154,9 @@ tools_json: ?[]u8 = null,
 system_prompt: []const u8 = base_prompt.default,
 /// Where the app is running, for the environment block. Borrowed.
 project: ?*const Project = null,
+/// The skills this project offers, for the `<skills>` block. Borrowed, and
+/// empty where nothing discovered any.
+skills: []const skill.Skill = &.{},
 /// The assembled system prompt, shared by the steps of one turn.
 prompt_cache: Context.Cache = .{},
 /// Set when a turn ends in failure, for the UI to surface.
@@ -343,6 +347,7 @@ fn systemPrompt(self: *Loop) []const u8 {
         self.system_prompt,
         self.agent.prompt,
         project,
+        self.skills,
     ) catch self.system_prompt;
 }
 

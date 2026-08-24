@@ -34,7 +34,7 @@ pub const Agent = struct {
 pub const default_id = "build";
 
 /// Read-only tools, shared by the agents that may not change anything.
-const reading: []const []const u8 = &.{ "read", "list", "glob", "grep", "ask_user" };
+const reading: []const []const u8 = &.{ "read", "list", "glob", "grep", "ask_user", "skill" };
 /// The same, plus delegating. A subagent can only read, so an agent that may
 /// not change anything loses nothing by being allowed to start one - and a
 /// multi-round search is exactly what plan and review modes spend their steps

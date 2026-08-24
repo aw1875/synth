@@ -15,11 +15,13 @@ const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
 const humanize = @import("core/humanize.zig");
 const Project = @import("core/project.zig");
+const skill = @import("core/skill.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
 const Provider = @import("provider/provider.zig");
 const Registry = @import("tools/registry.zig");
 const mcp_tools = @import("tools/mcp.zig");
+const skill_tool = @import("tools/skill.zig");
 const tool = @import("tools/tool.zig");
 
 const dim = "\x1b[2m";
@@ -59,6 +61,10 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     var registry = try Registry.init(allocator);
     defer registry.deinit();
+
+    var skills = try skill.load(allocator, io, project.root, config.skill_paths, init.environ_map.get("HOME"));
+    defer skills.deinit();
+    try skill_tool.install(&registry, &skills);
 
     var mcp_host: mcp_tools.Host = .init(allocator, io);
     mcp_host.stderr = .inherit;
@@ -129,6 +135,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     loop.auto_approve_safe = config.auto_approve_safe_commands;
     if (config.system_prompt) |text| loop.system_prompt = text;
     loop.project = &project;
+    loop.skills = skills.skills;
     try loop.useAgent(agents.default_id);
 
     try loop.attachDatabase(&db, project.name(), project.cwd, backend.model());
