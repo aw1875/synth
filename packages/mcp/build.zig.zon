@@ -1,0 +1,21 @@
+.{
+    .name = .mcp,
+    .version = "0.0.0",
+    .fingerprint = 0xa19bc83904fdd67b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .oauth2 = .{
+            .url = "git+https://github.com/aw1875/oauth2.zig#1828474a50d62619d335511b16292b616cf4a571",
+            .hash = "oauth2-2.0.0-icZTHxCpAAAX43APAlDLsWa0Bt5q7nwf9TjieRZ8iS4Z",
+        },
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig#01dc09453ae50b82cc74ac2f90e9cd57e0b38500",
+            .hash = "httpz-0.0.0-PNVzrEnoCAAwAtnht2430lpr-ynyNpLeTpoy_-lmWyhD",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

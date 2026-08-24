@@ -1,0 +1,10 @@
+.zig-cache
+zig-out
+zig-pkg
+
+*.db
+*.db-shm
+*.db-wal
+*.json
+*.log
+*.tar.gz
