@@ -53,6 +53,7 @@ pub fn main(init: std.process.Init) !void {
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
         .models => try commands.models(init),
+        .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),
         .mcp => |sub| try commands.mcp_command(init, sub),
     }

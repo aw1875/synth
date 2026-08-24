@@ -11,6 +11,7 @@ const Auth = @import("core/auth.zig");
 const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
 const Project = @import("core/project.zig");
+const skill = @import("core/skill.zig");
 const mcp = @import("mcp");
 const mcp_tools = @import("tools/mcp.zig");
 const catalog = @import("provider/catalog.zig");
@@ -153,6 +154,44 @@ fn removeSession(ctx: *Context, out: *std.Io.Writer, handle: []const u8) !void {
 }
 
 /// Models the configured provider offers.
+/// `synth skills`: what this project offers, and every directory that was
+/// searched. The paths matter more than the list: a skill that did not turn up
+/// is the reason to run this at all.
+pub fn skills(init_process: std.process.Init) !void {
+    var ctx = try Context.init(init_process);
+    defer ctx.deinit();
+
+    var buffer: [8192]u8 = undefined;
+    var file = std.Io.File.stdout().writer(ctx.io, &buffer);
+    const out = &file.interface;
+    defer out.flush() catch {};
+
+    var found = try skill.load(
+        ctx.allocator,
+        ctx.io,
+        ctx.project.root,
+        ctx.config.skill_paths,
+        init_process.environ_map.get("HOME"),
+    );
+    defer found.deinit();
+
+    if (found.skills.len == 0) {
+        try out.print("No skills found.\n\n", .{});
+    } else {
+        for (found.skills) |entry| {
+            try out.print("{s}{s}{s}\n", .{ bold, entry.id, reset });
+            if (entry.description.len > 0) {
+                try out.print("  {s}\n", .{entry.description});
+            }
+            try out.print("  {s}{s}{s}\n", .{ dim, entry.dir, reset });
+        }
+        try out.print("\n", .{});
+    }
+
+    try out.print("{s}Looked in{s}\n", .{ dim, reset });
+    for (found.paths) |path| try out.print("  {s}{s}{s}\n", .{ dim, path, reset });
+}
+
 pub fn models(init_process: std.process.Init) !void {
     var ctx = try Context.init(init_process);
     defer ctx.deinit();

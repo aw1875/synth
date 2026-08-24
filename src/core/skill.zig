@@ -237,7 +237,7 @@ fn read(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !?Skill {
         return null;
 
     const id = std.fs.path.basename(dir);
-    const parsed = parse(source);
+    const parsed = try parse(arena, source);
 
     return .{
         .id = id,
@@ -270,10 +270,14 @@ pub const Front = struct {
 /// Split a `SKILL.md` into its frontmatter and its instructions.
 ///
 /// Deliberately not a YAML parser. The frontmatter of a skill is a handful of
-/// single-line scalars, and treating it as more than that would mean carrying a
-/// parser for the sake of syntax nothing writes. A file with no frontmatter at
-/// all is all body, which is the sensible reading of a plain Markdown file.
-pub fn parse(source: []const u8) Front {
+/// scalars, and carrying a parser for the rest of YAML would cost more than the
+/// syntax it would buy. What it does understand beyond `key: value` is the
+/// folded and literal blocks skills actually use for a long description - `>`,
+/// `|`, and a value simply continued on the following indented lines.
+///
+/// A file with no frontmatter at all is all body, which is the sensible reading
+/// of a plain Markdown file.
+pub fn parse(arena: std.mem.Allocator, source: []const u8) !Front {
     const text = std.mem.trimStart(u8, source, "\xef\xbb\xbf");
     if (!std.mem.startsWith(u8, text, "---")) return .{ .body = std.mem.trim(u8, text, " \t\r\n") };
 
@@ -284,12 +288,23 @@ pub fn parse(source: []const u8) Front {
 
     var front: Front = .{ .body = std.mem.trim(u8, rest[close.end..], " \t\r\n") };
 
-    var lines = std.mem.splitScalar(u8, rest[0..close.start], '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const key = std.mem.trim(u8, line[0..colon], " \t");
-        const value = unquote(std.mem.trim(u8, line[colon + 1 ..], " \t"));
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(arena);
+
+    var walk = std.mem.splitScalar(u8, rest[0..close.start], '\n');
+    while (walk.next()) |raw| try lines.append(arena, std.mem.trimEnd(u8, raw, "\r"));
+
+    var i: usize = 0;
+    while (i < lines.items.len) : (i += 1) {
+        const line = lines.items[i];
+        if (indentOf(line) > 0) continue;
+
+        const trimmed = std.mem.trim(u8, line, " \t");
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const key = std.mem.trim(u8, trimmed[0..colon], " \t");
+
+        var value = unquote(std.mem.trim(u8, trimmed[colon + 1 ..], " \t"));
+        if (continues(value)) value = try fold(arena, lines.items, &i);
 
         if (std.mem.eql(u8, key, "name")) front.name = value;
         if (std.mem.eql(u8, key, "description")) {
@@ -298,6 +313,47 @@ pub fn parse(source: []const u8) Front {
     }
 
     return front;
+}
+
+/// Whether a value is really carried by the lines beneath it: a block
+/// indicator, or nothing at all.
+fn continues(value: []const u8) bool {
+    if (value.len == 0) return true;
+    return switch (value[0]) {
+        '>', '|' => true,
+        else => false,
+    };
+}
+
+/// The indented lines under a key, joined into one.
+///
+/// Folded and literal blocks are both joined with spaces rather than kept
+/// apart, because every value this reads ends up on a single line - one row in
+/// the picker, one line in the system prompt. `i` is left on the last line
+/// consumed.
+fn fold(arena: std.mem.Allocator, lines: []const []const u8, i: *usize) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+
+    while (i.* + 1 < lines.len) {
+        const next = lines[i.* + 1];
+        if (std.mem.trim(u8, next, " \t").len == 0) {
+            i.* += 1;
+            continue;
+        }
+        if (indentOf(next) == 0) break;
+
+        if (out.items.len > 0) try out.append(arena, ' ');
+        try out.appendSlice(arena, std.mem.trim(u8, next, " \t"));
+        i.* += 1;
+    }
+
+    return out.toOwnedSlice(arena);
+}
+
+fn indentOf(line: []const u8) usize {
+    var n: usize = 0;
+    while (n < line.len and (line[n] == ' ' or line[n] == '\t')) n += 1;
+    return n;
 }
 
 /// Where the closing `---` starts, and where the text after it begins.
@@ -325,8 +381,17 @@ fn unquote(value: []const u8) []const u8 {
 
 const testing = std.testing;
 
+/// An arena for the parse tests, since a folded value is built rather than
+/// borrowed.
+fn parseIn(arena: *std.heap.ArenaAllocator, source: []const u8) !Front {
+    return parse(arena.allocator(), source);
+}
+
 test "frontmatter gives up its name and description, and the body starts after it" {
-    const front = parse(
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const front = try parseIn(&arena,
         \\---
         \\name: Release
         \\description: how a release is cut here
@@ -341,18 +406,24 @@ test "frontmatter gives up its name and description, and the body starts after i
 }
 
 test "a file without frontmatter is all instructions" {
-    const front = parse("Just do the thing.\n");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const front = try parseIn(&arena, "Just do the thing.\n");
     try testing.expectEqualStrings("", front.name);
     try testing.expectEqualStrings("", front.description);
     try testing.expectEqualStrings("Just do the thing.", front.body);
 
-    const unclosed = parse("---\nname: nope\nstill going\n");
+    const unclosed = try parseIn(&arena, "---\nname: nope\nstill going\n");
     try testing.expectEqualStrings("", unclosed.name);
     try testing.expect(unclosed.body.len > 0);
 }
 
 test "quoting, spacing and colons in the value survive" {
-    const front = parse(
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const front = try parseIn(&arena,
         \\---
         \\name:   "Commit style"
         \\description: 'use: a prefix, then a summary'
@@ -365,19 +436,66 @@ test "quoting, spacing and colons in the value survive" {
     try testing.expectEqualStrings("use: a prefix, then a summary", front.description);
 }
 
-test "a description cannot crowd out the rest of the prompt" {
-    var buffer: [max_description_bytes * 2]u8 = undefined;
-    const long = buffer[0..];
-    @memset(long, 'x');
+test "a folded description is read as the one line it becomes" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
 
-    var source: std.ArrayList(u8) = .empty;
-    defer source.deinit(testing.allocator);
-    try source.appendSlice(testing.allocator, "---\ndescription: ");
-    try source.appendSlice(testing.allocator, long);
-    try source.appendSlice(testing.allocator, "\n---\nbody");
+    const folded = try parseIn(&arena,
+        \\---
+        \\name: caveman
+        \\description: >
+        \\  Ultra-compressed communication mode. Cuts token usage ~75%.
+        \\  Use when user says "caveman mode", or invokes /caveman.
+        \\---
+        \\Respond terse.
+    );
 
-    const front = parse(source.items);
-    try testing.expectEqual(max_description_bytes, front.description.len);
+    try testing.expectEqualStrings("caveman", folded.name);
+    try testing.expectEqualStrings(
+        "Ultra-compressed communication mode. Cuts token usage ~75%. Use when user says \"caveman mode\", or invokes /caveman.",
+        folded.description,
+    );
+    try testing.expectEqualStrings("Respond terse.", folded.body);
+
+    const literal = try parseIn(&arena,
+        \\---
+        \\description: |-
+        \\  first line
+        \\  second line
+        \\name: after
+        \\---
+        \\body
+    );
+
+    try testing.expectEqualStrings("first line second line", literal.description);
+    try testing.expectEqualStrings("after", literal.name);
+
+    const bare = try parseIn(&arena,
+        \\---
+        \\description:
+        \\  carried on the next line
+        \\---
+        \\body
+    );
+
+    try testing.expectEqualStrings("carried on the next line", bare.description);
+}
+
+test "a colon inside a folded value does not start a new key" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const front = try parseIn(&arena,
+        \\---
+        \\description: >
+        \\  Supports levels: lite, full, ultra.
+        \\  name: not a key
+        \\---
+        \\body
+    );
+
+    try testing.expectEqualStrings("", front.name);
+    try testing.expectEqualStrings("Supports levels: lite, full, ultra. name: not a key", front.description);
 }
 
 test "an id has to be typeable" {
