@@ -61,10 +61,7 @@ pub const Set = struct {
     }
 
     pub fn find(self: *const Set, id: []const u8) ?Skill {
-        for (self.skills) |skill| {
-            if (std.mem.eql(u8, skill.id, id)) return skill;
-        }
-        return null;
+        return findIn(self.skills, id);
     }
 
     /// Whether any skill was found at all. What decides if the prompt gets a
@@ -73,6 +70,15 @@ pub const Set = struct {
         return self.skills.len > 0;
     }
 };
+
+/// The skill with this id, from a plain slice. What the parts holding skills
+/// without the set they came from - the loop, the slash picker - look through.
+pub fn findIn(available: []const Skill, id: []const u8) ?Skill {
+    for (available) |entry| {
+        if (std.mem.eql(u8, entry.id, id)) return entry;
+    }
+    return null;
+}
 
 /// Search paths for `root`, in precedence order: the project first, then
 /// whatever the config named, then the person's own. Caller owns the result and

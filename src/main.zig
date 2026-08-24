@@ -195,6 +195,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     if (config.system_prompt) |text| model.loop.system_prompt = text;
     model.loop.project = &project;
     model.loop.skills = skills.skills;
+    model.slash.skills = skills.skills;
     try model.loop.useAgent(agents.default_id);
     try model.loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");

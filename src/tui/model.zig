@@ -463,16 +463,26 @@ pub fn startCompaction(self: *Model, ctx: *vxfw.EventContext) !void {
 }
 
 pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !void {
-    try self.remember(prompt);
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try self.loop.submit(prompt, .{
+    try self.beginTurn(ctx, prompt, .{
         .attachments = try self.held.textAttachments(arena, prompt),
         .images = try self.held.images(arena, prompt),
     });
     self.held.consume(prompt);
+}
+
+/// Everything starting a turn involves besides the prompt itself.
+///
+/// The tick is the part that must not be missed: a turn runs on a worker, and
+/// without a scheduled tick nothing polls it, so the spinner sits still and the
+/// reply never lands until some other event wakes the loop.
+pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extras: AgentLoop.Extras) !void {
+    try self.remember(prompt);
+    try self.loop.submit(prompt, extras);
+
     self.thinking.stream = self.loop.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = true;
