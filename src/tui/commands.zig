@@ -79,6 +79,19 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (std.mem.eql(u8, line, "/skills")) {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+
+        const text = if (self.skills) |set|
+            try set.listText(arena_state.allocator())
+        else
+            "No skills found.";
+        _ = try self.conversation.append(.{ .role = .assistant, .text = text });
+        self.scroll = 0;
+        ctx.redraw = true;
+        return true;
+    }
     if (std.mem.eql(u8, line, "/providers")) {
         try showProviders(self);
         ctx.redraw = true;

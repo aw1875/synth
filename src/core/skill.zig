@@ -55,6 +55,9 @@ pub const Skill = struct {
 pub const Set = struct {
     arena: std.heap.ArenaAllocator,
     skills: []const Skill = &.{},
+    /// Every directory that was looked in, whether or not it existed. Kept so a
+    /// skill that did not turn up can be explained rather than guessed at.
+    paths: []const []const u8 = &.{},
 
     pub fn deinit(self: *Set) void {
         self.arena.deinit();
@@ -64,12 +67,46 @@ pub const Set = struct {
         return findIn(self.skills, id);
     }
 
+    /// The set as a person reads it: what was found, and where it was looked for.
+    /// Written here rather than in the UI because both the TUI and a future command
+    /// line listing want the same answer.
+    pub fn listText(self: *const Set, arena: std.mem.Allocator) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+
+        if (self.skills.len == 0) {
+            try out.appendSlice(arena, "No skills found.\n");
+        } else {
+            try out.appendSlice(arena, "**Skills**\n\n");
+            for (self.skills) |entry| {
+                try out.print(arena, "- `/{s}` - {s}\n", .{
+                    entry.id,
+                    if (entry.description.len > 0) entry.description else "no description",
+                });
+                try out.print(arena, "  `{s}`\n", .{entry.dir});
+            }
+        }
+
+        try out.appendSlice(arena, "\n**Looked in**\n\n");
+        for (self.paths) |path| try out.print(arena, "- `{s}`\n", .{path});
+
+        return out.toOwnedSlice(arena);
+    }
+
     /// Whether any skill was found at all. What decides if the prompt gets a
     /// `<skills>` block and if `/` has anything extra to offer.
     pub fn any(self: *const Set) bool {
         return self.skills.len > 0;
     }
 };
+
+/// The skill a `SKILL.md` path belongs to, or null for any other file. Borrows
+/// from `path`, so the caller does not have to hold a set to label one.
+pub fn idFromPath(path: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, std.fs.path.basename(path), file_name)) return null;
+    const dir = std.fs.path.dirname(path) orelse return null;
+    const id = std.fs.path.basename(dir);
+    return if (id.len > 0) id else null;
+}
 
 /// The skill with this id, from a plain slice. What the parts holding skills
 /// without the set they came from - the loop, the slash picker - look through.
@@ -145,6 +182,10 @@ pub fn discover(
 
     var found: std.ArrayList(Skill) = .empty;
     var seen: std.StringHashMapUnmanaged(void) = .empty;
+
+    const kept = try arena.alloc([]const u8, paths.len);
+    for (paths, kept) |path, *out| out.* = try arena.dupe(u8, path);
+    set.paths = kept;
 
     for (paths) |path| {
         if (found.items.len >= max_skills) break;
@@ -454,4 +495,39 @@ test "a folder without a SKILL.md is passed over" {
 
     try testing.expectEqual(@as(usize, 1), set.skills.len);
     try testing.expectEqualStrings("real", set.skills[0].id);
+}
+
+test "a SKILL.md path names the skill it belongs to" {
+    try testing.expectEqualStrings("caveman", idFromPath("/home/a/.agents/skills/caveman/SKILL.md").?);
+    try testing.expectEqualStrings("release", idFromPath("release/SKILL.md").?);
+    try testing.expect(idFromPath("/home/a/src/main.zig") == null);
+    try testing.expect(idFromPath("SKILL.md") == null);
+    try testing.expect(idFromPath("") == null);
+}
+
+test "the listing names what was found and where it looked" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var set: Set = .{ .arena = .init(testing.allocator) };
+    defer set.deinit();
+    set.skills = &.{
+        .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
+        .{ .id = "quiet", .name = "quiet", .description = "", .dir = "/p/quiet", .body = "b" },
+    };
+    set.paths = &.{ "/p/.agents/skills", "/home/a/.claude/skills" };
+
+    const text = try set.listText(arena);
+    try testing.expect(std.mem.indexOf(u8, text, "/release") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "cut a release") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "no description") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "/home/a/.claude/skills") != null);
+
+    var empty: Set = .{ .arena = .init(testing.allocator) };
+    defer empty.deinit();
+    empty.paths = &.{"/nowhere"};
+    const none = try empty.listText(arena);
+    try testing.expect(std.mem.indexOf(u8, none, "No skills found") != null);
+    try testing.expect(std.mem.indexOf(u8, none, "/nowhere") != null);
 }

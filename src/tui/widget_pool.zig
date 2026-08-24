@@ -11,6 +11,7 @@ const Conversation = @import("../core/conversation.zig");
 const AttachmentCard = @import("attachment_card.zig");
 const diff = @import("diff.zig");
 const Model = @import("model.zig");
+const skill = @import("../core/skill.zig");
 const ThoughtView = @import("thought_view.zig");
 const ToolCard = @import("tool_card.zig");
 
@@ -100,7 +101,13 @@ pub fn attachmentCard(
     }
 
     const card = entry.value_ptr.*;
-    card.label = attachment.path;
+    if (skill.idFromPath(attachment.path)) |id| {
+        card.label = id;
+        card.kind = "skill";
+    } else {
+        card.label = attachment.path;
+        card.kind = "";
+    }
     card.body = attachment.content;
     return card;
 }

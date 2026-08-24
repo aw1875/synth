@@ -18,6 +18,7 @@ const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
+const skill = @import("../core/skill.zig");
 const tool = @import("../tools/tool.zig");
 const Approval = @import("approval.zig");
 const AttachmentCard = @import("attachment_card.zig");
@@ -137,6 +138,9 @@ input_cursor: ?vxfw.CursorState = null,
 /// The agent loop. Owns the conversation's mutations, the in-flight request,
 /// and any running tools.
 loop: AgentLoop = undefined,
+/// Every skill found at startup, for `/skills`. Borrowed, and null where
+/// nothing looked.
+skills: ?*const skill.Set = null,
 /// Tool registry, and the read log the tools share. Owned.
 registry: Registry = undefined,
 reads: tool.ReadLog = undefined,
