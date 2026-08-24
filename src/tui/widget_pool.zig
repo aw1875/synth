@@ -109,6 +109,12 @@ pub fn attachmentCard(
         card.kind = "";
     }
     card.body = attachment.content;
+
+    if (card.expanded and attachment.shortened()) {
+        self.loop.loadAttachment(msg, index) catch {};
+        card.body = attachment.content;
+    }
+
     return card;
 }
 

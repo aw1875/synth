@@ -27,7 +27,17 @@ pub const Span = struct {
 pub const Attachment = struct {
     /// Path as written in the prompt.
     path: []const u8,
+    /// The file's text, which past `Conversation.preview_bytes` may be only the
+    /// first part of it. `content_bytes` holds the full length.
     content: []const u8,
+    /// Full length of the file in bytes. Zero where nothing has said otherwise,
+    /// which means `content` is all of it.
+    content_bytes: u64 = 0,
+
+    /// Whether `content` is only the start of the file.
+    pub fn shortened(self: Attachment) bool {
+        return self.content_bytes > self.content.len;
+    }
 
     pub fn deinit(self: *Attachment, allocator: std.mem.Allocator) void {
         allocator.free(self.path);

@@ -36,6 +36,11 @@ pub const no_reply = "(no reply)";
 /// Messages whose pasted images stay in memory. Older ones keep their token in
 /// the text but stop being resent; the bodies remain in the blob table.
 const max_resident_images: usize = 2;
+/// How much attachment text is held in full across the whole transcript. Past
+/// this the oldest are cut back to a preview, which is recoverable from the
+/// `attachment` table. Generous enough for a handful of skills and mentioned
+/// files, small enough that a session full of them cannot grow without bound.
+const max_resident_attachment_bytes: usize = 256 * 1024;
 
 /// Cap on tool output fed back to the model. The whole conversation is resent
 /// every turn, so an unbounded `read` of a large file does not just cost once -
@@ -580,6 +585,27 @@ pub fn loadThinking(self: *Loop, msg: *Conversation.Message) !void {
     const full = try db.loadThinking(self.allocator, session_id, @intCast(msg.seq)) orelse return;
     if (msg.thinking) |t| self.allocator.free(t);
     msg.thinking = full;
+}
+
+/// Load an attachment in full, replacing its in-memory preview. No-op without a
+/// database, or when the preview already holds the whole file.
+pub fn loadAttachment(self: *Loop, msg: *Conversation.Message, index: usize) !void {
+    const db = self.db orelse return;
+    const session_id = self.session_id orelse return;
+    if (index >= msg.attachments.len) return;
+
+    const attachment = &msg.attachments[index];
+    if (!attachment.shortened()) return;
+
+    const full = try db.loadAttachment(
+        self.allocator,
+        session_id,
+        @intCast(msg.seq),
+        @intCast(index),
+    ) orelse return;
+
+    self.allocator.free(attachment.content);
+    attachment.content = full;
 }
 
 /// Load the full result body for a tool call, replacing its in-memory preview.
@@ -1232,6 +1258,7 @@ fn persistMessage(self: *Loop, index: usize) !void {
         try db.appendBlob(message_id, @intCast(i), "image", image);
     }
     self.conversation.dropOldImages(max_resident_images);
+    self.conversation.shrinkAttachments(max_resident_attachment_bytes);
 
     for (msg.tool_calls, 0..) |call, i| {
         try db.appendToolCall(

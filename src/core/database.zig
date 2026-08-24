@@ -493,8 +493,16 @@ pub fn loadAttachments(
     while (rows.next()) |row| {
         const path = try allocator.dupe(u8, row.text(0));
         errdefer allocator.free(path);
-        const body = try allocator.dupe(u8, row.text(1));
-        try list.append(allocator, .{ .path = path, .content = body });
+
+        const stored = row.text(1);
+        const body = try Conversation.preview(allocator, stored);
+        const owned = if (body.ptr == stored.ptr) try allocator.dupe(u8, stored) else body;
+
+        try list.append(allocator, .{
+            .path = path,
+            .content = owned,
+            .content_bytes = stored.len,
+        });
     }
     return list.toOwnedSlice(allocator);
 }
@@ -650,6 +658,23 @@ pub fn loadToolResult(
         \\SELECT b.body FROM blob b JOIN message m ON b.message_id = m.id
         \\WHERE m.session_id = ? AND m.seq = ? AND b.kind = 'tool_result' AND b.seq = ?
     , .{ session_id, seq, call_seq }) orelse return null;
+    defer row.deinit();
+    return try allocator.dupe(u8, row.text(0));
+}
+
+/// The whole of one attachment, for a card that was expanded. Returns null when
+/// the message or the attachment is not there.
+pub fn loadAttachment(
+    self: *Database,
+    allocator: std.mem.Allocator,
+    session_id: i64,
+    seq: i64,
+    attachment_seq: i64,
+) !?[]const u8 {
+    const row = try self.conn.row(
+        \\SELECT a.body FROM attachment a JOIN message m ON a.message_id = m.id
+        \\WHERE m.session_id = ? AND m.seq = ? AND a.seq = ?
+    , .{ session_id, seq, attachment_seq }) orelse return null;
     defer row.deinit();
     return try allocator.dupe(u8, row.text(0));
 }
@@ -1122,4 +1147,43 @@ test "what a message carried comes back with it" {
     const empty = try db.loadAttachments(std.testing.allocator, plain);
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "a long attachment comes back as a preview, and in full when asked for" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/p.db", .{buf[0..n]});
+    defer std.testing.allocator.free(db_path);
+
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const body = try std.testing.allocator.alloc(u8, Conversation.preview_bytes * 3);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'z');
+
+    const project_id = try db.resolveProject("/tmp/project", "git", "project");
+    const session_id = try db.createSession(project_id, "/tmp/project", "qwen3");
+    const message_id = try db.appendMessage(session_id, 0, "user", "/big", null, 0);
+    try db.appendAttachment(message_id, 0, "big/SKILL.md", body);
+
+    const loaded = try db.loadAttachments(std.testing.allocator, message_id);
+    defer {
+        for (loaded) |*attachment| attachment.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expect(loaded[0].content.len <= Conversation.preview_bytes);
+    try std.testing.expect(loaded[0].shortened());
+    try std.testing.expectEqual(@as(u64, body.len), loaded[0].content_bytes);
+
+    const full = (try db.loadAttachment(std.testing.allocator, session_id, 0, 0)).?;
+    defer std.testing.allocator.free(full);
+    try std.testing.expectEqual(body.len, full.len);
+
+    try std.testing.expect(try db.loadAttachment(std.testing.allocator, session_id, 0, 9) == null);
 }
