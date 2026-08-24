@@ -275,6 +275,20 @@ pub fn appendBlob(
     , .{ message_id, seq, kind, body });
 }
 
+/// Append one file a message carried: an `@path` mention, or the instructions
+/// a skill was invoked with.
+pub fn appendAttachment(
+    self: *Database,
+    message_id: i64,
+    seq: i64,
+    path: []const u8,
+    body: []const u8,
+) !void {
+    try self.conn.exec(
+        \\INSERT INTO attachment (message_id, seq, path, body) VALUES (?, ?, ?, ?)
+    , .{ message_id, seq, path, body });
+}
+
 /// Append a tool call row.
 pub fn appendToolCall(
     self: *Database,
@@ -457,6 +471,34 @@ pub fn loadImages(self: *Database, allocator: std.mem.Allocator, message_id: i64
     return list.toOwnedSlice(allocator);
 }
 
+/// The files a message carried, in the order they were attached. Caller owns
+/// the result and everything in it.
+pub fn loadAttachments(
+    self: *Database,
+    allocator: std.mem.Allocator,
+    message_id: i64,
+) ![]Conversation.Attachment {
+    var rows = try self.conn.rows(
+        "SELECT path, body FROM attachment WHERE message_id = ? ORDER BY seq",
+        .{message_id},
+    );
+    defer rows.deinit();
+
+    var list: std.ArrayList(Conversation.Attachment) = .empty;
+    errdefer {
+        for (list.items) |*attachment| attachment.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    while (rows.next()) |row| {
+        const path = try allocator.dupe(u8, row.text(0));
+        errdefer allocator.free(path);
+        const body = try allocator.dupe(u8, row.text(1));
+        try list.append(allocator, .{ .path = path, .content = body });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// One remembered approval: a tool and the pattern it was approved for.
 pub const Approval = struct {
     tool: []const u8,
@@ -561,6 +603,7 @@ pub fn loadMessages(
         }
 
         msg.tool_calls = try self.loadToolCalls(allocator, id);
+        msg.attachments = try self.loadAttachments(allocator, id);
 
         if (!loaded_images) {
             const images = try self.loadImages(allocator, id);
@@ -688,6 +731,7 @@ test "migrations bring a fresh database to the current version" {
     try db.conn.execNoArgs("SELECT 1 FROM message LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM blob LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM tool_call LIMIT 0");
+    try db.conn.execNoArgs("SELECT 1 FROM attachment LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM read_file LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM approval LIMIT 0");
 }
@@ -929,7 +973,7 @@ test "sessions get a handle, and are found by it" {
     try std.testing.expect(try db.findSession(project_id, handle) == null);
 }
 
-test "deleting a session takes its messages, blobs and tool calls with it" {
+test "deleting a session takes its messages, blobs, attachments and tool calls with it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -947,6 +991,7 @@ test "deleting a session takes its messages, blobs and tool calls with it" {
     const message_id = try db.appendMessage(session_id, 0, "assistant", "hi", 12, 4);
     try db.appendBlob(message_id, 0, "reasoning", "a long thought");
     try db.appendToolCall(message_id, 0, "1", "bash", "{}", "ok", "output", 6);
+    try db.appendAttachment(message_id, 0, "/p/.agents/skills/release/SKILL.md", "tag, then push");
     try db.recordRead(session_id, "/tmp/project/a.zig", 1234);
 
     try db.deleteSession(session_id);
@@ -954,6 +999,7 @@ test "deleting a session takes its messages, blobs and tool calls with it" {
     try std.testing.expectEqual(@as(u64, 0), try db.countMessages(session_id));
     try std.testing.expect(try db.conn.row("SELECT 1 FROM blob WHERE message_id = ?", .{message_id}) == null);
     try std.testing.expect(try db.conn.row("SELECT 1 FROM tool_call WHERE message_id = ?", .{message_id}) == null);
+    try std.testing.expect(try db.conn.row("SELECT 1 FROM attachment WHERE message_id = ?", .{message_id}) == null);
     try std.testing.expect(try db.conn.row("SELECT 1 FROM read_file WHERE session_id = ?", .{session_id}) == null);
 }
 
@@ -1034,4 +1080,46 @@ test "a chosen theme outlives the process" {
     const stored = try db.setting(testing.allocator, "theme");
     defer testing.allocator.free(stored);
     try testing.expectEqualStrings("nord", stored);
+}
+
+test "what a message carried comes back with it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/a.db", .{buf[0..n]});
+    defer std.testing.allocator.free(db_path);
+
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const project_id = try db.resolveProject("/tmp/project", "git", "project");
+    const session_id = try db.createSession(project_id, "/tmp/project", "qwen3");
+
+    const message_id = try db.appendMessage(session_id, 0, "user", "/release 2.1", null, 0);
+    try db.appendAttachment(message_id, 0, "/p/.agents/skills/release/SKILL.md", "tag, then push");
+    try db.appendAttachment(message_id, 1, "src/main.zig", "const std = @import(\"std\");");
+
+    const plain = try db.appendMessage(session_id, 1, "user", "no files here", null, 0);
+
+    const loaded = try db.loadMessages(std.testing.allocator, session_id, 10, 10);
+    defer {
+        for (loaded) |*msg| msg.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+
+    const carried = loaded[1];
+    try std.testing.expectEqualStrings("/release 2.1", carried.text);
+    try std.testing.expectEqual(@as(usize, 2), carried.attachments.len);
+    try std.testing.expectEqualStrings("/p/.agents/skills/release/SKILL.md", carried.attachments[0].path);
+    try std.testing.expectEqualStrings("tag, then push", carried.attachments[0].content);
+    try std.testing.expectEqualStrings("src/main.zig", carried.attachments[1].path);
+    try std.testing.expectEqual(@as(usize, 0), loaded[0].attachments.len);
+
+    const empty = try db.loadAttachments(std.testing.allocator, plain);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

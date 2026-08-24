@@ -28,6 +28,7 @@ pub const Migration = struct {
 pub const all = [_]Migration{
     .{ .version = 1, .sql = @embedFile("migrations/001_initial.sql") },
     .{ .version = 2, .sql = @embedFile("migrations/002_session_agent.sql") },
+    .{ .version = 3, .sql = @embedFile("migrations/003_attachment.sql") },
 };
 
 /// The version this build writes. Derived, so adding a migration is one edit.

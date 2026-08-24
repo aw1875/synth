@@ -1224,6 +1224,10 @@ fn persistMessage(self: *Loop, index: usize) !void {
         }
     }
 
+    for (msg.attachments, 0..) |attachment, i| {
+        try db.appendAttachment(message_id, @intCast(i), attachment.path, attachment.content);
+    }
+
     for (msg.images, 0..) |image, i| {
         try db.appendBlob(message_id, @intCast(i), "image", image);
     }
