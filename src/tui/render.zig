@@ -258,8 +258,8 @@ const Block = union(enum) {
     thinking,
     /// The reply as it streams in, before it becomes a message.
     streaming,
-    queued: []const u8,
-    queued_more: usize,
+    steering: []const u8,
+    steering_more: usize,
 
     /// Whether this block belongs to the live tail - the part that grows while
     /// a turn is in flight. Growth there is what the scroll offset has to be
@@ -267,7 +267,7 @@ const Block = union(enum) {
     /// happens above the viewport and moves nothing.
     fn inTail(self: Block) bool {
         return switch (self) {
-            .thinking, .streaming, .queued, .queued_more => true,
+            .thinking, .streaming, .steering, .steering_more => true,
             else => false,
         };
     }
@@ -309,12 +309,13 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
         try blocks.append(arena, .streaming);
     }
 
-    for (self.queued.items, 0..) |prompt, i| {
-        if (i == Model.max_queued_shown) {
-            try blocks.append(arena, .{ .queued_more = self.queued.items.len - i });
+    const steering = self.loop.pendingSteering();
+    for (steering, 0..) |prompt, i| {
+        if (i == Model.max_steering_shown) {
+            try blocks.append(arena, .{ .steering_more = steering.len - i });
             break;
         }
-        try blocks.append(arena, .{ .queued = prompt });
+        try blocks.append(arena, .{ .steering = prompt });
     }
 
     return blocks.toOwnedSlice(arena);
@@ -382,12 +383,12 @@ fn drawBlock(
             return try messageBlock(self, ctx, .{ .role = .assistant, .text = partial }, width);
         },
 
-        .queued => |prompt| return try queuedBlock(self, ctx, prompt, width),
+        .steering => |prompt| return try steeringBlock(self, ctx, prompt, width),
 
-        .queued_more => |count| return try queuedBlock(
+        .steering_more => |count| return try steeringBlock(
             self,
             ctx,
-            try std.fmt.allocPrint(ctx.arena, "+{d} more queued", .{count}),
+            try std.fmt.allocPrint(ctx.arena, "+{d} more waiting", .{count}),
             width,
         ),
     }
@@ -451,7 +452,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
                 std.hash.autoHash(&hasher, card.expanded);
             }
         },
-        .question, .thinking, .streaming, .queued, .queued_more => return null,
+        .question, .thinking, .streaming, .steering, .steering_more => return null,
     }
 
     return hasher.final();
@@ -466,7 +467,7 @@ pub fn drawTranscript(
     const messages = self.conversation.messages.items;
     const pending: usize = if (self.loop.isBusy() and
         self.loop.state != .awaiting_approval) 1 else 0;
-    if (height == 0 or messages.len + pending + self.queued.items.len == 0) return null;
+    if (height == 0 or messages.len + pending + self.loop.pendingSteering().len == 0) return null;
 
     const constraints = ctx.withConstraints(
         .{ .width = width },
@@ -699,8 +700,9 @@ fn skillLine(
     return surface;
 }
 
-/// A prompt waiting its turn: the user's card, dimmed, so it reads as not yet
-/// sent rather than as part of the transcript.
+/// Something typed while the turn was running: the user's card, dimmed, so it
+/// reads as not yet sent rather than as part of the transcript. It reaches the
+/// model at its next step.
 /// A dim one-line note in the transcript, for things that are neither a
 /// message nor a tool call.
 pub fn noticeBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {
@@ -743,7 +745,7 @@ pub fn questionBlock(
     return w.wrap(constraints, try plainText(ctx, text.items, style, inner_width), opts);
 }
 
-pub fn queuedBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {
+pub fn steeringBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {
     const style = theme.on_card(theme.fg_dim).cell;
 
     const opts: w.PanelOptions = .{
@@ -874,12 +876,12 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
         col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
     }
     _ = w.writeText(surface, col, footer, self.provider.name, theme.on_card(theme.fg_muted).cell);
-    if (self.queued.items.len > 0) {
+    if (self.loop.pendingSteering().len > 0) {
         col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
         col = w.writeText(surface, col, footer, try std.fmt.allocPrint(
             ctx.arena,
-            "{d} queued",
-            .{self.queued.items.len},
+            "{d} waiting",
+            .{self.loop.pendingSteering().len},
         ), theme.on_card(theme.accent_alt).cell);
     }
 

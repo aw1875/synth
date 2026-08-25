@@ -99,7 +99,7 @@ const Confirm = struct {
     }
 };
 /// Queued prompts shown under the transcript before the rest are summarised.
-pub const max_queued_shown: usize = 3;
+pub const max_steering_shown: usize = 3;
 
 /// Prompts kept for up-arrow recall.
 const max_history: usize = 200;
@@ -254,7 +254,6 @@ pending_model_check: bool = false,
 
 /// Prompts typed while a turn was in flight, oldest first. Drained one per
 /// turn once the loop goes idle. Each is owned.
-queued: std.ArrayList([]const u8) = .empty,
 
 /// Tracks the ctrl+c pressed during a running turn. A second press inside
 /// `quit_confirm_ms` quits; otherwise the arming lapses.
@@ -397,8 +396,6 @@ pub fn deinit(self: *Model) void {
     self.paste_toggles.deinit(self.allocator);
     self.diff_starts.deinit(self.allocator);
     self.input.deinit();
-    self.clearQueue();
-    self.queued.deinit(self.allocator);
     self.conversation.deinit();
     self.allocator.free(self.cwd);
     self.allocator.free(self.cwd_display);
@@ -504,17 +501,14 @@ pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extr
     ctx.redraw = true;
 }
 
-/// Start the oldest queued prompt, if the loop has gone idle.
-pub fn drainQueue(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.loop.isBusy() or self.queued.items.len == 0) return;
-    const prompt = self.queued.orderedRemove(0);
+/// Start a turn with whatever was typed mid-turn but never handed over, once
+/// the loop has gone idle. A cancelled turn leaves its steering behind, and
+/// what was a correction is now simply the next thing to do.
+pub fn drainSteering(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (self.loop.isBusy()) return;
+    const prompt = self.loop.takeSteering() orelse return;
     defer self.allocator.free(prompt);
     try self.startTurn(ctx, prompt);
-}
-
-fn clearQueue(self: *Model) void {
-    for (self.queued.items) |prompt| self.allocator.free(prompt);
-    self.queued.clearRetainingCapacity();
 }
 
 /// Terminals send a carriage return for each pasted newline, so the buffer is
@@ -674,7 +668,7 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     clearToolCards(self);
     clearThoughtRows(self);
     self.thinking.stream = null;
-    self.clearQueue();
+    self.loop.dropSteering();
     try self.seedHistory();
     self.input.clear();
     self.held.clear();
@@ -775,7 +769,7 @@ pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
         self.input.clear();
         self.mentions.close();
         self.endRecall();
-        if (self.queued.items.len == 0) self.held.clear();
+        if (self.loop.pendingSteering().len == 0) self.held.clear();
         return ctx.consumeAndRedraw();
     }
     if (self.loop.isBusy()) {

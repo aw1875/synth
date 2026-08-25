@@ -147,6 +147,9 @@ steps: usize = 0,
 /// Both reset by `submit`.
 turn_started_ms: ?i64 = null,
 turn_tokens: u64 = 0,
+/// What the user typed while the turn was running, waiting to be handed to the
+/// model at its next step. Owned.
+steering: std.ArrayList([]const u8) = .empty,
 /// The turn's limits. Zero disables either one.
 max_turn_ms: i64 = default_turn_ms,
 max_turn_tokens: u64 = default_turn_tokens,
@@ -458,6 +461,8 @@ pub fn deinit(self: *Loop) void {
     }
 
     self.todos.deinit();
+    for (self.steering.items) |text| self.allocator.free(text);
+    self.steering.deinit(self.allocator);
     self.prompt_cache.deinit(self.allocator);
     if (self.last_calls) |calls| self.allocator.free(calls);
     if (self.tools_json) |json| self.allocator.free(json);
@@ -676,6 +681,7 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 }
 
 fn ask(self: *Loop) !void {
+    try self.applySteering();
     self.steps += 1;
     if (self.steps > self.agent.steps) {
         return self.stop("Stopped: too many tool calls in one turn.");
@@ -690,6 +696,60 @@ fn ask(self: *Loop) !void {
         self.turn(""),
     );
     self.state = .thinking;
+}
+
+/// Hand the model whatever was typed while it was working.
+///
+/// Drained here rather than the moment it is typed: a user message written
+/// between an assistant's tool calls and their results would split an exchange
+/// the wire format requires to be whole. By the time a step is being asked for,
+/// every result is in.
+fn applySteering(self: *Loop) !void {
+    if (self.steering.items.len == 0) return;
+
+    for (self.steering.items) |text| {
+        defer self.allocator.free(text);
+        _ = try self.conversation.addUser(text, &.{}, &.{});
+        try self.persistMessage(self.conversation.messages.items.len - 1);
+    }
+    self.steering.clearRetainingCapacity();
+}
+
+/// Add to what the model is being asked, without waiting for the turn to end.
+///
+/// A correction is only worth anything while there is still work to redirect,
+/// so this is refused when the loop is idle - the caller starts a turn instead.
+pub fn steer(self: *Loop, text: []const u8) !bool {
+    if (!self.isBusy()) return false;
+
+    const owned = try self.allocator.dupe(u8, text);
+    errdefer self.allocator.free(owned);
+    try self.steering.append(self.allocator, owned);
+    return true;
+}
+
+/// What has been typed mid-turn and not yet handed over, for the UI to show as
+/// waiting.
+pub fn pendingSteering(self: *const Loop) []const []const u8 {
+    return self.steering.items;
+}
+
+/// Take the oldest thing typed mid-turn, handing ownership to the caller.
+///
+/// For when the turn it was meant to steer ended before it could be handed
+/// over - cancelled, or stopped at a limit. It is a prompt now rather than a
+/// correction, and the caller starts a turn with it. Leaving it pending would
+/// mean it silently rode along with whatever was typed next.
+pub fn takeSteering(self: *Loop) ?[]const u8 {
+    if (self.steering.items.len == 0) return null;
+    return self.steering.orderedRemove(0);
+}
+
+/// Throw away anything typed mid-turn that has not been handed over. Used when
+/// the transcript it was meant for is being swapped out from under it.
+pub fn dropSteering(self: *Loop) void {
+    for (self.steering.items) |text| self.allocator.free(text);
+    self.steering.clearRetainingCapacity();
 }
 
 /// Why this turn should not take another step, or null while it may.
@@ -2625,4 +2685,122 @@ test "each turn gets the whole budget again" {
 
     try loop.submit("again", .{});
     try testing.expectEqual(@as(u64, 0), loop.turn_tokens);
+}
+
+test "a correction typed mid-turn reaches the model at its next step" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try testing.expect(loop.isBusy());
+
+    try testing.expect(try loop.steer("no, not that file"));
+    try testing.expect(try loop.steer("and be quick"));
+    try testing.expectEqual(@as(usize, 2), loop.pendingSteering().len);
+
+    try settle(&loop);
+
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+
+    var seen: usize = 0;
+    for (loop.conversation.messages.items) |msg| {
+        if (msg.role != .user) continue;
+        if (std.mem.eql(u8, msg.text, "no, not that file")) seen += 1;
+        if (std.mem.eql(u8, msg.text, "and be quick")) seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "steering never splits an assistant's calls from their results" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("actually, stop reading"));
+    try settle(&loop);
+
+    const messages = loop.conversation.messages.items;
+
+    var found = false;
+    for (messages, 0..) |msg, i| {
+        if (msg.role != .user) continue;
+        if (!std.mem.eql(u8, msg.text, "actually, stop reading")) continue;
+        found = true;
+
+        try testing.expect(i > 0);
+        try testing.expectEqual(@as(usize, 0), messages[i - 1].tool_calls.len);
+    }
+    try testing.expect(found);
+}
+
+test "there is nothing to steer when the loop is idle" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try testing.expect(!try loop.steer("hello?"));
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+}
+
+test "steering is dropped when the transcript it was meant for is swapped out" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("never mind"));
+
+    loop.dropSteering();
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+
+    try settle(&loop);
+    for (loop.conversation.messages.items) |msg| {
+        try testing.expect(!std.mem.eql(u8, msg.text, "never mind"));
+    }
+}
+
+test "a cancelled turn hands back what was typed during it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    fixture.fake.latency = .fromMilliseconds(50);
+
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("wait, do this instead"));
+
+    try loop.cancel();
+    try settle(&loop);
+
+    const left = loop.takeSteering() orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(left);
+    try testing.expectEqualStrings("wait, do this instead", left);
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+
+    for (loop.conversation.messages.items) |msg| {
+        if (msg.role != .user) continue;
+        try testing.expect(!std.mem.eql(u8, msg.text, "wait, do this instead"));
+    }
+}
+
+test "taking steering from a turn that had none is not an error" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try testing.expect(loop.takeSteering() == null);
 }

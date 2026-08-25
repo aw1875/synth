@@ -32,8 +32,7 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
         return;
     }
 
-    if (self.loop.isBusy()) {
-        try self.queued.append(self.allocator, try self.allocator.dupe(u8, value));
+    if (try self.loop.steer(value)) {
         self.scroll = 0;
         ctx.redraw = true;
         return;
@@ -223,7 +222,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (!self.loop.isBusy() and self.loop.shouldCompact()) {
                 try self.startCompaction(ctx);
             }
-            try self.drainQueue(ctx);
+            try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
             if (self.loop.isBusy()) {
                 self.thinking.stream = self.loop.thoughts();
