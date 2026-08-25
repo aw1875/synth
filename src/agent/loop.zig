@@ -528,19 +528,22 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
 pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.isBusy()) return;
 
-    const mentioned: []mention.Attachment =
-        mention.resolve(self.allocator, self.io, self.project_root, prompt) catch &.{};
-    defer {
-        for (mentioned) |*attachment| attachment.deinit(self.allocator);
-        self.allocator.free(mentioned);
-    }
+    var mentioned: mention.Resolved =
+        mention.resolve(self.allocator, self.io, self.project_root, prompt) catch .{};
+    defer mentioned.deinit(self.allocator);
 
-    const attachments = try self.allocator.alloc(mention.Attachment, mentioned.len + extras.attachments.len);
+    const files = mentioned.attachments;
+    const attachments = try self.allocator.alloc(mention.Attachment, files.len + extras.attachments.len);
     defer self.allocator.free(attachments);
-    @memcpy(attachments[0..mentioned.len], mentioned);
-    @memcpy(attachments[mentioned.len..], extras.attachments);
+    @memcpy(attachments[0..files.len], files);
+    @memcpy(attachments[files.len..], extras.attachments);
 
-    _ = try self.conversation.addUser(prompt, attachments, extras.images);
+    const images = try self.allocator.alloc([]const u8, mentioned.images.len + extras.images.len);
+    defer self.allocator.free(images);
+    @memcpy(images[0..mentioned.images.len], mentioned.images);
+    @memcpy(images[mentioned.images.len..], extras.images);
+
+    _ = try self.conversation.addUser(prompt, attachments, images);
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.steps = 0;
     self.repeats = 0;

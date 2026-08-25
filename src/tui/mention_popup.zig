@@ -96,7 +96,7 @@ pub fn update(
 
     try self.startScan(io, root);
 
-    const query = text[anchor + 1 .. cursor];
+    const query = std.mem.trimStart(u8, text[anchor + 1 .. cursor], "\"");
     self.anchor = anchor;
     try self.filter(query);
     if (self.selected >= self.matches.items.len) self.selected = 0;
@@ -457,4 +457,28 @@ test "an index with no build time behind it is stale" {
 
     popup.indexed_at = nowMilliseconds(testing.io) - stale_after_ms - 1;
     try testing.expect(popup.stale(testing.io));
+}
+
+test "typing the opening quote does not break the search" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buffer);
+    const root = buffer[0..n];
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Pasted image.png", .data = "" });
+
+    var popup: Popup = .init(testing.allocator);
+    defer popup.deinit();
+
+    try popup.update(testing.io, root, "@\"Pas", 5);
+    while (!popup.poll()) {
+        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch break;
+    }
+
+    try popup.update(testing.io, root, "@\"Pas", 5);
+    try testing.expectEqualStrings("Pasted image.png", popup.selectedPath().?);
 }

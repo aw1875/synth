@@ -14,6 +14,7 @@ const Conversation = @import("../core/conversation.zig");
 const humanize = @import("../core/humanize.zig");
 const agents = @import("../agent/agent.zig");
 const Model = @import("model.zig");
+const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const widget_pool = @import("widget_pool.zig");
 const AgentLoop = @import("../agent/loop.zig");
@@ -882,7 +883,8 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
     }
 
     const armed = self.quit_confirm.armed(self.io);
-    const blind = !self.provider.vision and self.held.imageCount() > 0;
+    const carries_image = self.held.imageCount() > 0 or mention.mentionsImage(self.input.text.items);
+    const blind = !self.provider.vision and carries_image;
     const hint = if (armed)
         "ctrl+c again to quit"
     else if (blind)
