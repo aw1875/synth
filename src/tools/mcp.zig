@@ -451,6 +451,10 @@ pub const Host = struct {
             .handler = call,
             // Never. See the note at the top of this file.
             .read_only = false,
+            // Never either: one `Client` correlates replies by draining its
+            // transport until an id matches, so two calls at once would eat
+            // each other's answers.
+            .parallel = false,
             .userdata = binding,
             // The registry frees these; they came from this host's arena, which
             // outlives it, so freeing is a no-op that keeps the rule simple.

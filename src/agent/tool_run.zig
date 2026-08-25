@@ -8,6 +8,10 @@ const Conversation = @import("../core/conversation.zig");
 
 const ToolRun = @This();
 
+/// Most calls that may run together at once, so a batch of twenty reads does
+/// not become twenty threads.
+const max_parallel: usize = 8;
+
 pub const Result = struct {
     /// Index of the call within the assistant message that requested it.
     index: usize,
@@ -30,12 +34,12 @@ results: []Result,
 
 future: std.Io.Future(void) = undefined,
 done: std.atomic.Value(bool) = .init(false),
-/// How many results are written and safe to read. Published as each call
-/// lands so the owner can settle one card at a time instead of the whole
-/// batch at once when the last call finishes.
+/// How many results are written and safe to read. Published as each group
+/// lands - a group being one call, or the run of calls that ran together - so
+/// the owner settles cards as they finish rather than all at once at the end.
 settled: std.atomic.Value(usize) = .init(0),
-/// Set by the owner to ask the worker to give up. Checked between calls, so
-/// the tools after the current one are skipped.
+/// Set by the owner to ask the worker to give up. Checked as each call starts,
+/// so everything after the ones already running is skipped.
 stop: std.atomic.Value(bool) = .init(false),
 
 pub const Call = struct {
@@ -81,7 +85,11 @@ pub fn start(
 
     const results = try allocator.alloc(Result, approved.len);
     errdefer allocator.free(results);
-    @memset(results, .{ .index = 0, .content = "", .is_error = false });
+    // Not left to the worker: a call cancelled before its handler ran writes
+    // nothing, and index 0 would then be adopted as call 0's answer.
+    for (results, calls) |*result, call| {
+        result.* = .{ .index = call.index, .content = "", .is_error = true };
+    }
 
     self.* = .{
         .allocator = allocator,
@@ -142,42 +150,315 @@ pub fn destroy(self: *ToolRun) void {
 fn run(self: *ToolRun) void {
     defer self.done.store(true, .release);
 
-    var ctx: tool.Context = .{
+    var start_index: usize = 0;
+    while (start_index < self.calls.len) {
+        const group = self.groupAt(start_index);
+        if (group == 1) {
+            self.runOne(start_index);
+        } else {
+            self.runGroup(start_index, group);
+        }
+        // The whole group is written by the time the count is published, and
+        // `.release` is what makes it visible.
+        _ = self.settled.fetchAdd(group, .release);
+        start_index += group;
+    }
+}
+
+/// How many calls starting at `index` may run together. One unless every call
+/// in the run says it is safe beside another, capped so a long batch of reads
+/// does not become a thread per call.
+fn groupAt(self: *ToolRun, index: usize) usize {
+    var count: usize = 0;
+    while (index + count < self.calls.len and count < max_parallel) : (count += 1) {
+        const call = self.calls[index + count];
+        const found = self.registry.get(call.name) orelse break;
+        if (!found.parallel) break;
+    }
+    return @max(count, 1);
+}
+
+/// Run `count` calls at once and wait for all of them.
+///
+/// A `Group` rather than a future each: cancelling the batch cancels this
+/// worker, and `Group.await` is what passes that on to the calls inside it.
+fn runGroup(self: *ToolRun, index: usize, count: usize) void {
+    var group: std.Io.Group = .init;
+
+    var spawned: usize = 0;
+    while (spawned < count) : (spawned += 1) {
+        group.concurrent(self.io, runOne, .{ self, index + spawned }) catch break;
+    }
+
+    // A call that found no thread still runs, here.
+    for (index + spawned..index + count) |at| self.runOne(at);
+
+    group.await(self.io) catch {
+        self.stop.store(true, .release);
+    };
+}
+
+/// Run one call and write its result, with a `Context` of its own: the calls
+/// in a group differ in what they may touch.
+fn runOne(self: *ToolRun, index: usize) void {
+    const call = self.calls[index];
+    const result = &self.results[index];
+
+    if (self.stop.load(.acquire)) {
+        result.* = .{
+            .index = call.index,
+            .content = self.allocator.dupe(u8, "cancelled") catch "cancelled",
+            .is_error = true,
+        };
+        return;
+    }
+
+    const ctx: tool.Context = .{
         .allocator = self.allocator,
         .io = self.io,
         .project_root = self.project_root,
         .reads = self.reads,
         .delegate = self.delegate,
         .cancelled = &self.stop,
+        .allow_outside = call.allow_outside,
     };
 
-    for (self.calls, self.results) |call, *result| {
-        ctx.allow_outside = call.allow_outside;
-        // Whatever this iteration decides, the result is written by the time
-        // the count is published, and `.release` is what makes it visible.
-        defer _ = self.settled.fetchAdd(1, .release);
-
-        result.index = call.index;
-        if (self.stop.load(.acquire)) {
-            result.* = .{
-                .index = call.index,
-                .content = self.allocator.dupe(u8, "cancelled") catch "cancelled",
-                .is_error = true,
-            };
-            continue;
-        }
-        const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
-            result.* = .{
-                .index = call.index,
-                .content = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s} failed: {s}",
-                    .{ call.name, @errorName(err) },
-                ) catch "tool failed",
-                .is_error = true,
-            };
-            continue;
+    const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
+        result.* = .{
+            .index = call.index,
+            .content = std.fmt.allocPrint(
+                self.allocator,
+                "{s} failed: {s}",
+                .{ call.name, @errorName(err) },
+            ) catch "tool failed",
+            .is_error = true,
         };
-        result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
+        return;
+    };
+    result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
+}
+
+const testing = std.testing;
+
+/// Shared state for the test tools below. `arrived` counts how many calls have
+/// entered a handler; `peak` is the most that were ever inside one at once,
+/// which is what tells a batch that overlapped from one that did not.
+const Probe = struct {
+    arrived: std.atomic.Value(usize) = .init(0),
+    inside: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+    /// How many calls each one waits for before returning. Zero waits for
+    /// nobody, which is what a barrier tool wants.
+    rendezvous: usize = 0,
+    /// Whether a handler asks the batch to stop once it has met the others.
+    stop_run: bool = false,
+    /// The batch to ask, set once it has started - which is after the workers
+    /// are already going, so the handlers read it atomically rather than
+    /// racing the test thread for it.
+    run: std.atomic.Value(?*ToolRun) = .init(null),
+
+    fn enter(self: *Probe) usize {
+        const now = self.inside.fetchAdd(1, .acq_rel) + 1;
+        _ = self.peak.fetchMax(now, .acq_rel);
+        return self.arrived.fetchAdd(1, .acq_rel) + 1;
     }
+
+    fn leave(self: *Probe) void {
+        _ = self.inside.fetchSub(1, .acq_rel);
+    }
+};
+
+/// Wait until every call in the group has arrived. A batch that runs one call
+/// after another never gets there, so the deadline is the assertion: it fails
+/// the test rather than hanging the suite.
+fn rendezvousHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
+    const probe: *Probe = @ptrCast(@alignCast(ctx.userdata.?));
+    _ = probe.enter();
+    defer probe.leave();
+
+    const deadline = tool.monotonicMilliseconds(ctx.io) + 2000;
+    while (probe.arrived.load(.acquire) < probe.rendezvous) {
+        if (tool.monotonicMilliseconds(ctx.io) >= deadline) {
+            return tool.Output.err(try ctx.allocator.dupe(u8, "timed out waiting for the others"));
+        }
+        std.Io.sleep(ctx.io, .fromMilliseconds(1), .awake) catch break;
+    }
+    if (probe.stop_run) {
+        if (probe.run.load(.acquire)) |run_state| run_state.requestStop();
+    }
+    return tool.Output.ok(try ctx.allocator.dupe(u8, "together"));
+}
+
+/// Record how many calls were running alongside this one, then return.
+fn aloneHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
+    const probe: *Probe = @ptrCast(@alignCast(ctx.userdata.?));
+    _ = probe.enter();
+    defer probe.leave();
+
+    std.Io.sleep(ctx.io, .fromMilliseconds(5), .awake) catch {};
+    return tool.Output.ok(try ctx.allocator.dupe(u8, "alone"));
+}
+
+fn probeRegistry(allocator: std.mem.Allocator, probe: *Probe) !Registry {
+    var registry: Registry = .{ .allocator = allocator };
+    errdefer registry.deinit();
+
+    try registry.register(.{
+        .name = "together",
+        .description = "test",
+        .schema = "{}",
+        .handler = rendezvousHandler,
+        .read_only = true,
+        .parallel = true,
+        .userdata = probe,
+    });
+    try registry.register(.{
+        .name = "alone",
+        .description = "test",
+        .schema = "{}",
+        .handler = aloneHandler,
+        .read_only = true,
+        .userdata = probe,
+    });
+    return registry;
+}
+
+fn drain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    registry: *const Registry,
+    reads: *tool.ReadLog,
+    calls: []const Call,
+) !*ToolRun {
+    const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, calls);
+    run_state.join();
+    return run_state;
+}
+
+test "calls that may run together do" {
+    const allocator = testing.allocator;
+
+    var probe: Probe = .{ .rendezvous = 4 };
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+
+    const calls: []const Call = &.{
+        .{ .index = 0, .name = "together", .arguments = "{}" },
+        .{ .index = 1, .name = "together", .arguments = "{}" },
+        .{ .index = 2, .name = "together", .arguments = "{}" },
+        .{ .index = 3, .name = "together", .arguments = "{}" },
+    };
+
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+
+    const run_state = try drain(allocator, testing.io, &registry, &reads, calls);
+    defer run_state.destroy();
+
+    try testing.expectEqual(@as(usize, 4), run_state.settledCount());
+    for (run_state.results) |result| {
+        try testing.expect(!result.is_error);
+        try testing.expectEqualStrings("together", result.content);
+    }
+    try testing.expectEqual(@as(usize, 4), probe.peak.load(.acquire));
+}
+
+test "a call that cannot run beside another never does" {
+    const allocator = testing.allocator;
+
+    var probe: Probe = .{ .rendezvous = 2 };
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+
+    // The pair rendezvous, proving they grouped; the barrier must still be alone.
+    const calls: []const Call = &.{
+        .{ .index = 0, .name = "together", .arguments = "{}" },
+        .{ .index = 1, .name = "together", .arguments = "{}" },
+        .{ .index = 2, .name = "alone", .arguments = "{}" },
+    };
+
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+
+    const run_state = try drain(allocator, testing.io, &registry, &reads, calls);
+    defer run_state.destroy();
+
+    try testing.expectEqual(@as(usize, 3), run_state.settledCount());
+    try testing.expectEqualStrings("alone", run_state.results[2].content);
+    try testing.expectEqual(@as(usize, 2), probe.peak.load(.acquire));
+}
+
+test "results land in the slot their call asked for" {
+    const allocator = testing.allocator;
+
+    var probe: Probe = .{ .rendezvous = 0 };
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+
+    const calls: []const Call = &.{
+        .{ .index = 7, .name = "together", .arguments = "{}" },
+        .{ .index = 3, .name = "alone", .arguments = "{}" },
+        .{ .index = 5, .name = "together", .arguments = "{}" },
+    };
+
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+
+    const run_state = try drain(allocator, testing.io, &registry, &reads, calls);
+    defer run_state.destroy();
+
+    try testing.expectEqual(@as(usize, 7), run_state.results[0].index);
+    try testing.expectEqual(@as(usize, 3), run_state.results[1].index);
+    try testing.expectEqual(@as(usize, 5), run_state.results[2].index);
+}
+
+test "a batch wider than the cap runs in several groups" {
+    const allocator = testing.allocator;
+
+    var probe: Probe = .{ .rendezvous = 0 };
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+
+    var many: [max_parallel + 3]Call = undefined;
+    for (&many, 0..) |*call, i| {
+        call.* = .{ .index = i, .name = "together", .arguments = "{}" };
+    }
+
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, &many);
+    defer run_state.destroy();
+    run_state.join();
+
+    try testing.expectEqual(max_parallel, run_state.groupAt(0));
+    try testing.expectEqual(@as(usize, 3), run_state.groupAt(max_parallel));
+    try testing.expectEqual(many.len, run_state.settledCount());
+}
+
+test "giving up inside a group stops the calls after it" {
+    const allocator = testing.allocator;
+
+    var probe: Probe = .{ .rendezvous = 2, .stop_run = true };
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+
+    // The pair stop the batch; the barrier starts after them and must see it.
+    const calls: []const Call = &.{
+        .{ .index = 0, .name = "together", .arguments = "{}" },
+        .{ .index = 1, .name = "together", .arguments = "{}" },
+        .{ .index = 2, .name = "alone", .arguments = "{}" },
+    };
+
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, calls);
+    defer run_state.destroy();
+    probe.run.store(run_state, .release);
+    run_state.join();
+
+    try testing.expect(run_state.results[2].is_error);
+    try testing.expectEqualStrings("cancelled", run_state.results[2].content);
+    try testing.expectEqual(@as(usize, 2), probe.peak.load(.acquire));
 }
