@@ -139,6 +139,13 @@ input_cursor: ?vxfw.CursorState = null,
 /// The agent loop. Owns the conversation's mutations, the in-flight request,
 /// and any running tools.
 loop: AgentLoop = undefined,
+/// Rows the plan occupied in the last frame, so a click can find it. Both zero
+/// when there is no plan on screen.
+plan_top: u16 = 0,
+plan_bottom: u16 = 0,
+/// Whether the pointer is over the plan, which is the only thing that says it
+/// can be clicked at all.
+plan_hover: bool = false,
 /// Every skill found at startup, for `/skills`. Borrowed, and null where
 /// nothing looked.
 skills: ?*const skill.Set = null,

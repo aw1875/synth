@@ -32,6 +32,15 @@ pub const default = std.fmt.comptimePrint(
     \\Make one edit per logical change and check each result before the next.
     \\</tools>
     \\
+    \\<plan>
+    \\For work that takes several steps, keep a plan with `todo`. Write the whole
+    \\list before you start, mark the one step you are on as active, and mark it
+    \\done the moment it is finished rather than in a batch at the end - a stale
+    \\list is worse than none, because the reader is watching it.
+    \\Send the entire list every time; it replaces the last one.
+    \\Skip it for anything you can finish in a single step.
+    \\</plan>
+    \\
     \\<verification>
     \\Work is done when it stands up, not when the edit lands. After changing code,
     \\build it and run the tests the project already has.
@@ -50,7 +59,7 @@ pub const default = std.fmt.comptimePrint(
 
 test "the prompt names the tools that exist" {
     const testing = std.testing;
-    for ([_][]const u8{ "read", "list", "glob", "grep", "write", "edit", "bash", "task" }) |name| {
+    for ([_][]const u8{ "read", "list", "glob", "grep", "write", "edit", "bash", "task", "todo" }) |name| {
         try testing.expect(std.mem.indexOf(u8, default, name) != null);
     }
     try testing.expect(std.mem.indexOf(u8, default, pkg.name) != null);
