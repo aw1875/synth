@@ -6,6 +6,7 @@ const testing = std.testing;
 
 const Database = @import("../core/database.zig");
 const Provider = @import("../provider/provider.zig");
+const recap = @import("recap.zig");
 const ask_user = @import("../tools/ask.zig");
 const todo_tool = @import("../tools/todo.zig");
 const Registry = @import("../tools/registry.zig");
@@ -61,6 +62,19 @@ const max_resident_attachment_bytes: usize = 256 * 1024;
 /// it inflates every request that follows, until the context fills and the
 /// model slows to a crawl. The full output is still shown in the transcript.
 pub const max_tool_result_bytes: usize = 8 * 1024;
+
+/// How the turn that just ended ended. Read by the UI to say so, and reset
+/// when the next one starts.
+pub const Outcome = enum {
+    /// The model answered and asked for nothing more.
+    done,
+    /// The user gave up on it.
+    cancelled,
+    /// The provider refused, or the request never landed.
+    failed,
+    /// The loop called it: a budget, the step ceiling, or the same calls again.
+    halted,
+};
 
 pub const State = enum {
     idle,
@@ -177,6 +191,14 @@ agent: agents.Agent = agents.all[0],
 /// model looping at step two hundred; this catches it at step three.
 last_calls: ?[]u8 = null,
 repeats: usize = 0,
+/// How the last turn ended, and which message began it. Together these are all
+/// the UI needs to recap a turn: everything else it wants is already in the
+/// messages between there and the end.
+///
+/// A seq rather than an index, for the same reason `pending_seq` is one: paging
+/// older history in and trimming it back out both move every index.
+outcome: ?Outcome = null,
+turn_start_seq: ?u64 = null,
 /// The agent's tool schema, owned and sent with every call.
 tools_json: ?[]u8 = null,
 /// Base instructions, before the agent's and the project's are appended.
@@ -592,6 +614,8 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.steps = 0;
     self.repeats = 0;
+    self.outcome = null;
+    self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
     self.turn_started_ms = tool.monotonicMilliseconds(self.io);
     self.turn_tokens = 0;
     if (self.last_calls) |calls| self.allocator.free(calls);
@@ -823,7 +847,7 @@ fn pollCancelled(self: *Loop) !bool {
 
     try self.abandonPending();
 
-    self.state = .idle;
+    self.finish(.cancelled);
     return true;
 }
 
@@ -886,7 +910,6 @@ fn pollRequest(self: *Loop) !bool {
 
     if (request.failed) |err| {
         self.last_error = err;
-        self.compacting = false;
 
         const detail = self.provider.explain(err, self.allocator) catch
             try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
@@ -896,7 +919,7 @@ fn pollRequest(self: *Loop) !bool {
         defer self.allocator.free(text);
         _ = try self.conversation.addAssistant(text, thinking, thinking_ms);
         try self.persistMessage(self.conversation.messages.items.len - 1);
-        self.state = .idle;
+        self.finish(.failed);
         return true;
     }
 
@@ -912,8 +935,7 @@ fn pollRequest(self: *Loop) !bool {
     }
 
     const reply = request.reply orelse {
-        self.compacting = false;
-        self.state = .idle;
+        self.finish(.failed);
         return true;
     };
 
@@ -937,8 +959,7 @@ fn pollRequest(self: *Loop) !bool {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     if (reply.tool_calls.len == 0) {
-        self.state = .idle;
-        self.repeats = 0;
+        self.finish(.done);
         return true;
     }
 
@@ -953,13 +974,28 @@ fn pollRequest(self: *Loop) !bool {
     return true;
 }
 
+/// What the turn that just ended did, read back off the transcript. The caller
+/// owns the result. Empty while a turn is still running, since the turn it would
+/// describe is the one in progress.
+pub fn lastTurn(self: *Loop, allocator: std.mem.Allocator) !recap.Recap {
+    return recap.of(allocator, self.conversation.messages.items, self.turn_start_seq);
+}
+
+/// The one place a turn ends. Anything that has to happen once per turn goes
+/// here rather than at each of the places that used to set `.idle` by hand.
+fn finish(self: *Loop, outcome: Outcome) void {
+    self.state = .idle;
+    self.repeats = 0;
+    self.compacting = false;
+    self.outcome = outcome;
+}
+
 /// End the turn with a message saying why. The message is an assistant turn, so
 /// the model sees it too and a later turn is not left guessing.
 fn stop(self: *Loop, reason: []const u8) !void {
     _ = try self.conversation.addAssistant(reason, null, null);
     try self.persistMessage(self.conversation.messages.items.len - 1);
-    self.state = .idle;
-    self.repeats = 0;
+    self.finish(.halted);
 }
 
 /// Whether this batch of calls is the one before it, again. Identical means
@@ -2801,4 +2837,55 @@ test "taking steering from a turn that had none is not an error" {
     defer loop.deinit();
 
     try testing.expect(loop.takeSteering() == null);
+}
+
+test "a finished turn says how it ended and what it did" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try testing.expect(loop.outcome == null);
+
+    try loop.submit("what is here?", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Outcome.done, loop.outcome.?);
+
+    var did = try loop.lastTurn(testing.allocator);
+    defer did.deinit(testing.allocator);
+
+    // The fixture's model asks for one `list`, which is a read: counted, and
+    // not worth a line of its own.
+    try testing.expectEqual(@as(usize, 1), did.ok);
+    try testing.expectEqual(@as(usize, 0), did.changed);
+    try testing.expect(did.any());
+}
+
+test "the turn a recap covers starts at the prompt that began it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("first", .{});
+    try settle(&loop);
+    const first_start = loop.turn_start_seq.?;
+
+    try loop.submit("second", .{});
+    try settle(&loop);
+
+    try testing.expect(loop.turn_start_seq.? > first_start);
+    for (fixture.convo.messages.items) |msg| {
+        if (msg.seq != loop.turn_start_seq.?) continue;
+        try testing.expectEqual(Conversation.Role.user, msg.role);
+        try testing.expectEqualStrings("second", msg.text);
+    }
+
+    var did = try loop.lastTurn(testing.allocator);
+    defer did.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), did.ok);
 }

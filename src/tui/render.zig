@@ -19,6 +19,7 @@ const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
 const widget_pool = @import("widget_pool.zig");
 const AgentLoop = @import("../agent/loop.zig");
+const recap = @import("../agent/recap.zig");
 const ask_user = @import("../tools/ask.zig");
 const pkg = @import("pkg");
 const Input = @import("input.zig");
@@ -260,6 +261,8 @@ const Block = union(enum) {
     streaming,
     steering: []const u8,
     steering_more: usize,
+    /// What the turn that just ended did, drawn under it.
+    recap: recap.Recap,
 
     /// Whether this block belongs to the live tail - the part that grows while
     /// a turn is in flight. Growth there is what the scroll offset has to be
@@ -267,7 +270,7 @@ const Block = union(enum) {
     /// happens above the viewport and moves nothing.
     fn inTail(self: Block) bool {
         return switch (self) {
-            .thinking, .streaming, .steering, .steering_more => true,
+            .thinking, .streaming, .steering, .steering_more, .recap => true,
             else => false,
         };
     }
@@ -302,6 +305,11 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
             }
             try blocks.append(arena, .{ .tool = .{ .msg = msg, .index = index } });
         }
+    }
+
+    if (self.loop.outcome) |_| {
+        var done = try self.loop.lastTurn(arena);
+        if (done.any()) try blocks.append(arena, .{ .recap = done });
     }
 
     if (pending == 1) {
@@ -383,6 +391,8 @@ fn drawBlock(
             return try messageBlock(self, ctx, .{ .role = .assistant, .text = partial }, width);
         },
 
+        .recap => |done| return try recapBlock(self, ctx, done, width),
+
         .steering => |prompt| return try steeringBlock(self, ctx, prompt, width),
 
         .steering_more => |count| return try steeringBlock(
@@ -452,7 +462,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
                 std.hash.autoHash(&hasher, card.expanded);
             }
         },
-        .question, .thinking, .streaming, .steering, .steering_more => return null,
+        .question, .thinking, .streaming, .steering, .steering_more, .recap => return null,
     }
 
     return hasher.final();
@@ -743,6 +753,72 @@ pub fn questionBlock(
 
     const style = theme.on_card(theme.fg).cell;
     return w.wrap(constraints, try plainText(ctx, text.items, style, inner_width), opts);
+}
+
+/// How the turn ended, and the files and commands it touched.
+pub fn recapBlock(
+    self: *Model,
+    ctx: vxfw.DrawContext,
+    done: recap.Recap,
+    width: u16,
+) !vxfw.Surface {
+    const style = theme.on_card(theme.fg_dim).cell;
+
+    const opts: w.PanelOptions = .{
+        .style = theme.card.cell,
+        .left = 2,
+        .right = 2,
+        .accent = theme.fg_dim,
+        .width = width,
+    };
+
+    const constraints = ctx.withConstraints(.{}, .{ .width = width, .height = null });
+    const inner_width = w.panelInnerWidth(constraints, opts);
+    if (inner_width == 0) return .empty(self.plainWidget());
+
+    return w.wrap(constraints, try plainText(ctx, try recapText(self, ctx.arena, done), style, inner_width), opts);
+}
+
+/// The recap as lines: a heading naming how the turn ended and what it cost,
+/// then the files and commands themselves.
+///
+/// The draw path deals in `OutOfMemory` alone, and the only way writing into an
+/// arena fails is running out of it, so that is what the failure is called here.
+fn recapText(self: *Model, arena: std.mem.Allocator, done: recap.Recap) error{OutOfMemory}![]const u8 {
+    return recapLines(self, arena, done) catch error.OutOfMemory;
+}
+
+fn recapLines(self: *Model, arena: std.mem.Allocator, done: recap.Recap) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+
+    const ending: []const u8 = switch (self.loop.outcome orelse .done) {
+        .done => "done",
+        .cancelled => "cancelled",
+        .failed => "failed",
+        .halted => "stopped",
+    };
+
+    const ran = done.ok + done.failed;
+    try out.writer.print("{s} · {d} {s}", .{ ending, ran, plural(ran, "tool", "tools") });
+    if (done.changed > 0) {
+        try out.writer.print(", {d} {s} changed", .{
+            done.changed,
+            plural(done.changed, "file", "files"),
+        });
+    }
+    if (done.failed > 0) try out.writer.print(", {d} failed", .{done.failed});
+    if (done.rejected > 0) try out.writer.print(", {d} refused", .{done.rejected});
+
+    for (done.entries.items) |entry| {
+        try out.writer.print("\n  {s}  {s}", .{ entry.kind.label(), entry.subject });
+    }
+    if (done.more > 0) try out.writer.print("\n  and {d} more", .{done.more});
+
+    return out.written();
+}
+
+fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
+    return if (n == 1) one else many;
 }
 
 pub fn steeringBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {

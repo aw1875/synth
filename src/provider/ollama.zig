@@ -987,8 +987,7 @@ test "an error body is reduced to the sentence the server wrote" {
 
     try testing.expectEqualStrings(
         "model requires more system memory (21.5 GiB) than is available (12.3 GiB)",
-        complaint(
-            testing.allocator,
+        complaint(testing.allocator,
             \\{"error":"model requires more system memory (21.5 GiB) than is available (12.3 GiB)"}
         ),
     );
