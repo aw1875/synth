@@ -897,8 +897,8 @@ fn inlineAttachments(arena: std.mem.Allocator, msg: Conversation.Message) ![]con
     try out.writer.writeAll(msg.text);
     for (msg.attachments) |attachment| {
         try out.writer.print(
-            "\n\n<file path=\"{s}\">\n{s}\n</file>",
-            .{ attachment.path, attachment.content },
+            "\n\n<file path=\"{s}\"{s}>\n{s}\n</file>",
+            .{ attachment.path, if (attachment.shortened()) " truncated=\"true\"" else "", attachment.content },
         );
     }
     return out.toOwnedSlice();

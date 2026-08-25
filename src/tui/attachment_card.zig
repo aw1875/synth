@@ -17,6 +17,9 @@ const indent: u16 = 3;
 
 /// Borrowed from the conversation and refreshed every frame.
 label: []const u8 = "",
+/// What kind of thing the label names, drawn after it. Empty for a mentioned
+/// file, whose path already says what it is.
+kind: []const u8 = "",
 body: []const u8 = "",
 
 expanded: bool = false,
@@ -85,6 +88,9 @@ pub fn draw(self: *AttachmentCard, ctx: vxfw.DrawContext) std.mem.Allocator.Erro
     const marker = if (self.expanded) "▾ " else "▸ ";
     var col = w.writeText(surface, indent, 0, marker, theme.on_card(theme.fg_dim).cell);
     col = w.writeText(surface, col, 0, self.label, theme.on_card(theme.accent_alt).cell);
+    if (self.kind.len > 0) {
+        col = w.writeText(surface, col + 1, 0, self.kind, theme.on_card(theme.fg_dim).cell);
+    }
     col = w.writeText(surface, col, 0, try std.fmt.allocPrint(
         ctx.arena,
         "  {d} lines",

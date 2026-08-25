@@ -7,6 +7,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const fuzzy = @import("../core/fuzzy.zig");
+const skill = @import("../core/skill.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
 
@@ -23,7 +24,18 @@ pub const Command = struct {
     /// Argument hint, or "" when it takes none. A command with an argument
     /// completes with a trailing space so typing can continue.
     argument: []const u8 = "",
+    /// Whether this came from a skill directory rather than the table below.
+    /// What tells the dispatcher to load instructions instead of running a verb.
+    is_skill: bool = false,
 };
+
+/// Ranked fuzzy matches kept when nothing matched by prefix. A ceiling on the
+/// ranking buffer, not on what can be typed: a project with two hundred skills
+/// still completes them all by prefix.
+const max_ranked: usize = 32;
+
+/// What a skill offers when it has no description of its own.
+const unlabelled_skill = "run this skill";
 
 /// Everything `/` offers. Kept in the order it should be read, not
 /// alphabetically: the ones that change what the model sees come first.
@@ -34,12 +46,17 @@ pub const commands: []const Command = &.{
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = "[name]" },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
+    .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = "[name]" },
     .{ .name = "rename", .description = "name this session", .argument = "[name]" },
     .{ .name = "help", .description = "list these commands" },
 };
 
-/// Indices into `commands` matching what has been typed, best first.
+/// The project's skills, offered after the built-in commands. Borrowed, and
+/// empty where nothing discovered any.
+skills: []const skill.Skill = &.{},
+
+/// Indices into everything on offer, matching what has been typed, best first.
 matches: std.ArrayList(usize) = .empty,
 selected: usize = 0,
 /// Whether the draft currently is a slash command being typed.
@@ -53,6 +70,25 @@ pub fn init(allocator: std.mem.Allocator) Slash {
 
 pub fn deinit(self: *Slash) void {
     self.matches.deinit(self.allocator);
+}
+
+/// How many entries `/` can offer: the fixed table, then the skills.
+pub fn total(self: *const Slash) usize {
+    return commands.len + self.skills.len;
+}
+
+/// One entry by index, wherever it came from. A skill takes an argument
+/// because a skill is usually invoked against something.
+pub fn at(self: *const Slash, index: usize) Command {
+    if (index < commands.len) return commands[index];
+
+    const found = self.skills[index - commands.len];
+    return .{
+        .name = found.id,
+        .description = if (found.description.len > 0) found.description else unlabelled_skill,
+        .argument = "[input]",
+        .is_skill = true,
+    };
 }
 
 pub fn isOpen(self: *const Slash) bool {
@@ -87,15 +123,16 @@ pub fn update(self: *Slash, text: []const u8, cursor: usize) !void {
 fn filter(self: *Slash, query: []const u8) !void {
     self.matches.clearRetainingCapacity();
 
-    for (commands, 0..) |command, i| {
-        if (std.ascii.startsWithIgnoreCase(command.name, query)) {
+    for (0..self.total()) |i| {
+        if (std.ascii.startsWithIgnoreCase(self.at(i).name, query)) {
             try self.matches.append(self.allocator, i);
         }
     }
     if (query.len == 0) return;
 
-    var top: fuzzy.Top(commands.len) = .{};
-    for (commands, 0..) |command, i| {
+    var top: fuzzy.Top(max_ranked) = .{};
+    for (0..self.total()) |i| {
+        const command = self.at(i);
         if (std.ascii.startsWithIgnoreCase(command.name, query)) continue;
         top.consider(i, command.name, query, .{});
     }
@@ -112,7 +149,7 @@ pub fn moveSelection(self: *Slash, delta: i32) void {
 /// The highlighted command, if the picker is open.
 pub fn selectedCommand(self: *const Slash) ?Command {
     if (!self.isOpen()) return null;
-    return commands[self.matches.items[self.selected]];
+    return self.at(self.matches.items[self.selected]);
 }
 
 /// What the draft becomes when the highlighted command is accepted.
@@ -137,8 +174,8 @@ pub const shortcuts: []const struct { keys: []const u8, description: []const u8 
     .{ .keys = "esc", .description = "cancel the turn, or close what is open" },
 };
 
-/// Commands and keys, for `/help`.
-pub fn helpText(arena: std.mem.Allocator) ![]const u8 {
+/// Commands, skills and keys, for `/help`.
+pub fn helpText(arena: std.mem.Allocator, available: []const skill.Skill) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
 
     try out.appendSlice(arena, "**Commands**\n\n");
@@ -149,6 +186,16 @@ pub fn helpText(arena: std.mem.Allocator) ![]const u8 {
             command.argument,
             command.description,
         });
+    }
+
+    if (available.len > 0) {
+        try out.appendSlice(arena, "\n**Skills**\n\n");
+        for (available) |entry| {
+            try out.print(arena, "- `/{s}` - {s}\n", .{
+                entry.id,
+                if (entry.description.len > 0) entry.description else unlabelled_skill,
+            });
+        }
     }
 
     try out.appendSlice(arena, "\n**Keys**\n\n");
@@ -163,13 +210,19 @@ test "help names every command and every key" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
 
-    const text = try helpText(arena_state.allocator());
+    const skills: []const skill.Skill = &.{
+        .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
+    };
+
+    const text = try helpText(arena_state.allocator(), skills);
     for (commands) |command| {
         try std.testing.expect(std.mem.indexOf(u8, text, command.name) != null);
     }
     for (shortcuts) |shortcut| {
         try std.testing.expect(std.mem.indexOf(u8, text, shortcut.keys) != null);
     }
+    try std.testing.expect(std.mem.indexOf(u8, text, "/release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cut a release") != null);
 }
 
 /// Render the match list. The caller positions it above the prompt.
@@ -179,7 +232,7 @@ pub fn draw(self: *Slash, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
     w.fill(surface, theme.card.cell);
 
     for (self.matches.items[0..rows], 0..) |index, row| {
-        const command = commands[index];
+        const command = self.at(index);
         const chosen = row == self.selected;
         const y: u16 = @intCast(row);
 
@@ -199,9 +252,9 @@ pub fn draw(self: *Slash, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
             x = w.writeText(surface, x + 1, y, command.argument, theme.on_card(theme.fg_dim).cell);
         }
 
-        const at = 24;
-        if (width > at + 8) {
-            _ = w.writeText(surface, at, y, command.description, theme.on_card(theme.fg_dim).cell);
+        const column = 24;
+        if (width > column + 8) {
+            _ = w.writeText(surface, column, y, command.description, theme.on_card(theme.fg_dim).cell);
         }
     }
 
@@ -218,6 +271,7 @@ test "the picker opens on a slash and closes once arguments start" {
     try slash.update("/", 1);
     try std.testing.expect(slash.isOpen());
     try std.testing.expectEqual(commands.len, slash.matches.items.len);
+    try std.testing.expect(!slash.selectedCommand().?.is_skill);
 
     try slash.update("/co", 3);
     try std.testing.expectEqualStrings("compact", slash.selectedCommand().?.name);
@@ -256,4 +310,44 @@ test "a half-remembered command still lands" {
 
     try slash.filter("zzz");
     try std.testing.expectEqual(@as(usize, 0), slash.matches.items.len);
+}
+
+test "a skill is offered like any other command, and says it is one" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
+    slash.skills = &.{
+        .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
+        .{ .id = "commit-style", .name = "commit-style", .description = "", .dir = "/p/commit", .body = "b" },
+    };
+
+    try slash.update("/", 1);
+    try std.testing.expectEqual(commands.len + 2, slash.matches.items.len);
+
+    try slash.update("/rel", 4);
+    const chosen = slash.selectedCommand().?;
+    try std.testing.expectEqualStrings("release", chosen.name);
+    try std.testing.expect(chosen.is_skill);
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.expectEqualStrings("/release ", (try slash.completion(arena_state.allocator())).?);
+
+    try slash.update("/commit-style", 13);
+    try std.testing.expectEqualStrings("run this skill", slash.selectedCommand().?.description);
+
+    try slash.filter("cmtstyl");
+    try std.testing.expectEqualStrings("commit-style", slash.at(slash.matches.items[0]).name);
+}
+
+test "a name a skill shares with a command still reaches the command" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
+    slash.skills = &.{
+        .{ .id = "compact", .name = "compact", .description = "not the built-in", .dir = "/p/compact", .body = "b" },
+    };
+
+    try slash.update("/compact", 8);
+    try std.testing.expect(!slash.selectedCommand().?.is_skill);
 }

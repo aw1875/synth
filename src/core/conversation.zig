@@ -353,6 +353,40 @@ pub fn dropOldImages(self: *Conversation, keep: usize) void {
     }
 }
 
+/// Hold the newest attachments in full and cut the rest back to a preview,
+/// keeping the total under `budget` bytes.
+///
+/// Unlike an image, an attachment is text the model is still reading: the
+/// instructions a skill was invoked with, the file a mention pulled in. So the
+/// recent ones are kept whole and only what has scrolled out of relevance is
+/// cut, rather than dropped outright. The full text stays in the `attachment`
+/// table, and expanding a card fetches it back.
+pub fn shrinkAttachments(self: *Conversation, budget: usize) void {
+    var kept: usize = 0;
+    var i = self.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        for (self.messages.items[i].attachments) |*attachment| {
+            if (attachment.content_bytes == 0) {
+                attachment.content_bytes = attachment.content.len;
+            }
+            if (attachment.content.len <= preview_bytes) {
+                kept += attachment.content.len;
+                continue;
+            }
+            if (kept + attachment.content.len <= budget) {
+                kept += attachment.content.len;
+                continue;
+            }
+
+            const cut = preview(self.allocator, attachment.content) catch continue;
+            self.allocator.free(attachment.content);
+            attachment.content = cut;
+            kept += cut.len;
+        }
+    }
+}
+
 /// The most recent message, if any.
 pub fn last(self: *Conversation) ?*Message {
     if (self.messages.items.len == 0) return null;
@@ -508,4 +542,65 @@ test "only the newest images stay in memory" {
     try std.testing.expectEqual(@as(usize, 0), convo.messages.items[1].images.len);
     try std.testing.expectEqual(@as(usize, 1), convo.messages.items[2].images.len);
     try std.testing.expectEqualStrings("image 2", convo.messages.items[2].images[0]);
+}
+
+test "the newest attachments stay whole and older ones fall back to a preview" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const big = try std.testing.allocator.alloc(u8, preview_bytes * 4);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+
+    for (0..3) |_| {
+        var one = [_]Attachment{.{ .path = "skill/SKILL.md", .content = big }};
+        _ = try convo.addUser("/skill", &one, &.{});
+    }
+
+    convo.shrinkAttachments(preview_bytes * 5);
+
+    const oldest = convo.messages.items[0].attachments[0];
+    const newest = convo.messages.items[2].attachments[0];
+
+    try std.testing.expectEqual(big.len, newest.content.len);
+    try std.testing.expect(!newest.shortened());
+
+    try std.testing.expect(oldest.content.len <= preview_bytes);
+    try std.testing.expect(oldest.shortened());
+    try std.testing.expectEqual(@as(u64, big.len), oldest.content_bytes);
+}
+
+test "shrinking twice does not shrink what is already a preview" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const big = try std.testing.allocator.alloc(u8, preview_bytes * 2);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'y');
+
+    var one = [_]Attachment{.{ .path = "a/SKILL.md", .content = big }};
+    _ = try convo.addUser("/a", &one, &.{});
+
+    convo.shrinkAttachments(0);
+    const after_first = convo.messages.items[0].attachments[0].content;
+
+    convo.shrinkAttachments(0);
+    const after_second = convo.messages.items[0].attachments[0].content;
+
+    try std.testing.expectEqual(after_first.ptr, after_second.ptr);
+    try std.testing.expectEqual(@as(u64, big.len), convo.messages.items[0].attachments[0].content_bytes);
+}
+
+test "a small attachment is left alone whatever the budget" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    var one = [_]Attachment{.{ .path = "small.zig", .content = "two lines\nof it\n" }};
+    _ = try convo.addUser("look", &one, &.{});
+
+    convo.shrinkAttachments(0);
+
+    const kept = convo.messages.items[0].attachments[0];
+    try std.testing.expectEqualStrings("two lines\nof it\n", kept.content);
+    try std.testing.expect(!kept.shortened());
 }

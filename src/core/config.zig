@@ -94,6 +94,9 @@ path: []const u8 = "",
 /// A prompt from `config.json`, replacing the built-in one. Null means the
 /// built-in one: what that says is the agent's business, not this file's.
 system_prompt: ?[]const u8 = null,
+/// Extra directories to look for skills in, on top of the ones under the
+/// project root and `$HOME`. Absolute paths, searched in the order given.
+skill_paths: []const []const u8 = &.{},
 /// The `mcp` block, still as JSON. Held rather than parsed because what a
 /// server entry means is the MCP adapter's business, and this file would only
 /// be repeating its shape. Borrowed from this config's arena.
@@ -107,6 +110,7 @@ const File = struct {
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
     debug_log: ?[]const u8 = null,
+    skill_paths: ?[]const []const u8 = null,
     mcp: ?std.json.Value = null,
     /// The single-provider shape this file used to have. Still read, so an
     /// existing `config.json` keeps working; nothing writes it any more, and
@@ -211,6 +215,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.think) |value| self.think = value;
     if (parsed.auto_approve_safe_commands) |value| self.auto_approve_safe_commands = value;
     if (parsed.debug_log) |value| self.debug_log = value;
+    if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
 
     if (parsed.ollama) |ollama| {
@@ -306,4 +311,31 @@ test "an existing config file is never written over" {
 test "a bare filename has no directory to create" {
     try ensureDir(std.testing.io, "config.json");
     try ensureDir(std.testing.io, database_file);
+}
+
+test "extra skill directories are read from the file" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    const edited =
+        \\{"skill_paths": ["/opt/skills", "/srv/team/skills"]}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = edited });
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try config.applyFile(io, path);
+
+    try testing.expectEqual(@as(usize, 2), config.skill_paths.len);
+    try testing.expectEqualStrings("/opt/skills", config.skill_paths[0]);
+    try testing.expectEqualStrings("/srv/team/skills", config.skill_paths[1]);
 }

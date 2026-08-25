@@ -12,6 +12,7 @@ pub const Command = union(enum) {
     run: Run,
     session: Session,
     mcp: Mcp,
+    skills,
     models,
     prompt,
     help,
@@ -92,7 +93,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"},
+    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -123,6 +124,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
             if (std.mem.eql(u8, word, "run")) return parseRun(init, allocator, &iter);
             if (std.mem.eql(u8, word, "models")) return .models;
+            if (std.mem.eql(u8, word, "skills")) return .skills;
             return .prompt;
         }
     }
@@ -286,6 +288,7 @@ const help_sections: []const Section = &.{
             .{ .left = "mcp debug <name>", .right = "show what OAuth discovery finds" },
             .{ .left = "mcp enable <name>", .right = "start using a server again" },
             .{ .left = "mcp disable <name>", .right = "stop connecting to a server" },
+            .{ .left = "skills", .right = "skills on offer, and where they came from" },
             .{ .left = "models", .right = "models the provider offers" },
             .{ .left = "prompt", .right = "print the system prompt" },
         },
@@ -403,5 +406,6 @@ test "a flag in the wrong place names the subcommand it belongs to" {
 test "a bare invocation is the TUI" {
     try std.testing.expect(known.has("session"));
     try std.testing.expect(known.has("models"));
+    try std.testing.expect(known.has("skills"));
     try std.testing.expect(!known.has("~/code/thing"));
 }

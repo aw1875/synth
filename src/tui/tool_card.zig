@@ -252,6 +252,7 @@ fn primaryKeys(name: []const u8) []const []const u8 {
     if (std.mem.eql(u8, name, "list")) return &.{"path"};
     if (std.mem.eql(u8, name, "write")) return &.{"path"};
     if (std.mem.eql(u8, name, "edit")) return &.{"path"};
+    if (std.mem.eql(u8, name, "skill")) return &.{"name"};
     return &.{};
 }
 

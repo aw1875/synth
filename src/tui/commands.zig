@@ -10,6 +10,9 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const agents = @import("../agent/agent.zig");
+const mention = @import("../core/mention.zig");
+const skill = @import("../core/skill.zig");
+const skill_tool = @import("../tools/skill.zig");
 const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
@@ -29,7 +32,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (std.mem.eql(u8, line, "/help")) {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
-        const text = try Slash.helpText(arena_state.allocator());
+        const text = try Slash.helpText(arena_state.allocator(), self.loop.skills);
         _ = try self.conversation.append(.{ .role = .assistant, .text = text });
         self.scroll = 0;
         ctx.redraw = true;
@@ -76,6 +79,19 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (std.mem.eql(u8, line, "/skills")) {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+
+        const text = if (self.skills) |set|
+            try set.listText(arena_state.allocator())
+        else
+            "No skills found.";
+        _ = try self.conversation.append(.{ .role = .assistant, .text = text });
+        self.scroll = 0;
+        ctx.redraw = true;
+        return true;
+    }
     if (std.mem.eql(u8, line, "/providers")) {
         try showProviders(self);
         ctx.redraw = true;
@@ -101,7 +117,35 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    return false;
+    return runSkill(self, ctx, line);
+}
+
+/// Invoke a skill by name: `/release 2.1`.
+///
+/// The instructions travel as an attachment rather than as the message text, so
+/// the transcript shows what was typed and the model still receives the whole
+/// skill. It is the same path an `@path` mention takes, which is what keeps a
+/// two hundred line skill from being pasted into the conversation view.
+fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
+    const word_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+    const id = line[1..word_end];
+    const found = skill.findIn(self.loop.skills, id) orelse return false;
+
+    if (self.loop.isBusy()) {
+        try self.notification.show(ctx, .info, "Finish the turn first");
+        ctx.redraw = true;
+        return true;
+    }
+
+    const path = try std.fs.path.join(self.allocator, &.{ found.dir, skill.file_name });
+    defer self.allocator.free(path);
+
+    const content = try skill_tool.render(self.allocator, found);
+    defer self.allocator.free(content);
+
+    const attachment: mention.Attachment = .{ .path = path, .content = content };
+    try self.beginTurn(ctx, line, .{ .attachments = &.{attachment} });
+    return true;
 }
 
 /// Open the provider connect flow.

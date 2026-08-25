@@ -14,6 +14,7 @@ const Conversation = @import("../core/conversation.zig");
 const humanize = @import("../core/humanize.zig");
 const agents = @import("../agent/agent.zig");
 const Model = @import("model.zig");
+const skill = @import("../core/skill.zig");
 const widget_pool = @import("widget_pool.zig");
 const AgentLoop = @import("../agent/loop.zig");
 const ask_user = @import("../tools/ask.zig");
@@ -630,12 +631,13 @@ pub fn pasteToggle(self: *Model, seq: u64) !*Model.PasteToggle {
 pub fn messageBlock(self: *Model, ctx: vxfw.DrawContext, msg: Conversation.Message, width: u16) !vxfw.Surface {
     const on_card = msg.role == .user;
     const style = if (on_card) theme.card.cell else theme.base.cell;
+    const invoked = invokedSkill(msg);
 
     const opts: w.PanelOptions = .{
         .style = style,
         .left = if (on_card) 2 else 3,
         .right = 2,
-        .accent = if (on_card) theme.accent else null,
+        .accent = if (invoked != null) theme.accent_alt else if (on_card) theme.accent else null,
         .width = width,
     };
 
@@ -643,12 +645,56 @@ pub fn messageBlock(self: *Model, ctx: vxfw.DrawContext, msg: Conversation.Messa
     const inner_width = w.panelInnerWidth(constraints, opts);
     if (inner_width == 0) return .empty(self.plainWidget());
 
-    const content = if (msg.role == .user)
+    const content = if (invoked) |id|
+        try skillLine(self, ctx, id, arguments(msg.text), style, inner_width)
+    else if (msg.role == .user)
         try plainText(ctx, msg.text, style, inner_width)
     else
         try markdown.draw(constraints, self.plainWidget(), msg.text, style, inner_width);
 
     return w.wrap(constraints, content, opts);
+}
+
+/// The skill a user turn invoked, or null for an ordinary message.
+///
+/// Read off the attachment rather than the text: what makes this a skill run is
+/// that the instructions were attached to it, and a message that merely starts
+/// with a slash is not one.
+fn invokedSkill(msg: Conversation.Message) ?[]const u8 {
+    if (msg.role != .user) return null;
+    for (msg.attachments) |attachment| {
+        if (skill.idFromPath(attachment.path)) |id| return id;
+    }
+    return null;
+}
+
+/// Whatever followed the command word, which is what the skill was run against.
+fn arguments(text: []const u8) []const u8 {
+    const space = std.mem.indexOfAny(u8, text, " \t") orelse return "";
+    return std.mem.trim(u8, text[space..], " \t");
+}
+
+/// A skill run, headed so it reads as neither a message nor a tool call. It is
+/// both - a turn the reader started, carrying instructions the model was given -
+/// and the accent is the one questions use, since those are the other blocks
+/// that are not quite either.
+fn skillLine(
+    self: *Model,
+    ctx: vxfw.DrawContext,
+    id: []const u8,
+    args: []const u8,
+    style: vaxis.Cell.Style,
+    width: u16,
+) !vxfw.Surface {
+    const surface = try w.surfaceClamped(ctx.arena, self.plainWidget(), .{ .width = width, .height = 1 });
+    w.fill(surface, style);
+
+    var col = w.writeText(surface, 0, 0, "skill", theme.on_card(theme.fg_dim).cell);
+    col = w.writeText(surface, col + 1, 0, id, theme.on_card(theme.accent_alt).bold().cell);
+    if (args.len > 0) {
+        _ = w.writeText(surface, col + 1, 0, args, theme.on_card(theme.fg_muted).cell);
+    }
+    return surface;
 }
 
 /// A prompt waiting its turn: the user's card, dimmed, so it reads as not yet
@@ -1068,4 +1114,43 @@ test "a long name is trimmed from the end, a path from the front" {
         const fitted = fitLeft(arena, "/home/dev", @intCast(width));
         try std.testing.expect(w.textWidth(fitted) <= width);
     }
+}
+
+test "a skill run is told apart from a message that merely starts with a slash" {
+    var attachments = [_]Conversation.Attachment{
+        .{ .path = "/p/.agents/skills/caveman/SKILL.md", .content = "body" },
+    };
+    const invoked: Conversation.Message = .{
+        .role = .user,
+        .text = "/caveman ultra",
+        .attachments = &attachments,
+    };
+    try std.testing.expectEqualStrings("caveman", invokedSkill(invoked).?);
+
+    const typed: Conversation.Message = .{ .role = .user, .text = "/caveman ultra" };
+    try std.testing.expect(invokedSkill(typed) == null);
+
+    var mentioned = [_]Conversation.Attachment{
+        .{ .path = "src/main.zig", .content = "body" },
+    };
+    const mention_msg: Conversation.Message = .{
+        .role = .user,
+        .text = "look at @src/main.zig",
+        .attachments = &mentioned,
+    };
+    try std.testing.expect(invokedSkill(mention_msg) == null);
+
+    const from_model: Conversation.Message = .{
+        .role = .assistant,
+        .text = "/caveman",
+        .attachments = &attachments,
+    };
+    try std.testing.expect(invokedSkill(from_model) == null);
+}
+
+test "the arguments a skill was run against are what followed its name" {
+    try std.testing.expectEqualStrings("ultra", arguments("/caveman ultra"));
+    try std.testing.expectEqualStrings("2.1 --dry-run", arguments("/release  2.1 --dry-run"));
+    try std.testing.expectEqualStrings("", arguments("/caveman"));
+    try std.testing.expectEqualStrings("", arguments("/caveman   "));
 }

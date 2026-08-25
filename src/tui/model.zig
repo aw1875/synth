@@ -18,6 +18,7 @@ const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
+const skill = @import("../core/skill.zig");
 const tool = @import("../tools/tool.zig");
 const Approval = @import("approval.zig");
 const AttachmentCard = @import("attachment_card.zig");
@@ -137,6 +138,9 @@ input_cursor: ?vxfw.CursorState = null,
 /// The agent loop. Owns the conversation's mutations, the in-flight request,
 /// and any running tools.
 loop: AgentLoop = undefined,
+/// Every skill found at startup, for `/skills`. Borrowed, and null where
+/// nothing looked.
+skills: ?*const skill.Set = null,
 /// Tool registry, and the read log the tools share. Owned.
 registry: Registry = undefined,
 reads: tool.ReadLog = undefined,
@@ -463,16 +467,26 @@ pub fn startCompaction(self: *Model, ctx: *vxfw.EventContext) !void {
 }
 
 pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !void {
-    try self.remember(prompt);
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try self.loop.submit(prompt, .{
+    try self.beginTurn(ctx, prompt, .{
         .attachments = try self.held.textAttachments(arena, prompt),
         .images = try self.held.images(arena, prompt),
     });
     self.held.consume(prompt);
+}
+
+/// Everything starting a turn involves besides the prompt itself.
+///
+/// The tick is the part that must not be missed: a turn runs on a worker, and
+/// without a scheduled tick nothing polls it, so the spinner sits still and the
+/// reply never lands until some other event wakes the loop.
+pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extras: AgentLoop.Extras) !void {
+    try self.remember(prompt);
+    try self.loop.submit(prompt, extras);
+
     self.thinking.stream = self.loop.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = true;
