@@ -38,6 +38,7 @@ pub const all: []const tool.Tool = &.{
         ,
         .handler = read,
         .read_only = true,
+        .parallel = true,
     },
     .{
         .name = "list",
@@ -47,6 +48,7 @@ pub const all: []const tool.Tool = &.{
         ,
         .handler = list,
         .read_only = true,
+        .parallel = true,
     },
     .{
         .name = "glob",
@@ -56,6 +58,7 @@ pub const all: []const tool.Tool = &.{
         ,
         .handler = globTool,
         .read_only = true,
+        .parallel = true,
     },
     .{
         .name = "grep",
@@ -65,6 +68,7 @@ pub const all: []const tool.Tool = &.{
         ,
         .handler = grep,
         .read_only = true,
+        .parallel = true,
     },
     .{
         .name = "write",
@@ -104,7 +108,7 @@ fn read(ctx: Context, input: Input) !Output {
     defer ctx.allocator.free(source);
 
     if (std.Io.Dir.cwd().statFile(ctx.io, resolved, .{})) |stat| {
-        try ctx.reads.record(resolved, stat.mtime.nanoseconds);
+        try ctx.reads.record(ctx.io, resolved, stat.mtime.nanoseconds);
     } else |_| {}
 
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
@@ -519,7 +523,7 @@ fn edit(ctx: Context, input: Input) !Output {
     const stat = std.Io.Dir.cwd().statFile(ctx.io, resolved, .{}) catch |err| {
         return Output.err(try std.fmt.allocPrint(ctx.allocator, "edit {s}: {s}", .{ path, @errorName(err) }));
     };
-    const last_read = ctx.reads.lastRead(resolved) orelse {
+    const last_read = ctx.reads.lastRead(ctx.io, resolved) orelse {
         return Output.err(try std.fmt.allocPrint(
             ctx.allocator,
             "edit {s}: read the file before editing it",
@@ -574,7 +578,7 @@ fn edit(ctx: Context, input: Input) !Output {
     };
 
     if (std.Io.Dir.cwd().statFile(ctx.io, resolved, .{})) |updated| {
-        try ctx.reads.record(resolved, updated.mtime.nanoseconds);
+        try ctx.reads.record(ctx.io, resolved, updated.mtime.nanoseconds);
     } else |_| {}
 
     if (edits.len == 1) {

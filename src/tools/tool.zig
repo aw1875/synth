@@ -181,6 +181,13 @@ pub const Tool = struct {
     /// drives a whole nested agent - says so here rather than being killed
     /// halfway.
     timeout_ms: ?u64 = null,
+    /// Whether this tool may run beside another call in the same batch.
+    ///
+    /// Deliberately not `read_only`: that says a call needs no approval, which
+    /// is a different question. `task` is read-only and still has to run alone,
+    /// because a subagent borrows the parent's provider and only the parent
+    /// being blocked inside the call keeps that safe.
+    parallel: bool = false,
 
     /// Release the strings a runtime-registered tool brought with it. A no-op
     /// for a built-in.
@@ -197,6 +204,13 @@ pub const Tool = struct {
 pub const ReadLog = struct {
     allocator: std.mem.Allocator,
     seen: std.StringHashMapUnmanaged(i96) = .empty,
+    /// Guards `seen`. A batch may run several reads at once, and two of them
+    /// growing the map together is corruption rather than a lost entry.
+    ///
+    /// Taken uncancelable: the hold is one hashmap insert, and a lock that
+    /// could return `error.Canceled` would spend the call's cancellation on
+    /// bookkeeping instead of on the tool.
+    mutex: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator) ReadLog {
         return .{ .allocator = allocator };
@@ -208,7 +222,10 @@ pub const ReadLog = struct {
         self.seen.deinit(self.allocator);
     }
 
-    pub fn record(self: *ReadLog, path: []const u8, mtime: i96) !void {
+    pub fn record(self: *ReadLog, io: std.Io, path: []const u8, mtime: i96) !void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
         const entry = try self.seen.getOrPut(self.allocator, path);
         if (!entry.found_existing) {
             entry.key_ptr.* = try self.allocator.dupe(u8, path);
@@ -216,12 +233,16 @@ pub const ReadLog = struct {
         entry.value_ptr.* = mtime;
     }
 
-    pub fn lastRead(self: *ReadLog, path: []const u8) ?i96 {
+    pub fn lastRead(self: *ReadLog, io: std.Io, path: []const u8) ?i96 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
         return self.seen.get(path);
     }
 
     /// Iterate the recorded reads, for flushing to the `read_file` table on the
-    /// UI thread after a tool run.
+    /// UI thread after a tool run. Unguarded: the batch has been joined by the
+    /// time anything iterates, so there is nothing left to race with.
     pub fn iterator(self: *ReadLog) std.StringHashMapUnmanaged(i96).Iterator {
         return self.seen.iterator();
     }

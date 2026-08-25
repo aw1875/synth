@@ -1536,9 +1536,9 @@ fn runApproved(self: *Loop) !void {
 
 /// Copy across every result the worker has finished so far.
 ///
-/// Called while the batch is still running, so a card settles as its own call
-/// lands. Waiting for the whole batch is what made a run of edits look stuck:
-/// nothing moved until the last one finished, however long the first took.
+/// Called while the batch is still running, so a card settles as its call
+/// lands rather than when the last one does - which is what made a run of
+/// edits look stuck. Calls that ran together settle together.
 ///
 /// `tools_adopted` is what keeps this idempotent - each result is taken once,
 /// so the final pass after the worker exits cannot dupe a result twice and
