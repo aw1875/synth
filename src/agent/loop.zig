@@ -705,14 +705,12 @@ fn ask(self: *Loop) !void {
 /// the wire format requires to be whole. By the time a step is being asked for,
 /// every result is in.
 fn applySteering(self: *Loop) !void {
-    if (self.steering.items.len == 0) return;
-
-    for (self.steering.items) |text| {
+    while (self.steering.items.len > 0) {
+        const text = self.steering.orderedRemove(0);
         defer self.allocator.free(text);
         _ = try self.conversation.addUser(text, &.{}, &.{});
         try self.persistMessage(self.conversation.messages.items.len - 1);
     }
-    self.steering.clearRetainingCapacity();
 }
 
 /// Add to what the model is being asked, without waiting for the turn to end.
