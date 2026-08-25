@@ -5,6 +5,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const Database = @import("../core/database.zig");
+const Hooks = @import("../core/hooks.zig");
 const Provider = @import("../provider/provider.zig");
 const recap = @import("recap.zig");
 const ask_user = @import("../tools/ask.zig");
@@ -110,6 +111,11 @@ provider: Provider,
 registry: *const Registry,
 conversation: *Conversation,
 reads: *tool.ReadLog,
+/// Configured lifecycle hooks. Null when hooks are disabled.
+hooks: ?*const Hooks.Runner = null,
+/// Why the last submitted prompt was stopped by a hook. Kept outside the
+/// transcript so a blocked prompt is never sent to the model on a later turn.
+hook_notice: ?[]u8 = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
 
@@ -472,6 +478,7 @@ pub fn deinit(self: *Loop) void {
     }
 
     self.todos.deinit();
+    if (self.hook_notice) |notice| self.allocator.free(notice);
     for (self.steering.items) |text| self.allocator.free(text);
     self.steering.deinit(self.allocator);
     self.prompt_cache.deinit(self.allocator);
@@ -584,6 +591,26 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
 pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.isBusy()) return;
 
+    if (self.hook_notice) |notice| self.allocator.free(notice);
+    self.hook_notice = null;
+
+    if (self.hooks) |runner| {
+        const blocked = runner.dispatch(.{
+            .event = .user_prompt_submit,
+            .prompt = prompt,
+        }) catch |err| blk: {
+            break :blk try std.fmt.allocPrint(
+                self.allocator,
+                "UserPromptSubmit hook failed: {s}",
+                .{@errorName(err)},
+            );
+        };
+        if (blocked) |reason| {
+            self.hook_notice = reason;
+            return;
+        }
+    }
+
     var mentioned: mention.Resolved =
         mention.resolve(self.allocator, self.io, self.project_root, prompt) catch .{};
     defer mentioned.deinit(self.allocator);
@@ -611,6 +638,14 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.last_calls = null;
     self.last_error = null;
     try self.ask();
+}
+
+/// Take the reason a prompt hook stopped the most recent submission. The
+/// caller owns the returned string.
+pub fn takeHookNotice(self: *Loop) ?[]u8 {
+    const notice = self.hook_notice;
+    self.hook_notice = null;
+    return notice;
 }
 
 /// Page up to `limit` older messages in from the database, prepending them to
@@ -1573,6 +1608,7 @@ fn runApproved(self: *Loop) !void {
         self.project_root,
         self.reads,
         self.delegate,
+        self.hooks,
         batch.items,
     );
     self.state = .running_tools;
@@ -1806,6 +1842,31 @@ const Fixture = struct {
         );
     }
 };
+
+test "a blocked prompt never enters the model transcript" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    const hook = Hooks.Hook{ .command = "echo prompt rejected >&2; exit 2" };
+    var runner: Hooks.Runner = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .root = fixture.root,
+        .set = .{ .user_prompt_submit = &.{hook} },
+    };
+    loop.hooks = &runner;
+
+    try loop.submit("do not send this", .{});
+
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
+    const notice = loop.takeHookNotice().?;
+    defer testing.allocator.free(notice);
+    try testing.expectEqualStrings("prompt rejected", notice);
+}
 
 test "a read-only tool call runs without asking" {
     const fixture = try Fixture.init();
