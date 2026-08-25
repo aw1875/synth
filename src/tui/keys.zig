@@ -32,8 +32,7 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
         return;
     }
 
-    if (self.loop.isBusy()) {
-        try self.queued.append(self.allocator, try self.allocator.dupe(u8, value));
+    if (try self.loop.steer(value)) {
         self.scroll = 0;
         ctx.redraw = true;
         return;
@@ -45,9 +44,51 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
 pub fn typeErasedCaptureHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
     const self: *Model = @ptrCast(@alignCast(ptr));
     switch (event) {
-        .mouse => |mouse| try trackSelection(self, ctx, mouse),
+        .mouse => |mouse| {
+            if (try trackPlan(self, ctx, mouse)) return;
+            try trackSelection(self, ctx, mouse);
+        },
         else => {},
     }
+}
+
+/// Clicking the plan collapses or expands it, and hovering says that it can be.
+///
+/// Handled here rather than by a widget of its own because the sidebar is drawn
+/// as one flat surface: there is nothing for vxfw to route a click to, and the
+/// rows the plan occupied last frame are enough to find it.
+///
+/// Called from both mouse phases. Which one the root sees depends on what was
+/// drawn under the pointer: over a widget it is an ancestor and captures, over
+/// a plain region it is the target itself and its capture handler never runs.
+/// Consuming a press in the capture phase is what stops the two from toggling
+/// twice. Returns whether the event was the plan's.
+fn trackPlan(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !bool {
+    const row: u16 = @intCast(@max(mouse.row, 0));
+    const col: u16 = @intCast(@max(mouse.col, 0));
+
+    const over = self.plan_bottom > self.plan_top and
+        col >= self.sidebar_col and
+        row >= self.plan_top and
+        row < self.plan_bottom;
+
+    if (over != self.plan_hover) {
+        self.plan_hover = over;
+        try ctx.setMouseShape(if (over) .pointer else .default);
+        ctx.redraw = true;
+    }
+    if (!over) return false;
+
+    switch (mouse.button) {
+        .wheel_up, .wheel_down, .wheel_left, .wheel_right => return false,
+        .left => {},
+        else => return true,
+    }
+    if (mouse.type != .press) return true;
+
+    self.loop.todos.expanded = !self.loop.todos.expanded;
+    ctx.consumeAndRedraw();
+    return true;
 }
 
 /// Mouse selection, driven from whichever phase reaches the root.
@@ -146,6 +187,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             return ctx.consumeAndRedraw();
         },
         .mouse => |mouse| {
+            if (try trackPlan(self, ctx, mouse)) return;
             try trackSelection(self, ctx, mouse);
             if (ctx.consume_event) return;
 
@@ -180,7 +222,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (!self.loop.isBusy() and self.loop.shouldCompact()) {
                 try self.startCompaction(ctx);
             }
-            try self.drainQueue(ctx);
+            try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
             if (self.loop.isBusy()) {
                 self.thinking.stream = self.loop.thoughts();
@@ -315,6 +357,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (key.matches('t', .{ .ctrl = true })) {
+                self.loop.todos.expanded = !self.loop.todos.expanded;
+                return ctx.consumeAndRedraw();
+            }
             if (key.matches('z', .{ .ctrl = true })) {
                 suspendToShell(self);
                 return ctx.consumeAndRedraw();

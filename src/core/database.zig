@@ -6,6 +6,7 @@ const std = @import("std");
 const zqlite = @import("zqlite");
 
 const Conversation = @import("conversation.zig");
+const Todo = @import("todo.zig");
 const Config = @import("config.zig");
 const migrations = @import("migrations.zig");
 
@@ -629,6 +630,41 @@ pub fn loadMessages(
     return messages.toOwnedSlice(allocator);
 }
 
+/// Replace a session's steps with `items`. The list is rewritten whole, the
+/// same way the model sends it, so there is no partial state to reconcile.
+pub fn setTodos(self: *Database, session_id: i64, items: []const Todo.Item) !void {
+    try self.conn.exec("DELETE FROM todo WHERE session_id = ?", .{session_id});
+    for (items, 0..) |item, i| {
+        try self.conn.exec(
+            "INSERT INTO todo (session_id, seq, text, status) VALUES (?, ?, ?, ?)",
+            .{ session_id, @as(i64, @intCast(i)), item.text, @tagName(item.status) },
+        );
+    }
+}
+
+/// A session's steps, in order. Caller owns the result and each step's text.
+pub fn loadTodos(self: *Database, allocator: std.mem.Allocator, session_id: i64) ![]Todo.Item {
+    var rows = try self.conn.rows(
+        "SELECT text, status FROM todo WHERE session_id = ? ORDER BY seq",
+        .{session_id},
+    );
+    defer rows.deinit();
+
+    var list: std.ArrayList(Todo.Item) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item.text);
+        list.deinit(allocator);
+    }
+
+    while (rows.next()) |row| {
+        try list.append(allocator, .{
+            .text = try allocator.dupe(u8, row.text(0)),
+            .status = Todo.Status.parse(row.text(1)) orelse .pending,
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// Load the full reasoning body for a message, from the blob table. Returns
 /// null when the message has no reasoning.
 pub fn loadThinking(
@@ -757,6 +793,7 @@ test "migrations bring a fresh database to the current version" {
     try db.conn.execNoArgs("SELECT 1 FROM blob LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM tool_call LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM attachment LIMIT 0");
+    try db.conn.execNoArgs("SELECT 1 FROM todo LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM read_file LIMIT 0");
     try db.conn.execNoArgs("SELECT 1 FROM approval LIMIT 0");
 }
@@ -1186,4 +1223,52 @@ test "a long attachment comes back as a preview, and in full when asked for" {
     try std.testing.expectEqual(body.len, full.len);
 
     try std.testing.expect(try db.loadAttachment(std.testing.allocator, session_id, 0, 9) == null);
+}
+
+test "a session's steps outlive it being closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/t.db", .{buf[0..n]});
+    defer std.testing.allocator.free(db_path);
+
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const project_id = try db.resolveProject("/tmp/project", "git", "project");
+    const session_id = try db.createSession(project_id, "/tmp/project", "qwen3");
+
+    try db.setTodos(session_id, &.{
+        .{ .text = "read the code", .status = .done },
+        .{ .text = "write the test", .status = .active },
+    });
+
+    {
+        const loaded = try db.loadTodos(std.testing.allocator, session_id);
+        defer {
+            for (loaded) |item| std.testing.allocator.free(item.text);
+            std.testing.allocator.free(loaded);
+        }
+        try std.testing.expectEqual(@as(usize, 2), loaded.len);
+        try std.testing.expectEqualStrings("read the code", loaded[0].text);
+        try std.testing.expectEqual(Todo.Status.done, loaded[0].status);
+        try std.testing.expectEqual(Todo.Status.active, loaded[1].status);
+    }
+
+    try db.setTodos(session_id, &.{.{ .text = "only this", .status = .pending }});
+
+    const replaced = try db.loadTodos(std.testing.allocator, session_id);
+    defer {
+        for (replaced) |item| std.testing.allocator.free(item.text);
+        std.testing.allocator.free(replaced);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replaced.len);
+    try std.testing.expectEqualStrings("only this", replaced[0].text);
+
+    try db.deleteSession(session_id);
+    const gone = try db.loadTodos(std.testing.allocator, session_id);
+    defer std.testing.allocator.free(gone);
+    try std.testing.expectEqual(@as(usize, 0), gone.len);
 }

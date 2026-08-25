@@ -85,6 +85,11 @@ think: bool = true,
 /// Let the preset list of read-only shell commands run without an approval
 /// prompt. Off makes every command a question, however harmless.
 auto_approve_safe_commands: bool = true,
+/// How long one turn may run, and what it may spend, before the loop gives up
+/// on it. Zero turns either off. Null means the built-in default: what a
+/// runaway turn costs is the loop's business, not this file's.
+max_turn_ms: ?i64 = null,
+max_turn_tokens: ?u64 = null,
 /// Append every request and reply to this file, for debugging.
 debug_log: ?[]const u8 = null,
 database_path: []const u8 = database_file,
@@ -110,6 +115,8 @@ const File = struct {
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
     debug_log: ?[]const u8 = null,
+    max_turn_ms: ?i64 = null,
+    max_turn_tokens: ?u64 = null,
     skill_paths: ?[]const []const u8 = null,
     mcp: ?std.json.Value = null,
     /// The single-provider shape this file used to have. Still read, so an
@@ -215,6 +222,8 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.think) |value| self.think = value;
     if (parsed.auto_approve_safe_commands) |value| self.auto_approve_safe_commands = value;
     if (parsed.debug_log) |value| self.debug_log = value;
+    if (parsed.max_turn_ms) |value| self.max_turn_ms = value;
+    if (parsed.max_turn_tokens) |value| self.max_turn_tokens = value;
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
 

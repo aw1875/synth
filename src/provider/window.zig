@@ -35,10 +35,24 @@ pub fn estimateTokens(msg: Conversation.Message, with_images: bool) usize {
     return bytes / 4;
 }
 
+/// What replaces a tool result that a later identical call has already
+/// answered. Short on purpose: its whole reason for existing is the bytes it
+/// gives back.
+pub const superseded_note = "[superseded: an identical call later in this conversation returned the current result]";
+
+/// Results shorter than this are left alone. Collapsing a one-line result costs
+/// more in confusion than it saves in context.
+pub const supersede_floor: usize = 256;
+
 /// The most recent messages that fit within `budget` tokens, oldest dropped
 /// first. The newest message is always kept even if it alone exceeds the
 /// budget, so the model always sees the prompt it is answering.
-/// The newest messages that fit in `budget`, oldest dropped first.
+///
+/// A tool result that a later identical call has already answered is replaced
+/// by a note as the window is chosen, not after: the room it gives back is what
+/// lets an older message stay. Ten reads of one file otherwise cost ten copies
+/// of it in every request from then on, which is context spent on nine answers
+/// that are already known to be stale.
 pub fn messages(
     convo: *Conversation,
     allocator: std.mem.Allocator,
@@ -50,16 +64,81 @@ pub fn messages(
 
     const floor = summaryFloor(all);
 
+    const stale = try supersededResults(allocator, all);
+    defer allocator.free(stale);
+
     var used: usize = 0;
     var first: usize = all.len;
     while (first > floor) {
-        const cost = estimateTokens(all[first - 1], with_images);
+        const at = first - 1;
+        const cost = if (stale[at]) superseded_note.len / 4 else estimateTokens(all[at], with_images);
         if (first < all.len and used + cost > budget) break;
         used += cost;
         first -= 1;
     }
 
-    return allocator.dupe(Conversation.Message, all[alignToExchange(all, first)..]);
+    const start = alignToExchange(all, first);
+    const kept = try allocator.dupe(Conversation.Message, all[start..]);
+    for (kept, start..) |*msg, at| {
+        if (stale[at]) msg.text = superseded_note;
+    }
+    return kept;
+}
+
+/// Which messages hold a tool result that a later identical call has made
+/// stale. Indexed alongside `all`; caller owns the result.
+///
+/// Identical means the same tool and byte-for-byte the same arguments, which
+/// needs no knowledge of what any tool means. A `read` of the same file at a
+/// different offset is a different call and is left alone.
+fn supersededResults(
+    allocator: std.mem.Allocator,
+    all: []const Conversation.Message,
+) ![]bool {
+    const stale = try allocator.alloc(bool, all.len);
+    errdefer allocator.free(stale);
+    @memset(stale, false);
+
+    var keys: std.StringHashMapUnmanaged(void) = .empty;
+    defer keys.deinit(allocator);
+
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |key| allocator.free(key);
+        owned.deinit(allocator);
+    }
+
+    var i = all.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = all[i];
+        if (msg.role != .tool) continue;
+        if (msg.text.len <= supersede_floor) continue;
+
+        const id = msg.tool_call_id orelse continue;
+        const call = callFor(all, id) orelse continue;
+
+        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ call.name, call.arguments });
+        const entry = try keys.getOrPut(allocator, key);
+        if (entry.found_existing) {
+            allocator.free(key);
+            stale[i] = true;
+        } else {
+            try owned.append(allocator, key);
+        }
+    }
+
+    return stale;
+}
+
+/// The call a result belongs to, found by the id the two share.
+fn callFor(all: []const Conversation.Message, id: []const u8) ?Conversation.ToolCall {
+    for (all) |msg| {
+        for (msg.tool_calls) |call| {
+            if (std.mem.eql(u8, call.id, id)) return call;
+        }
+    }
+    return null;
 }
 
 /// Index of the newest compaction summary, which is as far back as the window
@@ -231,4 +310,92 @@ test "the dropped-messages note still gets through" {
 
     const text = try systemText(arena_state.allocator(), "brief", &.{}, 3);
     try std.testing.expect(std.mem.indexOf(u8, text, "3 earlier message(s)") != null);
+}
+
+/// A read of `path` and the result it came back with, as the transcript stores
+/// them: the call on an assistant message, the result on a `tool` message that
+/// shares its id.
+fn addRead(convo: *Conversation, id: []const u8, path: []const u8, body: []const u8) !void {
+    var arguments_buffer: [64]u8 = undefined;
+    const arguments = try std.fmt.bufPrint(&arguments_buffer, "{{\"path\":\"{s}\"}}", .{path});
+
+    var calls = [_]Conversation.ToolCall{.{ .id = id, .name = "read", .arguments = arguments }};
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    _ = try convo.append(.{ .role = .tool, .text = body, .tool_call_id = id });
+}
+
+test "an identical call later on makes the earlier result redundant" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const body = "x" ** (supersede_floor * 2);
+
+    try convo.add(.user, "go");
+    try addRead(&convo, "1", "a.zig", body);
+    try addRead(&convo, "2", "b.zig", body);
+    try addRead(&convo, "3", "a.zig", body);
+
+    const kept = try messages(&convo, std.testing.allocator, 10_000, true);
+    defer std.testing.allocator.free(kept);
+
+    try std.testing.expectEqual(@as(usize, 7), kept.len);
+    try std.testing.expectEqualStrings(superseded_note, kept[2].text);
+    try std.testing.expectEqualStrings(body, kept[4].text);
+    try std.testing.expectEqualStrings(body, kept[6].text);
+}
+
+test "the room a collapsed result gives back keeps an older message in" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const body = "x" ** (supersede_floor * 4);
+
+    try convo.add(.user, "the first thing I asked");
+    try addRead(&convo, "1", "a.zig", body);
+    try addRead(&convo, "2", "a.zig", body);
+
+    const budget = (body.len / 4) + 60;
+    const kept = try messages(&convo, std.testing.allocator, budget, true);
+    defer std.testing.allocator.free(kept);
+
+    try std.testing.expectEqualStrings("the first thing I asked", kept[0].text);
+    try std.testing.expectEqualStrings(superseded_note, kept[2].text);
+}
+
+test "a different call, or a short result, is left alone" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const body = "x" ** (supersede_floor * 2);
+
+    try convo.add(.user, "go");
+    try addRead(&convo, "1", "a.zig", body);
+    try addRead(&convo, "2", "other.zig", body);
+    try addRead(&convo, "3", "a.zig", "short");
+    try addRead(&convo, "4", "a.zig", "short");
+
+    const kept = try messages(&convo, std.testing.allocator, 100_000, true);
+    defer std.testing.allocator.free(kept);
+
+    for (kept) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.text, superseded_note));
+    }
+}
+
+test "a result with no call to match is never collapsed" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const body = "x" ** (supersede_floor * 2);
+
+    try convo.add(.user, "go");
+    _ = try convo.append(.{ .role = .tool, .text = body, .tool_call_id = "missing" });
+    _ = try convo.append(.{ .role = .tool, .text = body, .tool_call_id = "missing" });
+
+    const kept = try messages(&convo, std.testing.allocator, 100_000, true);
+    defer std.testing.allocator.free(kept);
+
+    for (kept) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.text, superseded_note));
+    }
 }

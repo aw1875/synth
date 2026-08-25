@@ -290,6 +290,7 @@ fn globTool(ctx: Context, input: Input) !Output {
 
     var count: usize = 0;
     for (paths) |candidate| {
+        if (ctx.shouldStop()) return stopped(ctx);
         if (!set.matches(candidate)) continue;
         if (count == max_results) {
             try out.writer.print("... more than {d} matches; narrow the pattern\n", .{max_results});
@@ -356,6 +357,14 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 /// Whether a file is binary, decided the way every search tool decides it: a
 /// NUL byte near the start.
+/// What a search that was given up on reports. Says which of the two it was,
+/// because a timeout and a cancelled turn call for different things from the
+/// reader.
+fn stopped(ctx: tool.Context) !Output {
+    const why = if (ctx.givenUp()) "cancelled" else "timed out";
+    return Output.err(try std.fmt.allocPrint(ctx.allocator, "search {s}", .{why}));
+}
+
 fn isBinary(source: []const u8) bool {
     const head = source[0..@min(source.len, binary_sniff_bytes)];
     return std.mem.indexOfScalar(u8, head, 0) != null;
@@ -409,6 +418,7 @@ fn grep(ctx: Context, input: Input) !Output {
 
     for (paths) |candidate| {
         if (count >= max_results) break;
+        if (ctx.shouldStop()) return stopped(ctx);
         if (filter) |*set| {
             if (!set.matches(candidate)) continue;
         }
@@ -1041,4 +1051,49 @@ test "an edit with neither shape says what it wanted" {
 
     try testing.expect(out.is_error);
     try testing.expect(std.mem.indexOf(u8, out.content, "'edits' array") != null);
+}
+
+/// Run a handler against a context the caller has adjusted, which
+/// `Fixture.call` cannot do because it builds its own.
+fn invoke(ctx: Context, handler: tool.Handler, args: []const u8) !Output {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, args, .{});
+    defer parsed.deinit();
+    return handler(ctx, .{ .arguments = parsed.value });
+}
+
+test "a search that has been given up on stops rather than finishing" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try fixture.writeFile("a.zig", "needle\n");
+    try fixture.writeFile("b.zig", "needle\n");
+
+    var stop: std.atomic.Value(bool) = .init(true);
+    var ctx = fixture.context();
+    ctx.cancelled = &stop;
+
+    const searched = try invoke(ctx, grep, "{\"pattern\":\"needle\"}");
+    defer testing.allocator.free(searched.content);
+    try testing.expect(searched.is_error);
+    try testing.expectEqualStrings("search cancelled", searched.content);
+
+    const globbed = try invoke(ctx, globTool, "{\"pattern\":\"**/*.zig\"}");
+    defer testing.allocator.free(globbed.content);
+    try testing.expect(globbed.is_error);
+    try testing.expectEqualStrings("search cancelled", globbed.content);
+}
+
+test "a search that ran out of time says so rather than saying cancelled" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try fixture.writeFile("a.zig", "needle\n");
+
+    var ctx = fixture.context();
+    ctx.deadline_ms = tool.monotonicMilliseconds(ctx.io) - 1;
+
+    const searched = try invoke(ctx, grep, "{\"pattern\":\"needle\"}");
+    defer testing.allocator.free(searched.content);
+    try testing.expect(searched.is_error);
+    try testing.expectEqualStrings("search timed out", searched.content);
 }

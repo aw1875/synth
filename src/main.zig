@@ -193,6 +193,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     timing.mark("mcp start");
 
     model.loop.auto_approve_safe = config.auto_approve_safe_commands;
+    if (config.max_turn_ms) |ms| model.loop.max_turn_ms = ms;
+    if (config.max_turn_tokens) |tokens| model.loop.max_turn_tokens = tokens;
     if (config.system_prompt) |text| model.loop.system_prompt = text;
     model.loop.project = &project;
     model.loop.skills = skills.skills;

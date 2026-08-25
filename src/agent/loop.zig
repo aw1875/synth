@@ -7,12 +7,14 @@ const testing = std.testing;
 const Database = @import("../core/database.zig");
 const Provider = @import("../provider/provider.zig");
 const ask_user = @import("../tools/ask.zig");
+const todo_tool = @import("../tools/todo.zig");
 const Registry = @import("../tools/registry.zig");
 const agents = @import("agent.zig");
 const Context = @import("context.zig");
 const base_prompt = @import("prompt.zig");
 const Project = @import("../core/project.zig");
 const skill = @import("../core/skill.zig");
+const todo = @import("../core/todo.zig");
 const tool = @import("../tools/tool.zig");
 const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
@@ -26,6 +28,18 @@ const Loop = @This();
 /// How many times the same tool call may repeat before the turn is stopped.
 /// Two is a model correcting itself; three is a model stuck.
 pub const max_repeats: usize = 3;
+
+/// How long one turn may run before the loop gives up on it. A backstop for a
+/// turn that is merely expensive: the step ceiling counts calls and the repeat
+/// check catches a model going in circles, and neither notices a turn that is
+/// simply grinding. Generous, because a real refactor against a local model
+/// legitimately takes a while. Zero turns it off.
+pub const default_turn_ms: i64 = 30 * std.time.ms_per_min;
+
+/// Tokens one turn may spend, prompt and completion together. The whole
+/// transcript is resent every step, so a long turn's cost grows with the square
+/// of its length; this is what notices. Zero turns it off.
+pub const default_turn_tokens: u64 = 2_000_000;
 
 /// Stands in for an assistant turn that said nothing at all, so the transcript
 /// shows a turn happened. Named because a caller reading the transcript back -
@@ -129,6 +143,16 @@ tools_adopted: usize = 0,
 cancel_at_ms: ?i64 = null,
 signalled: bool = false,
 steps: usize = 0,
+/// When this turn started, on the monotonic clock, and what it has spent since.
+/// Both reset by `submit`.
+turn_started_ms: ?i64 = null,
+turn_tokens: u64 = 0,
+/// What the user typed while the turn was running, waiting to be handed to the
+/// model at its next step. Owned.
+steering: std.ArrayList([]const u8) = .empty,
+/// The turn's limits. Zero disables either one.
+max_turn_ms: i64 = default_turn_ms,
+max_turn_tokens: u64 = default_turn_tokens,
 /// `seq` of the assistant message whose tool calls are being decided. A seq
 /// rather than an index: trimming the transcript shifts indices down and paging
 /// history back in shifts them up, either of which would leave a decision
@@ -162,6 +186,9 @@ project: ?*const Project = null,
 /// The skills this project offers, for the `<skills>` block. Borrowed, and
 /// empty where nothing discovered any.
 skills: []const skill.Skill = &.{},
+/// The steps the model says it is working through. Owned, and only ever
+/// written on the thread that draws.
+todos: todo.List = undefined,
 /// The assembled system prompt, shared by the steps of one turn.
 prompt_cache: Context.Cache = .{},
 /// Set when a turn ends in failure, for the UI to surface.
@@ -217,6 +244,7 @@ pub fn init(
         .conversation = conversation,
         .reads = reads,
         .project_root = project_root,
+        .todos = .init(allocator),
     };
 }
 
@@ -293,6 +321,20 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
 
     try self.restoreModel(session_id);
     try self.restoreAgent(session_id);
+    try self.restoreTodos(session_id);
+}
+
+/// Bring back the steps the session was working through.
+fn restoreTodos(self: *Loop, session_id: i64) !void {
+    const db = self.db orelse return;
+
+    const items = try db.loadTodos(self.allocator, session_id);
+    defer {
+        for (items) |item| self.allocator.free(item.text);
+        self.allocator.free(items);
+    }
+
+    try self.todos.replace(items);
 }
 
 /// Point the provider back at the model the session was last run under.
@@ -418,6 +460,9 @@ pub fn deinit(self: *Loop) void {
         self.tools = null;
     }
 
+    self.todos.deinit();
+    for (self.steering.items) |text| self.allocator.free(text);
+    self.steering.deinit(self.allocator);
     self.prompt_cache.deinit(self.allocator);
     if (self.last_calls) |calls| self.allocator.free(calls);
     if (self.tools_json) |json| self.allocator.free(json);
@@ -547,6 +592,8 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.steps = 0;
     self.repeats = 0;
+    self.turn_started_ms = tool.monotonicMilliseconds(self.io);
+    self.turn_tokens = 0;
     if (self.last_calls) |calls| self.allocator.free(calls);
     self.last_calls = null;
     self.last_error = null;
@@ -634,10 +681,12 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 }
 
 fn ask(self: *Loop) !void {
+    try self.applySteering();
     self.steps += 1;
     if (self.steps > self.agent.steps) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
+    if (self.overBudget()) |reason| return self.stop(reason);
 
     self.request = try Request.start(
         self.allocator,
@@ -647,6 +696,77 @@ fn ask(self: *Loop) !void {
         self.turn(""),
     );
     self.state = .thinking;
+}
+
+/// Hand the model whatever was typed while it was working.
+///
+/// Drained here rather than the moment it is typed: a user message written
+/// between an assistant's tool calls and their results would split an exchange
+/// the wire format requires to be whole. By the time a step is being asked for,
+/// every result is in.
+fn applySteering(self: *Loop) !void {
+    while (self.steering.items.len > 0) {
+        const text = self.steering.orderedRemove(0);
+        defer self.allocator.free(text);
+        _ = try self.conversation.addUser(text, &.{}, &.{});
+        try self.persistMessage(self.conversation.messages.items.len - 1);
+    }
+}
+
+/// Add to what the model is being asked, without waiting for the turn to end.
+///
+/// A correction is only worth anything while there is still work to redirect,
+/// so this is refused when the loop is idle - the caller starts a turn instead.
+pub fn steer(self: *Loop, text: []const u8) !bool {
+    if (!self.isBusy()) return false;
+
+    const owned = try self.allocator.dupe(u8, text);
+    errdefer self.allocator.free(owned);
+    try self.steering.append(self.allocator, owned);
+    return true;
+}
+
+/// What has been typed mid-turn and not yet handed over, for the UI to show as
+/// waiting.
+pub fn pendingSteering(self: *const Loop) []const []const u8 {
+    return self.steering.items;
+}
+
+/// Take the oldest thing typed mid-turn, handing ownership to the caller.
+///
+/// For when the turn it was meant to steer ended before it could be handed
+/// over - cancelled, or stopped at a limit. It is a prompt now rather than a
+/// correction, and the caller starts a turn with it. Leaving it pending would
+/// mean it silently rode along with whatever was typed next.
+pub fn takeSteering(self: *Loop) ?[]const u8 {
+    if (self.steering.items.len == 0) return null;
+    return self.steering.orderedRemove(0);
+}
+
+/// Throw away anything typed mid-turn that has not been handed over. Used when
+/// the transcript it was meant for is being swapped out from under it.
+pub fn dropSteering(self: *Loop) void {
+    for (self.steering.items) |text| self.allocator.free(text);
+    self.steering.clearRetainingCapacity();
+}
+
+/// Why this turn should not take another step, or null while it may.
+///
+/// Checked before asking rather than after answering: the point is to stop
+/// spending, and a turn that has already blown its budget spends again the
+/// moment it takes another step.
+fn overBudget(self: *Loop) ?[]const u8 {
+    if (self.max_turn_tokens > 0 and self.turn_tokens >= self.max_turn_tokens) {
+        return "Stopped: this turn has spent its token budget. Ask again to carry on.";
+    }
+    if (self.max_turn_ms > 0) {
+        const started = self.turn_started_ms orelse return null;
+        const spent = tool.monotonicMilliseconds(self.io) - started;
+        if (spent >= self.max_turn_ms) {
+            return "Stopped: this turn ran out of time. Ask again to carry on.";
+        }
+    }
+    return null;
 }
 
 /// Abandon the turn, discarding whatever the worker had produced.
@@ -784,6 +904,7 @@ fn pollRequest(self: *Loop) !bool {
         self.usage.calls += 1;
         self.usage.input_tokens += reply.usage.prompt_tokens;
         self.usage.output_tokens += reply.usage.completion_tokens;
+        self.turn_tokens += reply.usage.prompt_tokens + reply.usage.completion_tokens;
         self.usage.eval_duration_ns += reply.usage.eval_duration_ns;
         if (reply.usage.prompt_tokens > 0) {
             self.usage.context_tokens = reply.usage.prompt_tokens;
@@ -928,6 +1049,42 @@ pub fn answer(self: *Loop, text: []const u8) !void {
 
     if (self.firstAsk() != null) return;
     try self.runApproved();
+}
+
+/// Write the step list to the session it belongs to. No-op without a database,
+/// or before the session row exists - there is nothing to attach it to yet, and
+/// the next write after the first message picks it up.
+fn persistTodos(self: *Loop) !void {
+    const db = self.db orelse return;
+    const session_id = self.session_id orelse return;
+    try db.setTodos(session_id, self.todos.items.items);
+}
+
+/// Settle every `todo` call in the batch, here on the thread that draws.
+///
+/// The list is what the sidebar reads every frame, so a tool worker writing it
+/// would be a race - and there is nothing in it worth a worker: no file is
+/// touched and no process runs.
+fn applyTodos(self: *Loop, message_index: usize) !void {
+    const calls = self.conversation.messages.items[message_index].tool_calls;
+
+    for (calls, 0..) |*call, i| {
+        if (call.status != .running) continue;
+        if (!std.mem.eql(u8, call.name, todo_tool.name)) continue;
+
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+
+        try self.todos.replace(todo_tool.parse(arena_state.allocator(), call.arguments));
+        try self.persistTodos();
+
+        const text = try todo_tool.summary(self.allocator, &self.todos);
+        call.status = .ok;
+        if (call.result) |old| self.allocator.free(old);
+        call.result = text;
+        call.result_bytes = text.len;
+        try self.persistToolCall(message_index, i);
+    }
 }
 
 /// Where the message being decided currently sits, or null when there is no
@@ -1337,11 +1494,14 @@ fn runApproved(self: *Loop) !void {
     const message_index = self.pendingIndex() orelse return;
     const calls = self.conversation.messages.items[message_index].tool_calls;
 
+    try self.applyTodos(message_index);
+
     var batch: std.ArrayList(ToolRun.Call) = .empty;
     defer batch.deinit(self.allocator);
 
     for (calls, 0..) |call, i| {
         if (call.status != .running) continue;
+        if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
         try batch.append(self.allocator, .{
             .index = i,
             .name = call.name,
@@ -1473,6 +1633,8 @@ const FakeProvider = struct {
     tool_arguments: []const u8 = "{\"path\":\".\"}",
     /// Ask for the same tool forever, the way a stuck model does.
     loop_forever: bool = false,
+    /// Reported prompt tokens, for the tests that care what a turn spends.
+    prompt_tokens: u32 = 0,
 
     fn provider(self: *FakeProvider) Provider {
         return .{ .name = "fake", .userdata = self, .respond = respond };
@@ -1496,7 +1658,10 @@ const FakeProvider = struct {
         // A one-off instruction is a question, not a turn: answer it rather
         // than reaching for a tool.
         if (asked.instruction.len > 0) {
-            return .{ .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}) };
+            return .{
+                .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}),
+                .usage = .{ .prompt_tokens = self.prompt_tokens },
+            };
         }
 
         const last = convo.last();
@@ -1515,11 +1680,15 @@ const FakeProvider = struct {
             return .{
                 .text = try allocator.dupe(u8, "Let me look at the project."),
                 .tool_calls = calls,
+                .usage = .{ .prompt_tokens = self.prompt_tokens },
             };
         }
 
         const question = if (convo.last()) |msg| msg.text else "";
-        return .{ .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{question}) };
+        return .{
+            .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{question}),
+            .usage = .{ .prompt_tokens = self.prompt_tokens },
+        };
     }
 };
 
@@ -2378,4 +2547,258 @@ test "a worker that ignores the ask is signalled once the grace is up" {
     try testing.expect(loop.signalled);
     try testing.expectEqual(State.idle, loop.state);
     try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 20_000);
+}
+
+test "a plan is applied without a worker, and reads back as progress" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    fixture.fake.tool_name = "todo";
+    fixture.fake.tool_arguments =
+        \\{"items":[{"text":"read the code","status":"done"},{"text":"write the test","status":"active"},{"text":"run it"}]}
+    ;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(@as(usize, 3), loop.todos.items.items.len);
+    try testing.expectEqualStrings("write the test", loop.todos.current().?.text);
+    try testing.expectEqual(@as(usize, 1), loop.todos.done());
+
+    const call = &loop.conversation.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, call.status);
+    try testing.expectEqualStrings("1/3 done, now: write the test", call.result.?);
+}
+
+test "a plan survives the session being resumed" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    const db_path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "t.db" });
+    defer testing.allocator.free(db_path);
+
+    var db = try Database.init(testing.allocator, testing.io, db_path);
+    defer db.deinit();
+
+    fixture.fake.tool_name = "todo";
+    fixture.fake.tool_arguments =
+        \\{"items":[{"text":"first","status":"done"},{"text":"second","status":"active"}]}
+    ;
+
+    var loop = fixture.loop();
+    try loop.attachDatabase(&db, "project", fixture.root, "fake");
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    const session_id = loop.session_id orelse return error.TestUnexpectedResult;
+    loop.deinit();
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    var next: Loop = .init(
+        testing.allocator,
+        testing.io,
+        fixture.fake.provider(),
+        &fixture.registry,
+        &convo,
+        &fixture.reads,
+        fixture.root,
+    );
+    defer next.deinit();
+
+    try next.attachDatabase(&db, "project", fixture.root, "fake");
+    try next.resumeSession(session_id, 50);
+
+    try testing.expectEqual(@as(usize, 2), next.todos.items.items.len);
+    try testing.expectEqualStrings("second", next.todos.current().?.text);
+    try testing.expectEqual(@as(usize, 1), next.todos.done());
+}
+
+test "a turn that has spent its tokens stops rather than asking again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    loop.max_turn_tokens = 10;
+    fixture.fake.prompt_tokens = 40;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    try testing.expect(loop.turn_tokens >= 10);
+    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last.text, "token budget") != null);
+}
+
+test "a turn that has run out of time stops rather than asking again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    loop.max_turn_ms = 1;
+
+    try loop.submit("go", .{});
+    loop.turn_started_ms = tool.monotonicMilliseconds(loop.io) - 1000;
+    try settle(&loop);
+
+    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last.text, "ran out of time") != null);
+}
+
+test "a budget of zero is no budget at all" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    loop.max_turn_ms = 0;
+    loop.max_turn_tokens = 0;
+    loop.turn_started_ms = 0;
+    loop.turn_tokens = std.math.maxInt(u64);
+
+    try testing.expect(loop.overBudget() == null);
+}
+
+test "each turn gets the whole budget again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    fixture.fake.prompt_tokens = 40;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expect(loop.turn_tokens > 0);
+
+    try loop.submit("again", .{});
+    try testing.expectEqual(@as(u64, 0), loop.turn_tokens);
+}
+
+test "a correction typed mid-turn reaches the model at its next step" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try testing.expect(loop.isBusy());
+
+    try testing.expect(try loop.steer("no, not that file"));
+    try testing.expect(try loop.steer("and be quick"));
+    try testing.expectEqual(@as(usize, 2), loop.pendingSteering().len);
+
+    try settle(&loop);
+
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+
+    var seen: usize = 0;
+    for (loop.conversation.messages.items) |msg| {
+        if (msg.role != .user) continue;
+        if (std.mem.eql(u8, msg.text, "no, not that file")) seen += 1;
+        if (std.mem.eql(u8, msg.text, "and be quick")) seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+}
+
+test "steering never splits an assistant's calls from their results" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("actually, stop reading"));
+    try settle(&loop);
+
+    const messages = loop.conversation.messages.items;
+
+    var found = false;
+    for (messages, 0..) |msg, i| {
+        if (msg.role != .user) continue;
+        if (!std.mem.eql(u8, msg.text, "actually, stop reading")) continue;
+        found = true;
+
+        try testing.expect(i > 0);
+        try testing.expectEqual(@as(usize, 0), messages[i - 1].tool_calls.len);
+    }
+    try testing.expect(found);
+}
+
+test "there is nothing to steer when the loop is idle" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try testing.expect(!try loop.steer("hello?"));
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+}
+
+test "steering is dropped when the transcript it was meant for is swapped out" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("never mind"));
+
+    loop.dropSteering();
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+
+    try settle(&loop);
+    for (loop.conversation.messages.items) |msg| {
+        try testing.expect(!std.mem.eql(u8, msg.text, "never mind"));
+    }
+}
+
+test "a cancelled turn hands back what was typed during it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    fixture.fake.latency = .fromMilliseconds(50);
+
+    try loop.submit("go", .{});
+    try testing.expect(try loop.steer("wait, do this instead"));
+
+    try loop.cancel();
+    try settle(&loop);
+
+    const left = loop.takeSteering() orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(left);
+    try testing.expectEqualStrings("wait, do this instead", left);
+    try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
+
+    for (loop.conversation.messages.items) |msg| {
+        if (msg.role != .user) continue;
+        try testing.expect(!std.mem.eql(u8, msg.text, "wait, do this instead"));
+    }
+}
+
+test "taking steering from a turn that had none is not an error" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try testing.expect(loop.takeSteering() == null);
 }

@@ -16,6 +16,7 @@ const agents = @import("../agent/agent.zig");
 const Model = @import("model.zig");
 const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
+const todo = @import("../core/todo.zig");
 const widget_pool = @import("widget_pool.zig");
 const AgentLoop = @import("../agent/loop.zig");
 const ask_user = @import("../tools/ask.zig");
@@ -257,8 +258,8 @@ const Block = union(enum) {
     thinking,
     /// The reply as it streams in, before it becomes a message.
     streaming,
-    queued: []const u8,
-    queued_more: usize,
+    steering: []const u8,
+    steering_more: usize,
 
     /// Whether this block belongs to the live tail - the part that grows while
     /// a turn is in flight. Growth there is what the scroll offset has to be
@@ -266,7 +267,7 @@ const Block = union(enum) {
     /// happens above the viewport and moves nothing.
     fn inTail(self: Block) bool {
         return switch (self) {
-            .thinking, .streaming, .queued, .queued_more => true,
+            .thinking, .streaming, .steering, .steering_more => true,
             else => false,
         };
     }
@@ -308,12 +309,13 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
         try blocks.append(arena, .streaming);
     }
 
-    for (self.queued.items, 0..) |prompt, i| {
-        if (i == Model.max_queued_shown) {
-            try blocks.append(arena, .{ .queued_more = self.queued.items.len - i });
+    const steering = self.loop.pendingSteering();
+    for (steering, 0..) |prompt, i| {
+        if (i == Model.max_steering_shown) {
+            try blocks.append(arena, .{ .steering_more = steering.len - i });
             break;
         }
-        try blocks.append(arena, .{ .queued = prompt });
+        try blocks.append(arena, .{ .steering = prompt });
     }
 
     return blocks.toOwnedSlice(arena);
@@ -381,12 +383,12 @@ fn drawBlock(
             return try messageBlock(self, ctx, .{ .role = .assistant, .text = partial }, width);
         },
 
-        .queued => |prompt| return try queuedBlock(self, ctx, prompt, width),
+        .steering => |prompt| return try steeringBlock(self, ctx, prompt, width),
 
-        .queued_more => |count| return try queuedBlock(
+        .steering_more => |count| return try steeringBlock(
             self,
             ctx,
-            try std.fmt.allocPrint(ctx.arena, "+{d} more queued", .{count}),
+            try std.fmt.allocPrint(ctx.arena, "+{d} more waiting", .{count}),
             width,
         ),
     }
@@ -450,7 +452,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
                 std.hash.autoHash(&hasher, card.expanded);
             }
         },
-        .question, .thinking, .streaming, .queued, .queued_more => return null,
+        .question, .thinking, .streaming, .steering, .steering_more => return null,
     }
 
     return hasher.final();
@@ -465,7 +467,7 @@ pub fn drawTranscript(
     const messages = self.conversation.messages.items;
     const pending: usize = if (self.loop.isBusy() and
         self.loop.state != .awaiting_approval) 1 else 0;
-    if (height == 0 or messages.len + pending + self.queued.items.len == 0) return null;
+    if (height == 0 or messages.len + pending + self.loop.pendingSteering().len == 0) return null;
 
     const constraints = ctx.withConstraints(
         .{ .width = width },
@@ -698,8 +700,9 @@ fn skillLine(
     return surface;
 }
 
-/// A prompt waiting its turn: the user's card, dimmed, so it reads as not yet
-/// sent rather than as part of the transcript.
+/// Something typed while the turn was running: the user's card, dimmed, so it
+/// reads as not yet sent rather than as part of the transcript. It reaches the
+/// model at its next step.
 /// A dim one-line note in the transcript, for things that are neither a
 /// message nor a tool call.
 pub fn noticeBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {
@@ -742,7 +745,7 @@ pub fn questionBlock(
     return w.wrap(constraints, try plainText(ctx, text.items, style, inner_width), opts);
 }
 
-pub fn queuedBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {
+pub fn steeringBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {
     const style = theme.on_card(theme.fg_dim).cell;
 
     const opts: w.PanelOptions = .{
@@ -873,12 +876,12 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
         col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
     }
     _ = w.writeText(surface, col, footer, self.provider.name, theme.on_card(theme.fg_muted).cell);
-    if (self.queued.items.len > 0) {
+    if (self.loop.pendingSteering().len > 0) {
         col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
         col = w.writeText(surface, col, footer, try std.fmt.allocPrint(
             ctx.arena,
-            "{d} queued",
-            .{self.queued.items.len},
+            "{d} waiting",
+            .{self.loop.pendingSteering().len},
         ), theme.on_card(theme.accent_alt).cell);
     }
 
@@ -978,11 +981,11 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16)
     };
 
     var row: u16 = 1;
-    const heading = if (self.loop.title().len > 0)
+    const heading_row = if (self.loop.title().len > 0)
         fitRight(self.loop.title(), inner)
     else
         fitLeft(ctx.arena, projectName(self), inner);
-    _ = w.writeText(surface, left, row, heading, theme.on_card(theme.fg).bold().cell);
+    _ = w.writeText(surface, left, row, heading_row, theme.on_card(theme.fg).bold().cell);
     row += 2;
 
     for (sections) |section| {
@@ -997,6 +1000,8 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16)
         row += 1;
     }
 
+    _ = try drawPlan(self, ctx, surface, left, inner, height -| 2, row);
+
     if (height >= 3) {
         const col = w.writeText(surface, left, height - 2, "• ", theme.on_card(theme.accent).cell);
         const title_col = w.writeText(surface, col, height - 2, pkg.name ++ " ", theme.on_card(theme.fg_muted).cell);
@@ -1004,6 +1009,111 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16)
     }
 
     return surface;
+}
+
+/// The steps the model is working through, at the top of the sidebar where a
+/// glance lands. Returns the row after it.
+///
+/// Collapsed it is one line - the step in hand - because that is the part worth
+/// a permanent place. Expanded it is the whole list, which the sidebar has the
+/// room for and the transcript does not.
+fn drawPlan(
+    self: *Model,
+    ctx: vxfw.DrawContext,
+    surface: vxfw.Surface,
+    left: u16,
+    inner: u16,
+    height: u16,
+    start: u16,
+) !u16 {
+    const list = &self.loop.todos;
+    self.plan_top = 0;
+    self.plan_bottom = 0;
+    if (!list.any() or start >= height) return start;
+
+    var row = start;
+    const title = w.writeText(surface, left, row, "Plan", theme.on_card(theme.fg).bold().cell);
+    const counted = w.writeText(surface, title + 1, row, try std.fmt.allocPrint(
+        ctx.arena,
+        "{d}/{d}",
+        .{ list.done(), list.items.items.len },
+    ), theme.on_card(theme.fg_dim).cell);
+    if (self.plan_hover) {
+        const hint = if (list.expanded) " hide" else " show";
+        _ = w.writeText(surface, counted, row, hint, theme.on_card(theme.fg_dim).cell);
+    }
+    row += 1;
+
+    if (list.expanded) {
+        for (list.items.items) |item| {
+            if (row >= height) break;
+            row = drawStep(surface, left, inner, height, row, item);
+        }
+    } else if (list.current()) |item| {
+        row = drawStep(surface, left, inner, height, row, item);
+    }
+
+    self.plan_top = start;
+    self.plan_bottom = row;
+    return row + 1;
+}
+
+/// One step, its text wrapped under its own mark. The sidebar is narrow and
+/// tall, so a step that does not fit is given another line rather than cut.
+fn drawStep(
+    surface: vxfw.Surface,
+    left: u16,
+    inner: u16,
+    height: u16,
+    start: u16,
+    item: todo.Item,
+) u16 {
+    const style = switch (item.status) {
+        .active => theme.on_card(theme.accent).bold(),
+        .done => theme.on_card(theme.fg_dim).strikethrough(),
+        .pending => theme.on_card(theme.fg_muted),
+    };
+
+    _ = w.writeText(surface, left, start, item.status.mark(), style.cell);
+
+    const text_col = left + 2;
+    const text_width = inner -| 2;
+    if (text_width == 0) return start + 1;
+
+    var row = start;
+    var rest = item.text;
+    while (rest.len > 0 and row < height) {
+        const cut = wrapPoint(rest, text_width);
+        _ = w.writeText(surface, text_col, row, rest[0..cut], style.cell);
+        rest = std.mem.trimStart(u8, rest[cut..], " ");
+        row += 1;
+        if (row - start >= plan_step_rows) break;
+    }
+    return row;
+}
+
+/// Rows one step may take before the rest of it is dropped. Three is enough for
+/// any step worth writing down, and stops one runaway line pushing the whole
+/// list off the screen.
+const plan_step_rows: u16 = 3;
+
+/// How much of `text` fits in `width`, broken at a space where there is one.
+fn wrapPoint(text: []const u8, width: u16) usize {
+    if (w.textWidth(text) <= width) return text.len;
+
+    var kept: u16 = 0;
+    var last_space: ?usize = null;
+    var iter = vaxis.unicode.graphemeIterator(text);
+    while (iter.next()) |g| {
+        const bytes = g.bytes(text);
+        const cw = vaxis.gwidth.gwidth(bytes, .unicode);
+        if (kept + cw > width) {
+            return last_space orelse g.start;
+        }
+        if (bytes.len == 1 and bytes[0] == ' ') last_space = g.start;
+        kept += cw;
+    }
+    return text.len;
 }
 
 /// Group digits so six-figure token counts stay readable at a glance.
@@ -1155,4 +1265,12 @@ test "the arguments a skill was run against are what followed its name" {
     try std.testing.expectEqualStrings("2.1 --dry-run", arguments("/release  2.1 --dry-run"));
     try std.testing.expectEqualStrings("", arguments("/caveman"));
     try std.testing.expectEqualStrings("", arguments("/caveman   "));
+}
+
+test "a step breaks at a space, and mid-word only when it has to" {
+    try std.testing.expectEqual(@as(usize, 11), wrapPoint("write tests", 20));
+    try std.testing.expectEqual(@as(usize, 5), wrapPoint("write tests", 8));
+    try std.testing.expectEqual(@as(usize, 5), wrapPoint("write tests", 5));
+    try std.testing.expectEqual(@as(usize, 4), wrapPoint("supercalifragilistic", 4));
+    try std.testing.expectEqual(@as(usize, 0), wrapPoint("supercalifragilistic", 0));
 }
