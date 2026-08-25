@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const pkg = @import("pkg");
+const Hooks = @import("hooks.zig");
 
 const Config = @This();
 
@@ -106,6 +107,8 @@ skill_paths: []const []const u8 = &.{},
 /// server entry means is the MCP adapter's business, and this file would only
 /// be repeating its shape. Borrowed from this config's arena.
 mcp: ?std.json.Value = null,
+/// Commands invoked at selected points in the agent lifecycle.
+hooks: Hooks.Set = .{},
 
 /// The shape `config.json` is parsed into. Every field is optional so an
 /// absent key falls through to whatever the previous layer set.
@@ -119,6 +122,7 @@ const File = struct {
     max_turn_tokens: ?u64 = null,
     skill_paths: ?[]const []const u8 = null,
     mcp: ?std.json.Value = null,
+    hooks: ?Hooks.File = null,
     /// The single-provider shape this file used to have. Still read, so an
     /// existing `config.json` keeps working; nothing writes it any more, and
     /// where a provider lives is the database's business now.
@@ -227,6 +231,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.max_turn_tokens) |value| self.max_turn_tokens = value;
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
+    if (parsed.hooks) |value| self.hooks = value.set();
 
     if (parsed.ollama) |ollama| {
         if (ollama.host) |value| self.host_override = value;
@@ -348,4 +353,30 @@ test "extra skill directories are read from the file" {
     try testing.expectEqual(@as(usize, 2), config.skill_paths.len);
     try testing.expectEqualStrings("/opt/skills", config.skill_paths[0]);
     try testing.expectEqualStrings("/srv/team/skills", config.skill_paths[1]);
+}
+
+test "lifecycle hooks are read from the file" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    const source =
+        \\{"hooks":{"PreToolUse":[{"matcher":"bash","command":"./check.sh"}]}}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = source });
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try config.applyFile(io, path);
+
+    try testing.expectEqual(@as(usize, 1), config.hooks.pre_tool_use.len);
+    try testing.expectEqualStrings("bash", config.hooks.pre_tool_use[0].matcher);
+    try testing.expectEqualStrings("./check.sh", config.hooks.pre_tool_use[0].command);
 }
