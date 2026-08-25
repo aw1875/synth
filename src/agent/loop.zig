@@ -29,6 +29,18 @@ const Loop = @This();
 /// Two is a model correcting itself; three is a model stuck.
 pub const max_repeats: usize = 3;
 
+/// How long one turn may run before the loop gives up on it. A backstop for a
+/// turn that is merely expensive: the step ceiling counts calls and the repeat
+/// check catches a model going in circles, and neither notices a turn that is
+/// simply grinding. Generous, because a real refactor against a local model
+/// legitimately takes a while. Zero turns it off.
+pub const default_turn_ms: i64 = 30 * std.time.ms_per_min;
+
+/// Tokens one turn may spend, prompt and completion together. The whole
+/// transcript is resent every step, so a long turn's cost grows with the square
+/// of its length; this is what notices. Zero turns it off.
+pub const default_turn_tokens: u64 = 2_000_000;
+
 /// Stands in for an assistant turn that said nothing at all, so the transcript
 /// shows a turn happened. Named because a caller reading the transcript back -
 /// a subagent handing up its answer - has to tell it from something the model
@@ -131,6 +143,13 @@ tools_adopted: usize = 0,
 cancel_at_ms: ?i64 = null,
 signalled: bool = false,
 steps: usize = 0,
+/// When this turn started, on the monotonic clock, and what it has spent since.
+/// Both reset by `submit`.
+turn_started_ms: ?i64 = null,
+turn_tokens: u64 = 0,
+/// The turn's limits. Zero disables either one.
+max_turn_ms: i64 = default_turn_ms,
+max_turn_tokens: u64 = default_turn_tokens,
 /// `seq` of the assistant message whose tool calls are being decided. A seq
 /// rather than an index: trimming the transcript shifts indices down and paging
 /// history back in shifts them up, either of which would leave a decision
@@ -568,6 +587,8 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.steps = 0;
     self.repeats = 0;
+    self.turn_started_ms = tool.monotonicMilliseconds(self.io);
+    self.turn_tokens = 0;
     if (self.last_calls) |calls| self.allocator.free(calls);
     self.last_calls = null;
     self.last_error = null;
@@ -659,6 +680,7 @@ fn ask(self: *Loop) !void {
     if (self.steps > self.agent.steps) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
+    if (self.overBudget()) |reason| return self.stop(reason);
 
     self.request = try Request.start(
         self.allocator,
@@ -668,6 +690,25 @@ fn ask(self: *Loop) !void {
         self.turn(""),
     );
     self.state = .thinking;
+}
+
+/// Why this turn should not take another step, or null while it may.
+///
+/// Checked before asking rather than after answering: the point is to stop
+/// spending, and a turn that has already blown its budget spends again the
+/// moment it takes another step.
+fn overBudget(self: *Loop) ?[]const u8 {
+    if (self.max_turn_tokens > 0 and self.turn_tokens >= self.max_turn_tokens) {
+        return "Stopped: this turn has spent its token budget. Ask again to carry on.";
+    }
+    if (self.max_turn_ms > 0) {
+        const started = self.turn_started_ms orelse return null;
+        const spent = tool.monotonicMilliseconds(self.io) - started;
+        if (spent >= self.max_turn_ms) {
+            return "Stopped: this turn ran out of time. Ask again to carry on.";
+        }
+    }
+    return null;
 }
 
 /// Abandon the turn, discarding whatever the worker had produced.
@@ -805,6 +846,7 @@ fn pollRequest(self: *Loop) !bool {
         self.usage.calls += 1;
         self.usage.input_tokens += reply.usage.prompt_tokens;
         self.usage.output_tokens += reply.usage.completion_tokens;
+        self.turn_tokens += reply.usage.prompt_tokens + reply.usage.completion_tokens;
         self.usage.eval_duration_ns += reply.usage.eval_duration_ns;
         if (reply.usage.prompt_tokens > 0) {
             self.usage.context_tokens = reply.usage.prompt_tokens;
@@ -1533,6 +1575,8 @@ const FakeProvider = struct {
     tool_arguments: []const u8 = "{\"path\":\".\"}",
     /// Ask for the same tool forever, the way a stuck model does.
     loop_forever: bool = false,
+    /// Reported prompt tokens, for the tests that care what a turn spends.
+    prompt_tokens: u32 = 0,
 
     fn provider(self: *FakeProvider) Provider {
         return .{ .name = "fake", .userdata = self, .respond = respond };
@@ -1556,7 +1600,10 @@ const FakeProvider = struct {
         // A one-off instruction is a question, not a turn: answer it rather
         // than reaching for a tool.
         if (asked.instruction.len > 0) {
-            return .{ .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}) };
+            return .{
+                .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}),
+                .usage = .{ .prompt_tokens = self.prompt_tokens },
+            };
         }
 
         const last = convo.last();
@@ -1575,11 +1622,15 @@ const FakeProvider = struct {
             return .{
                 .text = try allocator.dupe(u8, "Let me look at the project."),
                 .tool_calls = calls,
+                .usage = .{ .prompt_tokens = self.prompt_tokens },
             };
         }
 
         const question = if (convo.last()) |msg| msg.text else "";
-        return .{ .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{question}) };
+        return .{
+            .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{question}),
+            .usage = .{ .prompt_tokens = self.prompt_tokens },
+        };
     }
 };
 
@@ -2507,4 +2558,71 @@ test "a plan survives the session being resumed" {
     try testing.expectEqual(@as(usize, 2), next.todos.items.items.len);
     try testing.expectEqualStrings("second", next.todos.current().?.text);
     try testing.expectEqual(@as(usize, 1), next.todos.done());
+}
+
+test "a turn that has spent its tokens stops rather than asking again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    loop.max_turn_tokens = 10;
+    fixture.fake.prompt_tokens = 40;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    try testing.expect(loop.turn_tokens >= 10);
+    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last.text, "token budget") != null);
+}
+
+test "a turn that has run out of time stops rather than asking again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    loop.max_turn_ms = 1;
+
+    try loop.submit("go", .{});
+    loop.turn_started_ms = tool.monotonicMilliseconds(loop.io) - 1000;
+    try settle(&loop);
+
+    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last.text, "ran out of time") != null);
+}
+
+test "a budget of zero is no budget at all" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    loop.max_turn_ms = 0;
+    loop.max_turn_tokens = 0;
+    loop.turn_started_ms = 0;
+    loop.turn_tokens = std.math.maxInt(u64);
+
+    try testing.expect(loop.overBudget() == null);
+}
+
+test "each turn gets the whole budget again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    fixture.fake.prompt_tokens = 40;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expect(loop.turn_tokens > 0);
+
+    try loop.submit("again", .{});
+    try testing.expectEqual(@as(u64, 0), loop.turn_tokens);
 }

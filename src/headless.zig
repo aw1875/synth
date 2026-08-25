@@ -133,6 +133,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     var runner: subagent.Runner = .{ .parent = &loop };
     loop.delegate = runner.delegate();
     loop.auto_approve_safe = config.auto_approve_safe_commands;
+    if (config.max_turn_ms) |ms| loop.max_turn_ms = ms;
+    if (config.max_turn_tokens) |tokens| loop.max_turn_tokens = tokens;
     if (config.system_prompt) |text| loop.system_prompt = text;
     loop.project = &project;
     loop.skills = skills.skills;
