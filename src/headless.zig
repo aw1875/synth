@@ -12,6 +12,7 @@ const Auth = @import("core/auth.zig");
 const mcp = @import("mcp");
 
 const Config = @import("core/config.zig");
+const Hooks = @import("core/hooks.zig");
 const Database = @import("core/database.zig");
 const humanize = @import("core/humanize.zig");
 const Project = @import("core/project.zig");
@@ -138,11 +139,24 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     if (config.system_prompt) |text| loop.system_prompt = text;
     loop.project = &project;
     loop.skills = skills.skills;
+    var hook_runner: Hooks.Runner = .{
+        .allocator = allocator,
+        .io = io,
+        .root = project.root,
+        .set = config.hooks,
+    };
+    loop.hooks = &hook_runner;
     try loop.useAgent(agents.default_id);
 
     try loop.attachDatabase(&db, project.name(), project.cwd, backend.model());
 
     try loop.submit(prompt, .{});
+    if (loop.takeHookNotice()) |notice| {
+        defer allocator.free(notice);
+        try out.print("{s}hook blocked prompt{s} {s}\n", .{ red, reset, notice });
+        try out.flush();
+        return;
+    }
 
     var printed: usize = 0;
     while (loop.isBusy()) {
