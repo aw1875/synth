@@ -31,6 +31,10 @@ pub const all: []const tool.Tool = &.{
         // The subagent's own agent record is read-only, so nothing it does
         // needs a decision from the user, and neither does starting it.
         .read_only = true,
+        // Read-only but never beside another call: a subagent borrows the
+        // parent's provider, and the parent being blocked here is what makes
+        // that safe.
+        .parallel = false,
         .timeout_ms = 15 * std.time.ms_per_min,
     },
 };
