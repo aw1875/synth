@@ -18,6 +18,7 @@ const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
+const image = @import("../core/image.zig");
 const skill = @import("../core/skill.zig");
 const tool = @import("../tools/tool.zig");
 const Approval = @import("approval.zig");
@@ -577,7 +578,7 @@ pub fn handlePaste(self: *Model, text: []const u8) !void {
     }
 
     const trimmed = trimPastedPath(text);
-    if (Attachments.hasImageExtension(trimmed) and self.attachImageFile(trimmed)) return;
+    if (image.hasImageExtension(trimmed) and self.attachImageFile(trimmed)) return;
 
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) {
         self.attachClipboardImage();
@@ -617,7 +618,7 @@ fn attachImageFile(self: *Model, path: []const u8) bool {
     ) catch return false;
     defer self.allocator.free(bytes);
 
-    if (!Attachments.isImage(bytes)) return false;
+    if (!image.isImage(bytes)) return false;
     self.holdImage(bytes, std.fs.path.basename(path));
     return true;
 }
@@ -640,14 +641,14 @@ pub fn attachClipboardImage(self: *Model) void {
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
-        if (!Attachments.isImage(result.stdout)) continue;
+        if (!image.isImage(result.stdout)) continue;
         self.holdImage(result.stdout, "");
         return;
     }
 }
 
 fn holdImage(self: *Model, bytes: []const u8, label: []const u8) void {
-    const encoded = Attachments.encode(self.allocator, bytes) catch return;
+    const encoded = image.encode(self.allocator, bytes) catch return;
     defer self.allocator.free(encoded);
 
     const token = self.held.addImage(encoded, label) catch return;
@@ -823,7 +824,10 @@ pub fn acceptMention(self: *Model) !void {
     const anchor = self.mentions.anchor orelse return;
     const path = self.mentions.selectedPath() orelse return;
 
-    const completed = try std.fmt.allocPrint(self.allocator, "@{s} ", .{path});
+    const completed = if (mention.needsQuoting(path))
+        try std.fmt.allocPrint(self.allocator, "@\"{s}\" ", .{path})
+    else
+        try std.fmt.allocPrint(self.allocator, "@{s} ", .{path});
     defer self.allocator.free(completed);
 
     try self.input.replaceRange(anchor, self.input.cursor, completed);
