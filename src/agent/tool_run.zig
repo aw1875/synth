@@ -203,7 +203,6 @@ fn runGroup(self: *ToolRun, index: usize, count: usize) void {
 fn runOne(self: *ToolRun, index: usize) void {
     const call = self.calls[index];
     const result = &self.results[index];
-    result.index = call.index;
 
     if (self.stop.load(.acquire)) {
         result.* = .{
@@ -253,8 +252,10 @@ const Probe = struct {
     rendezvous: usize = 0,
     /// Whether a handler asks the batch to stop once it has met the others.
     stop_run: bool = false,
-    /// The batch to ask, set after it starts. Only read once `stop_run` is on.
-    run: ?*ToolRun = null,
+    /// The batch to ask, set once it has started - which is after the workers
+    /// are already going, so the handlers read it atomically rather than
+    /// racing the test thread for it.
+    run: std.atomic.Value(?*ToolRun) = .init(null),
 
     fn enter(self: *Probe) usize {
         const now = self.inside.fetchAdd(1, .acq_rel) + 1;
@@ -283,7 +284,7 @@ fn rendezvousHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
         std.Io.sleep(ctx.io, .fromMilliseconds(1), .awake) catch break;
     }
     if (probe.stop_run) {
-        if (probe.run) |run_state| run_state.requestStop();
+        if (probe.run.load(.acquire)) |run_state| run_state.requestStop();
     }
     return tool.Output.ok(try ctx.allocator.dupe(u8, "together"));
 }
@@ -454,7 +455,7 @@ test "giving up inside a group stops the calls after it" {
 
     const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, calls);
     defer run_state.destroy();
-    probe.run = run_state;
+    probe.run.store(run_state, .release);
     run_state.join();
 
     try testing.expect(run_state.results[2].is_error);
