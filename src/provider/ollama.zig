@@ -343,7 +343,7 @@ fn readRejection(self: *OllamaProvider, request: Ollama.ChatRequest) !?[]u8 {
         .limited(max_rejection_bytes),
     );
 
-    const message = complaint(body);
+    const message = complaint(arena, body);
     if (message.len == 0) return null;
     return try self.allocator.dupe(u8, message);
 }
@@ -351,11 +351,11 @@ fn readRejection(self: *OllamaProvider, request: Ollama.ChatRequest) !?[]u8 {
 /// The sentence out of an error body. Ollama answers `{"error": "..."}`; a proxy
 /// in front of it might answer anything, so an unparseable body is handed back
 /// as it came, trimmed.
-fn complaint(body: []const u8) []const u8 {
+fn complaint(allocator: std.mem.Allocator, body: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, body, " \t\r\n");
     var parsed = std.json.parseFromSlice(
         struct { @"error": ?[]const u8 = null },
-        std.heap.page_allocator,
+        allocator,
         trimmed,
         .{ .ignore_unknown_fields = true },
     ) catch return trimmed;
@@ -988,13 +988,14 @@ test "an error body is reduced to the sentence the server wrote" {
     try testing.expectEqualStrings(
         "model requires more system memory (21.5 GiB) than is available (12.3 GiB)",
         complaint(
+            testing.allocator,
             \\{"error":"model requires more system memory (21.5 GiB) than is available (12.3 GiB)"}
         ),
     );
 
-    try testing.expectEqualStrings("502 Bad Gateway", complaint("  502 Bad Gateway\n"));
-    try testing.expectEqualStrings("{\"detail\":\"nope\"}", complaint("{\"detail\":\"nope\"}"));
-    try testing.expectEqualStrings("", complaint("   \n"));
+    try testing.expectEqualStrings("502 Bad Gateway", complaint(testing.allocator, "  502 Bad Gateway\n"));
+    try testing.expectEqualStrings("{\"detail\":\"nope\"}", complaint(testing.allocator, "{\"detail\":\"nope\"}"));
+    try testing.expectEqualStrings("", complaint(testing.allocator, "   \n"));
 }
 
 test "advice follows the complaint" {
