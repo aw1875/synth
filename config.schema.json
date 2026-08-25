@@ -1,0 +1,113 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://raw.githubusercontent.com/aw1875/synth/master/config.schema.json",
+    "title": "synth config",
+    "description": "Schema for $XDG_CONFIG_HOME/synth/config.json. Every key is optional; an absent one keeps the built-in default.",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "system_prompt": {
+            "type": "string",
+            "description": "Replaces the base instructions entirely."
+        },
+        "think": {
+            "type": "boolean",
+            "default": true,
+            "description": "Ask for reasoning output. Turn off for models that do not support it."
+        },
+        "auto_approve_safe_commands": {
+            "type": "boolean",
+            "default": true,
+            "description": "Let a preset of read-only shell commands run without a prompt."
+        },
+        "debug_log": {
+            "type": "string",
+            "description": "Append every request and reply to this file."
+        },
+        "max_turn_ms": {
+            "type": "number",
+            "default": 1800000,
+            "minimum": 0,
+            "description": "How long one turn may run. 0 disables it."
+        },
+        "max_turn_tokens": {
+            "type": "number",
+            "default": 2000000,
+            "minimum": 0,
+            "description": "Tokens one turn may spend, prompt and completion together. 0 disables it."
+        },
+        "skill_paths": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "minItems": 1,
+            "default": [],
+            "description": "Extra directories to look for skills in, searched in order."
+        },
+        "database_path": {
+            "type": "string",
+            "default": "synth.db",
+            "description": "Where sessions live."
+        },
+        "mcp": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "servers": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/$defs/mcpServer"
+                    }
+                }
+            },
+            "description": "MCP servers. See README."
+        }
+    },
+    "$defs": {
+        "mcpServer": {
+            "type": "object",
+            "minProperties": 1,
+            "additionalProperties": false,
+            "oneOf": [
+                {
+                    "required": [
+                        "command"
+                    ]
+                },
+                {
+                    "required": [
+                        "url"
+                    ]
+                }
+            ],
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "A command to run a child process."
+                },
+                "args": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Arguments passed to that command."
+                },
+                "url": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "A remote server over Streamable HTTP."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    },
+                    "description": "Extra headers for the remote server."
+                }
+            }
+        }
+    },
+    "allowComments": false,
+    "allowTrailingCommas": false
+}

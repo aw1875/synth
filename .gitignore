@@ -1,10 +1,17 @@
+# Build output
 .zig-cache
 zig-out
 zig-pkg
 
+# Databases
 *.db
 *.db-shm
 *.db-wal
-*.json
+
+# Logs
 *.log
 *.tar.gz
+
+# Configs, except the schema
+*.json
+!*.schema.json
