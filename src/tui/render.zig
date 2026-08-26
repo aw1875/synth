@@ -261,8 +261,8 @@ const Block = union(enum) {
     streaming,
     steering: []const u8,
     steering_more: usize,
-    /// What the turn that just ended did, drawn under it.
-    recap: recap.Recap,
+    /// What a finished turn did, as the harness wrote it down.
+    recap: *Conversation.Message,
 
     /// Whether this block belongs to the live tail - the part that grows while
     /// a turn is in flight. Growth there is what the scroll offset has to be
@@ -291,6 +291,11 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
             continue;
         }
 
+        if (msg.role == .summary) {
+            try blocks.append(arena, .{ .recap = msg });
+            continue;
+        }
+
         try blocks.append(arena, .{ .thought = msg });
         if (msg.text.len > 0) try blocks.append(arena, .{ .text = msg });
 
@@ -305,11 +310,6 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
             }
             try blocks.append(arena, .{ .tool = .{ .msg = msg, .index = index } });
         }
-    }
-
-    if (self.loop.outcome) |_| {
-        var done = try self.loop.lastTurn(arena);
-        if (done.any()) try blocks.append(arena, .{ .recap = done });
     }
 
     if (pending == 1) {
@@ -391,7 +391,7 @@ fn drawBlock(
             return try messageBlock(self, ctx, .{ .role = .assistant, .text = partial }, width);
         },
 
-        .recap => |done| return try recapBlock(self, ctx, done, width),
+        .recap => |msg| return try recapBlock(self, ctx, msg.text, width),
 
         .steering => |prompt| return try steeringBlock(self, ctx, prompt, width),
 
@@ -756,12 +756,7 @@ pub fn questionBlock(
 }
 
 /// How the turn ended, and the files and commands it touched.
-pub fn recapBlock(
-    self: *Model,
-    ctx: vxfw.DrawContext,
-    done: recap.Recap,
-    width: u16,
-) !vxfw.Surface {
+pub fn recapBlock(self: *Model, ctx: vxfw.DrawContext, body: []const u8, width: u16) !vxfw.Surface {
     const style = theme.on_card(theme.fg_dim).cell;
 
     const opts: w.PanelOptions = .{
@@ -776,49 +771,7 @@ pub fn recapBlock(
     const inner_width = w.panelInnerWidth(constraints, opts);
     if (inner_width == 0) return .empty(self.plainWidget());
 
-    return w.wrap(constraints, try plainText(ctx, try recapText(self, ctx.arena, done), style, inner_width), opts);
-}
-
-/// The recap as lines: a heading naming how the turn ended and what it cost,
-/// then the files and commands themselves.
-///
-/// The draw path deals in `OutOfMemory` alone, and the only way writing into an
-/// arena fails is running out of it, so that is what the failure is called here.
-fn recapText(self: *Model, arena: std.mem.Allocator, done: recap.Recap) error{OutOfMemory}![]const u8 {
-    return recapLines(self, arena, done) catch error.OutOfMemory;
-}
-
-fn recapLines(self: *Model, arena: std.mem.Allocator, done: recap.Recap) ![]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-
-    const ending: []const u8 = switch (self.loop.outcome orelse .done) {
-        .done => "done",
-        .cancelled => "cancelled",
-        .failed => "failed",
-        .halted => "stopped",
-    };
-
-    const ran = done.ok + done.failed;
-    try out.writer.print("{s} · {d} {s}", .{ ending, ran, plural(ran, "tool", "tools") });
-    if (done.changed > 0) {
-        try out.writer.print(", {d} {s} changed", .{
-            done.changed,
-            plural(done.changed, "file", "files"),
-        });
-    }
-    if (done.failed > 0) try out.writer.print(", {d} failed", .{done.failed});
-    if (done.rejected > 0) try out.writer.print(", {d} refused", .{done.rejected});
-
-    for (done.entries.items) |entry| {
-        try out.writer.print("\n  {s}  {s}", .{ entry.kind.label(), entry.subject });
-    }
-    if (done.more > 0) try out.writer.print("\n  and {d} more", .{done.more});
-
-    return out.written();
-}
-
-fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
-    return if (n == 1) one else many;
+    return w.wrap(constraints, try plainText(ctx, body, style, inner_width), opts);
 }
 
 pub fn steeringBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {

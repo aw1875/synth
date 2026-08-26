@@ -63,18 +63,7 @@ const max_resident_attachment_bytes: usize = 256 * 1024;
 /// model slows to a crawl. The full output is still shown in the transcript.
 pub const max_tool_result_bytes: usize = 8 * 1024;
 
-/// How the turn that just ended ended. Read by the UI to say so, and reset
-/// when the next one starts.
-pub const Outcome = enum {
-    /// The model answered and asked for nothing more.
-    done,
-    /// The user gave up on it.
-    cancelled,
-    /// The provider refused, or the request never landed.
-    failed,
-    /// The loop called it: a budget, the step ceiling, or the same calls again.
-    halted,
-};
+pub const Outcome = recap.Outcome;
 
 pub const State = enum {
     idle,
@@ -988,6 +977,25 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
+
+    // Written down rather than worked out again at each draw: once older
+    // messages are trimmed away the turn could no longer be read back, and
+    // what a turn did does not change after it has ended.
+    self.recordSummary(outcome) catch {};
+}
+
+/// Append what the turn did as a `summary` message. Failing to write one is
+/// not worth failing the turn over, so the caller swallows it.
+fn recordSummary(self: *Loop, outcome: Outcome) !void {
+    var done = try self.lastTurn(self.allocator);
+    defer done.deinit(self.allocator);
+    if (!done.any()) return;
+
+    const line = try recap.text(self.allocator, &done, outcome);
+    defer self.allocator.free(line);
+
+    _ = try self.conversation.append(.{ .role = .summary, .text = line });
+    try self.persistMessage(self.conversation.messages.items.len - 1);
 }
 
 /// End the turn with a message saying why. The message is an assistant turn, so
@@ -1728,6 +1736,17 @@ const FakeProvider = struct {
     }
 };
 
+/// The last thing the model said. A finished turn ends with the harness's own
+/// summary, so the reply before it is what a test about the reply wants.
+fn lastAssistant(convo: *Conversation) ?Conversation.Message {
+    var i = convo.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (convo.messages.items[i].role == .assistant) return convo.messages.items[i];
+    }
+    return null;
+}
+
 /// Drive the loop to a stopping point: idle, or waiting on the user. Polls on
 /// a short sleep rather than spinning, since the work is on another thread.
 fn settle(self: *Loop) !void {
@@ -1804,8 +1823,11 @@ test "a read-only tool call runs without asking" {
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqual(Conversation.ToolCall.Status.ok, calls[0].status);
 
-    try testing.expectEqual(@as(usize, 4), fixture.convo.messages.items.len);
+    // The user's prompt, the call, its result, the reply, and the summary the
+    // harness writes once the turn is over.
+    try testing.expectEqual(@as(usize, 5), fixture.convo.messages.items.len);
     try testing.expectEqual(Conversation.Role.tool, fixture.convo.messages.items[2].role);
+    try testing.expectEqual(Conversation.Role.summary, fixture.convo.last().?.role);
 }
 
 test "a mutating tool call stops for approval" {
@@ -2191,7 +2213,7 @@ test "the same call three times running stops the turn" {
     try settle(&loop);
 
     try testing.expectEqual(State.idle, loop.state);
-    const last = loop.conversation.last().?;
+    const last = lastAssistant(loop.conversation).?;
     try testing.expect(std.mem.indexOf(u8, last.text, "three times running") != null);
 
     // Three model calls, not two hundred: the ceiling never came into it.
@@ -2668,7 +2690,7 @@ test "a turn that has spent its tokens stops rather than asking again" {
     try settle(&loop);
 
     try testing.expect(loop.turn_tokens >= 10);
-    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    const last = lastAssistant(loop.conversation).?;
     try testing.expect(std.mem.indexOf(u8, last.text, "token budget") != null);
 }
 
@@ -2685,7 +2707,7 @@ test "a turn that has run out of time stops rather than asking again" {
     loop.turn_started_ms = tool.monotonicMilliseconds(loop.io) - 1000;
     try settle(&loop);
 
-    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    const last = lastAssistant(loop.conversation).?;
     try testing.expect(std.mem.indexOf(u8, last.text, "ran out of time") != null);
 }
 
@@ -2888,4 +2910,49 @@ test "the turn a recap covers starts at the prompt that began it" {
     var did = try loop.lastTurn(testing.allocator);
     defer did.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), did.ok);
+}
+
+test "what a turn did survives the session being resumed" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    const db_path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "t.db" });
+    defer testing.allocator.free(db_path);
+
+    var db = try Database.init(testing.allocator, testing.io, db_path);
+    defer db.deinit();
+
+    var loop = fixture.loop();
+    try loop.attachDatabase(&db, "project", fixture.root, "fake");
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    const written = loop.conversation.last().?;
+    try testing.expectEqual(Conversation.Role.summary, written.role);
+    const said = try testing.allocator.dupe(u8, written.text);
+    defer testing.allocator.free(said);
+
+    const session_id = loop.session_id orelse return error.TestUnexpectedResult;
+    loop.deinit();
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    var next: Loop = .init(
+        testing.allocator,
+        testing.io,
+        fixture.fake.provider(),
+        &fixture.registry,
+        &convo,
+        &fixture.reads,
+        fixture.root,
+    );
+    defer next.deinit();
+
+    try next.attachDatabase(&db, "project", fixture.root, "fake");
+    try next.resumeSession(session_id, 50);
+
+    const restored = convo.last().?;
+    try testing.expectEqual(Conversation.Role.summary, restored.role);
+    try testing.expectEqualStrings(said, restored.text);
 }

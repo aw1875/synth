@@ -816,12 +816,12 @@ fn buildMessages(
 
     var next: usize = 1;
     for (kept) |msg| {
-        if (msg.role == .system) continue;
+        if (msg.role == .system or msg.role == .summary) continue;
         const out = &messages[next];
         next += 1;
         out.* = .{
             .role = switch (msg.role) {
-                .system => unreachable,
+                .system, .summary => unreachable,
                 .user => .user,
                 .assistant => .assistant,
                 .tool => .tool,

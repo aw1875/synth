@@ -757,7 +757,7 @@ fn writeMessages(
     try w.writeAll("}");
 
     for (kept) |msg| {
-        if (msg.role == .system) continue;
+        if (msg.role == .system or msg.role == .summary) continue;
         try w.writeByte(',');
         try self.writeMessage(arena, w, msg);
     }
@@ -778,6 +778,8 @@ fn writeMessage(
     const content = try messageContent(arena, msg, self.supports_vision);
 
     switch (msg.role) {
+        // Filtered out before this, along with the system prompt.
+        .summary => unreachable,
         .system => {
             try w.writeAll("{\"role\":\"system\",\"content\":");
             try std.json.Stringify.encodeJsonString(content, .{}, w);

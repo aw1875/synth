@@ -22,6 +22,10 @@ pub const Role = enum {
     assistant,
     /// The result of a tool call, fed back to the model.
     tool,
+    /// What a finished turn did, written by the harness for the person reading
+    /// it. Never sent to a model: it performed those calls itself and they are
+    /// already in its transcript, so this would be a worse copy of what it has.
+    summary,
 };
 
 /// One tool invocation requested by the model.

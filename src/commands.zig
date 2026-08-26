@@ -136,6 +136,7 @@ fn showSession(ctx: *Context, out: *std.Io.Writer, handle: []const u8) !void {
             .assistant => pkg.name,
             .tool => "tool",
             .system => "system",
+            .summary => "summary",
         };
         try out.print("{s}▸ {s}{s} {s}\n", .{ bold, label, reset, msg.text });
         for (msg.tool_calls) |call| {

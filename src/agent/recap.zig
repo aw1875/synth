@@ -8,6 +8,27 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 
+/// How the turn that just ended ended.
+pub const Outcome = enum {
+    /// The model answered and asked for nothing more.
+    done,
+    /// The user gave up on it.
+    cancelled,
+    /// The provider refused, or the request never landed.
+    failed,
+    /// The loop called it: a budget, the step ceiling, or the same calls again.
+    halted,
+
+    pub fn label(self: Outcome) []const u8 {
+        return switch (self) {
+            .done => "done",
+            .cancelled => "cancelled",
+            .failed => "failed",
+            .halted => "stopped",
+        };
+    }
+};
+
 /// Most paths named before the rest become a count. A turn that touched twenty
 /// files is better summed than listed.
 pub const max_paths: usize = 5;
@@ -127,6 +148,32 @@ pub fn of(
         }
     }
     return recap;
+}
+
+/// The recap as the lines it is stored and drawn as: a heading naming how the
+/// turn ended and what it cost, then the files and commands themselves.
+pub fn text(allocator: std.mem.Allocator, self: *const Recap, outcome: Outcome) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    const ran = self.ok + self.failed;
+    try out.writer.print("{s} \u{b7} {d} {s}", .{ outcome.label(), ran, plural(ran, "tool", "tools") });
+    if (self.changed > 0) {
+        try out.writer.print(", {d} {s} changed", .{ self.changed, plural(self.changed, "file", "files") });
+    }
+    if (self.failed > 0) try out.writer.print(", {d} failed", .{self.failed});
+    if (self.rejected > 0) try out.writer.print(", {d} refused", .{self.rejected});
+
+    for (self.entries.items) |entry| {
+        try out.writer.print("\n  {s}  {s}", .{ entry.kind.label(), entry.subject });
+    }
+    if (self.more > 0) try out.writer.print("\n  and {d} more", .{self.more});
+
+    return out.toOwnedSlice();
+}
+
+fn plural(n: usize, one: []const u8, many: []const u8) []const u8 {
+    return if (n == 1) one else many;
 }
 
 fn indexOf(messages: []const Conversation.Message, seq: ?u64) ?usize {
