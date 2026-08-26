@@ -134,6 +134,8 @@ pub const Message = struct {
             .user => "you » ",
             .assistant => pkg.name ++ " » ",
             .tool => "tool » ",
+            // Nobody said it, so nobody is named.
+            .summary => "",
         };
     }
 
