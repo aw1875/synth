@@ -489,13 +489,6 @@ pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extr
     try self.remember(prompt);
     try self.loop.submit(prompt, extras);
 
-    if (self.loop.takeHookNotice()) |notice| {
-        defer self.allocator.free(notice);
-        try self.notification.show(ctx, .warn, notice);
-        ctx.redraw = true;
-        return;
-    }
-
     self.thinking.stream = self.loop.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = true;

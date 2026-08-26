@@ -53,6 +53,31 @@
             "default": "synth.db",
             "description": "Where sessions live."
         },
+        "hooks": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "UserPromptSubmit": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/hook"
+                    }
+                },
+                "PreToolUse": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/hook"
+                    }
+                },
+                "PostToolUse": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/hook"
+                    }
+                }
+            },
+            "description": "Commands run at selected agent lifecycle events."
+        },
         "mcp": {
             "type": "object",
             "additionalProperties": false,
@@ -68,6 +93,25 @@
         }
     },
     "$defs": {
+        "hook": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "command"
+            ],
+            "properties": {
+                "matcher": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Exact tool name to match. Empty or absent matches every tool."
+                },
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Shell command run from the project root."
+                }
+            }
+        },
         "mcpServer": {
             "type": "object",
             "minProperties": 1,

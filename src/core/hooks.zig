@@ -71,24 +71,23 @@ pub const Invocation = struct {
 };
 
 pub const Runner = struct {
-    allocator: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
     set: Set,
 
     /// Run every matching command. Returns an owned block reason when a hook
     /// exits 2, otherwise null. The caller owns the returned string.
-    pub fn dispatch(self: Runner, invocation: Invocation) !?[]u8 {
+    pub fn dispatch(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !?[]u8 {
         for (self.set.forEvent(invocation.event)) |hook| {
             if (!matches(hook.matcher, invocation.tool_name)) continue;
-            const result = try self.runCommand(hook.command, invocation);
-            defer self.allocator.free(result.stderr);
+            const result = try self.runCommand(allocator, hook.command, invocation);
+            defer allocator.free(result.stderr);
 
             if (result.code == 2 and invocation.event != .post_tool_use) {
                 const reason = std.mem.trim(u8, result.stderr, " \t\r\n");
-                if (reason.len > 0) return @as(?[]u8, try self.allocator.dupe(u8, reason));
+                if (reason.len > 0) return @as(?[]u8, try allocator.dupe(u8, reason));
                 return @as(?[]u8, try std.fmt.allocPrint(
-                    self.allocator,
+                    allocator,
                     "{s} hook blocked the operation",
                     .{invocation.event.name()},
                 ));
@@ -102,7 +101,12 @@ pub const Runner = struct {
         stderr: []u8,
     };
 
-    fn runCommand(self: Runner, command: []const u8, invocation: Invocation) !CommandResult {
+    fn runCommand(
+        self: Runner,
+        allocator: std.mem.Allocator,
+        command: []const u8,
+        invocation: Invocation,
+    ) !CommandResult {
         var dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{});
         defer dir.close(self.io);
 
@@ -113,11 +117,13 @@ pub const Runner = struct {
             .stdout = .ignore,
             .stderr = .pipe,
         });
-        errdefer child.kill(self.io);
+        // `kill` waits for the process and reaps it. After a successful `wait`
+        // it is a no-op, so this also covers every earlier error path.
+        defer child.kill(self.io);
 
         var input_buffer: [4096]u8 = undefined;
         var input = child.stdin.?.writer(self.io, &input_buffer);
-        try writeJson(&input.interface, self.root, invocation);
+        try writeJson(allocator, &input.interface, self.root, invocation);
         try input.interface.writeByte('\n');
         try input.interface.flush();
         child.stdin.?.close(self.io);
@@ -125,8 +131,8 @@ pub const Runner = struct {
 
         var stderr_buffer: [4096]u8 = undefined;
         var stderr_reader = child.stderr.?.reader(self.io, &stderr_buffer);
-        const stderr = try stderr_reader.interface.allocRemaining(self.allocator, .limited(64 * 1024));
-        errdefer self.allocator.free(stderr);
+        const stderr = try stderr_reader.interface.allocRemaining(allocator, .limited(64 * 1024));
+        errdefer allocator.free(stderr);
 
         const term = try child.wait(self.io);
         const code: u8 = switch (term) {
@@ -137,12 +143,75 @@ pub const Runner = struct {
     }
 };
 
+/// One hook dispatch running away from the event thread.
+///
+/// The invocation's strings are borrowed until `join`; callers must keep them
+/// alive for the lifetime of this task.
+pub const Dispatch = struct {
+    allocator: std.mem.Allocator,
+    runner: Runner,
+    invocation: Invocation,
+    blocked: ?[]u8 = null,
+    failed: ?anyerror = null,
+    future: std.Io.Future(void) = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+
+    pub fn start(allocator: std.mem.Allocator, runner: Runner, invocation: Invocation) !*Dispatch {
+        const self = try allocator.create(Dispatch);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .runner = runner,
+            .invocation = invocation,
+        };
+        self.future = try runner.io.concurrent(run, .{self});
+        return self;
+    }
+
+    pub fn isFinished(self: *Dispatch) bool {
+        return self.done.load(.acquire);
+    }
+
+    pub fn join(self: *Dispatch) void {
+        self.future.await(self.runner.io);
+    }
+
+    pub fn cancel(self: *Dispatch) void {
+        self.future.cancel(self.runner.io);
+    }
+
+    pub fn takeBlocked(self: *Dispatch) ?[]u8 {
+        const blocked = self.blocked;
+        self.blocked = null;
+        return blocked;
+    }
+
+    pub fn destroy(self: *Dispatch) void {
+        const allocator = self.allocator;
+        if (self.blocked) |blocked| allocator.free(blocked);
+        allocator.destroy(self);
+    }
+
+    fn run(self: *Dispatch) void {
+        defer self.done.store(true, .release);
+        self.blocked = self.runner.dispatch(self.allocator, self.invocation) catch |err| {
+            self.failed = err;
+            return;
+        };
+    }
+};
+
 fn matches(matcher: []const u8, tool_name: []const u8) bool {
     if (matcher.len == 0) return true;
     return std.mem.eql(u8, matcher, tool_name);
 }
 
-fn writeJson(w: *std.Io.Writer, root: []const u8, invocation: Invocation) !void {
+fn writeJson(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+    root: []const u8,
+    invocation: Invocation,
+) !void {
     try w.writeAll("{\"hook_event_name\":");
     try std.json.Stringify.encodeJsonString(invocation.event.name(), .{}, w);
     try w.writeAll(",\"cwd\":");
@@ -158,7 +227,7 @@ fn writeJson(w: *std.Io.Writer, root: []const u8, invocation: Invocation) !void 
         try w.writeAll(",\"tool_input\":");
         // Model-produced arguments have already been parsed by the registry.
         // Keep malformed input valid JSON for hooks that only inspect metadata.
-        if (try std.json.validate(std.heap.page_allocator, invocation.tool_input)) {
+        if (try std.json.validate(allocator, invocation.tool_input)) {
             try w.writeAll(invocation.tool_input);
         } else {
             try w.writeAll("{}");
@@ -175,13 +244,12 @@ test "a matching pre-tool hook can block" {
     const testing = std.testing;
     const hook = Hook{ .matcher = "bash", .command = "read payload; echo blocked by policy >&2; exit 2" };
     const runner: Runner = .{
-        .allocator = testing.allocator,
         .io = testing.io,
         .root = ".",
         .set = .{ .pre_tool_use = &.{hook} },
     };
 
-    const reason = try runner.dispatch(.{
+    const reason = try runner.dispatch(testing.allocator, .{
         .event = .pre_tool_use,
         .tool_name = "bash",
         .tool_input = "{\"command\":\"make\"}",
@@ -194,10 +262,9 @@ test "a matcher leaves other tools alone" {
     const testing = std.testing;
     const hook = Hook{ .matcher = "write", .command = "exit 2" };
     const runner: Runner = .{
-        .allocator = testing.allocator,
         .io = testing.io,
         .root = ".",
         .set = .{ .pre_tool_use = &.{hook} },
     };
-    try testing.expect(try runner.dispatch(.{ .event = .pre_tool_use, .tool_name = "read" }) == null);
+    try testing.expect(try runner.dispatch(testing.allocator, .{ .event = .pre_tool_use, .tool_name = "read" }) == null);
 }

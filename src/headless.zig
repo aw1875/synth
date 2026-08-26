@@ -140,7 +140,6 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     loop.project = &project;
     loop.skills = skills.skills;
     var hook_runner: Hooks.Runner = .{
-        .allocator = allocator,
         .io = io,
         .root = project.root,
         .set = config.hooks,
@@ -151,12 +150,6 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     try loop.attachDatabase(&db, project.name(), project.cwd, backend.model());
 
     try loop.submit(prompt, .{});
-    if (loop.takeHookNotice()) |notice| {
-        defer allocator.free(notice);
-        try out.print("{s}hook blocked prompt{s} {s}\n", .{ red, reset, notice });
-        try out.flush();
-        return;
-    }
 
     var printed: usize = 0;
     while (loop.isBusy()) {
@@ -174,6 +167,12 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
         printed = try report(out, &convo, printed);
         std.Io.sleep(io, .fromMilliseconds(20), .real) catch {};
+    }
+    if (loop.takeHookNotice()) |notice| {
+        defer allocator.free(notice);
+        try out.print("{s}hook blocked prompt{s} {s}\n", .{ red, reset, notice });
+        try out.flush();
+        return;
     }
     _ = try report(out, &convo, printed);
 

@@ -228,7 +228,7 @@ fn runOne(self: *ToolRun, index: usize) void {
     };
 
     if (self.hooks) |runner| {
-        const blocked = runner.dispatch(.{
+        const blocked = runner.dispatch(self.allocator, .{
             .event = .pre_tool_use,
             .tool_name = call.name,
             .tool_input = call.arguments,
@@ -259,14 +259,14 @@ fn runOne(self: *ToolRun, index: usize) void {
         return;
     };
     result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
-    if (!output.is_error) if (self.hooks) |runner| {
-        _ = runner.dispatch(.{
+    if (self.hooks) |runner| {
+        _ = runner.dispatch(self.allocator, .{
             .event = .post_tool_use,
             .tool_name = call.name,
             .tool_input = call.arguments,
             .tool_response = output.content,
         }) catch {};
-    };
+    }
 }
 
 const testing = std.testing;
@@ -492,4 +492,48 @@ test "giving up inside a group stops the calls after it" {
     try testing.expect(run_state.results[2].is_error);
     try testing.expectEqualStrings("cancelled", run_state.results[2].content);
     try testing.expectEqual(@as(usize, 2), probe.peak.load(.acquire));
+}
+
+test "post-tool hooks run for ordinary tool errors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+
+    var registry = try Registry.init(testing.allocator);
+    defer registry.deinit();
+    var reads = tool.ReadLog.init(testing.allocator);
+    defer reads.deinit();
+
+    const hook = Hooks.Hook{
+        .command = "read payload; printf '%s' \"$payload\" > post.json",
+    };
+    const runner: Hooks.Runner = .{
+        .io = testing.io,
+        .root = root,
+        .set = .{ .post_tool_use = &.{hook} },
+    };
+    const calls = [_]Call{.{
+        .index = 0,
+        .name = "not-a-tool",
+        .arguments = "{}",
+    }};
+
+    const batch = try ToolRun.start(
+        testing.allocator,
+        testing.io,
+        &registry,
+        root,
+        &reads,
+        null,
+        &runner,
+        &calls,
+    );
+    batch.join();
+    defer batch.destroy();
+
+    try testing.expect(batch.results[0].is_error);
+    const payload = try tmp.dir.readFileAlloc(testing.io, "post.json", testing.allocator, .limited(4096));
+    defer testing.allocator.free(payload);
+    try testing.expect(std.mem.indexOf(u8, payload, "unknown tool") != null);
 }

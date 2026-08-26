@@ -213,7 +213,6 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     model.loop.project = &project;
     model.loop.skills = skills.skills;
     var hook_runner: Hooks.Runner = .{
-        .allocator = allocator,
         .io = io,
         .root = project.root,
         .set = config.hooks,

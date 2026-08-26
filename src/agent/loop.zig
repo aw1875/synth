@@ -68,6 +68,8 @@ pub const Outcome = recap.Outcome;
 
 pub const State = enum {
     idle,
+    /// Running UserPromptSubmit hooks before the prompt enters the transcript.
+    running_hooks,
     /// Waiting on the model.
     thinking,
     /// Waiting on the user to approve tool calls.
@@ -87,6 +89,7 @@ pub const State = enum {
     pub fn label(self: State) []const u8 {
         return switch (self) {
             .idle => "",
+            .running_hooks => "Running hooks",
             .thinking => "Thinking",
             .awaiting_approval => "Awaiting approval",
             .awaiting_answer => "Waiting for your answer",
@@ -113,6 +116,10 @@ conversation: *Conversation,
 reads: *tool.ReadLog,
 /// Configured lifecycle hooks. Null when hooks are disabled.
 hooks: ?*const Hooks.Runner = null,
+/// UserPromptSubmit hooks run here so a slow command cannot freeze the TUI.
+hook_dispatch: ?*Hooks.Dispatch = null,
+/// Owned input kept alive until the prompt hooks finish.
+pending_submit: ?PendingSubmit = null,
 /// Why the last submitted prompt was stopped by a hook. Kept outside the
 /// transcript so a blocked prompt is never sent to the model on a later turn.
 hook_notice: ?[]u8 = null,
@@ -476,6 +483,13 @@ pub fn deinit(self: *Loop) void {
         tools.destroy();
         self.tools = null;
     }
+    if (self.hook_dispatch) |dispatch| {
+        dispatch.cancel();
+        dispatch.destroy();
+        self.hook_dispatch = null;
+    }
+    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+    self.pending_submit = null;
 
     self.todos.deinit();
     if (self.hook_notice) |notice| self.allocator.free(notice);
@@ -537,6 +551,61 @@ pub const Extras = struct {
     images: []const []const u8 = &.{},
 };
 
+/// A submitted prompt copied out of the composer's short-lived arena while
+/// its hooks run on a worker.
+const PendingSubmit = struct {
+    prompt: []u8,
+    attachments: []mention.Attachment,
+    images: [][]u8,
+
+    fn init(allocator: std.mem.Allocator, prompt: []const u8, extras: Extras) !PendingSubmit {
+        const owned_prompt = try allocator.dupe(u8, prompt);
+        errdefer allocator.free(owned_prompt);
+
+        const attachments = try allocator.alloc(mention.Attachment, extras.attachments.len);
+        var attachments_built: usize = 0;
+        errdefer {
+            for (attachments[0..attachments_built]) |*attachment| attachment.deinit(allocator);
+            allocator.free(attachments);
+        }
+        for (extras.attachments, attachments) |source, *dest| {
+            const path = try allocator.dupe(u8, source.path);
+            errdefer allocator.free(path);
+            dest.* = .{
+                .path = path,
+                .content = try allocator.dupe(u8, source.content),
+                .content_bytes = source.content_bytes,
+            };
+            attachments_built += 1;
+        }
+
+        const images = try allocator.alloc([]u8, extras.images.len);
+        var images_built: usize = 0;
+        errdefer {
+            for (images[0..images_built]) |image| allocator.free(image);
+            allocator.free(images);
+        }
+        for (extras.images, images) |source, *dest| {
+            dest.* = try allocator.dupe(u8, source);
+            images_built += 1;
+        }
+
+        return .{ .prompt = owned_prompt, .attachments = attachments, .images = images };
+    }
+
+    fn asExtras(self: *const PendingSubmit) Extras {
+        return .{ .attachments = self.attachments, .images = self.images };
+    }
+
+    fn deinit(self: *PendingSubmit, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        for (self.attachments) |*attachment| attachment.deinit(allocator);
+        allocator.free(self.attachments);
+        for (self.images) |image| allocator.free(image);
+        allocator.free(self.images);
+    }
+};
+
 /// What the model is asked for when compacting. The summary is fed back as the
 /// only history, so it has to carry the parts a later turn would need.
 const compaction_prompt =
@@ -595,22 +664,25 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.hook_notice = null;
 
     if (self.hooks) |runner| {
-        const blocked = runner.dispatch(.{
-            .event = .user_prompt_submit,
-            .prompt = prompt,
-        }) catch |err| blk: {
-            break :blk try std.fmt.allocPrint(
-                self.allocator,
-                "UserPromptSubmit hook failed: {s}",
-                .{@errorName(err)},
-            );
-        };
-        if (blocked) |reason| {
-            self.hook_notice = reason;
-            return;
+        if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.finishSubmit(prompt, extras);
+
+        self.pending_submit = try PendingSubmit.init(self.allocator, prompt, extras);
+        errdefer {
+            self.pending_submit.?.deinit(self.allocator);
+            self.pending_submit = null;
         }
+        self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, .{
+            .event = .user_prompt_submit,
+            .prompt = self.pending_submit.?.prompt,
+        });
+        self.state = .running_hooks;
+        return;
     }
 
+    try self.finishSubmit(prompt, extras);
+}
+
+fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     var mentioned: mention.Resolved =
         mention.resolve(self.allocator, self.io, self.project_root, prompt) catch .{};
     defer mentioned.deinit(self.allocator);
@@ -638,6 +710,38 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.last_calls = null;
     self.last_error = null;
     try self.ask();
+}
+
+fn pollPromptHooks(self: *Loop) !bool {
+    const dispatch = self.hook_dispatch orelse return false;
+    if (!dispatch.isFinished()) return false;
+
+    dispatch.join();
+    self.hook_dispatch = null;
+    defer dispatch.destroy();
+
+    var pending = self.pending_submit orelse return false;
+    self.pending_submit = null;
+    defer pending.deinit(self.allocator);
+
+    if (dispatch.failed) |err| {
+        self.hook_notice = try std.fmt.allocPrint(
+            self.allocator,
+            "UserPromptSubmit hook failed: {s}",
+            .{@errorName(err)},
+        );
+        self.state = .idle;
+        return true;
+    }
+    if (dispatch.takeBlocked()) |reason| {
+        self.hook_notice = reason;
+        self.state = .idle;
+        return true;
+    }
+
+    self.state = .idle;
+    try self.finishSubmit(pending.prompt, pending.asExtras());
+    return true;
 }
 
 /// Take the reason a prompt hook stopped the most recent submission. The
@@ -849,6 +953,16 @@ const cancel_grace_ms: i64 = 250;
 /// provider borrows it, and a tool run writes into results the loop is about to
 /// free.
 fn pollCancelled(self: *Loop) !bool {
+    if (self.hook_dispatch) |dispatch| {
+        if (!dispatch.isFinished()) {
+            self.signalStragglers();
+            return false;
+        }
+        dispatch.join();
+        dispatch.destroy();
+        self.hook_dispatch = null;
+    }
+
     if (self.request) |request| {
         if (!request.isFinished()) {
             self.signalStragglers();
@@ -870,6 +984,8 @@ fn pollCancelled(self: *Loop) !bool {
     }
 
     try self.abandonPending();
+    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+    self.pending_submit = null;
 
     self.finish(.cancelled);
     return true;
@@ -887,6 +1003,7 @@ fn signalStragglers(self: *Loop) void {
     if (tool.monotonicMilliseconds(self.io) - since < cancel_grace_ms) return;
 
     self.signalled = true;
+    if (self.hook_dispatch) |dispatch| dispatch.cancel();
     if (self.request) |request| request.cancel();
     if (self.tools) |tools| tools.cancel();
 }
@@ -909,6 +1026,7 @@ fn abandonPending(self: *Loop) !void {
 pub fn poll(self: *Loop) !bool {
     return switch (self.state) {
         .idle, .awaiting_approval, .awaiting_answer => false,
+        .running_hooks => self.pollPromptHooks(),
         .thinking, .compacting => self.pollRequest(),
         .running_tools => self.pollTools(),
         .cancelling => self.pollCancelled(),
@@ -1852,7 +1970,6 @@ test "a blocked prompt never enters the model transcript" {
 
     const hook = Hooks.Hook{ .command = "echo prompt rejected >&2; exit 2" };
     var runner: Hooks.Runner = .{
-        .allocator = testing.allocator,
         .io = testing.io,
         .root = fixture.root,
         .set = .{ .user_prompt_submit = &.{hook} },
@@ -1860,6 +1977,8 @@ test "a blocked prompt never enters the model transcript" {
     loop.hooks = &runner;
 
     try loop.submit("do not send this", .{});
+    try testing.expectEqual(State.running_hooks, loop.state);
+    try settle(&loop);
 
     try testing.expectEqual(State.idle, loop.state);
     try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
