@@ -6,6 +6,15 @@
 //! later version without baking shell concerns into the agent loop.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+const stderr_limit: usize = 64 * 1024;
+const poll_slice_ms: u64 = 100;
+const default_timeout_ms: u64 = 30_000;
+const posix_signals = switch (builtin.os.tag) {
+    .windows, .wasi => false,
+    else => true,
+};
 
 pub const Event = enum {
     user_prompt_submit,
@@ -74,6 +83,8 @@ pub const Runner = struct {
     io: std.Io,
     root: []const u8,
     set: Set,
+    /// Hooks are lifecycle helpers, not long-running jobs.
+    timeout_ms: u64 = default_timeout_ms,
 
     /// Run every matching command. Returns an owned block reason when a hook
     /// exits 2, otherwise null. The caller owns the returned string.
@@ -110,31 +121,64 @@ pub const Runner = struct {
         var dir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{});
         defer dir.close(self.io);
 
+        var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer payload_writer.deinit();
+        try writeJson(allocator, &payload_writer.writer, self.root, invocation);
+        try payload_writer.writer.writeByte('\n');
+        const payload = try payload_writer.toOwnedSlice();
+        defer allocator.free(payload);
+
         var child = try std.process.spawn(self.io, .{
             .argv = &.{ "bash", "-lc", command },
             .cwd = .{ .dir = dir },
             .stdin = .pipe,
             .stdout = .ignore,
             .stderr = .pipe,
+            .pgid = if (posix_signals) 0 else null,
         });
-        // `kill` waits for the process and reaps it. After a successful `wait`
-        // it is a no-op, so this also covers every earlier error path.
-        defer child.kill(self.io);
+        var reaped = false;
+        defer if (!reaped) killGroup(self.io, &child);
 
-        var input_buffer: [4096]u8 = undefined;
-        var input = child.stdin.?.writer(self.io, &input_buffer);
-        try writeJson(allocator, &input.interface, self.root, invocation);
-        try input.interface.writeByte('\n');
-        try input.interface.flush();
-        child.stdin.?.close(self.io);
-        child.stdin = null;
+        var input: InputWrite = .{ .io = self.io, .child = &child, .payload = payload };
+        var input_future = try self.io.concurrent(InputWrite.run, .{&input});
+        defer input_future.cancel(self.io);
 
-        var stderr_buffer: [4096]u8 = undefined;
-        var stderr_reader = child.stderr.?.reader(self.io, &stderr_buffer);
-        const stderr = try stderr_reader.interface.allocRemaining(allocator, .limited(64 * 1024));
-        errdefer allocator.free(stderr);
+        var buffers: std.Io.File.MultiReader.Buffer(1) = undefined;
+        var readers: std.Io.File.MultiReader = undefined;
+        readers.init(allocator, self.io, buffers.toStreams(), &.{child.stderr.?});
+        defer readers.deinit();
+
+        const stderr_reader = readers.reader(0);
+        const deadline = std.Io.Clock.now(.awake, self.io).toMilliseconds() + @as(i64, @intCast(self.timeout_ms));
+        var stderr_done = false;
+
+        while (!stderr_done or !input.done.load(.acquire)) {
+            const left = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds();
+            if (left <= 0) return error.Timeout;
+            const slice = @min(poll_slice_ms, @as(u64, @intCast(left)));
+
+            if (stderr_done) {
+                try std.Io.sleep(self.io, .fromMilliseconds(@intCast(slice)), .awake);
+            } else {
+                readers.fill(64, .{ .duration = .{
+                    .raw = .fromMilliseconds(@intCast(slice)),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.EndOfStream => stderr_done = true,
+                    error.Timeout => {},
+                    else => |other| return other,
+                };
+                if (stderr_reader.buffered().len > stderr_limit) return error.StreamTooLong;
+            }
+        }
+
+        input_future.await(self.io);
+        try readers.checkAnyError();
 
         const term = try child.wait(self.io);
+        reaped = true;
+        const stderr = try readers.toOwnedSlice(0);
+        errdefer allocator.free(stderr);
         const code: u8 = switch (term) {
             .exited => |value| value,
             else => 1,
@@ -142,6 +186,37 @@ pub const Runner = struct {
         return .{ .code = code, .stderr = stderr };
     }
 };
+
+/// Feed stdin beside the stderr drain so neither pipe can fill behind the
+/// other. A hook may deliberately ignore stdin; a broken pipe is advisory.
+const InputWrite = struct {
+    io: std.Io,
+    child: *std.process.Child,
+    payload: []const u8,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *InputWrite) void {
+        defer self.done.store(true, .release);
+        defer {
+            if (self.child.stdin) |stdin| stdin.close(self.io);
+            self.child.stdin = null;
+        }
+
+        var buffer: [4096]u8 = undefined;
+        var writer = self.child.stdin.?.writer(self.io, &buffer);
+        writer.interface.writeAll(self.payload) catch return;
+        writer.interface.flush() catch return;
+    }
+};
+
+/// Kill the shell and anything it started, then reap the direct child. This is
+/// the same process-group cleanup used by the bash tool.
+fn killGroup(io: std.Io, child: *std.process.Child) void {
+    const pid = child.id orelse return;
+    if (posix_signals) std.posix.kill(-pid, .TERM) catch {};
+    child.kill(io);
+    if (posix_signals) std.posix.kill(-pid, .KILL) catch {};
+}
 
 /// One hook dispatch running away from the event thread.
 ///
@@ -267,4 +342,44 @@ test "a matcher leaves other tools alone" {
         .set = .{ .pre_tool_use = &.{hook} },
     };
     try testing.expect(try runner.dispatch(testing.allocator, .{ .event = .pre_tool_use, .tool_name = "read" }) == null);
+}
+
+test "large input and stderr cannot block each other" {
+    const testing = std.testing;
+    const prompt = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(prompt);
+    @memset(prompt, 'x');
+
+    const hook = Hook{
+        .command = "i=0; while [ $i -lt 4096 ]; do printf 12345678 >&2; i=$((i + 1)); done; exit 2",
+    };
+    const runner: Runner = .{
+        .io = testing.io,
+        .root = ".",
+        .set = .{ .user_prompt_submit = &.{hook} },
+        .timeout_ms = 2_000,
+    };
+
+    const reason = try runner.dispatch(testing.allocator, .{
+        .event = .user_prompt_submit,
+        .prompt = prompt,
+    });
+    defer if (reason) |text| testing.allocator.free(text);
+    try testing.expectEqual(@as(usize, 32 * 1024), reason.?.len);
+}
+
+test "a hook is killed when its deadline passes" {
+    const testing = std.testing;
+    const hook = Hook{ .command = "sleep 5" };
+    const runner: Runner = .{
+        .io = testing.io,
+        .root = ".",
+        .set = .{ .user_prompt_submit = &.{hook} },
+        .timeout_ms = 50,
+    };
+
+    try testing.expectError(error.Timeout, runner.dispatch(testing.allocator, .{
+        .event = .user_prompt_submit,
+        .prompt = "hello",
+    }));
 }

@@ -171,7 +171,8 @@ Hooks run commands from the project root at selected lifecycle events. Each
 command receives a JSON object on stdin. Tool hooks may set `matcher` to an
 exact tool name; an empty or absent matcher matches every tool. A
 `UserPromptSubmit` or `PreToolUse` hook blocks the operation by exiting 2, with
-its stderr used as the reason. Other exit statuses are advisory.
+its stderr used as the reason. Other exit statuses are advisory. Hook commands
+that run longer than 30 seconds are killed.
 
 ```json
 {

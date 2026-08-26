@@ -211,7 +211,7 @@ fn runOne(self: *ToolRun, index: usize) void {
     if (self.stop.load(.acquire)) {
         result.* = .{
             .index = call.index,
-            .content = self.allocator.dupe(u8, "cancelled") catch "cancelled",
+            .content = self.allocator.dupe(u8, "cancelled") catch "",
             .is_error = true,
         };
         return;
@@ -235,7 +235,8 @@ fn runOne(self: *ToolRun, index: usize) void {
         }) catch |err| {
             result.* = .{
                 .index = call.index,
-                .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch "pre-tool hook failed",
+                .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch
+                    self.allocator.dupe(u8, "pre-tool hook failed") catch "",
                 .is_error = true,
             };
             return;
@@ -253,7 +254,7 @@ fn runOne(self: *ToolRun, index: usize) void {
                 self.allocator,
                 "{s} failed: {s}",
                 .{ call.name, @errorName(err) },
-            ) catch "tool failed",
+            ) catch self.allocator.dupe(u8, "tool failed") catch "",
             .is_error = true,
         };
         return;
