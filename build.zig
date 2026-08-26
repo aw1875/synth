@@ -33,7 +33,10 @@ pub fn build(b: *std.Build) !void {
         run_cmd.addArgs(args);
     }
 
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+    const exe_tests = b.addTest(.{
+        .root_module = exe.root_module,
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
+    });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // The mcp package is its own build, compiled against `std` and `oauth2`
@@ -42,7 +45,10 @@ pub fn build(b: *std.Build) !void {
     // module that stopped compiling on its own is caught before the program
     // that imports it hides the breakage behind its own dependencies.
     const mcp = b.dependency("mcp", .{ .target = target, .optimize = optimize });
-    const mcp_tests = b.addTest(.{ .root_module = mcp.module("mcp") });
+    const mcp_tests = b.addTest(.{
+        .root_module = mcp.module("mcp"),
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
+    });
     const run_mcp_tests = b.addRunArtifact(mcp_tests);
 
     const mcp_test_step = b.step("test-mcp", "Run the mcp package's tests on their own");

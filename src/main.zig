@@ -31,6 +31,19 @@ const tui_commands = @import("tui/commands.zig");
 const Input = @import("tui/input.zig");
 const themes = @import("tui/themes.zig");
 
+// We don't want to see the log messages from the libraries we use
+pub const std_options = std.Options{
+    .log_scope_levels = &[_]std.log.ScopeLevel{
+        .{ .scope = .vaxis, .level = .warn },
+        .{ .scope = .ollama, .level = .warn },
+        .{ .scope = .zqlite, .level = .warn },
+        .{ .scope = .clap, .level = .warn },
+        .{ .scope = .oauth2, .level = .warn },
+        .{ .scope = .http, .level = .warn },
+        .{ .scope = .websocket, .level = .warn },
+    },
+};
+
 pub fn main(init: std.process.Init) !void {
     const command = try cli.parse(init, init.arena.allocator());
     switch (command) {

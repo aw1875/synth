@@ -252,9 +252,6 @@ mcp: ?*mcp_tools.Host = null,
 /// message saying so anyway.
 pending_model_check: bool = false,
 
-/// Prompts typed while a turn was in flight, oldest first. Drained one per
-/// turn once the loop goes idle. Each is owned.
-
 /// Tracks the ctrl+c pressed during a running turn. A second press inside
 /// `quit_confirm_ms` quits; otherwise the arming lapses.
 quit_confirm: Confirm = .{ .window_ms = quit_confirm_ms },

@@ -19,6 +19,7 @@ const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
 const widget_pool = @import("widget_pool.zig");
 const AgentLoop = @import("../agent/loop.zig");
+const recap = @import("../agent/recap.zig");
 const ask_user = @import("../tools/ask.zig");
 const pkg = @import("pkg");
 const Input = @import("input.zig");
@@ -260,6 +261,8 @@ const Block = union(enum) {
     streaming,
     steering: []const u8,
     steering_more: usize,
+    /// What a finished turn did, as the harness wrote it down.
+    recap: *Conversation.Message,
 
     /// Whether this block belongs to the live tail - the part that grows while
     /// a turn is in flight. Growth there is what the scroll offset has to be
@@ -267,7 +270,7 @@ const Block = union(enum) {
     /// happens above the viewport and moves nothing.
     fn inTail(self: Block) bool {
         return switch (self) {
-            .thinking, .streaming, .steering, .steering_more => true,
+            .thinking, .streaming, .steering, .steering_more, .recap => true,
             else => false,
         };
     }
@@ -285,6 +288,11 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
 
         if (msg.role == .system) {
             try blocks.append(arena, .{ .summary = msg });
+            continue;
+        }
+
+        if (msg.role == .summary) {
+            try blocks.append(arena, .{ .recap = msg });
             continue;
         }
 
@@ -383,6 +391,8 @@ fn drawBlock(
             return try messageBlock(self, ctx, .{ .role = .assistant, .text = partial }, width);
         },
 
+        .recap => |msg| return try recapBlock(self, ctx, msg.text, width),
+
         .steering => |prompt| return try steeringBlock(self, ctx, prompt, width),
 
         .steering_more => |count| return try steeringBlock(
@@ -452,7 +462,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
                 std.hash.autoHash(&hasher, card.expanded);
             }
         },
-        .question, .thinking, .streaming, .steering, .steering_more => return null,
+        .question, .thinking, .streaming, .steering, .steering_more, .recap => return null,
     }
 
     return hasher.final();
@@ -743,6 +753,25 @@ pub fn questionBlock(
 
     const style = theme.on_card(theme.fg).cell;
     return w.wrap(constraints, try plainText(ctx, text.items, style, inner_width), opts);
+}
+
+/// How the turn ended, and the files and commands it touched.
+pub fn recapBlock(self: *Model, ctx: vxfw.DrawContext, body: []const u8, width: u16) !vxfw.Surface {
+    const style = theme.on_card(theme.fg_dim).cell;
+
+    const opts: w.PanelOptions = .{
+        .style = theme.card.cell,
+        .left = 2,
+        .right = 2,
+        .accent = theme.fg_dim,
+        .width = width,
+    };
+
+    const constraints = ctx.withConstraints(.{}, .{ .width = width, .height = null });
+    const inner_width = w.panelInnerWidth(constraints, opts);
+    if (inner_width == 0) return .empty(self.plainWidget());
+
+    return w.wrap(constraints, try plainText(ctx, body, style, inner_width), opts);
 }
 
 pub fn steeringBlock(self: *Model, ctx: vxfw.DrawContext, text: []const u8, width: u16) !vxfw.Surface {

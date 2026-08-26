@@ -31,7 +31,7 @@ pub fn install(registry: anytype, set: *const skills.Set) !void {
         .description = description,
         .schema = schema,
         .handler = handler,
-        .userdata = @constCast(@ptrCast(set)),
+        .userdata = @ptrCast(@constCast(set)),
         .read_only = true,
     });
 }
@@ -117,7 +117,7 @@ fn context(set: *const skills.Set, reads: *tool.ReadLog) tool.Context {
         .io = testing.io,
         .project_root = "/p",
         .reads = reads,
-        .userdata = @constCast(@ptrCast(set)),
+        .userdata = @ptrCast(@constCast(set)),
     };
 }
 

@@ -71,7 +71,14 @@ pub fn messages(
     var first: usize = all.len;
     while (first > floor) {
         const at = first - 1;
-        const cost = if (stale[at]) superseded_note.len / 4 else estimateTokens(all[at], with_images);
+        // A summary is the harness talking to the person, never sent, so it
+        // costs nothing and never crowds out a message that is sent.
+        const cost = if (all[at].role == .summary)
+            0
+        else if (stale[at])
+            superseded_note.len / 4
+        else
+            estimateTokens(all[at], with_images);
         if (first < all.len and used + cost > budget) break;
         used += cost;
         first -= 1;
@@ -398,4 +405,25 @@ test "a result with no call to match is never collapsed" {
     for (kept) |msg| {
         try std.testing.expect(!std.mem.eql(u8, msg.text, superseded_note));
     }
+}
+
+test "a summary is never sent to the model, and never costs budget" {
+    const testing = std.testing;
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    _ = try convo.addUser("go", &.{}, &.{});
+    _ = try convo.append(.{ .role = .assistant, .text = "did it" });
+    _ = try convo.append(.{
+        .role = .summary,
+        .text = "done - 3 tools, 2 files changed\n  edited src/a.zig\n  wrote src/b.zig",
+    });
+
+    // A budget with no room for the summary still keeps both real messages.
+    const kept = try messages(&convo, testing.allocator, 8, false);
+    defer testing.allocator.free(kept);
+
+    try testing.expectEqual(@as(usize, 3), kept.len);
+    try testing.expectEqual(Conversation.Role.summary, kept[2].role);
 }

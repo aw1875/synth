@@ -173,6 +173,7 @@ fn report(out: *std.Io.Writer, convo: *Conversation, from: usize) !usize {
     for (messages[from..]) |msg| {
         switch (msg.role) {
             .user, .system => {},
+            .summary => try out.print("{s}  {s}{s}\n", .{ dim, msg.text, reset }),
             .assistant => {
                 if (msg.thinking_ms) |ms| {
                     var buffer: [humanize.duration_bytes]u8 = undefined;
