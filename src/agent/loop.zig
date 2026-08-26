@@ -68,7 +68,6 @@ pub const Outcome = recap.Outcome;
 
 pub const State = enum {
     idle,
-    /// Running UserPromptSubmit hooks before the prompt enters the transcript.
     running_hooks,
     /// Waiting on the model.
     thinking,
@@ -114,14 +113,9 @@ provider: Provider,
 registry: *const Registry,
 conversation: *Conversation,
 reads: *tool.ReadLog,
-/// Configured lifecycle hooks. Null when hooks are disabled.
 hooks: ?*const Hooks.Runner = null,
-/// UserPromptSubmit hooks run here so a slow command cannot freeze the TUI.
 hook_dispatch: ?*Hooks.Dispatch = null,
-/// Owned input kept alive until the prompt hooks finish.
 pending_submit: ?PendingSubmit = null,
-/// Why the last submitted prompt was stopped by a hook. Kept outside the
-/// transcript so a blocked prompt is never sent to the model on a later turn.
 hook_notice: ?[]u8 = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
@@ -551,8 +545,6 @@ pub const Extras = struct {
     images: []const []const u8 = &.{},
 };
 
-/// A submitted prompt copied out of the composer's short-lived arena while
-/// its hooks run on a worker.
 const PendingSubmit = struct {
     prompt: []u8,
     attachments: []mention.Attachment,
@@ -744,8 +736,6 @@ fn pollPromptHooks(self: *Loop) !bool {
     return true;
 }
 
-/// Take the reason a prompt hook stopped the most recent submission. The
-/// caller owns the returned string.
 pub fn takeHookNotice(self: *Loop) ?[]u8 {
     const notice = self.hook_notice;
     self.hook_notice = null;

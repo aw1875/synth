@@ -107,7 +107,6 @@ skill_paths: []const []const u8 = &.{},
 /// server entry means is the MCP adapter's business, and this file would only
 /// be repeating its shape. Borrowed from this config's arena.
 mcp: ?std.json.Value = null,
-/// Commands invoked at selected points in the agent lifecycle.
 hooks: Hooks.Set = .{},
 
 /// The shape `config.json` is parsed into. Every field is optional so an

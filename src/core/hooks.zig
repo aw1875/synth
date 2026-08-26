@@ -1,10 +1,3 @@
-//! Lifecycle hooks: typed events inside synth, optionally handled by commands.
-//!
-//! Commands run from the project root and receive one JSON object on stdin.
-//! An exit status of 2 blocks events that can still be stopped; every other
-//! status is advisory. This deliberately leaves richer JSON decisions for a
-//! later version without baking shell concerns into the agent loop.
-
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -67,7 +60,6 @@ pub const Invocation = struct {
     event: Event,
     prompt: []const u8 = "",
     tool_name: []const u8 = "",
-    /// Raw JSON arguments produced by the model.
     tool_input: []const u8 = "{}",
     tool_response: []const u8 = "",
 };
@@ -76,11 +68,8 @@ pub const Runner = struct {
     io: std.Io,
     root: []const u8,
     set: Set,
-    /// Hooks are lifecycle helpers, not long-running jobs.
     timeout_ms: u64 = default_timeout_ms,
 
-    /// Run every matching command. Returns an owned block reason when a hook
-    /// exits 2, otherwise null. The caller owns the returned string.
     pub fn dispatch(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !?[]u8 {
         for (self.set.forEvent(invocation.event)) |hook| {
             if (!matches(hook.matcher, invocation.tool_name)) continue;
@@ -180,8 +169,6 @@ pub const Runner = struct {
     }
 };
 
-/// Feed stdin beside the stderr drain so neither pipe can fill behind the
-/// other. A hook may deliberately ignore stdin; a broken pipe is advisory.
 const InputWrite = struct {
     io: std.Io,
     child: *std.process.Child,
@@ -202,8 +189,6 @@ const InputWrite = struct {
     }
 };
 
-/// Kill the shell and anything it started, then reap the direct child. This is
-/// the same process-group cleanup used by the bash tool.
 fn killGroup(io: std.Io, child: *std.process.Child) void {
     const pid = child.id orelse return;
     if (posix_signals) std.posix.kill(-pid, .TERM) catch {};
@@ -211,10 +196,6 @@ fn killGroup(io: std.Io, child: *std.process.Child) void {
     if (posix_signals) std.posix.kill(-pid, .KILL) catch {};
 }
 
-/// One hook dispatch running away from the event thread.
-///
-/// The invocation's strings are borrowed until `join`; callers must keep them
-/// alive for the lifetime of this task.
 pub const Dispatch = struct {
     allocator: std.mem.Allocator,
     runner: Runner,
@@ -293,8 +274,6 @@ fn writeJson(
         try w.writeAll(",\"tool_name\":");
         try std.json.Stringify.encodeJsonString(invocation.tool_name, .{}, w);
         try w.writeAll(",\"tool_input\":");
-        // Model-produced arguments have already been parsed by the registry.
-        // Keep malformed input valid JSON for hooks that only inspect metadata.
         if (try std.json.validate(allocator, invocation.tool_input)) {
             try w.writeAll(invocation.tool_input);
         } else {
