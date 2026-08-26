@@ -28,13 +28,6 @@ pub const Event = enum {
             .post_tool_use => "PostToolUse",
         };
     }
-
-    pub fn parse(text: []const u8) ?Event {
-        inline for (std.meta.tags(Event)) |event| {
-            if (std.mem.eql(u8, text, event.name())) return event;
-        }
-        return null;
-    }
 };
 
 pub const Hook = struct {
