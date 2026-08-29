@@ -26,6 +26,10 @@ const indent: u16 = 3;
 name: []const u8 = "",
 arguments: []const u8 = "",
 result: ?[]const u8 = null,
+/// What the call says it is doing, while it is still doing it. Shown in place
+/// of the summary line so a tool that runs for minutes says something other
+/// than its own name.
+note: ?[]const u8 = null,
 status: Conversation.ToolCall.Status = .pending,
 /// Line the diff starts at in the file, resolved by the app from the file on
 /// disk. 1 when it could not be worked out.
@@ -266,6 +270,15 @@ fn oneLine(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 
 /// Collapsed: one summary line. Expanded: the output, capped.
 fn bodyLines(self: *ToolCard, arena: std.mem.Allocator, width: u16) ![]const []const u8 {
+    if (self.result == null) {
+        const note = self.note orelse return &.{};
+        if (note.len == 0) return &.{};
+
+        var lines: std.ArrayList([]const u8) = .empty;
+        try lines.append(arena, clip(note, width -| (indent + 1)));
+        return lines.toOwnedSlice(arena);
+    }
+
     const result = self.result orelse return &.{};
     const trimmed = std.mem.trim(u8, result, " \t\r\n");
     if (trimmed.len == 0) return &.{};

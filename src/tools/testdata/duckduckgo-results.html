@@ -1,0 +1,636 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+
+<!--[if IE 6]><html class="ie6" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if IE 7]><html class="lt-ie8 lt-ie9" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if IE 8]><html class="lt-ie9" xmlns="http://www.w3.org/1999/xhtml"><![endif]-->
+<!--[if gt IE 8]><!--><html xmlns="http://www.w3.org/1999/xhtml"><!--<![endif]-->
+<head>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=1" />
+  <meta name="referrer" content="origin" />
+  <meta name="HandheldFriendly" content="true" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>zig 0.16 std.Io.Writer at DuckDuckGo</title>
+  <link title="DuckDuckGo (HTML)" type="application/opensearchdescription+xml" rel="search" href="//duckduckgo.com/opensearch_html_v2.xml" />
+  <link href="//duckduckgo.com/favicon.ico" rel="shortcut icon" />
+  <link rel="icon" href="//duckduckgo.com/favicon.ico" type="image/x-icon" />
+  <link id="icon60" rel="apple-touch-icon" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_60x60.png?v=2"/>
+  <link id="icon76" rel="apple-touch-icon" sizes="76x76" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_76x76.png?v=2"/>
+  <link id="icon120" rel="apple-touch-icon" sizes="120x120" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_120x120.png?v=2"/>
+  <link id="icon152" rel="apple-touch-icon" sizes="152x152" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_152x152.png?v=2"/>
+  <link rel="image_src" href="//duckduckgo.com/assets/icons/meta/DDG-icon_256x256.png">
+  <link rel="stylesheet" media="handheld, all" href="//duckduckgo.com/dist/h.b7791eaa1c6d921ef675.css" type="text/css"/>
+</head>
+
+<body class="body--html">
+  <a name="top" id="top"></a>
+
+  <form action="/html/" method="post">
+    <input type="text" name="state_hidden" id="state_hidden" />
+  </form>
+
+  <div>
+    <div class="site-wrapper-border"></div>
+
+    <div id="header" class="header cw header--html">
+      <a title="DuckDuckGo" href="/html/" class="header__logo-wrap"></a>
+
+      <form name="x" class="header__form" action="/html/" method="post">
+        <div class="search search--header">
+          <input name="q" autocomplete="off" class="search__input" id="search_form_input_homepage" type="text" value="zig 0.16 std.Io.Writer" />
+          <input name="b" id="search_button_homepage" class="search__button search__button--html" value="" title="Search" alt="Search" type="submit" />
+        </div>
+
+        
+        
+        
+        
+
+        <div class="frm__select">
+          <select name="kl">
+            
+              <option value="" >All Regions</option>
+            
+              <option value="ar-es" >Argentina</option>
+            
+              <option value="au-en" >Australia</option>
+            
+              <option value="at-de" >Austria</option>
+            
+              <option value="be-fr" >Belgium (fr)</option>
+            
+              <option value="be-nl" >Belgium (nl)</option>
+            
+              <option value="br-pt" >Brazil</option>
+            
+              <option value="bg-bg" >Bulgaria</option>
+            
+              <option value="ca-en" >Canada (en)</option>
+            
+              <option value="ca-fr" >Canada (fr)</option>
+            
+              <option value="ct-ca" >Catalonia</option>
+            
+              <option value="cl-es" >Chile</option>
+            
+              <option value="cn-zh" >China</option>
+            
+              <option value="co-es" >Colombia</option>
+            
+              <option value="hr-hr" >Croatia</option>
+            
+              <option value="cz-cs" >Czech Republic</option>
+            
+              <option value="dk-da" >Denmark</option>
+            
+              <option value="ee-et" >Estonia</option>
+            
+              <option value="fi-fi" >Finland</option>
+            
+              <option value="fr-fr" >France</option>
+            
+              <option value="de-de" >Germany</option>
+            
+              <option value="gr-el" >Greece</option>
+            
+              <option value="hk-tzh" >Hong Kong</option>
+            
+              <option value="hu-hu" >Hungary</option>
+            
+              <option value="is-is" >Iceland</option>
+            
+              <option value="in-en" >India (en)</option>
+            
+              <option value="id-en" >Indonesia (en)</option>
+            
+              <option value="ie-en" >Ireland</option>
+            
+              <option value="il-en" >Israel (en)</option>
+            
+              <option value="it-it" >Italy</option>
+            
+              <option value="jp-jp" >Japan</option>
+            
+              <option value="kr-kr" >Korea</option>
+            
+              <option value="lv-lv" >Latvia</option>
+            
+              <option value="lt-lt" >Lithuania</option>
+            
+              <option value="my-en" >Malaysia (en)</option>
+            
+              <option value="mx-es" >Mexico</option>
+            
+              <option value="nl-nl" >Netherlands</option>
+            
+              <option value="nz-en" >New Zealand</option>
+            
+              <option value="no-no" >Norway</option>
+            
+              <option value="pk-en" >Pakistan (en)</option>
+            
+              <option value="pe-es" >Peru</option>
+            
+              <option value="ph-en" >Philippines (en)</option>
+            
+              <option value="pl-pl" >Poland</option>
+            
+              <option value="pt-pt" >Portugal</option>
+            
+              <option value="ro-ro" >Romania</option>
+            
+              <option value="ru-ru" >Russia</option>
+            
+              <option value="xa-ar" >Saudi Arabia</option>
+            
+              <option value="sg-en" >Singapore</option>
+            
+              <option value="sk-sk" >Slovakia</option>
+            
+              <option value="sl-sl" >Slovenia</option>
+            
+              <option value="za-en" >South Africa</option>
+            
+              <option value="es-ca" >Spain (ca)</option>
+            
+              <option value="es-es" >Spain (es)</option>
+            
+              <option value="se-sv" >Sweden</option>
+            
+              <option value="ch-de" >Switzerland (de)</option>
+            
+              <option value="ch-fr" >Switzerland (fr)</option>
+            
+              <option value="tw-tzh" >Taiwan</option>
+            
+              <option value="th-en" >Thailand (en)</option>
+            
+              <option value="tr-tr" >Turkey</option>
+            
+              <option value="us-en" >US (English)</option>
+            
+              <option value="us-es" >US (Spanish)</option>
+            
+              <option value="ua-uk" >Ukraine</option>
+            
+              <option value="uk-en" >United Kingdom</option>
+            
+              <option value="vn-en" >Vietnam (en)</option>
+            
+          </select>
+        </div>
+
+        <div class="frm__select frm__select--last">
+          <select class="" name="df">
+            
+              <option value="" selected>Any Time</option>
+            
+              <option value="d" >Past Day</option>
+            
+              <option value="w" >Past Week</option>
+            
+              <option value="m" >Past Month</option>
+            
+              <option value="y" >Past Year</option>
+            
+          </select>
+        </div>
+      </form>
+    </div>
+
+    
+
+    
+      <!-- Web results are present -->
+      <div>
+        <div class="serp__results">
+          <div id="links" class="results">
+            
+
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2Ffile%2Di%2Do%2Dbasics%2D0%2D16%2F14968&amp;rut=59b8b0deaee29416c3ca3dc2c7c719d5c92d693e68303ba1c7674818d9181333">File I/O basics (0.16) - Docs - Ziggit</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2Ffile%2Di%2Do%2Dbasics%2D0%2D16%2F14968&amp;rut=59b8b0deaee29416c3ca3dc2c7c719d5c92d693e68303ba1c7674818d9181333">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/ziggit.dev.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2Ffile%2Di%2Do%2Dbasics%2D0%2D16%2F14968&amp;rut=59b8b0deaee29416c3ca3dc2c7c719d5c92d693e68303ba1c7674818d9181333">
+                            ziggit.dev/t/file-i-o-basics-0-16/14968
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2Ffile%2Di%2Do%2Dbasics%2D0%2D16%2F14968&amp;rut=59b8b0deaee29416c3ca3dc2c7c719d5c92d693e68303ba1c7674818d9181333">(Note, this is a variation on this article, invited into docs with the release of <b>0.16</b>.) As always, reply/comment all you want, and I&#x27;ll endeavor to make changes accordingly. Motivation, and migration <b>Zig</b> <b>0.16</b> brought big changes to I/O. std.fs references deprecate everywhere, and understanding basic use of std.Io is in order. <b>Zig&#x27;s</b> new I/O model brings I/O into alignment with the ...</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziglang.org%2Fdownload%2F0.16.0%2Frelease%2Dnotes.html&amp;rut=c3fdec1066ae5947be960fd5674ac478bb3c96db984ee9aedc6ef7c0e1cf0c96">0.16.0 Release Notes ⚡ The Zig Programming Language</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziglang.org%2Fdownload%2F0.16.0%2Frelease%2Dnotes.html&amp;rut=c3fdec1066ae5947be960fd5674ac478bb3c96db984ee9aedc6ef7c0e1cf0c96">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/ziglang.org.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziglang.org%2Fdownload%2F0.16.0%2Frelease%2Dnotes.html&amp;rut=c3fdec1066ae5947be960fd5674ac478bb3c96db984ee9aedc6ef7c0e1cf0c96">
+                            ziglang.org/download/0.16.0/release-notes.html
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziglang.org%2Fdownload%2F0.16.0%2Frelease%2Dnotes.html&amp;rut=c3fdec1066ae5947be960fd5674ac478bb3c96db984ee9aedc6ef7c0e1cf0c96">0.16.0 Release Notes Download &amp; Documentation <b>Zig</b> is a general-purpose programming language and toolchain for maintaining robust, optimal, and reusable software. <b>Zig</b> development is funded via <b>Zig</b> Software Foundation, a 501 (c) (3) non-profit organization. Please consider a recurring donation so that we can offer more billable hours to our core team members. This is the most straightforward way ...</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fzig.guide%2Fstandard%2Dlibrary%2Freaders%2Dand%2Dwriters%2F&amp;rut=dac755cbab1980a1d3ff61d164f2f608d4e9e9382fa1dcc3d2ec730d833c3cb4">Readers and Writers - zig.guide</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fzig.guide%2Fstandard%2Dlibrary%2Freaders%2Dand%2Dwriters%2F&amp;rut=dac755cbab1980a1d3ff61d164f2f608d4e9e9382fa1dcc3d2ec730d833c3cb4">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/zig.guide.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fzig.guide%2Fstandard%2Dlibrary%2Freaders%2Dand%2Dwriters%2F&amp;rut=dac755cbab1980a1d3ff61d164f2f608d4e9e9382fa1dcc3d2ec730d833c3cb4">
+                            zig.guide/standard-library/readers-and-writers/
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fzig.guide%2Fstandard%2Dlibrary%2Freaders%2Dand%2Dwriters%2F&amp;rut=dac755cbab1980a1d3ff61d164f2f608d4e9e9382fa1dcc3d2ec730d833c3cb4"><b>std.io.Writer</b> Readers and Writers <b>std.io.Writer</b> and std.io.Reader provide standard ways of making use of IO. std.ArrayList (u8) has a writer method which gives us a writer. Let&#x27;s use it.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.openmymind.net%2FZigs%2DNew%2DWriter%2F&amp;rut=3a3c261cdf4659eaaa587164a57b72593e1b0bfa0c7f39479ca0fa321f449761">Zig&#x27;s new Writer - openmymind.net</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.openmymind.net%2FZigs%2DNew%2DWriter%2F&amp;rut=3a3c261cdf4659eaaa587164a57b72593e1b0bfa0c7f39479ca0fa321f449761">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/www.openmymind.net.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.openmymind.net%2FZigs%2DNew%2DWriter%2F&amp;rut=3a3c261cdf4659eaaa587164a57b72593e1b0bfa0c7f39479ca0fa321f449761">
+                            www.openmymind.net/Zigs-New-Writer/
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2025-07-17T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.openmymind.net%2FZigs%2DNew%2DWriter%2F&amp;rut=3a3c261cdf4659eaaa587164a57b72593e1b0bfa0c7f39479ca0fa321f449761">The instance of File.Writer needs to exist somewhere (e.g. on the stack) since that&#x27;s where the <b>std.Io.Writer</b> interface exists. It&#x27;s possible that File could directly have an writer_interface: <b>std.Io.Writer</b> field, but that would limit you to one writer per file and would bloat the File structure.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2F0%2D16%2Dmaster%2Dversion%2Dzig%2Duse%2Dexamples%2Dlike%2Dhello%2Dworld%2Dto%2Dstdout%2Dwrite%2Dworlds%2Dto%2Da%2Dfile%2Detc%2F14303&amp;rut=629be084e05eebc4d6dbf5b328830fa4affdd12e3116572498f24e50ed0d4c91">0.16/master version zig，use examples，like hello world to stdout，write ...</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2F0%2D16%2Dmaster%2Dversion%2Dzig%2Duse%2Dexamples%2Dlike%2Dhello%2Dworld%2Dto%2Dstdout%2Dwrite%2Dworlds%2Dto%2Da%2Dfile%2Detc%2F14303&amp;rut=629be084e05eebc4d6dbf5b328830fa4affdd12e3116572498f24e50ed0d4c91">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/ziggit.dev.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2F0%2D16%2Dmaster%2Dversion%2Dzig%2Duse%2Dexamples%2Dlike%2Dhello%2Dworld%2Dto%2Dstdout%2Dwrite%2Dworlds%2Dto%2Da%2Dfile%2Detc%2F14303&amp;rut=629be084e05eebc4d6dbf5b328830fa4affdd12e3116572498f24e50ed0d4c91">
+                            ziggit.dev/t/0-16-master-version-zig-use-examples-like-hello-world-to-stdout-write-worlds-to-a-file-etc/14303
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-02-13T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fziggit.dev%2Ft%2F0%2D16%2Dmaster%2Dversion%2Dzig%2Duse%2Dexamples%2Dlike%2Dhello%2Dworld%2Dto%2Dstdout%2Dwrite%2Dworlds%2Dto%2Da%2Dfile%2Detc%2F14303&amp;rut=629be084e05eebc4d6dbf5b328830fa4affdd12e3116572498f24e50ed0d4c91">So you have std.Io.File. You can use it to open files, write files (via std.Io.File.Writer) etc. And most operations in std.Io.File take an io argument which is the std.Io interface of your choice. Right now, the &quot;juicy main&quot; is already a thing, so you can write pub fn main (init: std.process.Init).</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbyteiota.com%2Fzig%2D0%2D16%2D0%2Djuicy%2Dmain%2Di%2Do%2Dinterfaces%2Dwhat%2Dbreaks%2F&amp;rut=6167b313efa98e416635d9756a4b0b919a14cbbfcd7f0dad33f2b7b460b58692">Zig 0.16.0: Juicy Main, I/O Interfaces, What Breaks | byteiota</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbyteiota.com%2Fzig%2D0%2D16%2D0%2Djuicy%2Dmain%2Di%2Do%2Dinterfaces%2Dwhat%2Dbreaks%2F&amp;rut=6167b313efa98e416635d9756a4b0b919a14cbbfcd7f0dad33f2b7b460b58692">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/byteiota.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbyteiota.com%2Fzig%2D0%2D16%2D0%2Djuicy%2Dmain%2Di%2Do%2Dinterfaces%2Dwhat%2Dbreaks%2F&amp;rut=6167b313efa98e416635d9756a4b0b919a14cbbfcd7f0dad33f2b7b460b58692">
+                            byteiota.com/zig-0-16-0-juicy-main-i-o-interfaces-what-breaks/
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-05-18T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbyteiota.com%2Fzig%2D0%2D16%2D0%2Djuicy%2Dmain%2Di%2Do%2Dinterfaces%2Dwhat%2Dbreaks%2F&amp;rut=6167b313efa98e416635d9756a4b0b919a14cbbfcd7f0dad33f2b7b460b58692"><b>Zig</b> 0.16.0 shipped on April 14 with 244 contributors, 1,183 commits, and the largest standard library redesign in the language&#x27;s history. Two changes dominate the release: a new std.Io interface that replaces nearly all of std.posix, and &quot;Juicy Main&quot; — dependency injection for your program&#x27;s entry point.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgist.github.com%2Falogic0%2Fabfee3e29515a3c7b57eca2475f2c0f1&amp;rut=0d829637bf52368ab9fd6d06b7f9f833d3bfcd1f181051dd6fc6def84f8df42a">std.Io.Writer explanation · GitHub</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgist.github.com%2Falogic0%2Fabfee3e29515a3c7b57eca2475f2c0f1&amp;rut=0d829637bf52368ab9fd6d06b7f9f833d3bfcd1f181051dd6fc6def84f8df42a">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/gist.github.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgist.github.com%2Falogic0%2Fabfee3e29515a3c7b57eca2475f2c0f1&amp;rut=0d829637bf52368ab9fd6d06b7f9f833d3bfcd1f181051dd6fc6def84f8df42a">
+                            gist.github.com/alogic0/abfee3e29515a3c7b57eca2475f2c0f1
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgist.github.com%2Falogic0%2Fabfee3e29515a3c7b57eca2475f2c0f1&amp;rut=0d829637bf52368ab9fd6d06b7f9f833d3bfcd1f181051dd6fc6def84f8df42a">The &quot;Writergate&quot; overhaul in <b>Zig</b> 0.15/0.16 completely re-architected how the standard library handles I/O. In <b>Zig</b> <b>0.16</b>, the old <b>std.io.Writer</b> (which relied heavily on duck-typing with anytype) has been removed and replaced by the strict, explicit interface type under <b>std.Io.Writer</b>.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fpedropark99.github.io%2Fzig%2Dbook%2FChapters%2F12%2Dfile%2Dop.html&amp;rut=0cb15a213145dfa42c7768f34c467b50a5f918c52fd7c5ca4a83887ebe5edb86">13 Filesystem and Input/Output (IO) - Introduction to Zig</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fpedropark99.github.io%2Fzig%2Dbook%2FChapters%2F12%2Dfile%2Dop.html&amp;rut=0cb15a213145dfa42c7768f34c467b50a5f918c52fd7c5ca4a83887ebe5edb86">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/pedropark99.github.io.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fpedropark99.github.io%2Fzig%2Dbook%2FChapters%2F12%2Dfile%2Dop.html&amp;rut=0cb15a213145dfa42c7768f34c467b50a5f918c52fd7c5ca4a83887ebe5edb86">
+                            pedropark99.github.io/zig-book/Chapters/12-file-op.html
+                          </a>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fpedropark99.github.io%2Fzig%2Dbook%2FChapters%2F12%2Dfile%2Dop.html&amp;rut=0cb15a213145dfa42c7768f34c467b50a5f918c52fd7c5ca4a83887ebe5edb86">Therefore, since <b>Zig</b> <b>0.16</b>, you will find different functions that perform some IO operation across the <b>Zig</b> Standard Library that takes an argument named io of type std.Io. A big example of that is the reader () method that you find in std.Io.File. This method is responsible for creating the Reader object through which you can read data from the file represented by the std.Io.File object. And ...</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fjoegm.github.io%2Fblog%2Finside%2Dzigs%2Dnew%2Dwriter%2Dinterface%2F&amp;rut=cc73c041dfd10c66aed9319a8b4a4dc74d65b9a92177ce9dd8d9f5aa02795c9a">Joe Mckay - Inside Zig&#x27;s New Writer - joegm.github.io</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fjoegm.github.io%2Fblog%2Finside%2Dzigs%2Dnew%2Dwriter%2Dinterface%2F&amp;rut=cc73c041dfd10c66aed9319a8b4a4dc74d65b9a92177ce9dd8d9f5aa02795c9a">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/joegm.github.io.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fjoegm.github.io%2Fblog%2Finside%2Dzigs%2Dnew%2Dwriter%2Dinterface%2F&amp;rut=cc73c041dfd10c66aed9319a8b4a4dc74d65b9a92177ce9dd8d9f5aa02795c9a">
+                            joegm.github.io/blog/inside-zigs-new-writer-interface/
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2025-08-27T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fjoegm.github.io%2Fblog%2Finside%2Dzigs%2Dnew%2Dwriter%2Dinterface%2F&amp;rut=cc73c041dfd10c66aed9319a8b4a4dc74d65b9a92177ce9dd8d9f5aa02795c9a"><b>Zig</b> version 0.15.1 recently released, bringing with it some breaking standard library changes which have been making waves in the <b>Zig</b> world. This event has been dubbed Writergate by the <b>Zig</b> community because it centers around a breaking overhaul of the standard library&#x27;s Reader and Writer interfaces. The new version is pretty sophisticated and claims various improvements, especially around ...</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+              
+                <div class="result results_links results_links_deep web-result ">
+                  <div class="links_main links_deep result__body"> <!-- This is the visible part -->
+                    
+                      <h2 class="result__title">
+                        <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fygalsk%2Fkeyway%2Dzig%2Fissues%2F80&amp;rut=9a277bdbe6bc1aedbbe9929db07490757dbe6976089a7a72c29495d8ecb27c32">Zig 0.16: Writergate — std.io removed, ArrayList.writer() gone ...</a>
+                      </h2>
+
+                    
+
+                    
+                      <div class="result__extras">
+                        <div class="result__extras__url">
+                          <span class="result__icon">
+                            <a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fygalsk%2Fkeyway%2Dzig%2Fissues%2F80&amp;rut=9a277bdbe6bc1aedbbe9929db07490757dbe6976089a7a72c29495d8ecb27c32">
+                              <img class="result__icon__img" width="16" height="16" alt="" src="//external-content.duckduckgo.com/ip3/github.com.ico" name="i15" />
+                            </a>
+                          </span>
+                          <a class="result__url" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fygalsk%2Fkeyway%2Dzig%2Fissues%2F80&amp;rut=9a277bdbe6bc1aedbbe9929db07490757dbe6976089a7a72c29495d8ecb27c32">
+                            github.com/ygalsk/keyway-zig/issues/80
+                          </a>
+                          
+                            <span>&nbsp; &nbsp; 2026-05-24T00:00:00.0000000</span>
+                          
+                        </div>
+                      </div>
+                    
+
+                    
+                      
+                        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgithub.com%2Fygalsk%2Fkeyway%2Dzig%2Fissues%2F80&amp;rut=9a277bdbe6bc1aedbbe9929db07490757dbe6976089a7a72c29495d8ecb27c32">http.<b>zig</b>, handler.<b>zig</b>, conn_stream.<b>zig</b> compile under <b>0.16</b> with no std.io.* / ArrayList.writer (); chunked + normal response serialization behavior preserved; <b>zig</b> build test green.</a>
+                      
+                    
+
+                    <div class="clear"></div>
+                  </div>
+                </div>
+              
+            
+
+            
+              
+              
+                <div class="nav-link">
+                  <form action="/html/" method="post">
+                    <input type="submit" class='btn btn--alt' value="Next" />
+                    <input type="hidden" name="q" value="zig 0.16 std.Io.Writer" />
+                    <input type="hidden" name="s" value="10" />
+                    <input type="hidden" name="nextParams" value="" />
+                    <input type="hidden" name="v" value="l" />
+                    <input type="hidden" name="o" value="json" />
+                    <input type="hidden" name="dc" value="11" />
+                    <input type="hidden" name="api" value="d.js" />
+                    <input type="hidden" name="vqd" value="4-30495744479358694947199888839348536894" />
+
+                    
+                    
+                    
+                      <input name="kl" value="wt-wt" type="hidden" />
+                    
+                    
+                    
+                    
+                  </form>
+                </div>
+              
+            
+
+            <div class="feedback-btn">
+              <a rel="nofollow" href="//duckduckgo.com/feedback.html" target="_new">Feedback</a>
+            </div>
+            <div class="clear"></div>
+          </div>
+        </div>
+      </div> <!-- links wrapper //-->
+    
+  </div>
+
+  <div id="bottom_spacing2"></div>
+
+  
+    <img src="//duckduckgo.com/t/sl_h"/>
+  
+</body>
+</html>

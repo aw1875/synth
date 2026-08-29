@@ -141,6 +141,7 @@ pub fn toolCard(
     card.arguments = call.arguments;
     card.start_line = diffStart(self, key, call);
     card.result = call.result;
+    card.note = self.loop.toolNote(msg.seq, call_index);
     card.status = call.status;
 
     if (card.expanded and call.result_bytes > Conversation.preview_bytes) {

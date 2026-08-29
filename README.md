@@ -128,11 +128,24 @@ set by using the app and kept in the database.
 `debug_log` is the first thing to reach for when a model goes quiet: it shows
 whether a request was sent at all, and how large it had grown.
 
+Ollama picks the context window a model is loaded with, and what it picks is
+usually far below what the model can do. `ollama.num_ctx` is what synth asks
+for; leave it out and it asks for the model's advertised maximum, and 0 leaves
+the choice to the server. Whether the server can give what was asked for is its
+own business: `/api/ps` is the last word on what the runner actually got, and
+that is what the sidebar plans against.
+
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
 `SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
-`OLLAMA_THINK`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`. Which host-and-key pair
-applies depends on the protocol the chosen provider speaks, so having both sets
-exported does not hand one server the other's settings.
+`OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
+`SYNTH_SEARCH_API_KEY`. Which host-and-key pair applies depends on the protocol
+the chosen provider speaks, so having both sets exported does not hand one
+server the other's settings.
+
+`web_search` needs no key: without one it reads DuckDuckGo's HTML results page.
+That works, but DuckDuckGo throttles it after a handful of searches and answers
+with a page that has no results on it, which the tool reports as such. A Brave
+Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 
 A debug build keeps all three files in the working directory, so a checkout
 never touches installed state.

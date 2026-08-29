@@ -8,6 +8,7 @@ const shell = @import("shell.zig");
 const task = @import("task.zig");
 const todo = @import("todo.zig");
 const tool = @import("tool.zig");
+const web = @import("web.zig");
 pub const Tool = tool.Tool;
 pub const Context = tool.Context;
 pub const Input = tool.Input;
@@ -29,6 +30,7 @@ pub fn init(allocator: std.mem.Allocator) !Registry {
     for (task.all) |t| try self.register(t);
     for (ask.all) |t| try self.register(t);
     for (todo.all) |t| try self.register(t);
+    for (web.all) |t| try self.register(t);
 
     return self;
 }
@@ -169,7 +171,7 @@ test "schema is valid JSON the model can be shown" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(usize, 10), parsed.value.array.items.len);
+    try std.testing.expectEqual(@as(usize, 12), parsed.value.array.items.len);
 }
 
 test "unknown tools and bad arguments come back as errors, not failures" {

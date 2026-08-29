@@ -123,7 +123,7 @@ fn supersededResults(
         if (msg.text.len <= supersede_floor) continue;
 
         const id = msg.tool_call_id orelse continue;
-        const call = callFor(all, id) orelse continue;
+        const call = callFor(all, id, i) orelse continue;
 
         const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ call.name, call.arguments });
         const entry = try keys.getOrPut(allocator, key);
@@ -138,10 +138,19 @@ fn supersededResults(
     return stale;
 }
 
-/// The call a result belongs to, found by the id the two share.
-fn callFor(all: []const Conversation.Message, id: []const u8) ?Conversation.ToolCall {
-    for (all) |msg| {
-        for (msg.tool_calls) |call| {
+/// The call a result belongs to: the nearest one before `before` that shares
+/// its id.
+///
+/// Nearest rather than first, because an id is only unique within the reply it
+/// arrived in. A provider that supplies none has one made up, and older
+/// transcripts are full of calls numbered from zero every reply. Searching from
+/// the start resolves every result in such a transcript to the same call, and
+/// each one then looks like a repeat of the one before it.
+fn callFor(all: []const Conversation.Message, id: []const u8, before: usize) ?Conversation.ToolCall {
+    var i = @min(before, all.len);
+    while (i > 0) {
+        i -= 1;
+        for (all[i].tool_calls) |call| {
             if (std.mem.eql(u8, call.id, id)) return call;
         }
     }
@@ -349,6 +358,25 @@ test "an identical call later on makes the earlier result redundant" {
     try std.testing.expectEqualStrings(superseded_note, kept[2].text);
     try std.testing.expectEqualStrings(body, kept[4].text);
     try std.testing.expectEqualStrings(body, kept[6].text);
+}
+
+test "a provider that reuses call ids does not collapse the whole transcript" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const body = "x" ** (supersede_floor * 2);
+
+    try convo.add(.user, "go");
+    try addRead(&convo, "call_0", "a.zig", body);
+    try addRead(&convo, "call_0", "b.zig", body);
+    try addRead(&convo, "call_0", "c.zig", body);
+
+    const kept = try messages(&convo, std.testing.allocator, 10_000, true);
+    defer std.testing.allocator.free(kept);
+
+    for (kept) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.text, superseded_note));
+    }
 }
 
 test "the room a collapsed result gives back keeps an older message in" {

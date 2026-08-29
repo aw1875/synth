@@ -56,6 +56,7 @@ fn run(ctx: Context, input: Input) !Output {
         .agent = agent_id,
         .prompt = prompt,
         .cancelled = ctx.cancelled,
+        .progress = ctx.progress,
     }) catch |err| {
         return Output.err(try std.fmt.allocPrint(
             ctx.allocator,

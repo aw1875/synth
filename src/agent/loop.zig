@@ -141,10 +141,19 @@ tools: ?*ToolRun = null,
 /// How many of the running batch's results have been copied into the
 /// conversation. Advances while the batch runs, so cards settle one at a time.
 tools_adopted: usize = 0,
-/// When the user gave up, on the monotonic clock, and whether the workers have
-/// been signalled since.
-cancel_at_ms: ?i64 = null,
+/// What each running call last said it was doing, refreshed once a poll so a
+/// frame draws a stable set of lines rather than racing the workers.
+notes: []ToolRun.Note = &.{},
+/// Whether the workers have been told to stop and handed to `canceller`.
 signalled: bool = false,
+/// The off-thread wait for the signalled workers, and whether it has finished.
+///
+/// `Io.Future.cancel` blocks until the worker unwinds, re-signalling on a
+/// doubling backoff. On the UI's thread that is the terminal locked up for as
+/// long as a blocked socket read takes to give up, so the wait happens here and
+/// the UI keeps polling `reaped` instead.
+canceller: ?std.Io.Future(void) = null,
+reaped: std.atomic.Value(bool) = .init(false),
 steps: usize = 0,
 /// When this turn started, on the monotonic clock, and what it has spent since.
 /// Both reset by `submit`.
@@ -460,6 +469,10 @@ pub fn deinit(self: *Loop) void {
     self.session_title = null;
     if (self.session_model_owned) |m| self.allocator.free(m);
     self.session_model_owned = null;
+    if (self.canceller) |*canceller| {
+        canceller.await(self.io);
+        self.canceller = null;
+    }
     if (self.request) |request| {
         request.cancel();
         request.destroy();
@@ -471,6 +484,7 @@ pub fn deinit(self: *Loop) void {
         self.tools = null;
     }
 
+    self.clearNotes();
     self.todos.deinit();
     for (self.steering.items) |text| self.allocator.free(text);
     self.steering.deinit(self.allocator);
@@ -787,26 +801,38 @@ pub fn cancel(self: *Loop) !void {
     if (!self.isBusy()) return;
     if (self.state == .cancelling) return;
 
-    // Asking is all that happens here. Waiting for the worker to unwind is what
-    // `Io.Future.cancel` does, and it does it on the calling thread - which is
-    // the UI's, so a provider midway through generating would freeze the
-    // terminal until it finished. The worker is reaped in `poll` instead.
+    // Both halves start here: the flag a worker checks between waits, and the
+    // signal that reaches one already blocked in a read. Waiting for either is
+    // what `Io.Future.cancel` does, on the calling thread, which is the UI's -
+    // so that wait happens on `canceller` and `poll` collects the result.
     self.requestStop();
+    self.startReaping();
 
-    self.cancel_at_ms = tool.monotonicMilliseconds(self.io);
-    self.signalled = false;
     self.compacting = false;
     self.state = .cancelling;
 }
 
-/// How long a worker is given to stop because it was asked to, before it is
-/// signalled instead.
-///
-/// Asking is cheap and lets a worker unwind tidily, but it only reaches one
-/// that checks: a provider between chunks, a tool between waits. A worker
-/// blocked in a read that never returns never gets the chance, and waiting for
-/// it is what leaves a turn sitting on `Cancelling` for minutes.
-const cancel_grace_ms: i64 = 250;
+/// Interrupt both workers, waiting for them somewhere other than here.
+fn startReaping(self: *Loop) void {
+    if (self.signalled) return;
+    self.signalled = true;
+    self.reaped.store(false, .release);
+
+    if (self.io.concurrent(reap, .{self})) |future| {
+        self.canceller = future;
+    } else |_| {
+        // No thread to hand the wait to. Taking it here stalls the screen,
+        // which is still better than leaving the turn on `Cancelling` forever.
+        self.reap();
+    }
+}
+
+/// Interrupt both workers and wait for them to unwind, off the UI's thread.
+fn reap(self: *Loop) void {
+    if (self.request) |request| request.cancel();
+    if (self.tools) |tools| tools.cancel();
+    self.reaped.store(true, .release);
+}
 
 /// Reap a cancelled turn once its worker has actually stopped.
 ///
@@ -814,25 +840,28 @@ const cancel_grace_ms: i64 = 250;
 /// provider borrows it, and a tool run writes into results the loop is about to
 /// free.
 fn pollCancelled(self: *Loop) !bool {
+    if (self.canceller) |*canceller| {
+        if (!self.reaped.load(.acquire)) return false;
+        canceller.await(self.io);
+        self.canceller = null;
+    } else if (!self.reaped.load(.acquire)) {
+        // Only when there was no thread for the reaper, and it ran inline.
+        self.startReaping();
+        return false;
+    }
+
     if (self.request) |request| {
-        if (!request.isFinished()) {
-            self.signalStragglers();
-            return false;
-        }
         request.join();
         request.destroy();
         self.request = null;
     }
 
     if (self.tools) |tools| {
-        if (!tools.isFinished()) {
-            self.signalStragglers();
-            return false;
-        }
         tools.join();
         tools.destroy();
         self.tools = null;
     }
+    self.clearNotes();
 
     try self.abandonPending();
 
@@ -842,20 +871,6 @@ fn pollCancelled(self: *Loop) !bool {
 
 /// Mark every call the cancelled turn left unfinished, so the transcript says
 /// what happened to it rather than leaving a row spinning forever.
-/// Signal a worker that has not stopped on its own once the grace period is
-/// up. Signalling interrupts a blocked syscall, which is the only thing that
-/// reaches a worker stuck in a read.
-fn signalStragglers(self: *Loop) void {
-    if (self.signalled) return;
-
-    const since = self.cancel_at_ms orelse return;
-    if (tool.monotonicMilliseconds(self.io) - since < cancel_grace_ms) return;
-
-    self.signalled = true;
-    if (self.request) |request| request.cancel();
-    if (self.tools) |tools| tools.cancel();
-}
-
 fn abandonPending(self: *Loop) !void {
     const index = self.pendingIndex() orelse return;
     for (self.conversation.messages.items[index].tool_calls, 0..) |*call, i| {
@@ -1587,6 +1602,50 @@ fn runApproved(self: *Loop) !void {
 /// `tools_adopted` is what keeps this idempotent - each result is taken once,
 /// so the final pass after the worker exits cannot dupe a result twice and
 /// leak the first copy.
+/// The name of the call the running batch is on, for anything that wants to say
+/// what is happening in a couple of words. The first unsettled one: a batch
+/// runs in order, so that is the one still going.
+pub fn runningToolName(self: *const Loop) ?[]const u8 {
+    const tools = self.tools orelse return null;
+    const at = tools.settledCount();
+    if (at >= tools.calls.len) return null;
+    return tools.calls[at].name;
+}
+
+/// What the call at `index` of the message `seq` is doing now, or null when it
+/// is not one of the running batch or has said nothing yet.
+pub fn toolNote(self: *const Loop, seq: u64, index: usize) ?[]const u8 {
+    if (self.pending_seq != seq) return null;
+    if (index >= self.notes.len) return null;
+    const text = self.notes[index].text();
+    return if (text.len == 0) null else text;
+}
+
+/// Take a copy of what every unsettled call is saying. Returns whether any of
+/// them changed, which is what tells the UI to draw again.
+fn refreshNotes(self: *Loop, tools: *ToolRun) !bool {
+    if (self.notes.len != tools.calls.len) {
+        self.allocator.free(self.notes);
+        self.notes = try self.allocator.alloc(ToolRun.Note, tools.calls.len);
+        @memset(self.notes, .{});
+    }
+
+    var changed = false;
+    for (self.notes, 0..) |*note, at| {
+        var fresh: ToolRun.Note = .{};
+        tools.copyNote(at, &fresh);
+        if (fresh.len == note.len and std.mem.eql(u8, fresh.text(), note.text())) continue;
+        note.* = fresh;
+        changed = true;
+    }
+    return changed;
+}
+
+fn clearNotes(self: *Loop) void {
+    self.allocator.free(self.notes);
+    self.notes = &.{};
+}
+
 fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
     const settled = tools.settledCount();
     if (self.tools_adopted >= settled) return;
@@ -1609,8 +1668,9 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
 fn pollTools(self: *Loop) !bool {
     const tools = self.tools orelse return false;
 
+    const moved = try self.refreshNotes(tools);
     try self.adoptSettled(tools);
-    if (!tools.isFinished()) return false;
+    if (!tools.isFinished()) return moved;
 
     tools.join();
     self.tools = null;
@@ -1618,6 +1678,7 @@ fn pollTools(self: *Loop) !bool {
 
     // Anything that landed between the check above and the worker exiting.
     try self.adoptSettled(tools);
+    self.clearNotes();
 
     try self.persistReads();
 
@@ -1679,6 +1740,11 @@ const FakeProvider = struct {
     loop_forever: bool = false,
     /// Reported prompt tokens, for the tests that care what a turn spends.
     prompt_tokens: u32 = 0,
+    /// Spend `latency` in a busy loop rather than a sleep, so the worker is
+    /// deaf to both the stop flag and the signal. Stands in for a provider
+    /// blocked inside a socket read, which is the only case where cancelling
+    /// costs real time.
+    deaf: bool = false,
 
     fn provider(self: *FakeProvider) Provider {
         return .{ .name = "fake", .userdata = self, .respond = respond };
@@ -1693,7 +1759,12 @@ const FakeProvider = struct {
     ) !Provider.Reply {
         const self: *FakeProvider = @ptrCast(@alignCast(ptr));
 
-        try std.Io.sleep(self.io, self.latency, .real);
+        if (self.deaf) {
+            const until = tool.monotonicMilliseconds(self.io) + @as(i64, @intCast(@divTrunc(self.latency.nanoseconds, std.time.ns_per_ms)));
+            while (tool.monotonicMilliseconds(self.io) < until) {}
+        } else {
+            try std.Io.sleep(self.io, self.latency, .real);
+        }
         if (sink) |s| {
             if (s.stopped(s.userdata)) return .{};
             s.onThinking(s.userdata, "thinking about it\n");
@@ -2573,7 +2644,7 @@ test "an answer offered when nothing was asked is ignored" {
     try testing.expect(loop.pendingQuestion() == null);
 }
 
-test "a worker that ignores the ask is signalled once the grace is up" {
+test "cancelling signals the worker at once, and the turn ends with it" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
 
@@ -2589,22 +2660,19 @@ test "a worker that ignores the ask is signalled once the grace is up" {
     }
 
     try loop.cancel();
-    try testing.expectEqual(State.cancelling, loop.state);
-    try testing.expect(!loop.signalled);
-
-    _ = try loop.poll();
-    try testing.expect(!loop.signalled);
+    try testing.expect(loop.signalled);
 
     const started = tool.monotonicMilliseconds(testing.io);
     while (loop.isBusy()) {
         _ = try loop.poll();
-        if (tool.monotonicMilliseconds(testing.io) - started > 20_000) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(5), .real);
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
     }
+    const spent = tool.monotonicMilliseconds(testing.io) - started;
 
-    try testing.expect(loop.signalled);
     try testing.expectEqual(State.idle, loop.state);
-    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 20_000);
+    // A worker sitting in a cancellation point is gone as soon as it is
+    // signalled. Waiting out a grace period first put a floor under this.
+    try testing.expect(spent < 250);
 }
 
 test "a plan is applied without a worker, and reads back as progress" {

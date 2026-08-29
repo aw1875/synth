@@ -43,6 +43,18 @@ pub const ToolCall = struct {
     /// Full length of `result` in bytes, or 0 when there is no result.
     result_bytes: u64 = 0,
 
+    /// A unique id for a call whose provider supplied none.
+    ///
+    /// Unique across the whole conversation, not just the reply it came in.
+    /// Results are matched back to calls by id, so a provider that numbers its
+    /// calls from zero every reply would have every result in the transcript
+    /// answer to the same call.
+    pub fn synthesizeId(allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(allocator, "call_{d}", .{next_id.fetchAdd(1, .monotonic)});
+    }
+
+    var next_id: std.atomic.Value(u64) = .init(0);
+
     pub const Status = enum {
         /// Waiting on the user.
         pending,

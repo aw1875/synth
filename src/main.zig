@@ -25,6 +25,7 @@ const Backend = @import("provider/backend.zig");
 const Provider = @import("provider/provider.zig");
 const mcp_tools = @import("tools/mcp.zig");
 const skill_tool = @import("tools/skill.zig");
+const web = @import("tools/web.zig");
 const tui_app = @import("tui/app.zig");
 const Model = @import("tui/model.zig");
 const tui_commands = @import("tui/commands.zig");
@@ -158,6 +159,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .model = active.model,
         .api_key = active.api_key,
         .want_think = config.think,
+        .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
     });
     defer backend.deinit();
@@ -201,6 +203,9 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     }
 
     try skill_tool.install(&model.registry, &skills);
+
+    const web_settings: web.Settings = .{ .search_api_key = config.search_api_key };
+    try web.install(&model.registry, &web_settings);
 
     model.pending_model_check = options.model == null;
     timing.mark("mcp start");

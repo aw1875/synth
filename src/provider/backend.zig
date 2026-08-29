@@ -29,6 +29,9 @@ pub const Options = struct {
     /// Ask the model to reason before answering. Ollama only; the OpenAI API
     /// has no field for it.
     want_think: bool = true,
+    /// Window to ask ollama to load the model with. Null takes the model's
+    /// advertised maximum; zero leaves the choice to the server.
+    num_ctx: ?u32 = null,
     debug_log: ?[]const u8 = null,
 };
 
@@ -55,6 +58,7 @@ fn build(kind: catalog.Kind, options: Options) Client {
                 .model = options.model,
                 .api_key = options.api_key,
                 .want_think = options.want_think,
+                .num_ctx = options.num_ctx,
                 .debug_log = options.debug_log,
             },
         },
@@ -159,6 +163,7 @@ pub fn connect(
             .host = "",
             .label = "",
             .want_think = self.options.want_think,
+            .num_ctx = self.options.num_ctx,
             .debug_log = self.options.debug_log,
         });
     }

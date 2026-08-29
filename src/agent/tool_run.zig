@@ -33,6 +33,9 @@ calls: []Call,
 results: []Result,
 
 future: std.Io.Future(void) = undefined,
+/// Whether the future has been awaited and freed. Awaiting twice is undefined,
+/// and cancelling happens on a worker thread while the owner still holds this.
+reaped: bool = false,
 done: std.atomic.Value(bool) = .init(false),
 /// How many results are written and safe to read. Published as each group
 /// lands - a group being one call, or the run of calls that ran together - so
@@ -41,6 +44,36 @@ settled: std.atomic.Value(usize) = .init(0),
 /// Set by the owner to ask the worker to give up. Checked as each call starts,
 /// so everything after the ones already running is skipped.
 stop: std.atomic.Value(bool) = .init(false),
+/// What each call last said it was doing, and the lock over them. Written on
+/// worker threads and read on the owner's.
+notes: []Note,
+reporters: []Reporter,
+notes_mutex: std.Io.Mutex = .init,
+
+pub const max_note_bytes: usize = tool.max_progress_bytes;
+
+/// The latest line one call published. Copied in and out under `notes_mutex`,
+/// never handed out by reference.
+pub const Note = struct {
+    buffer: [max_note_bytes]u8 = undefined,
+    len: usize = 0,
+
+    pub fn text(self: *const Note) []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+/// What a running call reports through. One per call, because the seam carries
+/// only a pointer and the worker has to know which call it is.
+const Reporter = struct {
+    run: *ToolRun,
+    index: usize,
+
+    fn report(ptr: *anyopaque, text: []const u8) void {
+        const self: *Reporter = @ptrCast(@alignCast(ptr));
+        self.run.setNote(self.index, text);
+    }
+};
 
 pub const Call = struct {
     index: usize,
@@ -85,6 +118,13 @@ pub fn start(
 
     const results = try allocator.alloc(Result, approved.len);
     errdefer allocator.free(results);
+
+    const notes = try allocator.alloc(Note, approved.len);
+    errdefer allocator.free(notes);
+    @memset(notes, .{});
+
+    const reporters = try allocator.alloc(Reporter, approved.len);
+    errdefer allocator.free(reporters);
     // Not left to the worker: a call cancelled before its handler ran writes
     // nothing, and index 0 would then be adopted as call 0's answer.
     for (results, calls) |*result, call| {
@@ -100,7 +140,11 @@ pub fn start(
         .delegate = delegate,
         .calls = calls,
         .results = results,
+        .notes = notes,
+        .reporters = reporters,
     };
+
+    for (self.reporters, 0..) |*reporter, at| reporter.* = .{ .run = self, .index = at };
 
     self.future = try io.concurrent(run, .{self});
     return self;
@@ -114,9 +158,31 @@ pub fn requestStop(self: *ToolRun) void {
 
 /// Interrupt the batch and wait for it to unwind. A tool blocked on I/O is
 /// unblocked; a child process spawned by one is not, and still has to exit.
+///
+/// Blocks until the batch is gone, however long that takes. Never call it from
+/// the thread drawing the screen.
 pub fn cancel(self: *ToolRun) void {
+    if (self.reaped) return;
+    self.reaped = true;
     self.requestStop();
     self.future.cancel(self.io);
+}
+
+/// Copy what the call at `index` last said into `out`, returning its length.
+/// A copy rather than a slice: the worker may overwrite it at any moment.
+pub fn copyNote(self: *ToolRun, index: usize, out: *Note) void {
+    self.notes_mutex.lockUncancelable(self.io);
+    defer self.notes_mutex.unlock(self.io);
+    out.* = self.notes[index];
+}
+
+fn setNote(self: *ToolRun, index: usize, text: []const u8) void {
+    self.notes_mutex.lockUncancelable(self.io);
+    defer self.notes_mutex.unlock(self.io);
+
+    const note = &self.notes[index];
+    note.len = @min(text.len, max_note_bytes);
+    @memcpy(note.buffer[0..note.len], text[0..note.len]);
 }
 
 pub fn isFinished(self: *ToolRun) bool {
@@ -130,6 +196,8 @@ pub fn settledCount(self: *ToolRun) usize {
 }
 
 pub fn join(self: *ToolRun) void {
+    if (self.reaped) return;
+    self.reaped = true;
     self.future.await(self.io);
 }
 
@@ -144,6 +212,8 @@ pub fn destroy(self: *ToolRun) void {
         if (result.content.len > 0) allocator.free(result.content);
     }
     allocator.free(self.results);
+    allocator.free(self.notes);
+    allocator.free(self.reporters);
     allocator.destroy(self);
 }
 
@@ -221,6 +291,7 @@ fn runOne(self: *ToolRun, index: usize) void {
         .delegate = self.delegate,
         .cancelled = &self.stop,
         .allow_outside = call.allow_outside,
+        .progress = .{ .userdata = &self.reporters[index], .report = Reporter.report },
     };
 
     const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
@@ -299,6 +370,14 @@ fn aloneHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
     return tool.Output.ok(try ctx.allocator.dupe(u8, "alone"));
 }
 
+/// Say something, then something else, so a test can watch a note change.
+fn talkativeHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
+    ctx.report("halfway");
+    std.Io.sleep(ctx.io, .fromMilliseconds(5), .awake) catch {};
+    ctx.report("nearly there");
+    return tool.Output.ok(try ctx.allocator.dupe(u8, "said its piece"));
+}
+
 fn probeRegistry(allocator: std.mem.Allocator, probe: *Probe) !Registry {
     var registry: Registry = .{ .allocator = allocator };
     errdefer registry.deinit();
@@ -310,6 +389,14 @@ fn probeRegistry(allocator: std.mem.Allocator, probe: *Probe) !Registry {
         .handler = rendezvousHandler,
         .read_only = true,
         .parallel = true,
+        .userdata = probe,
+    });
+    try registry.register(.{
+        .name = "talkative",
+        .description = "test",
+        .schema = "{}",
+        .handler = talkativeHandler,
+        .read_only = true,
         .userdata = probe,
     });
     try registry.register(.{
@@ -461,4 +548,32 @@ test "giving up inside a group stops the calls after it" {
     try testing.expect(run_state.results[2].is_error);
     try testing.expectEqualStrings("cancelled", run_state.results[2].content);
     try testing.expectEqual(@as(usize, 2), probe.peak.load(.acquire));
+}
+
+test "a running call's progress reaches the owner while it is still running" {
+    const allocator = testing.allocator;
+
+    var probe: Probe = .{};
+    var registry = try probeRegistry(allocator, &probe);
+    defer registry.deinit();
+
+    var reads: tool.ReadLog = .init(allocator);
+    defer reads.deinit();
+
+    const calls: []const Call = &.{.{ .index = 0, .name = "talkative", .arguments = "{}" }};
+
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, calls);
+    defer run_state.destroy();
+
+    var seen: Note = .{};
+    const deadline = tool.monotonicMilliseconds(testing.io) + 2000;
+    while (seen.len == 0 and tool.monotonicMilliseconds(testing.io) < deadline) {
+        run_state.copyNote(0, &seen);
+        std.Io.sleep(testing.io, .fromMilliseconds(1), .awake) catch break;
+    }
+    try testing.expect(seen.len > 0);
+
+    run_state.join();
+    run_state.copyNote(0, &seen);
+    try testing.expectEqualStrings("nearly there", seen.text());
 }
