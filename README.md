@@ -194,6 +194,9 @@ anything beyond that is discarded.
 
 Input includes `hook_event_name` and `cwd`, plus `prompt` for prompt hooks or
 `tool_name`, `tool_input`, and (afterward) `tool_response` for tool hooks.
+Tool hooks run once per tool call, and synth may run up to eight calls at once.
+A matcher-less `PreToolUse` and `PostToolUse` pair can therefore start 16 hook
+processes for one batch, so use `matcher` when a hook only applies to some tools.
 
 ### Try the logging hook
 
