@@ -7,6 +7,7 @@ const testing = std.testing;
 const Database = @import("../core/database.zig");
 const Provider = @import("../provider/provider.zig");
 const recap = @import("recap.zig");
+const redact = @import("../core/redact.zig");
 const ask_user = @import("../tools/ask.zig");
 const todo_tool = @import("../tools/todo.zig");
 const Registry = @import("../tools/registry.zig");
@@ -1659,7 +1660,7 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
 
         const call = &calls[result.index];
         call.status = if (result.is_error) .failed else .ok;
-        call.result = try self.allocator.dupe(u8, result.content);
+        call.result = try redact.scrub(self.allocator, result.content);
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
     }
@@ -2002,6 +2003,45 @@ test "usage derives rate and context fraction" {
 
     try testing.expect(usage.contextFraction(0) == null);
     try testing.expect((Usage{}).tokensPerSecond() == null);
+}
+
+fn leakHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
+    return tool.Output.ok(try ctx.allocator.dupe(
+        u8,
+        "AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n",
+    ));
+}
+
+test "a secret in tool output never reaches the transcript" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try fixture.registry.register(.{
+        .name = "leak",
+        .description = "hands back a secret",
+        .schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = leakHandler,
+        .read_only = true,
+        .parallel = true,
+    });
+    fixture.fake.tool_name = "leak";
+    fixture.fake.tool_arguments = "{}";
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("show me the config", .{});
+    try settle(&loop);
+
+    const secret = "AKIAIOSFODNN7EXAMPLE";
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expect(std.mem.indexOf(u8, call.result.?, secret) == null);
+
+    const result_message = fixture.convo.messages.items[2];
+    try testing.expectEqual(Conversation.Role.tool, result_message.role);
+    try testing.expect(std.mem.indexOf(u8, result_message.text, secret) == null);
+    try testing.expect(std.mem.indexOf(u8, result_message.text, redact.mask) != null);
+    try testing.expect(std.mem.indexOf(u8, result_message.text, "AWS_SECRET_ACCESS_KEY=") != null);
 }
 
 test "oversized tool output is truncated for the model" {
