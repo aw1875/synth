@@ -153,6 +153,7 @@ fn describe(child: *const Loop, buffer: *[tool.max_progress_bytes]u8) []const u8
 /// What the subagent is up to right now, in a couple of words.
 fn doing(child: *const Loop) []const u8 {
     return switch (child.state) {
+        .running_hooks => "running hooks",
         .thinking => "thinking",
         .compacting => "compacting",
         .running_tools => child.runningToolName() orelse "running tools",

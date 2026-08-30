@@ -112,6 +112,8 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See below. |
+| `hooks` | object | none | Commands run on selected agent lifecycle events. See below. |
+| `hook_timeout_ms` | number | `30000` | How long a hook command may run before it is killed. |
 
 ```json
 {
@@ -176,6 +178,71 @@ The `mcp` block is the shape every other client uses, so an entry from a
 A `command` runs a child process; a `url` is a remote server over Streamable
 HTTP, signed in with `synth mcp auth <name>` where it needs OAuth. `/mcp` turns
 servers on and off without leaving the TUI.
+
+## Hooks
+
+Hooks run commands from the project root at selected lifecycle events. Each
+command receives a JSON object on stdin. Tool hooks may set `matcher` to an
+exact tool name; an empty or absent matcher matches every tool. A
+`UserPromptSubmit` or `PreToolUse` hook blocks the operation by exiting 2, with
+its stderr used as the reason. Other exit statuses are advisory. Hook commands
+that exceed `hook_timeout_ms` are killed. Hook stderr is kept up to 64 KiB;
+anything beyond that is discarded.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "command": "./scripts/log-prompt.sh" }
+    ],
+    "PreToolUse": [
+      { "matcher": "bash", "command": "./scripts/check-command.sh" }
+    ],
+    "PostToolUse": [
+      { "matcher": "edit", "command": "zig fmt src" }
+    ]
+  }
+}
+```
+
+Input includes `hook_event_name` and `cwd`, plus `prompt` for prompt hooks or
+`tool_name`, `tool_input`, and (afterward) `tool_response` for tool hooks.
+Tool hooks run once per tool call, and synth may run up to eight calls at once.
+A matcher-less `PreToolUse` and `PostToolUse` pair can therefore start 16 hook
+processes for one batch, so use `matcher` when a hook only applies to some tools.
+
+### Try the logging hook
+
+The repository includes `examples/hooks/log-event.sh`, a dependency-free hook
+that appends the timestamp and input JSON for each event to
+`.synth-hooks.log`. Add this block to the checkout's `config.json`:
+
+```json
+{
+  "think": true,
+  "hooks": {
+    "UserPromptSubmit": [
+      { "command": "./examples/hooks/log-event.sh" }
+    ],
+    "PreToolUse": [
+      { "command": "./examples/hooks/log-event.sh" }
+    ],
+    "PostToolUse": [
+      { "command": "./examples/hooks/log-event.sh" }
+    ]
+  }
+}
+```
+
+Start synth and submit a prompt, then inspect the log from another terminal:
+
+```sh
+tail -f .synth-hooks.log
+```
+
+`UserPromptSubmit` appears for every prompt. The pre- and post-tool entries
+appear when the model calls a tool. The log is covered by the repository's
+`*.log` ignore rule.
 
 ## Skills
 

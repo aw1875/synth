@@ -5,6 +5,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const Database = @import("../core/database.zig");
+const Hooks = @import("../core/hooks.zig");
 const Provider = @import("../provider/provider.zig");
 const recap = @import("recap.zig");
 const redact = @import("../core/redact.zig");
@@ -68,6 +69,7 @@ pub const Outcome = recap.Outcome;
 
 pub const State = enum {
     idle,
+    running_hooks,
     /// Waiting on the model.
     thinking,
     /// Waiting on the user to approve tool calls.
@@ -87,6 +89,7 @@ pub const State = enum {
     pub fn label(self: State) []const u8 {
         return switch (self) {
             .idle => "",
+            .running_hooks => "Running hooks",
             .thinking => "Thinking",
             .awaiting_approval => "Awaiting approval",
             .awaiting_answer => "Waiting for your answer",
@@ -111,6 +114,10 @@ provider: Provider,
 registry: *const Registry,
 conversation: *Conversation,
 reads: *tool.ReadLog,
+hooks: ?*const Hooks.Runner = null,
+hook_dispatch: ?*Hooks.Dispatch = null,
+pending_submit: ?PendingSubmit = null,
+hook_notice: ?[]u8 = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
 
@@ -484,9 +491,17 @@ pub fn deinit(self: *Loop) void {
         tools.destroy();
         self.tools = null;
     }
+    if (self.hook_dispatch) |dispatch| {
+        dispatch.cancel();
+        dispatch.destroy();
+        self.hook_dispatch = null;
+    }
+    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+    self.pending_submit = null;
 
     self.clearNotes();
     self.todos.deinit();
+    if (self.hook_notice) |notice| self.allocator.free(notice);
     for (self.steering.items) |text| self.allocator.free(text);
     self.steering.deinit(self.allocator);
     self.prompt_cache.deinit(self.allocator);
@@ -545,6 +560,59 @@ pub const Extras = struct {
     images: []const []const u8 = &.{},
 };
 
+const PendingSubmit = struct {
+    prompt: []u8,
+    attachments: []mention.Attachment,
+    images: [][]u8,
+
+    fn init(allocator: std.mem.Allocator, prompt: []const u8, extras: Extras) !PendingSubmit {
+        const owned_prompt = try allocator.dupe(u8, prompt);
+        errdefer allocator.free(owned_prompt);
+
+        const attachments = try allocator.alloc(mention.Attachment, extras.attachments.len);
+        var attachments_built: usize = 0;
+        errdefer {
+            for (attachments[0..attachments_built]) |*attachment| attachment.deinit(allocator);
+            allocator.free(attachments);
+        }
+        for (extras.attachments, attachments) |source, *dest| {
+            const path = try allocator.dupe(u8, source.path);
+            errdefer allocator.free(path);
+            dest.* = .{
+                .path = path,
+                .content = try allocator.dupe(u8, source.content),
+                .content_bytes = source.content_bytes,
+            };
+            attachments_built += 1;
+        }
+
+        const images = try allocator.alloc([]u8, extras.images.len);
+        var images_built: usize = 0;
+        errdefer {
+            for (images[0..images_built]) |image| allocator.free(image);
+            allocator.free(images);
+        }
+        for (extras.images, images) |source, *dest| {
+            dest.* = try allocator.dupe(u8, source);
+            images_built += 1;
+        }
+
+        return .{ .prompt = owned_prompt, .attachments = attachments, .images = images };
+    }
+
+    fn asExtras(self: *const PendingSubmit) Extras {
+        return .{ .attachments = self.attachments, .images = self.images };
+    }
+
+    fn deinit(self: *PendingSubmit, allocator: std.mem.Allocator) void {
+        allocator.free(self.prompt);
+        for (self.attachments) |*attachment| attachment.deinit(allocator);
+        allocator.free(self.attachments);
+        for (self.images) |image| allocator.free(image);
+        allocator.free(self.images);
+    }
+};
+
 /// What the model is asked for when compacting. The summary is fed back as the
 /// only history, so it has to carry the parts a later turn would need.
 const compaction_prompt =
@@ -599,6 +667,29 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
 pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.isBusy()) return;
 
+    if (self.hook_notice) |notice| self.allocator.free(notice);
+    self.hook_notice = null;
+
+    if (self.hooks) |runner| {
+        if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.finishSubmit(prompt, extras);
+
+        self.pending_submit = try PendingSubmit.init(self.allocator, prompt, extras);
+        errdefer {
+            self.pending_submit.?.deinit(self.allocator);
+            self.pending_submit = null;
+        }
+        self.hook_dispatch = try Hooks.Dispatch.start(self.allocator, runner.*, .{
+            .event = .user_prompt_submit,
+            .prompt = self.pending_submit.?.prompt,
+        });
+        self.state = .running_hooks;
+        return;
+    }
+
+    try self.finishSubmit(prompt, extras);
+}
+
+fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     var mentioned: mention.Resolved =
         mention.resolve(self.allocator, self.io, self.project_root, prompt) catch .{};
     defer mentioned.deinit(self.allocator);
@@ -626,6 +717,44 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     self.last_calls = null;
     self.last_error = null;
     try self.ask();
+}
+
+fn pollPromptHooks(self: *Loop) !bool {
+    const dispatch = self.hook_dispatch orelse return false;
+    if (!dispatch.isFinished()) return false;
+
+    dispatch.join();
+    self.hook_dispatch = null;
+    defer dispatch.destroy();
+
+    var pending = self.pending_submit orelse return false;
+    self.pending_submit = null;
+    defer pending.deinit(self.allocator);
+
+    if (dispatch.failed) |err| {
+        self.hook_notice = try std.fmt.allocPrint(
+            self.allocator,
+            "UserPromptSubmit hook failed: {s}",
+            .{@errorName(err)},
+        );
+        self.state = .idle;
+        return true;
+    }
+    if (dispatch.takeBlocked()) |reason| {
+        self.hook_notice = reason;
+        self.state = .idle;
+        return true;
+    }
+
+    self.state = .idle;
+    try self.finishSubmit(pending.prompt, pending.asExtras());
+    return true;
+}
+
+pub fn takeHookNotice(self: *Loop) ?[]u8 {
+    const notice = self.hook_notice;
+    self.hook_notice = null;
+    return notice;
 }
 
 /// Page up to `limit` older messages in from the database, prepending them to
@@ -832,6 +961,7 @@ fn startReaping(self: *Loop) void {
 fn reap(self: *Loop) void {
     if (self.request) |request| request.cancel();
     if (self.tools) |tools| tools.cancel();
+    if (self.hook_dispatch) |dispatch| dispatch.cancel();
     self.reaped.store(true, .release);
 }
 
@@ -851,6 +981,12 @@ fn pollCancelled(self: *Loop) !bool {
         return false;
     }
 
+    if (self.hook_dispatch) |dispatch| {
+        dispatch.join();
+        dispatch.destroy();
+        self.hook_dispatch = null;
+    }
+
     if (self.request) |request| {
         request.join();
         request.destroy();
@@ -865,6 +1001,8 @@ fn pollCancelled(self: *Loop) !bool {
     self.clearNotes();
 
     try self.abandonPending();
+    if (self.pending_submit) |*pending| pending.deinit(self.allocator);
+    self.pending_submit = null;
 
     self.finish(.cancelled);
     return true;
@@ -890,6 +1028,7 @@ fn abandonPending(self: *Loop) !void {
 pub fn poll(self: *Loop) !bool {
     return switch (self.state) {
         .idle, .awaiting_approval, .awaiting_answer => false,
+        .running_hooks => self.pollPromptHooks(),
         .thinking, .compacting => self.pollRequest(),
         .running_tools => self.pollTools(),
         .cancelling => self.pollCancelled(),
@@ -1589,6 +1728,7 @@ fn runApproved(self: *Loop) !void {
         self.project_root,
         self.reads,
         self.delegate,
+        self.hooks,
         batch.items,
     );
     self.state = .running_tools;
@@ -1878,6 +2018,32 @@ const Fixture = struct {
         );
     }
 };
+
+test "a blocked prompt never enters the model transcript" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    const hook = Hooks.Hook{ .command = "echo prompt rejected >&2; exit 2" };
+    var runner: Hooks.Runner = .{
+        .io = testing.io,
+        .root = fixture.root,
+        .set = .{ .user_prompt_submit = &.{hook} },
+    };
+    loop.hooks = &runner;
+
+    try loop.submit("do not send this", .{});
+    try testing.expectEqual(State.running_hooks, loop.state);
+    try settle(&loop);
+
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 0), fixture.convo.messages.items.len);
+    const notice = loop.takeHookNotice().?;
+    defer testing.allocator.free(notice);
+    try testing.expectEqualStrings("prompt rejected", notice);
+}
 
 test "a read-only tool call runs without asking" {
     const fixture = try Fixture.init();

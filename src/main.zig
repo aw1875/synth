@@ -14,6 +14,7 @@ const subagent = @import("agent/subagent.zig");
 const mcp = @import("mcp");
 
 const Config = @import("core/config.zig");
+const Hooks = @import("core/hooks.zig");
 const Database = @import("core/database.zig");
 const Timing = @import("core/timing.zig");
 const Project = @import("core/project.zig");
@@ -216,6 +217,13 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     if (config.system_prompt) |text| model.loop.system_prompt = text;
     model.loop.project = &project;
     model.loop.skills = skills.skills;
+    var hook_runner: Hooks.Runner = .{
+        .io = io,
+        .root = project.root,
+        .set = config.hooks,
+        .timeout_ms = config.hook_timeout_ms,
+    };
+    model.loop.hooks = &hook_runner;
     model.slash.skills = skills.skills;
     model.skills = &skills;
     try model.loop.useAgent(agents.default_id);
