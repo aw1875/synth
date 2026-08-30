@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 
 const stderr_limit: usize = 64 * 1024;
 const poll_slice_ms: u64 = 100;
-const default_timeout_ms: u64 = 30_000;
+pub const default_timeout_ms: u64 = 30_000;
 const posix_signals = switch (builtin.os.tag) {
     .windows, .wasi => false,
     else => true,
@@ -131,6 +131,8 @@ pub const Runner = struct {
         defer readers.deinit();
 
         const stderr_reader = readers.reader(0);
+        var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+        errdefer stderr_writer.deinit();
         const deadline = std.Io.Clock.now(.awake, self.io).toMilliseconds() + @as(i64, @intCast(self.timeout_ms));
         var stderr_done = false;
 
@@ -150,7 +152,10 @@ pub const Runner = struct {
                     error.Timeout => {},
                     else => |other| return other,
                 };
-                if (stderr_reader.buffered().len > stderr_limit) return error.StreamTooLong;
+                const buffered = stderr_reader.buffered();
+                const remaining = stderr_limit - stderr_writer.written().len;
+                try stderr_writer.writer.writeAll(buffered[0..@min(buffered.len, remaining)]);
+                stderr_reader.tossBuffered();
             }
         }
 
@@ -159,7 +164,7 @@ pub const Runner = struct {
 
         const term = try child.wait(self.io);
         reaped = true;
-        const stderr = try readers.toOwnedSlice(0);
+        const stderr = try stderr_writer.toOwnedSlice();
         errdefer allocator.free(stderr);
         const code: u8 = switch (term) {
             .exited => |value| value,
@@ -323,7 +328,7 @@ test "large input and stderr cannot block each other" {
     @memset(prompt, 'x');
 
     const hook = Hook{
-        .command = "i=0; while [ $i -lt 4096 ]; do printf 12345678 >&2; i=$((i + 1)); done; exit 2",
+        .command = "i=0; while [ $i -lt 16384 ]; do printf 12345678 >&2; i=$((i + 1)); done; exit 2",
     };
     const runner: Runner = .{
         .io = testing.io,
@@ -337,7 +342,7 @@ test "large input and stderr cannot block each other" {
         .prompt = prompt,
     });
     defer if (reason) |text| testing.allocator.free(text);
-    try testing.expectEqual(@as(usize, 32 * 1024), reason.?.len);
+    try testing.expectEqual(stderr_limit, reason.?.len);
 }
 
 test "a hook is killed when its deadline passes" {

@@ -143,6 +143,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .io = io,
         .root = project.root,
         .set = config.hooks,
+        .timeout_ms = config.hook_timeout_ms,
     };
     loop.hooks = &hook_runner;
     try loop.useAgent(agents.default_id);

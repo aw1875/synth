@@ -78,6 +78,12 @@
             },
             "description": "Commands run at selected agent lifecycle events."
         },
+        "hook_timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 30000,
+            "description": "How long a hook command may run before it is killed."
+        },
         "mcp": {
             "type": "object",
             "additionalProperties": false,

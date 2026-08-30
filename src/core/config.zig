@@ -108,6 +108,7 @@ skill_paths: []const []const u8 = &.{},
 /// be repeating its shape. Borrowed from this config's arena.
 mcp: ?std.json.Value = null,
 hooks: Hooks.Set = .{},
+hook_timeout_ms: u64 = Hooks.default_timeout_ms,
 
 /// The shape `config.json` is parsed into. Every field is optional so an
 /// absent key falls through to whatever the previous layer set.
@@ -122,6 +123,7 @@ const File = struct {
     skill_paths: ?[]const []const u8 = null,
     mcp: ?std.json.Value = null,
     hooks: ?Hooks.File = null,
+    hook_timeout_ms: ?u64 = null,
     /// The single-provider shape this file used to have. Still read, so an
     /// existing `config.json` keeps working; nothing writes it any more, and
     /// where a provider lives is the database's business now.
@@ -231,6 +233,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
     if (parsed.hooks) |value| self.hooks = value.set();
+    if (parsed.hook_timeout_ms) |value| self.hook_timeout_ms = value;
 
     if (parsed.ollama) |ollama| {
         if (ollama.host) |value| self.host_override = value;
@@ -367,7 +370,7 @@ test "lifecycle hooks are read from the file" {
     defer testing.allocator.free(path);
 
     const source =
-        \\{"hooks":{"PreToolUse":[{"matcher":"bash","command":"./check.sh"}]}}
+        \\{"hook_timeout_ms":5000,"hooks":{"PreToolUse":[{"matcher":"bash","command":"./check.sh"}]}}
     ;
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = source });
 
@@ -378,4 +381,5 @@ test "lifecycle hooks are read from the file" {
     try testing.expectEqual(@as(usize, 1), config.hooks.pre_tool_use.len);
     try testing.expectEqualStrings("bash", config.hooks.pre_tool_use[0].matcher);
     try testing.expectEqualStrings("./check.sh", config.hooks.pre_tool_use[0].command);
+    try testing.expectEqual(@as(u64, 5000), config.hook_timeout_ms);
 }

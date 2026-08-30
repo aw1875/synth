@@ -216,6 +216,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .io = io,
         .root = project.root,
         .set = config.hooks,
+        .timeout_ms = config.hook_timeout_ms,
     };
     model.loop.hooks = &hook_runner;
     model.slash.skills = skills.skills;

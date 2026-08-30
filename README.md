@@ -113,6 +113,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See below. |
 | `hooks` | object | none | Commands run on selected agent lifecycle events. See below. |
+| `hook_timeout_ms` | number | `30000` | How long a hook command may run before it is killed. |
 
 ```json
 {
@@ -172,7 +173,8 @@ command receives a JSON object on stdin. Tool hooks may set `matcher` to an
 exact tool name; an empty or absent matcher matches every tool. A
 `UserPromptSubmit` or `PreToolUse` hook blocks the operation by exiting 2, with
 its stderr used as the reason. Other exit statuses are advisory. Hook commands
-that run longer than 30 seconds are killed.
+that exceed `hook_timeout_ms` are killed. Hook stderr is kept up to 64 KiB;
+anything beyond that is discarded.
 
 ```json
 {
