@@ -214,6 +214,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             if (self.mentions.isScanning()) try self.scheduleTick(ctx);
             const changed = try self.loop.poll();
+            if (self.loop.takeHookNotice()) |notice| {
+                defer self.allocator.free(notice);
+                try self.notification.show(ctx, .warn, notice);
+            }
             if (changed) {
                 widget_pool.pruneWidgets(self);
                 commands.syncProvider(self);

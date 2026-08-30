@@ -5,6 +5,7 @@ const std = @import("std");
 const Registry = @import("../tools/registry.zig");
 const tool = @import("../tools/tool.zig");
 const Conversation = @import("../core/conversation.zig");
+const Hooks = @import("../core/hooks.zig");
 
 const ToolRun = @This();
 
@@ -26,6 +27,7 @@ project_root: []const u8,
 reads: *tool.ReadLog,
 /// Passed through to every call's context, so a tool that delegates can.
 delegate: ?tool.Delegate,
+hooks: ?*const Hooks.Runner,
 
 /// Calls to run: name, arguments, and their index in the requesting message.
 /// Owned copies, because the conversation may move underneath the worker.
@@ -59,6 +61,7 @@ pub fn start(
     project_root: []const u8,
     reads: *tool.ReadLog,
     delegate: ?tool.Delegate,
+    hook_runner: ?*const Hooks.Runner,
     approved: []const Call,
 ) !*ToolRun {
     const self = try allocator.create(ToolRun);
@@ -98,6 +101,7 @@ pub fn start(
         .project_root = project_root,
         .reads = reads,
         .delegate = delegate,
+        .hooks = hook_runner,
         .calls = calls,
         .results = results,
     };
@@ -207,7 +211,7 @@ fn runOne(self: *ToolRun, index: usize) void {
     if (self.stop.load(.acquire)) {
         result.* = .{
             .index = call.index,
-            .content = self.allocator.dupe(u8, "cancelled") catch "cancelled",
+            .content = self.allocator.dupe(u8, "cancelled") catch "",
             .is_error = true,
         };
         return;
@@ -223,6 +227,26 @@ fn runOne(self: *ToolRun, index: usize) void {
         .allow_outside = call.allow_outside,
     };
 
+    if (self.hooks) |runner| {
+        const blocked = runner.dispatch(self.allocator, .{
+            .event = .pre_tool_use,
+            .tool_name = call.name,
+            .tool_input = call.arguments,
+        }) catch |err| {
+            result.* = .{
+                .index = call.index,
+                .content = std.fmt.allocPrint(self.allocator, "pre-tool hook failed: {s}", .{@errorName(err)}) catch
+                    self.allocator.dupe(u8, "pre-tool hook failed") catch "",
+                .is_error = true,
+            };
+            return;
+        };
+        if (blocked) |reason| {
+            result.* = .{ .index = call.index, .content = reason, .is_error = true };
+            return;
+        }
+    }
+
     const output = self.registry.executeJson(ctx, call.name, call.arguments) catch |err| {
         result.* = .{
             .index = call.index,
@@ -230,12 +254,20 @@ fn runOne(self: *ToolRun, index: usize) void {
                 self.allocator,
                 "{s} failed: {s}",
                 .{ call.name, @errorName(err) },
-            ) catch "tool failed",
+            ) catch self.allocator.dupe(u8, "tool failed") catch "",
             .is_error = true,
         };
         return;
     };
     result.* = .{ .index = call.index, .content = output.content, .is_error = output.is_error };
+    if (self.hooks) |runner| {
+        _ = runner.dispatch(self.allocator, .{
+            .event = .post_tool_use,
+            .tool_name = call.name,
+            .tool_input = call.arguments,
+            .tool_response = output.content,
+        }) catch {};
+    }
 }
 
 const testing = std.testing;
@@ -330,7 +362,7 @@ fn drain(
     reads: *tool.ReadLog,
     calls: []const Call,
 ) !*ToolRun {
-    const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, calls);
+    const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, null, calls);
     run_state.join();
     return run_state;
 }
@@ -427,7 +459,7 @@ test "a batch wider than the cap runs in several groups" {
     var reads: tool.ReadLog = .init(allocator);
     defer reads.deinit();
 
-    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, &many);
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, &many);
     defer run_state.destroy();
     run_state.join();
 
@@ -453,7 +485,7 @@ test "giving up inside a group stops the calls after it" {
         .{ .index = 2, .name = "alone", .arguments = "{}" },
     };
 
-    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, calls);
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, calls);
     defer run_state.destroy();
     probe.run.store(run_state, .release);
     run_state.join();
@@ -461,4 +493,48 @@ test "giving up inside a group stops the calls after it" {
     try testing.expect(run_state.results[2].is_error);
     try testing.expectEqualStrings("cancelled", run_state.results[2].content);
     try testing.expectEqual(@as(usize, 2), probe.peak.load(.acquire));
+}
+
+test "post-tool hooks run for ordinary tool errors" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+
+    var registry = try Registry.init(testing.allocator);
+    defer registry.deinit();
+    var reads = tool.ReadLog.init(testing.allocator);
+    defer reads.deinit();
+
+    const hook = Hooks.Hook{
+        .command = "read payload; printf '%s' \"$payload\" > post.json",
+    };
+    const runner: Hooks.Runner = .{
+        .io = testing.io,
+        .root = root,
+        .set = .{ .post_tool_use = &.{hook} },
+    };
+    const calls = [_]Call{.{
+        .index = 0,
+        .name = "not-a-tool",
+        .arguments = "{}",
+    }};
+
+    const batch = try ToolRun.start(
+        testing.allocator,
+        testing.io,
+        &registry,
+        root,
+        &reads,
+        null,
+        &runner,
+        &calls,
+    );
+    batch.join();
+    defer batch.destroy();
+
+    try testing.expect(batch.results[0].is_error);
+    const payload = try tmp.dir.readFileAlloc(testing.io, "post.json", testing.allocator, .limited(4096));
+    defer testing.allocator.free(payload);
+    try testing.expect(std.mem.indexOf(u8, payload, "unknown tool") != null);
 }
