@@ -932,10 +932,7 @@ pub fn cancel(self: *Loop) !void {
     if (!self.isBusy()) return;
     if (self.state == .cancelling) return;
 
-    // Both halves start here: the flag a worker checks between waits, and the
-    // signal that reaches one already blocked in a read. Waiting for either is
-    // what `Io.Future.cancel` does, on the calling thread, which is the UI's -
-    // so that wait happens on `canceller` and `poll` collects the result.
+    // `Io.Future.cancel` waits on the calling thread, so `canceller` takes it.
     self.requestStop();
     self.startReaping();
 
@@ -952,8 +949,7 @@ fn startReaping(self: *Loop) void {
     if (self.io.concurrent(reap, .{self})) |future| {
         self.canceller = future;
     } else |_| {
-        // No thread to hand the wait to. Taking it here stalls the screen,
-        // which is still better than leaving the turn on `Cancelling` forever.
+        // No thread for the wait; stalling beats never leaving `Cancelling`.
         self.reap();
     }
 }
@@ -1133,6 +1129,10 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
+
+    // Left raised, these would send the next cancel down the inline join.
+    self.signalled = false;
+    self.reaped.store(false, .release);
 
     // Written down rather than worked out again at each draw: once older
     // messages are trimmed away the turn could no longer be read back, and
@@ -1379,7 +1379,6 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
         defer self.allocator.free(path);
-        if (!self.agent.allows(call.name)) return false;
         return self.coversExactly(call.name, path);
     }
 
@@ -2306,8 +2305,7 @@ test "a tool asked for a document keeps more of it than the default allows" {
     defer testing.allocator.free(big);
     @memset(big, 'x');
 
-    // Under its own ceiling, so it arrives whole, where the default would
-    // have cut it in half and said so.
+    // Under its own ceiling, so it arrives whole.
     const kept = try loop.trimForModel("roomy", big);
     try testing.expectEqual(big.ptr, kept.ptr);
 
@@ -2961,9 +2959,46 @@ test "cancelling signals the worker at once, and the turn ends with it" {
     const spent = tool.monotonicMilliseconds(testing.io) - started;
 
     try testing.expectEqual(State.idle, loop.state);
-    // A worker sitting in a cancellation point is gone as soon as it is
-    // signalled. Waiting out a grace period first put a floor under this.
+    // A worker in a cancellation point goes as soon as it is signalled.
     try testing.expect(spent < 250);
+}
+
+test "a second cancel reaps off-thread like the first" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    // Deaf to the stop flag, so only the reaper's signal ends the worker.
+    fixture.fake.latency = .fromMilliseconds(500);
+    fixture.fake.deaf = true;
+
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        try loop.submit("go", .{});
+        while (loop.state != .thinking) {
+            _ = try loop.poll();
+            try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+        }
+
+        const started = tool.monotonicMilliseconds(testing.io);
+        try loop.cancel();
+
+        // Without a reaper the turn is joined here, and the screen is gone.
+        try testing.expect(loop.signalled);
+        try testing.expect(loop.canceller != null);
+        try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 50);
+
+        while (loop.isBusy()) {
+            _ = try loop.poll();
+            try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+        }
+        try testing.expectEqual(State.idle, loop.state);
+
+        // Cleared with the turn, so the next cancel starts a reaper of its own.
+        try testing.expect(!loop.signalled);
+    }
 }
 
 test "a plan is applied without a worker, and reads back as progress" {

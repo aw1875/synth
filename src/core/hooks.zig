@@ -147,8 +147,7 @@ pub const Runner = struct {
         var stderr_done = false;
 
         while (!stderr_done or !input.done.load(.acquire)) {
-            // Returning here runs the `killGroup` defer, so a cancelled turn
-            // takes the command's whole process group with it.
+            // Returning runs the `killGroup` defer, taking the whole group.
             if (self.givenUp()) return error.Cancelled;
             const left = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds();
             if (left <= 0) return error.Timeout;
@@ -351,8 +350,7 @@ test "raising the stop flag ends a hook that would otherwise run on" {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
 
-    // Sleeps far longer than the test and far longer than the timeout below,
-    // so finishing at all means the flag was what stopped it.
+    // Outlasts both the test and the timeout, so only the flag can end it.
     const hook = Hook{ .command = "read payload; sleep 30" };
     var stop: std.atomic.Value(bool) = .init(false);
     const runner: Runner = .{

@@ -136,8 +136,7 @@ fn search(ctx: Context, input: Input) !Output {
 
     switch (reply.status) {
         .ok => {},
-        // DuckDuckGo answers a request it thinks is automated with 202 and a
-        // page that has no results on it, rather than an error status.
+        // DuckDuckGo answers a suspected bot with 202 and an empty page.
         .accepted => if (backend == .duckduckgo) return fail(ctx, throttled_message, .{}),
         .unauthorized, .forbidden => return fail(ctx, "web_search: the search key was rejected", .{}),
         .too_many_requests => return fail(ctx, "web_search: rate limited by the search backend", .{}),
@@ -177,8 +176,7 @@ fn searchUrl(
                 try url.writer.print("&freshness={s}", .{window});
             }
         },
-        // The HTML page takes neither a count nor a date, so the cap is applied
-        // to what comes back instead.
+        // The HTML page takes neither a count nor a date; cap what returns.
         .duckduckgo => {},
     }
     return url.toOwnedSlice();
@@ -339,8 +337,7 @@ fn resultLink(arena: std.mem.Allocator, href: []const u8) !?[]const u8 {
     };
 
     var encoded = href[at + redirect_marker.len ..];
-    // The destination is percent-encoded, so the first `&` ends it whether the
-    // page wrote the next parameter as `&` or as `&amp;`.
+    // The destination is percent-encoded, so the first `&` always ends it.
     if (std.mem.indexOfScalar(u8, encoded, '&')) |cut| encoded = encoded[0..cut];
     if (encoded.len == 0) return null;
 
@@ -474,8 +471,7 @@ fn get(
             continue;
         }
 
-        // Copied before the reader is built: `readerDecompressing` invalidates
-        // every string the head points at.
+        // `readerDecompressing` invalidates every string the head points at.
         const content_type = try arena.dupe(u8, mediaType(response.head.content_type orelse ""));
 
         var decompress: std.http.Decompress = undefined;
@@ -504,8 +500,7 @@ fn get(
 fn resolve(arena: std.mem.Allocator, base_text: []const u8, location: []const u8) ![]u8 {
     const base = std.Uri.parse(base_text) catch return error.BadUrl;
 
-    // `resolveInPlace` merges into the buffer it is handed and wants the new
-    // location sitting at the front of it.
+    // `resolveInPlace` merges in place and wants the new location first.
     const buffer = try arena.alloc(u8, location.len + base_text.len + 1);
     @memcpy(buffer[0..location.len], location);
 
@@ -590,9 +585,7 @@ fn blockedIp6(text: []const u8) bool {
         if (parseIp4(head["::ffff:".len..])) |octets| return blockedIp4(octets);
     }
 
-    // fc00::/7 unique-local, fe80::/10 link-local, ff00::/8 multicast. Matching
-    // on the first two nibbles takes the deprecated site-local range with it,
-    // which is the safe direction to be wrong in.
+    // fc00::/7 unique-local, fe80::/10 link-local, ff00::/8 multicast.
     if (head.len < 2 or std.ascii.toLower(head[0]) != 'f') return false;
     return switch (std.ascii.toLower(head[1])) {
         'c', 'd', 'e', 'f' => true,
