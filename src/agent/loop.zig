@@ -1475,10 +1475,11 @@ fn isSafe(self: *const Loop, call: *const Conversation.ToolCall) bool {
 
 /// Truncate tool output destined for the model, keeping the head and marking
 /// what was dropped so it does not look like the tool simply stopped.
-fn trimForModel(self: *Loop, result: []const u8) ![]const u8 {
-    if (result.len <= max_tool_result_bytes) return result;
+fn trimForModel(self: *Loop, name: []const u8, result: []const u8) ![]const u8 {
+    const ceiling = self.resultCeiling(name);
+    if (result.len <= ceiling) return result;
 
-    var cut = max_tool_result_bytes;
+    var cut = ceiling;
     if (std.mem.lastIndexOfScalar(u8, result[0..cut], '\n')) |newline| cut = newline;
 
     return std.fmt.allocPrint(
@@ -1486,6 +1487,13 @@ fn trimForModel(self: *Loop, result: []const u8) ![]const u8 {
         "{s}\n... truncated, {d} more bytes not shown",
         .{ result[0..cut], result.len - cut },
     );
+}
+
+/// How much of one tool's output the model may see. A tool that says nothing
+/// takes `max_tool_result_bytes`.
+fn resultCeiling(self: *const Loop, name: []const u8) usize {
+    const found = self.registry.get(name) orelse return max_tool_result_bytes;
+    return found.max_result_bytes orelse max_tool_result_bytes;
 }
 
 /// Record an "allow always" for what this call is doing, and persist it.
@@ -1898,7 +1906,7 @@ fn finishToolMessages(self: *Loop) !void {
     }
 
     for (settled[0..count]) |entry| {
-        const trimmed = try self.trimForModel(entry.result);
+        const trimmed = try self.trimForModel(entry.name, entry.result);
         defer if (trimmed.ptr != entry.result.ptr) self.allocator.free(trimmed);
         _ = try self.conversation.addToolResult(entry.name, entry.id, trimmed);
         try self.persistMessage(self.conversation.messages.items.len - 1);
@@ -2267,14 +2275,45 @@ test "oversized tool output is truncated for the model" {
     defer testing.allocator.free(big);
     @memset(big, 'x');
 
-    const trimmed = try loop.trimForModel(big);
+    const trimmed = try loop.trimForModel("list", big);
     defer testing.allocator.free(trimmed);
 
     try testing.expect(trimmed.len < big.len);
     try testing.expect(std.mem.indexOf(u8, trimmed, "truncated") != null);
 
     const small = "fine";
-    try testing.expectEqual(small.ptr, (try loop.trimForModel(small)).ptr);
+    try testing.expectEqual(small.ptr, (try loop.trimForModel("list", small)).ptr);
+}
+
+test "a tool asked for a document keeps more of it than the default allows" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try fixture.registry.register(.{
+        .name = "roomy",
+        .description = "hands back a document",
+        .schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = leakHandler,
+        .read_only = true,
+        .parallel = true,
+        .max_result_bytes = max_tool_result_bytes * 4,
+    });
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    const big = try testing.allocator.alloc(u8, max_tool_result_bytes * 2);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+
+    // Under its own ceiling, so it arrives whole, where the default would
+    // have cut it in half and said so.
+    const kept = try loop.trimForModel("roomy", big);
+    try testing.expectEqual(big.ptr, kept.ptr);
+
+    const cut = try loop.trimForModel("list", big);
+    defer testing.allocator.free(cut);
+    try testing.expect(cut.len < big.len);
 }
 
 test "cancel returns while the worker is still running" {

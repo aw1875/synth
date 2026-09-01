@@ -71,12 +71,13 @@ pub const all: []const tool.Tool = &.{
         .name = "web_fetch",
         .description = "Fetch a webpage and return its readable text. Use this after web_search when the search snippet is insufficient.",
         .schema =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to fetch"},"format":{"type":"string","description":"'text' strips the markup, 'markdown' keeps headings, lists and links, 'html' returns the page as sent. Defaults to 'text'","enum":["markdown","text","html"]},"max_bytes":{"type":"integer","description":"Maximum response size returned; defaults to 50000"}},"required":["url"]}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"HTTP or HTTPS URL to fetch"},"format":{"type":"string","description":"'text' strips the markup, 'markdown' keeps headings, lists and links, 'html' returns the page as sent. Defaults to 'text'","enum":["markdown","text","html"]},"max_bytes":{"type":"integer","description":"Maximum response size returned; defaults to 50000, up to 262144"}},"required":["url"]}
         ,
         .handler = fetch,
         .read_only = true,
         .parallel = true,
         .timeout_ms = request_timeout_ms,
+        .max_result_bytes = @intCast(max_fetch_bytes),
     },
 };
 

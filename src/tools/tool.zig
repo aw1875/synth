@@ -207,6 +207,11 @@ pub const Tool = struct {
     /// drives a whole nested agent - says so here rather than being killed
     /// halfway.
     timeout_ms: ?u64 = null,
+    /// Largest result this tool's output may reach the model as. Null takes the
+    /// loop's own ceiling, which is sized for a tool whose output is a summary.
+    /// A tool asked for a document is the exception, and says so here rather
+    /// than advertising a size the loop then cuts down.
+    max_result_bytes: ?usize = null,
     /// Whether this tool may run beside another call in the same batch.
     ///
     /// Deliberately not `read_only`: that says a call needs no approval, which
