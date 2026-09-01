@@ -48,6 +48,7 @@ synth run [--allow] <message>  one headless turn, no TUI
 synth session list|show|rm     sessions for this project
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
+synth db status|prune|vacuum   what the database holds, and shrinking it
 synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
@@ -179,8 +180,18 @@ all the space goes, so 30 days is the default.
 defaults to 0, meaning never: losing a transcript is not something to do by
 accident. Set it if the machine is short of disk.
 
-Zero switches either half off. `/prune` applies the same policy on demand and
-says what it freed.
+Zero switches either half off. `/prune` applies the same policy on demand, and
+`synth db` does the same from the shell:
+
+```
+synth db status        what it holds, and what a prune would free
+synth db prune [days]  shed sessions idle that many days, or use the config
+synth db vacuum        hand freed pages back to the filesystem
+```
+
+`db status` is a dry run: it says what a prune would take without taking it.
+A day count given to `db prune` only ever sheds, so losing a transcript stays
+something `config.json` has to ask for.
 
 ## MCP
 
