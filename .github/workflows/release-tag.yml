@@ -56,7 +56,6 @@ jobs:
             from=$(git rev-parse --short "$(git rev-list --max-parents=0 "$tag" | tail -1)")
           fi
 
-          total=$(git rev-list --count --no-merges "$span")
           commits=$(git log --no-merges --pretty=format:'- %s (%h)' "$span" | head -n 20)
           range="Full history: ${from}...$(git rev-parse --short "$tag")"
 
