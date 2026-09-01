@@ -16,7 +16,8 @@ pub const Command = union(enum) {
     skills,
     models,
     prompt,
-    help,
+    /// Null for the whole menu, or the subcommand whose `-h` asked.
+    help: ?Topic,
     version,
 
     pub const Tui = struct {
@@ -131,7 +132,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = null };
     if (res.args.version != 0) return .version;
 
     const first = res.positionals[0];
@@ -194,7 +195,7 @@ fn parseMcp(
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .mcp };
 
     const verb = res.positionals[0] orelse return .{ .mcp = .list };
     if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .mcp = .list };
@@ -226,7 +227,7 @@ fn parseSession(
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .session };
 
     const verb = res.positionals[0] orelse return .{ .session = .list };
     if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .session = .list };
@@ -252,7 +253,7 @@ fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .db };
 
     const verb = res.positionals[0] orelse return .{ .db = .status };
     if (std.mem.eql(u8, verb, "status")) return .{ .db = .status };
@@ -279,7 +280,7 @@ fn parseRun(
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .run };
 
     const words = res.positionals[0];
     if (words.len == 0) return error.MissingPrompt;
@@ -298,6 +299,19 @@ fn dupeOptional(allocator: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
 }
 
 /// One line of help: what you type, and what it does.
+/// One subcommand's slice of the help. Rows belong to a topic by the word they
+/// start with, which is also how they are invoked.
+pub const Topic = enum {
+    run,
+    session,
+    mcp,
+    db,
+
+    fn word(self: Topic) []const u8 {
+        return @tagName(self);
+    }
+};
+
 const Row = struct {
     left: []const u8,
     right: []const u8,
@@ -362,16 +376,34 @@ const help_sections: []const Section = &.{
     },
 };
 
-pub const usage = buildUsage();
+pub const usage = buildUsage(null);
+
+/// The help for one subcommand, so `synth db -h` answers about `db` rather than
+/// reprinting everything.
+pub fn usageFor(topic: ?Topic) []const u8 {
+    const chosen = topic orelse return usage;
+    return switch (chosen) {
+        inline else => |t| comptime buildUsage(t),
+    };
+}
+
+/// Whether a row belongs to `topic`: its left column names the subcommand, or
+/// it is an option that subcommand takes.
+fn inTopic(section: Section, row: Row, topic: Topic) bool {
+    if (!section.invocation) return std.mem.indexOf(u8, section.title, topic.word()) != null;
+    return std.mem.startsWith(u8, row.left, topic.word() ++ " ") or
+        std.mem.eql(u8, row.left, topic.word());
+}
 
 /// Lay the sections out in two columns, every description starting at the same
 /// one. A description may run to several lines; the rest are indented to match.
-fn buildUsage() []const u8 {
-    @setEvalBranchQuota(10_000);
+fn buildUsage(comptime topic: ?Topic) []const u8 {
+    @setEvalBranchQuota(20_000);
     comptime {
         var column = 0;
         for (help_sections) |section| {
             for (section.rows) |row| {
+                if (topic) |t| if (!inTopic(section, row, t)) continue;
                 const width = leftOf(section, row).len;
                 if (width > column) column = width;
             }
@@ -380,8 +412,14 @@ fn buildUsage() []const u8 {
 
         var out: []const u8 = pkg.name ++ " - An agent for your terminal\n";
         for (help_sections) |section| {
-            out = out ++ "\n" ++ section.title ++ ":\n";
+            var wrote_title = false;
             for (section.rows) |row| {
+                if (topic) |t| if (!inTopic(section, row, t)) continue;
+                if (!wrote_title) {
+                    out = out ++ "\n" ++ section.title ++ ":\n";
+                    wrote_title = true;
+                }
+
                 const left = leftOf(section, row);
                 out = out ++ indent ++ left ++ pad(column - indent.len - left.len);
 
@@ -403,6 +441,26 @@ fn leftOf(section: Section, row: Row) []const u8 {
 
 fn pad(n: usize) []const u8 {
     return " " ** n;
+}
+
+test "a subcommand's help covers that subcommand and nothing else" {
+    const testing = std.testing;
+
+    inline for (comptime std.enums.values(Topic)) |topic| {
+        const text = usageFor(topic);
+        try testing.expect(text.len < usage.len);
+
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        _ = lines.first();
+        while (lines.next()) |line| {
+            const row = std.mem.trimStart(u8, line, " ");
+            const prefix = pkg.name ++ " ";
+            if (!std.mem.startsWith(u8, row, prefix)) continue;
+            try testing.expect(std.mem.startsWith(u8, row[prefix.len..], topic.word()));
+        }
+    }
+
+    try testing.expectEqualStrings(usage, usageFor(null));
 }
 
 test "prose stays ASCII" {

@@ -49,7 +49,7 @@ pub const std_options = std.Options{
 pub fn main(init: std.process.Init) !void {
     const command = try cli.parse(init, init.arena.allocator());
     switch (command) {
-        .help => try writeLine(init.io, cli.usage),
+        .help => |topic| try writeLine(init.io, cli.usageFor(topic)),
         .version => try writeLine(init.io, pkg.name ++ " " ++ pkg.version ++ "\n"),
         .tui => |options| {
             if (try runTui(init, options)) |handle| {
