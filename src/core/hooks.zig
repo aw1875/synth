@@ -147,6 +147,9 @@ pub const Runner = struct {
         var stderr_done = false;
 
         while (!stderr_done or !input.done.load(.acquire)) {
+            // Returning here runs the `killGroup` defer, so a cancelled turn
+            // takes the command's whole process group with it.
+            if (self.givenUp()) return error.Cancelled;
             const left = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds();
             if (left <= 0) return error.Timeout;
             const slice = @min(poll_slice_ms, @as(u64, @intCast(left)));
@@ -338,6 +341,51 @@ test "a matching pre-tool hook can block" {
     defer if (reason) |text| testing.allocator.free(text);
     try testing.expectEqualStrings("blocked by policy", reason.?);
 }
+
+test "raising the stop flag ends a hook that would otherwise run on" {
+    const testing = std.testing;
+    if (!posix_signals) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+
+    // Sleeps far longer than the test and far longer than the timeout below,
+    // so finishing at all means the flag was what stopped it.
+    const hook = Hook{ .command = "read payload; sleep 30" };
+    var stop: std.atomic.Value(bool) = .init(false);
+    const runner: Runner = .{
+        .io = testing.io,
+        .root = root,
+        .set = .{ .user_prompt_submit = &.{hook} },
+        .timeout_ms = 60_000,
+        .stop = &stop,
+    };
+
+    var raiser: StopAfter = .{ .io = testing.io, .flag = &stop };
+    var future = try testing.io.concurrent(StopAfter.run, .{&raiser});
+    defer future.await(testing.io);
+
+    const started: std.Io.Timestamp = .now(testing.io, .awake);
+    try testing.expectError(
+        error.Cancelled,
+        runner.dispatch(testing.allocator, .{ .event = .user_prompt_submit, .prompt = "go" }),
+    );
+    const elapsed = started.durationTo(.now(testing.io, .awake)).nanoseconds;
+    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+}
+
+/// Raises a stop flag once the command under test is certainly running.
+const StopAfter = struct {
+    io: std.Io,
+    flag: *std.atomic.Value(bool),
+
+    fn run(self: *StopAfter) void {
+        std.Io.sleep(self.io, .fromMilliseconds(150), .awake) catch {};
+        self.flag.store(true, .release);
+    }
+};
 
 test "a matcher leaves other tools alone" {
     const testing = std.testing;

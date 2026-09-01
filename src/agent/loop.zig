@@ -470,6 +470,7 @@ fn ensureSession(self: *Loop) !i64 {
 pub fn requestStop(self: *Loop) void {
     if (self.request) |request| request.requestStop();
     if (self.tools) |tools| tools.requestStop();
+    if (self.hook_dispatch) |dispatch| dispatch.requestStop();
 }
 
 pub fn deinit(self: *Loop) void {
