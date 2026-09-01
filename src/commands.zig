@@ -10,6 +10,7 @@ const cli = @import("cli.zig");
 const Auth = @import("core/auth.zig");
 const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
+const humanize = @import("core/humanize.zig");
 const Project = @import("core/project.zig");
 const skill = @import("core/skill.zig");
 const mcp = @import("mcp");
@@ -85,6 +86,111 @@ pub fn session(init_process: std.process.Init, sub: cli.Command.Session) !void {
         .show => |handle| try showSession(&ctx, out, handle),
         .remove => |handle| try removeSession(&ctx, out, handle),
     }
+}
+
+pub fn database(init_process: std.process.Init, sub: cli.Command.Db) !void {
+    var ctx = try Context.init(init_process);
+    defer ctx.deinit();
+
+    var buffer: [8192]u8 = undefined;
+    var file = std.Io.File.stdout().writer(ctx.io, &buffer);
+    const out = &file.interface;
+    defer out.flush() catch {};
+
+    switch (sub) {
+        .status => try dbStatus(&ctx, out),
+        .prune => |days| try dbPrune(&ctx, out, days),
+        .vacuum => try dbVacuum(&ctx, out),
+    }
+}
+
+fn dbStatus(ctx: *Context, out: *std.Io.Writer) !void {
+    const found = try ctx.db.stats();
+    var size: [humanize.bytes_len]u8 = undefined;
+    var when: [humanize.duration_bytes]u8 = undefined;
+
+    try out.print("{s}\n\n", .{ctx.config.database_path});
+
+    if (std.Io.Dir.cwd().statFile(ctx.io, ctx.config.database_path, .{})) |stat| {
+        try out.print("  {s:<16}{s}\n", .{ "file", humanize.bytes(&size, stat.size) });
+    } else |_| {}
+
+    try out.print("  {s:<16}{s}\n", .{ "payload", humanize.bytes(&size, found.payload()) });
+    try out.print("    {s:<14}{s}\n", .{ "tool output", humanize.bytes(&size, found.result_bytes + found.blob_bytes) });
+    try out.print("    {s:<14}{s}\n", .{ "messages", humanize.bytes(&size, found.message_bytes) });
+    try out.print("\n  {s:<16}{d}\n", .{ "sessions", found.sessions });
+    try out.print("  {s:<16}{d}\n", .{ "messages", found.messages });
+    try out.print("  {s:<16}{d}\n", .{ "tool calls", found.tool_calls });
+
+    const now = ctx.db.nowMs();
+    if (found.oldest_ms) |oldest| {
+        try out.print("  {s:<16}{s} ago\n", .{
+            "oldest session",
+            humanize.duration(&when, @intCast(@max(0, now - oldest))),
+        });
+    }
+
+    const policy = ctx.config.prune;
+    try out.writeAll("\n");
+    if (!policy.any()) {
+        try out.writeAll("  pruning is switched off in config.json\n");
+        return;
+    }
+
+    const would = try ctx.db.prunePreview(policy, now);
+    if (!would.any()) {
+        try out.print("  nothing is old enough to prune (shed after {d}d)\n", .{policy.shed_after_days});
+        return;
+    }
+    try out.print("  a prune would free {s}: {d} session(s), {d} stored result(s)\n", .{
+        humanize.bytes(&size, would.bytes_freed),
+        would.sessions_deleted,
+        would.blobs_dropped,
+    });
+}
+
+fn dbPrune(ctx: *Context, out: *std.Io.Writer, days: ?u32) !void {
+    // An explicit day count sheds only: deleting a transcript stays something
+    // config.json has to ask for.
+    const policy: Database.Policy = if (days) |value|
+        .{ .shed_after_days = value }
+    else
+        ctx.config.prune;
+
+    if (!policy.any()) {
+        try out.writeAll("pruning is switched off in config.json\n");
+        return;
+    }
+
+    const done = try ctx.db.prune(policy, ctx.db.nowMs());
+    var size: [humanize.bytes_len]u8 = undefined;
+
+    if (!done.any()) {
+        try out.print("nothing old enough to prune (shed after {d}d)\n", .{policy.shed_after_days});
+        return;
+    }
+
+    try ctx.db.vacuum();
+    try out.print("freed {s}: {d} session(s), {d} stored result(s)\n", .{
+        humanize.bytes(&size, done.bytes_freed),
+        done.sessions_deleted,
+        done.blobs_dropped,
+    });
+}
+
+fn dbVacuum(ctx: *Context, out: *std.Io.Writer) !void {
+    const before = sizeOf(ctx);
+    try ctx.db.vacuum();
+    const after = sizeOf(ctx);
+
+    var was: [humanize.bytes_len]u8 = undefined;
+    var now: [humanize.bytes_len]u8 = undefined;
+    try out.print("{s} -> {s}\n", .{ humanize.bytes(&was, before), humanize.bytes(&now, after) });
+}
+
+fn sizeOf(ctx: *Context) u64 {
+    const stat = std.Io.Dir.cwd().statFile(ctx.io, ctx.config.database_path, .{}) catch return 0;
+    return stat.size;
 }
 
 fn listSessions(ctx: *Context, out: *std.Io.Writer) !void {

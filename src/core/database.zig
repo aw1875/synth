@@ -796,6 +796,15 @@ pub const Pruned = struct {
 /// Apply `policy`, oldest first. Deleting runs before shedding so a session
 /// old enough for both is not measured twice.
 pub fn prune(self: *Database, policy: Policy, now_ms: i64) !Pruned {
+    return self.pruneInner(policy, now_ms, true);
+}
+
+/// What `prune` would take out, without taking it out.
+pub fn prunePreview(self: *Database, policy: Policy, now_ms: i64) !Pruned {
+    return self.pruneInner(policy, now_ms, false);
+}
+
+fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned {
     var out: Pruned = .{};
     if (!policy.any()) return out;
 
@@ -806,7 +815,7 @@ pub fn prune(self: *Database, policy: Policy, now_ms: i64) !Pruned {
             defer row.deinit();
             out.sessions_deleted = @intCast(row.int(0));
         }
-        try self.conn.exec("DELETE FROM session WHERE updated_at < ?", .{cutoff});
+        if (apply) try self.conn.exec("DELETE FROM session WHERE updated_at < ?", .{cutoff});
     }
 
     if (policy.shed_after_days > 0) {
@@ -818,7 +827,7 @@ pub fn prune(self: *Database, policy: Policy, now_ms: i64) !Pruned {
             out.blobs_dropped = @intCast(row.int(0));
             out.bytes_freed += @intCast(row.int(1));
         }
-        try self.conn.exec("DELETE " ++ scope, .{cutoff});
+        if (apply) try self.conn.exec("DELETE " ++ scope, .{cutoff});
     }
 
     return out;
@@ -839,6 +848,60 @@ fn sessionPayload(self: *Database, cutoff: i64) !u64 {
     , .{ cutoff, cutoff, cutoff }) orelse return 0;
     defer row.deinit();
     return @intCast(row.int(0));
+}
+
+/// What the database is holding, for `synth db status`.
+pub const Stats = struct {
+    sessions: u64 = 0,
+    messages: u64 = 0,
+    tool_calls: u64 = 0,
+    blobs: u64 = 0,
+    /// Payload only: the text columns, not the file, which carries indexes and
+    /// free pages on top.
+    message_bytes: u64 = 0,
+    result_bytes: u64 = 0,
+    blob_bytes: u64 = 0,
+    /// When the least and most recently touched sessions were last written.
+    oldest_ms: ?i64 = null,
+    newest_ms: ?i64 = null,
+
+    pub fn payload(self: Stats) u64 {
+        return self.message_bytes + self.result_bytes + self.blob_bytes;
+    }
+};
+
+pub fn stats(self: *Database) !Stats {
+    var out: Stats = .{};
+
+    const counts = try self.conn.row(
+        \\SELECT
+        \\  (SELECT count(*) FROM session),
+        \\  (SELECT count(*) FROM message),
+        \\  (SELECT count(*) FROM tool_call),
+        \\  (SELECT count(*) FROM blob),
+        \\  (SELECT coalesce(sum(length(text)), 0) FROM message),
+        \\  (SELECT coalesce(sum(length(result)), 0) FROM tool_call),
+        \\  (SELECT coalesce(sum(length(body)), 0) FROM blob)
+    , .{}) orelse return out;
+    defer counts.deinit();
+
+    out.sessions = @intCast(counts.int(0));
+    out.messages = @intCast(counts.int(1));
+    out.tool_calls = @intCast(counts.int(2));
+    out.blobs = @intCast(counts.int(3));
+    out.message_bytes = @intCast(counts.int(4));
+    out.result_bytes = @intCast(counts.int(5));
+    out.blob_bytes = @intCast(counts.int(6));
+
+    if (out.sessions > 0) {
+        if (try self.conn.row("SELECT min(updated_at), max(updated_at) FROM session", .{})) |row| {
+            defer row.deinit();
+            out.oldest_ms = row.int(0);
+            out.newest_ms = row.int(1);
+        }
+    }
+
+    return out;
 }
 
 /// Hand the freed pages back to the filesystem. Rewrites the whole file, so it

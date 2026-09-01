@@ -12,6 +12,7 @@ pub const Command = union(enum) {
     run: Run,
     session: Session,
     mcp: Mcp,
+    db: Db,
     skills,
     models,
     prompt,
@@ -52,6 +53,15 @@ pub const Command = union(enum) {
         show: []const u8,
         remove: []const u8,
     };
+
+    /// Looking after the database the transcripts live in.
+    pub const Db = union(enum) {
+        status,
+        /// Shed sessions idle this many days, or null for the configured
+        /// policy.
+        prune: ?u32,
+        vacuum,
+    };
 };
 
 const main_params = clap.parseParamsComptime(
@@ -61,6 +71,13 @@ const main_params = clap.parseParamsComptime(
     \\-s, --session <str>     resume a session by handle, e.g. ses_7k3f9a2b
     \\-m, --model <str>       override the configured model
     \\<str>                   a subcommand, or the directory to start in
+    \\
+);
+
+const db_params = clap.parseParamsComptime(
+    \\-h, --help    show this help and exit
+    \\<str>         status, prune, or vacuum
+    \\<str>         for prune: shed sessions idle this many days
     \\
 );
 
@@ -93,7 +110,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"},
+    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -122,6 +139,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
         if (known.has(word)) {
             if (std.mem.eql(u8, word, "session")) return parseSession(init, allocator, &iter);
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
+            if (std.mem.eql(u8, word, "db")) return parseDb(init, &iter);
             if (std.mem.eql(u8, word, "run")) return parseRun(init, allocator, &iter);
             if (std.mem.eql(u8, word, "models")) return .models;
             if (std.mem.eql(u8, word, "skills")) return .skills;
@@ -223,6 +241,29 @@ fn parseSession(
     return error.UnknownSessionCommand;
 }
 
+fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parseEx(clap.Help, &db_params, clap.parsers.default, iter, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0) return .help;
+
+    const verb = res.positionals[0] orelse return .{ .db = .status };
+    if (std.mem.eql(u8, verb, "status")) return .{ .db = .status };
+    if (std.mem.eql(u8, verb, "vacuum")) return .{ .db = .vacuum };
+    if (std.mem.eql(u8, verb, "prune")) {
+        const days = res.positionals[1] orelse return .{ .db = .{ .prune = null } };
+        return .{ .db = .{ .prune = std.fmt.parseInt(u32, days, 10) catch return error.BadPruneDays } };
+    }
+    return error.UnknownDbCommand;
+}
+
 fn parseRun(
     init: std.process.Init,
     allocator: std.mem.Allocator,
@@ -288,6 +329,9 @@ const help_sections: []const Section = &.{
             .{ .left = "mcp debug <name>", .right = "show what OAuth discovery finds" },
             .{ .left = "mcp enable <name>", .right = "start using a server again" },
             .{ .left = "mcp disable <name>", .right = "stop connecting to a server" },
+            .{ .left = "db status", .right = "what the database holds, and what a prune would free" },
+            .{ .left = "db prune [days]", .right = "shed stored tool output from idle sessions" },
+            .{ .left = "db vacuum", .right = "hand freed pages back to the filesystem" },
             .{ .left = "skills", .right = "skills on offer, and where they came from" },
             .{ .left = "models", .right = "models the provider offers" },
             .{ .left = "prompt", .right = "print the system prompt" },
