@@ -50,23 +50,19 @@ jobs:
           previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${tag}^" 2>/dev/null || true)
           if [ -n "$previous" ]; then
             span="${previous}..${tag}"
-            compare="**Full diff:** [\`${previous}...${tag}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${previous}...${tag})"
+            from=$(git rev-parse --short "$previous")
           else
             span="$tag"
-            compare="First release."
+            from=$(git rev-parse --short "$(git rev-list --max-parents=0 "$tag" | tail -1)")
           fi
 
           total=$(git rev-list --count --no-merges "$span")
-          commits=$(git log --reverse --no-merges --pretty=format:'- %s (`%h`)' "$span" | head -n 200)
-          if [ "$total" -gt 200 ]; then
-            commits="${commits}"$'\n'"- ... and $((total - 200)) more"
-          fi
+          commits=$(git log --no-merges --pretty=format:'- %s (%h)' "$span" | head -n 20)
+          range="Full history: ${from}...$(git rev-parse --short "$tag")"
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "range=$range" >> "$GITHUB_OUTPUT"
           {
-            echo "compare<<SYNTH_EOF"
-            echo "$compare"
-            echo "SYNTH_EOF"
             echo "commits<<SYNTH_EOF"
             echo "$commits"
             echo "SYNTH_EOF"
@@ -76,7 +72,6 @@ jobs:
         run: zig build release
 
       - name: Package the distributed targets
-        id: package
         run: ./.github/scripts/package.sh "${{ steps.vars.outputs.version }}"
 
       - name: Publish Release
@@ -94,18 +89,12 @@ jobs:
 
             ${{ steps.vars.outputs.commits }}
 
-            ${{ steps.vars.outputs.compare }}
+            ${{ steps.vars.outputs.range }}
 
             ## Install
 
             ```sh
             tar -xzf synth-${{ steps.vars.outputs.version }}-<target>.tar.gz
             install -m755 synth /usr/local/bin/synth
-            ```
-
-            ## SHA256 Checksums
-
-            ```
-            ${{ steps.package.outputs.checksums }}
             ```
           token: ${{ secrets.GITHUB_TOKEN }}

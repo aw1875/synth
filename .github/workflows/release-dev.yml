@@ -38,45 +38,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          sha=$(git rev-parse HEAD)
-          short=$(git rev-parse --short HEAD)
-          build=$(git rev-list --count HEAD)
-          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
-
-          if [ -n "$previous" ]; then
-            span="${previous}..HEAD"
-            heading="Since $previous"
-            compare="**Full diff:** [\`${previous}...${short}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${previous}...${sha})"
-          else
-            span="HEAD"
-            heading="Since the beginning"
-            compare=""
-          fi
-
-          total=$(git rev-list --count --no-merges "$span")
-          commits=$(git log --reverse --no-merges --pretty=format:'- %s (`%h`)' "$span" | head -n 200)
-          if [ "$total" -gt 200 ]; then
-            commits="${commits}"$'\n'"- ... and $((total - 200)) more"
-          fi
-
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "short=$short" >> "$GITHUB_OUTPUT"
-          echo "build=$build" >> "$GITHUB_OUTPUT"
-          echo "heading=$heading" >> "$GITHUB_OUTPUT"
-          {
-            echo "compare<<SYNTH_EOF"
-            echo "$compare"
-            echo "SYNTH_EOF"
-            echo "commits<<SYNTH_EOF"
-            echo "$commits"
-            echo "SYNTH_EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build every target
         run: zig build release
 
       - name: Package the distributed targets
-        id: package
         run: ./.github/scripts/package.sh dev
 
       - name: Point the dev tag at this commit
@@ -101,25 +70,5 @@ jobs:
             The latest build of `master`, replaced on every green run. Not a
             supported release: use it to try something before it ships.
 
-            **Build ${{ steps.vars.outputs.build }}** from
-            [`${{ steps.vars.outputs.short }}`](${{ github.server_url }}/${{ github.repository }}/commit/${{ steps.vars.outputs.sha }})
-
-            ## ${{ steps.vars.outputs.heading }}
-
-            ${{ steps.vars.outputs.commits }}
-
-            ${{ steps.vars.outputs.compare }}
-
-            ## Install
-
-            ```sh
-            tar -xzf synth-dev-<target>.tar.gz
-            install -m755 synth /usr/local/bin/synth
-            ```
-
-            ## SHA256 Checksums
-
-            ```
-            ${{ steps.package.outputs.checksums }}
-            ```
+            **Build ${{ steps.vars.outputs.build }}** from ${{ steps.vars.outputs.short }}
           token: ${{ secrets.GITHUB_TOKEN }}
