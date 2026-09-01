@@ -204,6 +204,9 @@ repeats: usize = 0,
 /// A seq rather than an index, for the same reason `pending_seq` is one: paging
 /// older history in and trimming it back out both move every index.
 outcome: ?Outcome = null,
+/// Turns that have ended. Only `finish` raises it, so a compaction settling
+/// back to idle is not mistaken for a turn finishing.
+finished: usize = 0,
 turn_start_seq: ?u64 = null,
 /// The agent's tool schema, owned and sent with every call.
 tools_json: ?[]u8 = null,
@@ -1126,6 +1129,7 @@ pub fn lastTurn(self: *Loop, allocator: std.mem.Allocator) !recap.Recap {
 /// here rather than at each of the places that used to set `.idle` by hand.
 fn finish(self: *Loop, outcome: Outcome) void {
     self.state = .idle;
+    self.finished += 1;
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
@@ -2261,6 +2265,26 @@ test "a secret in tool output never reaches the transcript" {
     try testing.expect(std.mem.indexOf(u8, result_message.text, secret) == null);
     try testing.expect(std.mem.indexOf(u8, result_message.text, redact.mask) != null);
     try testing.expect(std.mem.indexOf(u8, result_message.text, "AWS_SECRET_ACCESS_KEY=") != null);
+}
+
+test "a compaction settling back to idle is not a finished turn" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    const after_turn = loop.finished;
+    try testing.expectEqual(@as(usize, 1), after_turn);
+
+    try loop.compact();
+    try settle(&loop);
+
+    // Compaction ends by setting `.idle` directly, so nothing counted it.
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(after_turn, loop.finished);
 }
 
 test "oversized tool output is truncated for the model" {

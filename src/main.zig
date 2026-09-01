@@ -29,6 +29,7 @@ const skill_tool = @import("tools/skill.zig");
 const web = @import("tools/web.zig");
 const tui_app = @import("tui/app.zig");
 const Model = @import("tui/model.zig");
+const tui_bell = @import("tui/bell.zig");
 const tui_commands = @import("tui/commands.zig");
 const Input = @import("tui/input.zig");
 const themes = @import("tui/themes.zig");
@@ -49,7 +50,7 @@ pub const std_options = std.Options{
 pub fn main(init: std.process.Init) !void {
     const command = try cli.parse(init, init.arena.allocator());
     switch (command) {
-        .help => try writeLine(init.io, cli.usage),
+        .help => |topic| try writeLine(init.io, cli.usageFor(topic)),
         .version => try writeLine(init.io, pkg.name ++ " " ++ pkg.version ++ "\n"),
         .tui => |options| {
             if (try runTui(init, options)) |handle| {
@@ -71,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),
         .mcp => |sub| try commands.mcp_command(init, sub),
+        .db => |sub| try commands.database(init, sub),
     }
 }
 
@@ -101,6 +103,11 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     var db = try Database.init(allocator, io, config.database_path);
     defer db.deinit();
     timing.mark("database");
+
+    if (db.prune(config.prune, db.nowMs())) |dropped| {
+        if (dropped.any()) db.vacuum() catch {};
+    } else |_| {}
+    timing.mark("prune");
 
     {
         var theme_arena: std.heap.ArenaAllocator = .init(allocator);
@@ -180,6 +187,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .cwd_display = cwd_display,
         .project = &project,
         .app = &app,
+        .environ = init.environ_map,
         .auth = &auth,
         .backend = &backend,
     };
@@ -191,6 +199,10 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     var runner: subagent.Runner = .{ .parent = &model.loop };
     model.loop.delegate = runner.delegate();
     model.mcp = &mcp_host;
+    model.prune_policy = config.prune;
+    model.bell = config.bell;
+    tui_bell.askForFocusReports(&app);
+    defer tui_bell.stopFocusReports(&app);
 
     // Into the model's registry, which is the one the loop was built with, and
     // before `useAgent` builds the tool schema from it - a tool registered after

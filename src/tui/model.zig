@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const Cell = vaxis.Cell;
 
+const Database = @import("../core/database.zig");
 const Conversation = @import("../core/conversation.zig");
 const Role = Conversation.Role;
 const AgentLoop = @import("../agent/loop.zig");
@@ -149,6 +150,8 @@ plan_hover: bool = false,
 /// Every skill found at startup, for `/skills`. Borrowed, and null where
 /// nothing looked.
 skills: ?*const skill.Set = null,
+/// What `/prune` is allowed to throw away, as config.json set it.
+prune_policy: Database.Policy = .{},
 /// Tool registry, and the read log the tools share. Owned.
 registry: Registry = undefined,
 reads: tool.ReadLog = undefined,
@@ -259,6 +262,15 @@ quit_confirm: Confirm = .{ .window_ms = quit_confirm_ms },
 /// The vxfw app, borrowed from main. Only needed to hand the terminal back on
 /// ctrl+z: raw mode swallows the suspend key, so the app has to do it itself.
 app: ?*vxfw.App = null,
+/// The process environment, for the editor `ctrl+e` shells out to.
+environ: ?*std.process.Environ.Map = null,
+/// When a finished turn is worth a noise, as config.json set it.
+bell: Config.Bell = .unfocused,
+/// What the terminal last said about focus, or null if it has said nothing.
+focused: ?bool = null,
+/// Turns already announced, so a finished one rings once and a compaction
+/// settling back to idle rings not at all.
+rung_for: usize = 0,
 
 /// Rows the transcript is scrolled back from the newest message. Zero pins the
 /// view to the bottom, which is where it returns whenever a message arrives.

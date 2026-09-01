@@ -144,6 +144,30 @@
                 }
             },
             "description": "Settings for the web tools."
+        },
+        "prune": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "delete_after_days": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Sessions idle longer than this are deleted outright, taking their messages and tool calls with them. 0 never deletes a session."
+                },
+                "shed_after_days": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 30,
+                    "description": "Sessions idle longer than this keep their transcript but lose stored reasoning and the full tool output behind each card. What the model was shown stays. 0 keeps every payload."
+                }
+            },
+            "description": "What a prune throws away, on startup and on /prune. Ages are in days since a session was last touched."
+        },
+        "bell": {
+            "enum": ["unfocused", "always", "never"],
+            "default": "unfocused",
+            "description": "When a finished turn says so, by desktop notification and BEL. 'unfocused' needs the terminal to report focus; one that does not never rings, so use 'always' there. Under tmux both need focus-events and allow-passthrough on."
         }
     },
     "$defs": {

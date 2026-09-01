@@ -46,8 +46,10 @@ provider.
 synth [project]                start the TUI (default)
 synth run [--allow] <message>  one headless turn, no TUI
 synth session list|show|rm     sessions for this project
+synth session search <text>    find text in this project's transcripts
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
+synth db status|prune|vacuum   what the database holds, and shrinking it
 synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
@@ -72,6 +74,7 @@ anything that would change the project unless `--allow` is given.
 | `ctrl+o` / `ctrl+p` / `ctrl+s` | model / provider / session |
 | `ctrl+r` | rename this session |
 | `ctrl+t` | collapse or expand the plan |
+| `ctrl+e` | compose the draft in `$EDITOR` |
 | `ctrl+v` | paste an image |
 | `ctrl+c` | clear the draft, interrupt a turn, then quit |
 | `ctrl+z` | suspend to the shell |
@@ -79,6 +82,10 @@ anything that would change the project unless `--allow` is given.
 `/help` lists the slash commands. `@path` pulls a file into the prompt - an
 image comes along as a picture, and a name with spaces is written
 `@"Pasted image.png"`.
+
+`ctrl+e` hands the draft to `$VISUAL`, or `$EDITOR`, and takes back what was
+saved. The value is run through a shell, so `EDITOR="code -w"` works as long as
+it waits.
 
 ## Modes
 
@@ -114,6 +121,9 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `mcp` | object | none | MCP servers. See below. |
 | `hooks` | object | none | Commands run on selected agent lifecycle events. See below. |
 | `hook_timeout_ms` | number | `30000` | How long a hook command may run before it is killed. |
+| `web` | object | none | Settings for the web tools. See below. |
+| `prune` | object | shed after 30 days | What a prune throws away. See below. |
+| `bell` | string | `unfocused` | When a finished turn says so: `unfocused`, `always` or `never`. See below. |
 
 ```json
 {
@@ -140,7 +150,7 @@ that is what the sidebar plans against.
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
 `SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
 `OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
-`SYNTH_SEARCH_API_KEY`. Which host-and-key pair applies depends on the protocol
+`SYNTH_SEARCH_API_KEY`. `VISUAL` and `EDITOR` decide what `ctrl+e` opens. Which host-and-key pair applies depends on the protocol
 the chosen provider speaks, so having both sets exported does not hand one
 server the other's settings.
 
@@ -151,6 +161,68 @@ Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 
 A debug build keeps all three files in the working directory, so a checkout
 never touches installed state.
+
+`"bell"` decides when a finished turn says so: `unfocused` (the default),
+`always`, or `never`. It sends both a desktop notification and BEL, because
+neither lands everywhere.
+
+The default needs the terminal to report focus, which synth asks for at startup;
+a terminal that does not answer never rings, so use `always` there. Under tmux
+both halves need turning on, and neither is the default:
+
+```
+set -g focus-events on
+set -g allow-passthrough on
+```
+
+### Searching
+
+`synth session search <text>`, or `/search <text>` inside the TUI, looks through
+every transcript in the project. What was said comes first and tool output
+after, since a search is usually after the conversation rather than a file a
+tool printed.
+
+The match is plain text, not a query language, so `100%` searches for `100%`.
+
+### Pruning
+
+The database keeps every transcript, and most of its weight is stored tool
+output: the full result behind each card, plus the model's reasoning. Left
+alone that grows without bound.
+
+A prune runs at startup and reclaims it in two steps, each an age in days since
+a session was last touched:
+
+```json
+{
+  "prune": {
+    "shed_after_days": 30,
+    "delete_after_days": 0
+  }
+}
+```
+
+`shed_after_days` keeps an old session's transcript but drops the payloads
+behind it. The cards still read: what the model was shown is on the tool call
+itself, and only the expanded view loses its full text. This is where nearly
+all the space goes, so 30 days is the default.
+
+`delete_after_days` removes an old session outright, messages and all. It
+defaults to 0, meaning never: losing a transcript is not something to do by
+accident. Set it if the machine is short of disk.
+
+Zero switches either half off. `/prune` applies the same policy on demand, and
+`synth db` does the same from the shell:
+
+```
+synth db status        what it holds, and what a prune would free
+synth db prune [days]  shed sessions idle that many days, or use the config
+synth db vacuum        hand freed pages back to the filesystem
+```
+
+`db status` is a dry run: it says what a prune would take without taking it.
+A day count given to `db prune` only ever sheds, so losing a transcript stays
+something `config.json` has to ask for.
 
 ## MCP
 

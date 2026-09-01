@@ -19,15 +19,4 @@ for triple in "${targets[@]}"; do
   tar -C "zig-out/$triple" -czf "release/synth-${version}-${triple}.tar.gz" synth
 done
 
-cd release
-sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
-
-if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  {
-    echo "checksums<<SYNTH_EOF"
-    cat SHA256SUMS
-    echo "SYNTH_EOF"
-  } >> "$GITHUB_OUTPUT"
-fi
-
-cat SHA256SUMS
+ls -l release

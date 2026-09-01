@@ -62,7 +62,7 @@ fn setUserVersion(self: *Database, version: i32) !void {
 
 /// Wall-clock time in milliseconds since the Unix epoch, for `created_at` and
 /// friends. Stored as INTEGER.
-fn nowMs(self: *Database) i64 {
+pub fn nowMs(self: *Database) i64 {
     return std.Io.Timestamp.now(self.io, .real).toMilliseconds();
 }
 
@@ -205,6 +205,135 @@ pub fn listSessions(
         });
     }
     return list.toOwnedSlice(allocator);
+}
+
+/// One message matching a search, with enough around it to recognise.
+pub const Hit = struct {
+    session_id: i64,
+    public_id: []const u8,
+    title: []const u8,
+    seq: i64,
+    role: []const u8,
+    created_at: i64,
+    /// The match with a little either side, on one line.
+    excerpt: []const u8,
+
+    pub fn deinit(self: *const Hit, allocator: std.mem.Allocator) void {
+        allocator.free(self.public_id);
+        allocator.free(self.title);
+        allocator.free(self.role);
+        allocator.free(self.excerpt);
+    }
+};
+
+/// Characters of context kept either side of a match.
+const excerpt_margin: usize = 48;
+
+/// Messages in this project whose text contains `query`.
+///
+/// What was said comes before what a tool printed, then newest first: a search
+/// is usually looking for the conversation, and tool output is long enough to
+/// bury it.
+///
+/// A scan rather than an index: the transcript is bounded by pruning, and at
+/// the size it stays a full pass costs a few milliseconds. FTS5 would want a
+/// build flag on the sqlite amalgamation, a virtual table, triggers to keep it
+/// honest, and a backfill, which is a lot of machinery to buy that back.
+pub fn search(
+    self: *Database,
+    allocator: std.mem.Allocator,
+    project_id: i64,
+    query: []const u8,
+    limit: usize,
+) ![]Hit {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return &.{};
+
+    const needle = try escapeLike(allocator, trimmed);
+    defer allocator.free(needle);
+
+    var rows = try self.conn.rows(
+        \\SELECT s.id, s.public_id, s.title, m.seq, m.role, m.created_at, m.text
+        \\FROM message m
+        \\JOIN session s ON m.session_id = s.id
+        \\WHERE s.project_id = ? AND m.text LIKE '%' || ? || '%' ESCAPE '\'
+        \\ORDER BY m.role = 'tool', m.created_at DESC, m.seq DESC
+        \\LIMIT ?
+    , .{ project_id, needle, @as(i64, @intCast(limit)) });
+    defer rows.deinit();
+
+    var list: std.ArrayList(Hit) = .empty;
+    errdefer {
+        for (list.items) |hit| hit.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    while (rows.next()) |row| {
+        const public_id = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(public_id);
+        const title = try allocator.dupe(u8, row.text(2));
+        errdefer allocator.free(title);
+        const role = try allocator.dupe(u8, row.text(4));
+        errdefer allocator.free(role);
+
+        try list.append(allocator, .{
+            .session_id = row.int(0),
+            .public_id = public_id,
+            .title = title,
+            .seq = row.int(3),
+            .role = role,
+            .created_at = row.int(5),
+            .excerpt = try excerpt(allocator, row.text(6), trimmed),
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// `query` with LIKE's own wildcards defanged, so searching for `100%` does not
+/// match everything.
+fn escapeLike(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (query) |c| {
+        if (c == '%' or c == '_' or c == '\\') try out.writer.writeByte('\\');
+        try out.writer.writeByte(c);
+    }
+    return out.toOwnedSlice();
+}
+
+/// The line around the first match, collapsed to one line and elided either
+/// side, so a hit reads in a list without carrying a whole message with it.
+fn excerpt(allocator: std.mem.Allocator, text: []const u8, query: []const u8) ![]const u8 {
+    const at = indexOfIgnoreCase(text, query) orelse 0;
+    const start = at -| excerpt_margin;
+    const end = @min(text.len, at + query.len + excerpt_margin);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    if (start > 0) try out.writer.writeAll("...");
+    var spaced = false;
+    for (text[start..end]) |c| {
+        if (c == '\n' or c == '\r' or c == '\t') {
+            if (!spaced) try out.writer.writeByte(' ');
+            spaced = true;
+            continue;
+        }
+        spaced = false;
+        try out.writer.writeByte(c);
+    }
+    if (end < text.len) try out.writer.writeAll("...");
+
+    return out.toOwnedSlice();
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
 }
 
 /// The session a `--session` handle names, within this project.
@@ -765,12 +894,397 @@ fn loadToolCalls(self: *Database, allocator: std.mem.Allocator, message_id: i64)
     return calls.toOwnedSlice(allocator);
 }
 
+/// What a prune is allowed to throw away. Both are ages in days, counted from
+/// when a session was last touched; zero switches that half off.
+pub const Policy = struct {
+    /// Sessions idle longer than this are deleted outright, taking their
+    /// messages, tool calls and read log with them.
+    delete_after_days: u32 = 0,
+    /// Sessions idle longer than this keep their transcript but lose the
+    /// stored reasoning and the full tool output behind each card. What the
+    /// model was shown stays on `tool_call.result`, and a pasted image stays
+    /// whatever its age.
+    shed_after_days: u32 = 0,
+
+    pub fn any(self: Policy) bool {
+        return self.delete_after_days > 0 or self.shed_after_days > 0;
+    }
+};
+
+/// What one prune took out. Bytes are of the payload dropped, not of the file,
+/// which only shrinks once `vacuum` runs.
+pub const Pruned = struct {
+    sessions_deleted: u64 = 0,
+    blobs_dropped: u64 = 0,
+    bytes_freed: u64 = 0,
+
+    pub fn any(self: Pruned) bool {
+        return self.sessions_deleted > 0 or self.blobs_dropped > 0;
+    }
+};
+
+/// Apply `policy`, oldest first. Deleting runs before shedding so a session
+/// old enough for both is not measured twice.
+pub fn prune(self: *Database, policy: Policy, now_ms: i64) !Pruned {
+    return self.pruneInner(policy, now_ms, true);
+}
+
+/// What `prune` would take out, without taking it out.
+pub fn prunePreview(self: *Database, policy: Policy, now_ms: i64) !Pruned {
+    return self.pruneInner(policy, now_ms, false);
+}
+
+fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned {
+    var out: Pruned = .{};
+    if (!policy.any()) return out;
+
+    if (policy.delete_after_days > 0) {
+        const cutoff = now_ms - dayMs(policy.delete_after_days);
+        out.bytes_freed += try self.sessionPayload(cutoff);
+        if (try self.conn.row("SELECT count(*) FROM session WHERE updated_at < ?", .{cutoff})) |row| {
+            defer row.deinit();
+            out.sessions_deleted = @intCast(row.int(0));
+        }
+        if (apply) try self.conn.exec("DELETE FROM session WHERE updated_at < ?", .{cutoff});
+    }
+
+    if (policy.shed_after_days > 0) {
+        const cutoff = now_ms - dayMs(policy.shed_after_days);
+        // An allowlist: machine output goes, a hand-pasted image stays.
+        const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result')" ++
+            " AND message_id IN (SELECT m.id FROM message m" ++
+            " JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)";
+        if (try self.conn.row("SELECT count(*), coalesce(sum(length(body)), 0) " ++ scope, .{cutoff})) |row| {
+            defer row.deinit();
+            out.blobs_dropped = @intCast(row.int(0));
+            out.bytes_freed += @intCast(row.int(1));
+        }
+        if (apply) try self.conn.exec("DELETE " ++ scope, .{cutoff});
+    }
+
+    return out;
+}
+
+/// Every byte a session holds, for reporting what a delete reclaimed.
+fn sessionPayload(self: *Database, cutoff: i64) !u64 {
+    const row = try self.conn.row(
+        \\SELECT
+        \\  (SELECT coalesce(sum(length(m.text)), 0) FROM message m
+        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)
+        \\+ (SELECT coalesce(sum(length(b.body)), 0) FROM blob b
+        \\     JOIN message m ON b.message_id = m.id
+        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)
+        \\+ (SELECT coalesce(sum(length(t.result)), 0) FROM tool_call t
+        \\     JOIN message m ON t.message_id = m.id
+        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)
+    , .{ cutoff, cutoff, cutoff }) orelse return 0;
+    defer row.deinit();
+    return @intCast(row.int(0));
+}
+
+/// What the database is holding, for `synth db status`.
+pub const Stats = struct {
+    sessions: u64 = 0,
+    messages: u64 = 0,
+    tool_calls: u64 = 0,
+    blobs: u64 = 0,
+    /// Payload only: the text columns, not the file, which carries indexes and
+    /// free pages on top.
+    message_bytes: u64 = 0,
+    result_bytes: u64 = 0,
+    blob_bytes: u64 = 0,
+    /// When the least and most recently touched sessions were last written.
+    oldest_ms: ?i64 = null,
+    newest_ms: ?i64 = null,
+
+    pub fn payload(self: Stats) u64 {
+        return self.message_bytes + self.result_bytes + self.blob_bytes;
+    }
+};
+
+pub fn stats(self: *Database) !Stats {
+    var out: Stats = .{};
+
+    const counts = try self.conn.row(
+        \\SELECT
+        \\  (SELECT count(*) FROM session),
+        \\  (SELECT count(*) FROM message),
+        \\  (SELECT count(*) FROM tool_call),
+        \\  (SELECT count(*) FROM blob),
+        \\  (SELECT coalesce(sum(length(text)), 0) FROM message),
+        \\  (SELECT coalesce(sum(length(result)), 0) FROM tool_call),
+        \\  (SELECT coalesce(sum(length(body)), 0) FROM blob)
+    , .{}) orelse return out;
+    defer counts.deinit();
+
+    out.sessions = @intCast(counts.int(0));
+    out.messages = @intCast(counts.int(1));
+    out.tool_calls = @intCast(counts.int(2));
+    out.blobs = @intCast(counts.int(3));
+    out.message_bytes = @intCast(counts.int(4));
+    out.result_bytes = @intCast(counts.int(5));
+    out.blob_bytes = @intCast(counts.int(6));
+
+    if (out.sessions > 0) {
+        if (try self.conn.row("SELECT min(updated_at), max(updated_at) FROM session", .{})) |row| {
+            defer row.deinit();
+            out.oldest_ms = row.int(0);
+            out.newest_ms = row.int(1);
+        }
+    }
+
+    return out;
+}
+
+/// Hand the freed pages back to the filesystem. Rewrites the whole file, so it
+/// is worth doing only after a prune that took something out.
+pub fn vacuum(self: *Database) !void {
+    try self.conn.execNoArgs("VACUUM");
+}
+
+fn dayMs(days: u32) i64 {
+    return @as(i64, days) * std.time.ms_per_day;
+}
+
 fn parseRole(text: []const u8) !Conversation.Role {
     return std.meta.stringToEnum(Conversation.Role, text) orelse error.BadRole;
 }
 
 fn parseStatus(text: []const u8) Conversation.ToolCall.Status {
     return std.meta.stringToEnum(Conversation.ToolCall.Status, text) orelse .failed;
+}
+
+/// A database holding one session per age in `ages`, each with a message, a
+/// tool call and a stored result, so a prune has something to measure.
+fn agedFixture(dir: *std.testing.TmpDir, ages: []const u32) !Database {
+    const testing = std.testing;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dir.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.joinZ(testing.allocator, &.{ buf[0..n], "aged.db" });
+    defer testing.allocator.free(db_path);
+
+    var db = try init(testing.allocator, testing.io, db_path);
+    errdefer db.deinit();
+
+    const project_id = try db.resolveProject("/repo", "git", "repo");
+    for (ages) |days| {
+        const session_id = try db.createSession(project_id, "/repo", "a-model");
+        const message_id = try db.appendMessage(session_id, 0, "assistant", "a message", null, 0);
+        try db.appendToolCall(message_id, 0, "call_0", "read", "{}", "ok", "short", 5);
+        try db.appendBlob(message_id, 1, "image", "a pasted screenshot");
+        try db.appendBlob(message_id, 0, "tool_result", "the whole of a long result");
+        try db.appendBlob(message_id, 0, "reasoning", "some thinking");
+
+        // Written directly: the trigger on `message` sets `updated_at` to now.
+        try db.conn.exec("UPDATE session SET updated_at = ? WHERE id = ?", .{
+            db.nowMs() - @as(i64, days) * std.time.ms_per_day,
+            session_id,
+        });
+    }
+    return db;
+}
+
+fn countOf(db: *Database, sql: [:0]const u8) !i64 {
+    const row = try db.conn.row(sql, .{}) orelse return 0;
+    defer row.deinit();
+    return row.int(0);
+}
+
+fn searchFixture(dir: *std.testing.TmpDir) !struct { db: Database, project_id: i64 } {
+    const testing = std.testing;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dir.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.joinZ(testing.allocator, &.{ buf[0..n], "search.db" });
+    defer testing.allocator.free(db_path);
+
+    var db = try init(testing.allocator, testing.io, db_path);
+    errdefer db.deinit();
+
+    const project_id = try db.resolveProject("/repo", "git", "repo");
+    const session_id = try db.createSession(project_id, "/repo", "a-model");
+
+    _ = try db.appendMessage(session_id, 0, "user", "how do I cancel a turn?", null, 0);
+    _ = try db.appendMessage(session_id, 1, "assistant", "Press esc to CANCEL it.", null, 0);
+    _ = try db.appendMessage(session_id, 2, "user", "what about 100% of the time", null, 0);
+    _ = try db.appendMessage(session_id, 3, "user", "a line\nwith a needle in it\nand more", null, 0);
+
+    // A second project, to prove a search does not reach across them.
+    const other = try db.resolveProject("/elsewhere", "git", "elsewhere");
+    const other_session = try db.createSession(other, "/elsewhere", "a-model");
+    _ = try db.appendMessage(other_session, 0, "user", "cancel this too", null, 0);
+
+    return .{ .db = db, .project_id = project_id };
+}
+
+test "a search finds messages whatever their case, within the project" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "cancel", 20);
+    defer {
+        for (hits) |hit| hit.deinit(testing.allocator);
+        testing.allocator.free(hits);
+    }
+
+    try testing.expectEqual(@as(usize, 2), hits.len);
+    for (hits) |hit| try testing.expect(hit.public_id.len > 0);
+}
+
+test "a wildcard in the query is matched as itself" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "100%", 20);
+    defer {
+        for (hits) |hit| hit.deinit(testing.allocator);
+        testing.allocator.free(hits);
+    }
+
+    try testing.expectEqual(@as(usize, 1), hits.len);
+
+    const none = try fixture.db.search(testing.allocator, fixture.project_id, "%%%", 20);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "an excerpt is one line, elided around the match" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "needle", 20);
+    defer {
+        for (hits) |hit| hit.deinit(testing.allocator);
+        testing.allocator.free(hits);
+    }
+
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expect(std.mem.indexOfScalar(u8, hits[0].excerpt, '\n') == null);
+    try testing.expect(std.mem.indexOf(u8, hits[0].excerpt, "needle") != null);
+}
+
+test "an empty query finds nothing rather than everything" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "   ", 20);
+    defer testing.allocator.free(hits);
+    try testing.expectEqual(@as(usize, 0), hits.len);
+}
+
+test "a prune with no policy leaves everything alone" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{ 1, 100 });
+    defer db.deinit();
+
+    const done = try db.prune(.{}, db.nowMs());
+    try std.testing.expect(!done.any());
+    try std.testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM session"));
+    try std.testing.expectEqual(@as(i64, 6), try countOf(&db, "SELECT count(*) FROM blob"));
+}
+
+test "shedding drops stored payloads but keeps the transcript" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{ 1, 100 });
+    defer db.deinit();
+
+    const done = try db.prune(.{ .shed_after_days = 30 }, db.nowMs());
+
+    try testing.expectEqual(@as(u64, 0), done.sessions_deleted);
+    try testing.expectEqual(@as(u64, 2), done.blobs_dropped);
+    try testing.expect(done.bytes_freed > 0);
+
+    // Both sessions and both transcripts survive; only the old one's blobs go.
+    try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM session"));
+    try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM message"));
+    try testing.expectEqual(@as(i64, 4), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM tool_call"));
+}
+
+test "shedding keeps a pasted image however old the session is" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{100});
+    defer db.deinit();
+
+    _ = try db.prune(.{ .shed_after_days = 30 }, db.nowMs());
+
+    // An image was pasted in by hand; the other two are machine output.
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(
+        @as(i64, 1),
+        try countOf(&db, "SELECT count(*) FROM blob WHERE kind = 'image'"),
+    );
+}
+
+test "deleting takes the whole session with it" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{ 1, 100 });
+    defer db.deinit();
+
+    const done = try db.prune(.{ .delete_after_days = 90 }, db.nowMs());
+
+    try testing.expectEqual(@as(u64, 1), done.sessions_deleted);
+    try testing.expect(done.bytes_freed > 0);
+
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM session"));
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM message"));
+    try testing.expectEqual(@as(i64, 3), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM tool_call"));
+}
+
+test "a session old enough for both is only counted once" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{200});
+    defer db.deinit();
+
+    const done = try db.prune(.{ .delete_after_days = 90, .shed_after_days = 30 }, db.nowMs());
+
+    try testing.expectEqual(@as(u64, 1), done.sessions_deleted);
+    try testing.expectEqual(@as(u64, 0), done.blobs_dropped);
+    try testing.expectEqual(@as(i64, 0), try countOf(&db, "SELECT count(*) FROM blob"));
+}
+
+test "vacuum leaves a pruned database readable" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{ 1, 100 });
+    defer db.deinit();
+
+    _ = try db.prune(.{ .delete_after_days = 90 }, db.nowMs());
+    try db.vacuum();
+
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM session"));
 }
 
 test "migrations bring a fresh database to the current version" {

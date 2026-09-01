@@ -12,6 +12,8 @@ const vxfw = vaxis.vxfw;
 
 const agents = @import("../agent/agent.zig");
 const commands = @import("commands.zig");
+const bell = @import("bell.zig");
+const editor = @import("editor.zig");
 const Model = @import("model.zig");
 const Selection = @import("selection.zig");
 const widget_pool = @import("widget_pool.zig");
@@ -201,6 +203,14 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeEvent();
             }
         },
+        .focus_in => {
+            self.focused = true;
+            return;
+        },
+        .focus_out => {
+            self.focused = false;
+            return;
+        },
         .tick => {
             self.tick_pending = false;
             commands.checkModel(self, ctx);
@@ -228,6 +238,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
+            ringIfFinished(self);
             if (self.loop.isBusy()) {
                 self.thinking.stream = self.loop.thoughts();
                 self.thinking.label = self.loop.label();
@@ -370,6 +381,11 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (key.matches('e', .{ .ctrl = true })) {
+                try openEditor(self, ctx);
+                return ctx.consumeAndRedraw();
+            }
+
             if (key.matches(vaxis.Key.page_up, .{})) {
                 self.scrollBy(ctx, Model.page_scroll_rows);
                 try self.pageHistoryIfNeeded();
@@ -490,6 +506,39 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
     }
 }
 
+/// Say so once, for each turn that reaches the end of the loop.
+fn ringIfFinished(self: *Model) void {
+    if (self.loop.finished == self.rung_for) return;
+    self.rung_for = self.loop.finished;
+
+    if (!bell.shouldRing(self.bell, self.focused)) return;
+    const app = self.app orelse return;
+
+    const said = if (self.loop.outcome) |outcome| outcome.label() else "done";
+    bell.ring(app, self.environ, said);
+}
+
+/// Compose the draft in `$EDITOR`, and take back what was written.
+fn openEditor(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (self.loop.isBusy()) return;
+    const app = self.app orelse return;
+    const environ = self.environ orelse return;
+
+    const edited = editor.edit(self.allocator, self.io, app, environ, self.input.text.items) catch |err| {
+        const said = switch (err) {
+            editor.Error.NoEditor => "Set $EDITOR to compose a prompt outside synth",
+            editor.Error.EditorFailed => "The editor exited without saving",
+            else => "Could not open the editor",
+        };
+        try self.notification.show(ctx, .info, said);
+        return;
+    };
+    defer self.allocator.free(edited);
+
+    self.input.clear();
+    try self.input.insertText(edited);
+}
+
 /// Hand the terminal back and stop the process, the way ctrl+z does for any
 /// other program.
 pub fn suspendToShell(self: *Model) void {
@@ -510,6 +559,7 @@ pub fn suspendToShell(self: *Model) void {
     app.vx.setMouseMode(writer, true) catch {};
     app.vx.setBracketedPaste(writer, true) catch {};
     app.vx.subscribeToColorSchemeUpdates(writer) catch {};
+    writer.writeAll(bell.focus_set) catch {};
     if (in_band_resize) {
         writer.writeAll(vaxis.ctlseqs.in_band_resize_set) catch {};
         app.vx.state.in_band_resize = true;

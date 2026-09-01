@@ -49,6 +49,8 @@ pub const commands: []const Command = &.{
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = "[name]" },
     .{ .name = "rename", .description = "name this session", .argument = "[name]" },
+    .{ .name = "prune", .description = "shrink the database, dropping old stored tool output" },
+    .{ .name = "search", .description = "find text in this project's transcripts", .argument = "<text>" },
     .{ .name = "help", .description = "list these commands" },
 };
 

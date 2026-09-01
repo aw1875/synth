@@ -12,10 +12,12 @@ pub const Command = union(enum) {
     run: Run,
     session: Session,
     mcp: Mcp,
+    db: Db,
     skills,
     models,
     prompt,
-    help,
+    /// Null for the whole menu, or the subcommand whose `-h` asked.
+    help: ?Topic,
     version,
 
     pub const Tui = struct {
@@ -51,6 +53,16 @@ pub const Command = union(enum) {
         list,
         show: []const u8,
         remove: []const u8,
+        search: []const u8,
+    };
+
+    /// Looking after the database the transcripts live in.
+    pub const Db = union(enum) {
+        status,
+        /// Shed sessions idle this many days, or null for the configured
+        /// policy.
+        prune: ?u32,
+        vacuum,
     };
 };
 
@@ -64,6 +76,13 @@ const main_params = clap.parseParamsComptime(
     \\
 );
 
+const db_params = clap.parseParamsComptime(
+    \\-h, --help    show this help and exit
+    \\<str>         status, prune, or vacuum
+    \\<str>         for prune: shed sessions idle this many days
+    \\
+);
+
 const mcp_params = clap.parseParamsComptime(
     \\-h, --help    show this help and exit
     \\<str>         list, auth, logout, debug, enable, or disable
@@ -73,8 +92,8 @@ const mcp_params = clap.parseParamsComptime(
 
 const session_params = clap.parseParamsComptime(
     \\-h, --help    show this help and exit
-    \\<str>         list, show <id>, or rm <id>
-    \\<str>         the session handle, for show and rm
+    \\<str>         list, show <id>, rm <id>, or search <text>
+    \\<str>         the session handle, or the text to search for
     \\
 );
 
@@ -93,7 +112,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"},
+    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -114,7 +133,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = null };
     if (res.args.version != 0) return .version;
 
     const first = res.positionals[0];
@@ -122,6 +141,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
         if (known.has(word)) {
             if (std.mem.eql(u8, word, "session")) return parseSession(init, allocator, &iter);
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
+            if (std.mem.eql(u8, word, "db")) return parseDb(init, &iter);
             if (std.mem.eql(u8, word, "run")) return parseRun(init, allocator, &iter);
             if (std.mem.eql(u8, word, "models")) return .models;
             if (std.mem.eql(u8, word, "skills")) return .skills;
@@ -176,7 +196,7 @@ fn parseMcp(
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .mcp };
 
     const verb = res.positionals[0] orelse return .{ .mcp = .list };
     if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .mcp = .list };
@@ -208,7 +228,7 @@ fn parseSession(
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .session };
 
     const verb = res.positionals[0] orelse return .{ .session = .list };
     if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .session = .list };
@@ -220,7 +240,33 @@ fn parseSession(
     if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "delete")) {
         return .{ .session = .{ .remove = try allocator.dupe(u8, handle) } };
     }
+    if (std.mem.eql(u8, verb, "search") or std.mem.eql(u8, verb, "grep")) {
+        return .{ .session = .{ .search = try allocator.dupe(u8, handle) } };
+    }
     return error.UnknownSessionCommand;
+}
+
+fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parseEx(clap.Help, &db_params, clap.parsers.default, iter, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0) return .{ .help = .db };
+
+    const verb = res.positionals[0] orelse return .{ .db = .status };
+    if (std.mem.eql(u8, verb, "status")) return .{ .db = .status };
+    if (std.mem.eql(u8, verb, "vacuum")) return .{ .db = .vacuum };
+    if (std.mem.eql(u8, verb, "prune")) {
+        const days = res.positionals[1] orelse return .{ .db = .{ .prune = null } };
+        return .{ .db = .{ .prune = std.fmt.parseInt(u32, days, 10) catch return error.BadPruneDays } };
+    }
+    return error.UnknownDbCommand;
 }
 
 fn parseRun(
@@ -238,7 +284,7 @@ fn parseRun(
     };
     defer res.deinit();
 
-    if (res.args.help != 0) return .help;
+    if (res.args.help != 0) return .{ .help = .run };
 
     const words = res.positionals[0];
     if (words.len == 0) return error.MissingPrompt;
@@ -257,6 +303,19 @@ fn dupeOptional(allocator: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
 }
 
 /// One line of help: what you type, and what it does.
+/// One subcommand's slice of the help. Rows belong to a topic by the word they
+/// start with, which is also how they are invoked.
+pub const Topic = enum {
+    run,
+    session,
+    mcp,
+    db,
+
+    fn word(self: Topic) []const u8 {
+        return @tagName(self);
+    }
+};
+
 const Row = struct {
     left: []const u8,
     right: []const u8,
@@ -282,12 +341,16 @@ const help_sections: []const Section = &.{
             .{ .left = "session list", .right = "sessions for this project, newest first" },
             .{ .left = "session show <id>", .right = "print a session's transcript" },
             .{ .left = "session rm <id>", .right = "delete a session" },
+            .{ .left = "session search <text>", .right = "find messages in this project's transcripts" },
             .{ .left = "mcp list", .right = "configured MCP servers and their state" },
             .{ .left = "mcp auth <name>", .right = "sign in to a remote MCP server" },
             .{ .left = "mcp logout <name>", .right = "forget a server's credentials" },
             .{ .left = "mcp debug <name>", .right = "show what OAuth discovery finds" },
             .{ .left = "mcp enable <name>", .right = "start using a server again" },
             .{ .left = "mcp disable <name>", .right = "stop connecting to a server" },
+            .{ .left = "db status", .right = "what the database holds, and what a prune would free" },
+            .{ .left = "db prune [days]", .right = "shed stored tool output from idle sessions" },
+            .{ .left = "db vacuum", .right = "hand freed pages back to the filesystem" },
             .{ .left = "skills", .right = "skills on offer, and where they came from" },
             .{ .left = "models", .right = "models the provider offers" },
             .{ .left = "prompt", .right = "print the system prompt" },
@@ -318,16 +381,34 @@ const help_sections: []const Section = &.{
     },
 };
 
-pub const usage = buildUsage();
+pub const usage = buildUsage(null);
+
+/// The help for one subcommand, so `synth db -h` answers about `db` rather than
+/// reprinting everything.
+pub fn usageFor(topic: ?Topic) []const u8 {
+    const chosen = topic orelse return usage;
+    return switch (chosen) {
+        inline else => |t| comptime buildUsage(t),
+    };
+}
+
+/// Whether a row belongs to `topic`: its left column names the subcommand, or
+/// it is an option that subcommand takes.
+fn inTopic(section: Section, row: Row, topic: Topic) bool {
+    if (!section.invocation) return std.mem.indexOf(u8, section.title, topic.word()) != null;
+    return std.mem.startsWith(u8, row.left, topic.word() ++ " ") or
+        std.mem.eql(u8, row.left, topic.word());
+}
 
 /// Lay the sections out in two columns, every description starting at the same
 /// one. A description may run to several lines; the rest are indented to match.
-fn buildUsage() []const u8 {
-    @setEvalBranchQuota(10_000);
+fn buildUsage(comptime topic: ?Topic) []const u8 {
+    @setEvalBranchQuota(20_000);
     comptime {
         var column = 0;
         for (help_sections) |section| {
             for (section.rows) |row| {
+                if (topic) |t| if (!inTopic(section, row, t)) continue;
                 const width = leftOf(section, row).len;
                 if (width > column) column = width;
             }
@@ -336,8 +417,14 @@ fn buildUsage() []const u8 {
 
         var out: []const u8 = pkg.name ++ " - An agent for your terminal\n";
         for (help_sections) |section| {
-            out = out ++ "\n" ++ section.title ++ ":\n";
+            var wrote_title = false;
             for (section.rows) |row| {
+                if (topic) |t| if (!inTopic(section, row, t)) continue;
+                if (!wrote_title) {
+                    out = out ++ "\n" ++ section.title ++ ":\n";
+                    wrote_title = true;
+                }
+
                 const left = leftOf(section, row);
                 out = out ++ indent ++ left ++ pad(column - indent.len - left.len);
 
@@ -359,6 +446,26 @@ fn leftOf(section: Section, row: Row) []const u8 {
 
 fn pad(n: usize) []const u8 {
     return " " ** n;
+}
+
+test "a subcommand's help covers that subcommand and nothing else" {
+    const testing = std.testing;
+
+    inline for (comptime std.enums.values(Topic)) |topic| {
+        const text = usageFor(topic);
+        try testing.expect(text.len < usage.len);
+
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        _ = lines.first();
+        while (lines.next()) |line| {
+            const row = std.mem.trimStart(u8, line, " ");
+            const prefix = pkg.name ++ " ";
+            if (!std.mem.startsWith(u8, row, prefix)) continue;
+            try testing.expect(std.mem.startsWith(u8, row[prefix.len..], topic.word()));
+        }
+    }
+
+    try testing.expectEqualStrings(usage, usageFor(null));
 }
 
 test "prose stays ASCII" {
