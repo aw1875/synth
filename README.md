@@ -244,6 +244,49 @@ tail -f .synth-hooks.log
 appear when the model calls a tool. The log is covered by the repository's
 `*.log` ignore rule.
 
+### The other examples
+
+`examples/hooks/` holds four more, each usable as it stands and meant to be
+edited into whatever the project actually needs.
+
+| Hook | Event | Needs | What it does |
+| --- | --- | --- | --- |
+| `deny-command.sh` | `PreToolUse`, matcher `bash` | `jq` | Refuses force-pushes, `reset --hard`, `terraform apply`, cluster deletes, package publishes, and recursive deletes above the checkout. |
+| `protect-paths.sh` | `PreToolUse`, matchers `edit` and `write` | `jq` | Refuses `.env`, lockfiles, CI config, applied migrations and private keys. |
+| `format-after-edit.sh` | `PostToolUse`, matchers `edit` and `write` | `zig` | Runs `zig fmt` so the model does not spend turns on whitespace. |
+| `block-secrets.sh` | `UserPromptSubmit` | none | Refuses a prompt carrying what looks like a live credential. |
+
+`deny-command.sh` and `protect-paths.sh` decide *never*, which is the part
+`auto_approve_safe_commands` cannot express: that setting chooses between
+running a command and asking about it, and a hook is what removes the option.
+
+`block-secrets.sh` is the counterpart to the redaction synth already applies to
+tool output: that covers a key on the way out of a tool, this covers one pasted
+in on the way to the model.
+
+Both `jq` hooks exit 0 when `jq` is missing, so a checkout without it allows
+rather than blocks. Decide whether that is the tradeoff you want before relying
+on either as policy.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "command": "./examples/hooks/block-secrets.sh" }
+    ],
+    "PreToolUse": [
+      { "matcher": "bash", "command": "./examples/hooks/deny-command.sh" },
+      { "matcher": "edit", "command": "./examples/hooks/protect-paths.sh" },
+      { "matcher": "write", "command": "./examples/hooks/protect-paths.sh" }
+    ],
+    "PostToolUse": [
+      { "matcher": "edit", "command": "./examples/hooks/format-after-edit.sh" },
+      { "matcher": "write", "command": "./examples/hooks/format-after-edit.sh" }
+    ]
+  }
+}
+```
+
 ## Skills
 
 A skill is a directory holding a `SKILL.md`, whose frontmatter names it and says
