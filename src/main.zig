@@ -102,6 +102,11 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     defer db.deinit();
     timing.mark("database");
 
+    if (db.prune(config.prune, db.nowMs())) |dropped| {
+        if (dropped.any()) db.vacuum() catch {};
+    } else |_| {}
+    timing.mark("prune");
+
     {
         var theme_arena: std.heap.ArenaAllocator = .init(allocator);
         defer theme_arena.deinit();
@@ -191,6 +196,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     var runner: subagent.Runner = .{ .parent = &model.loop };
     model.loop.delegate = runner.delegate();
     model.mcp = &mcp_host;
+    model.prune_policy = config.prune;
 
     // Into the model's registry, which is the one the loop was built with, and
     // before `useAgent` builds the tool schema from it - a tool registered after

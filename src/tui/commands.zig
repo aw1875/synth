@@ -23,6 +23,7 @@ const Notification = @import("notification.zig");
 const Slash = @import("slash.zig");
 const theme = @import("theme.zig");
 const themes = @import("themes.zig");
+const humanize = @import("../core/humanize.zig");
 
 pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !bool {
     const line = std.mem.trim(u8, value, " \t\r\n");
@@ -36,6 +37,10 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         _ = try self.conversation.append(.{ .role = .assistant, .text = text });
         self.scroll = 0;
         ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.eql(u8, line, "/prune")) {
+        try pruneNow(self, ctx);
         return true;
     }
     if (std.mem.eql(u8, line, "/compact")) {
@@ -164,6 +169,40 @@ pub fn themeId(self: *Model) []const u8 {
 pub fn keepTheme(self: *Model, id: []const u8) void {
     const chosen = themes.apply(id);
     if (self.loop.database()) |db| db.setSetting("theme", chosen.id) catch {};
+}
+
+/// Apply the configured policy now, and say what it took out.
+fn pruneNow(self: *Model, ctx: *vxfw.EventContext) !void {
+    const db = self.loop.database() orelse {
+        try self.notification.show(ctx, .info, "No database to prune");
+        return;
+    };
+
+    const policy = self.prune_policy;
+    if (!policy.any()) {
+        try self.notification.show(ctx, .info, "Pruning is switched off in config.json");
+        return;
+    }
+
+    const dropped = db.prune(policy, db.nowMs()) catch {
+        try self.notification.show(ctx, .warn, "Could not prune the database");
+        return;
+    };
+    if (dropped.any()) db.vacuum() catch {};
+
+    var buffer: [128]u8 = undefined;
+    var size: [humanize.bytes_len]u8 = undefined;
+    const text = if (dropped.any())
+        try std.fmt.bufPrint(&buffer, "Freed {s}: {d} session(s), {d} stored result(s)", .{
+            humanize.bytes(&size, dropped.bytes_freed),
+            dropped.sessions_deleted,
+            dropped.blobs_dropped,
+        })
+    else
+        try std.fmt.bufPrint(&buffer, "Nothing old enough to prune", .{});
+
+    try self.notification.show(ctx, .info, text);
+    ctx.redraw = true;
 }
 
 /// Change mode and say so. The change is silent otherwise: the tool schema and

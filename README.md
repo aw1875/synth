@@ -152,6 +152,36 @@ Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 A debug build keeps all three files in the working directory, so a checkout
 never touches installed state.
 
+### Pruning
+
+The database keeps every transcript, and most of its weight is stored tool
+output: the full result behind each card, plus the model's reasoning. Left
+alone that grows without bound.
+
+A prune runs at startup and reclaims it in two steps, each an age in days since
+a session was last touched:
+
+```json
+{
+  "prune": {
+    "shed_after_days": 30,
+    "delete_after_days": 0
+  }
+}
+```
+
+`shed_after_days` keeps an old session's transcript but drops the payloads
+behind it. The cards still read: what the model was shown is on the tool call
+itself, and only the expanded view loses its full text. This is where nearly
+all the space goes, so 30 days is the default.
+
+`delete_after_days` removes an old session outright, messages and all. It
+defaults to 0, meaning never: losing a transcript is not something to do by
+accident. Set it if the machine is short of disk.
+
+Zero switches either half off. `/prune` applies the same policy on demand and
+says what it freed.
+
 ## MCP
 
 The `mcp` block is the shape every other client uses, so an entry from a

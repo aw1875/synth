@@ -6,6 +6,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const Cell = vaxis.Cell;
 
+const Database = @import("../core/database.zig");
 const Conversation = @import("../core/conversation.zig");
 const Role = Conversation.Role;
 const AgentLoop = @import("../agent/loop.zig");
@@ -149,6 +150,8 @@ plan_hover: bool = false,
 /// Every skill found at startup, for `/skills`. Borrowed, and null where
 /// nothing looked.
 skills: ?*const skill.Set = null,
+/// What `/prune` is allowed to throw away, as config.json set it.
+prune_policy: Database.Policy = .{},
 /// Tool registry, and the read log the tools share. Owned.
 registry: Registry = undefined,
 reads: tool.ReadLog = undefined,

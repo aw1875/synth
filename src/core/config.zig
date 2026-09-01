@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 
 const pkg = @import("pkg");
 const Hooks = @import("hooks.zig");
+const Database = @import("database.zig");
 
 const Config = @This();
 
@@ -118,6 +119,8 @@ skill_paths: []const []const u8 = &.{},
 mcp: ?std.json.Value = null,
 hooks: Hooks.Set = .{},
 hook_timeout_ms: u64 = Hooks.default_timeout_ms,
+/// What a startup prune is allowed to throw away.
+prune: Database.Policy = .{ .shed_after_days = 30 },
 
 /// The shape `config.json` is parsed into. Every field is optional so an
 /// absent key falls through to whatever the previous layer set.
@@ -136,6 +139,10 @@ const File = struct {
     } = null,
     hooks: ?Hooks.File = null,
     hook_timeout_ms: ?u64 = null,
+    prune: ?struct {
+        delete_after_days: ?u32 = null,
+        shed_after_days: ?u32 = null,
+    } = null,
     /// The single-provider shape this file used to have. Still read, so an
     /// existing `config.json` keeps working; nothing writes it any more, and
     /// where a provider lives is the database's business now.
@@ -250,6 +257,11 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
 
     if (parsed.web) |web| {
         if (web.search_api_key) |value| self.search_api_key = value;
+    }
+
+    if (parsed.prune) |prune| {
+        if (prune.delete_after_days) |value| self.prune.delete_after_days = value;
+        if (prune.shed_after_days) |value| self.prune.shed_after_days = value;
     }
 
     if (parsed.ollama) |ollama| {
@@ -378,6 +390,36 @@ test "extra skill directories are read from the file" {
     try testing.expectEqual(@as(usize, 2), config.skill_paths.len);
     try testing.expectEqualStrings("/opt/skills", config.skill_paths[0]);
     try testing.expectEqualStrings("/srv/team/skills", config.skill_paths[1]);
+}
+
+test "a prune policy is read from the file, and defaults to shedding only" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    var fresh: Config = .{ .arena = .init(testing.allocator) };
+    defer fresh.deinit();
+    try testing.expectEqual(@as(u32, 30), fresh.prune.shed_after_days);
+    try testing.expectEqual(@as(u32, 0), fresh.prune.delete_after_days);
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{\"prune\":{\"shed_after_days\":7,\"delete_after_days\":180}}",
+    });
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try config.applyFile(io, path);
+
+    try testing.expectEqual(@as(u32, 7), config.prune.shed_after_days);
+    try testing.expectEqual(@as(u32, 180), config.prune.delete_after_days);
 }
 
 test "lifecycle hooks are read from the file" {
