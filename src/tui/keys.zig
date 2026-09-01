@@ -12,6 +12,7 @@ const vxfw = vaxis.vxfw;
 
 const agents = @import("../agent/agent.zig");
 const commands = @import("commands.zig");
+const editor = @import("editor.zig");
 const Model = @import("model.zig");
 const Selection = @import("selection.zig");
 const widget_pool = @import("widget_pool.zig");
@@ -370,6 +371,11 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (key.matches('e', .{ .ctrl = true })) {
+                try openEditor(self, ctx);
+                return ctx.consumeAndRedraw();
+            }
+
             if (key.matches(vaxis.Key.page_up, .{})) {
                 self.scrollBy(ctx, Model.page_scroll_rows);
                 try self.pageHistoryIfNeeded();
@@ -488,6 +494,27 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         },
         else => {},
     }
+}
+
+/// Compose the draft in `$EDITOR`, and take back what was written.
+fn openEditor(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (self.loop.isBusy()) return;
+    const app = self.app orelse return;
+    const environ = self.environ orelse return;
+
+    const edited = editor.edit(self.allocator, self.io, app, environ, self.input.text.items) catch |err| {
+        const said = switch (err) {
+            editor.Error.NoEditor => "Set $EDITOR to compose a prompt outside synth",
+            editor.Error.EditorFailed => "The editor exited without saving",
+            else => "Could not open the editor",
+        };
+        try self.notification.show(ctx, .info, said);
+        return;
+    };
+    defer self.allocator.free(edited);
+
+    self.input.clear();
+    try self.input.insertText(edited);
 }
 
 /// Hand the terminal back and stop the process, the way ctrl+z does for any

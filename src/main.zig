@@ -186,6 +186,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .cwd_display = cwd_display,
         .project = &project,
         .app = &app,
+        .environ = init.environ_map,
         .auth = &auth,
         .backend = &backend,
     };

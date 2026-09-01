@@ -73,6 +73,7 @@ anything that would change the project unless `--allow` is given.
 | `ctrl+o` / `ctrl+p` / `ctrl+s` | model / provider / session |
 | `ctrl+r` | rename this session |
 | `ctrl+t` | collapse or expand the plan |
+| `ctrl+e` | compose the draft in `$EDITOR` |
 | `ctrl+v` | paste an image |
 | `ctrl+c` | clear the draft, interrupt a turn, then quit |
 | `ctrl+z` | suspend to the shell |
@@ -80,6 +81,10 @@ anything that would change the project unless `--allow` is given.
 `/help` lists the slash commands. `@path` pulls a file into the prompt - an
 image comes along as a picture, and a name with spaces is written
 `@"Pasted image.png"`.
+
+`ctrl+e` hands the draft to `$VISUAL`, or `$EDITOR`, and takes back what was
+saved. The value is run through a shell, so `EDITOR="code -w"` works as long as
+it waits.
 
 ## Modes
 
@@ -141,7 +146,7 @@ that is what the sidebar plans against.
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
 `SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
 `OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
-`SYNTH_SEARCH_API_KEY`. Which host-and-key pair applies depends on the protocol
+`SYNTH_SEARCH_API_KEY`. `VISUAL` and `EDITOR` decide what `ctrl+e` opens. Which host-and-key pair applies depends on the protocol
 the chosen provider speaks, so having both sets exported does not hand one
 server the other's settings.
 

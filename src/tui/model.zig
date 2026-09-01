@@ -262,6 +262,8 @@ quit_confirm: Confirm = .{ .window_ms = quit_confirm_ms },
 /// The vxfw app, borrowed from main. Only needed to hand the terminal back on
 /// ctrl+z: raw mode swallows the suspend key, so the app has to do it itself.
 app: ?*vxfw.App = null,
+/// The process environment, for the editor `ctrl+e` shells out to.
+environ: ?*std.process.Environ.Map = null,
 
 /// Rows the transcript is scrolled back from the newest message. Zero pins the
 /// view to the bottom, which is where it returns whenever a message arrives.
