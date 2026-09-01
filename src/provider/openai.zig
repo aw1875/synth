@@ -631,13 +631,13 @@ const Collector = struct {
             calls.deinit(self.allocator);
         }
 
-        for (self.calls.items, 0..) |*pending, index| {
+        for (self.calls.items) |*pending| {
             if (pending.name.items.len == 0) continue;
 
             const id = if (pending.id.items.len > 0)
                 try self.allocator.dupe(u8, pending.id.items)
             else
-                try std.fmt.allocPrint(self.allocator, "call_{d}", .{index});
+                try Conversation.ToolCall.synthesizeId(self.allocator);
             errdefer self.allocator.free(id);
 
             const name = try self.allocator.dupe(u8, pending.name.items);

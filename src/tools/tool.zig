@@ -26,6 +26,10 @@ pub const Context = struct {
     /// When this call runs out of time, on the monotonic clock. Filled in by
     /// the registry; null where nothing is enforcing a limit.
     deadline_ms: ?i64 = null,
+    /// How a tool that runs long says what it is doing, so the card the person
+    /// is watching says something other than "running". Null where nothing is
+    /// listening - a test, a one-off run.
+    progress: ?Progress = null,
     /// Whether this call may touch paths outside the project.
     ///
     /// True only for a call a person approved by hand. A call that skipped the
@@ -53,6 +57,13 @@ pub const Context = struct {
         return self.givenUp() or self.outOfTime();
     }
 
+    /// Say what this call is doing now. A no-op where nothing is watching, so
+    /// a tool can call it without asking whether anyone cares.
+    pub fn report(self: Context, text: []const u8) void {
+        const progress = self.progress orelse return;
+        progress.report(progress.userdata, text);
+    }
+
     /// How long a blocking wait may last: whatever is left, capped at `cap_ms`.
     ///
     /// The cap is what makes cancellation work. A tool that waits on the full
@@ -65,6 +76,18 @@ pub const Context = struct {
         if (left <= 0) return 0;
         return @min(cap_ms, @as(u64, @intCast(left)));
     }
+};
+
+/// Cap on one progress line. Fixed so a worker can publish it without
+/// allocating, and long enough for "step 3/12: grep".
+pub const max_progress_bytes: usize = 96;
+
+/// Where a tool's "what I am doing now" line goes.
+pub const Progress = struct {
+    userdata: *anyopaque,
+    /// Publish one short line, replacing whatever the last one was. The text is
+    /// copied, so the caller keeps its own.
+    report: *const fn (*anyopaque, []const u8) void,
 };
 
 /// How long a tool call may run before the caller gives up on it. Long enough
@@ -98,6 +121,9 @@ pub const Delegate = struct {
         /// The parent's give-up flag, so cancelling a turn also ends the
         /// subagent rather than waiting for it.
         cancelled: ?*const std.atomic.Value(bool) = null,
+        /// Where the nested run says what it is doing, so the card the person
+        /// is watching is not stuck on "running" for minutes.
+        progress: ?Progress = null,
     };
 };
 
@@ -181,6 +207,11 @@ pub const Tool = struct {
     /// drives a whole nested agent - says so here rather than being killed
     /// halfway.
     timeout_ms: ?u64 = null,
+    /// Largest result this tool's output may reach the model as. Null takes the
+    /// loop's own ceiling, which is sized for a tool whose output is a summary.
+    /// A tool asked for a document is the exception, and says so here rather
+    /// than advertising a size the loop then cuts down.
+    max_result_bytes: ?usize = null,
     /// Whether this tool may run beside another call in the same batch.
     ///
     /// Deliberately not `read_only`: that says a call needs no approval, which

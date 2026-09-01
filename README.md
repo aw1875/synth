@@ -130,11 +130,24 @@ set by using the app and kept in the database.
 `debug_log` is the first thing to reach for when a model goes quiet: it shows
 whether a request was sent at all, and how large it had grown.
 
+Ollama picks the context window a model is loaded with, and what it picks is
+usually far below what the model can do. `ollama.num_ctx` is what synth asks
+for; leave it out and it asks for the model's advertised maximum, and 0 leaves
+the choice to the server. Whether the server can give what was asked for is its
+own business: `/api/ps` is the last word on what the runner actually got, and
+that is what the sidebar plans against.
+
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
 `SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
-`OLLAMA_THINK`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`. Which host-and-key pair
-applies depends on the protocol the chosen provider speaks, so having both sets
-exported does not hand one server the other's settings.
+`OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
+`SYNTH_SEARCH_API_KEY`. Which host-and-key pair applies depends on the protocol
+the chosen provider speaks, so having both sets exported does not hand one
+server the other's settings.
+
+`web_search` needs no key: without one it reads DuckDuckGo's HTML results page.
+That works, but DuckDuckGo throttles it after a handful of searches and answers
+with a page that has no results on it, which the tool reports as such. A Brave
+Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 
 A debug build keeps all three files in the working directory, so a checkout
 never touches installed state.
@@ -230,6 +243,49 @@ tail -f .synth-hooks.log
 `UserPromptSubmit` appears for every prompt. The pre- and post-tool entries
 appear when the model calls a tool. The log is covered by the repository's
 `*.log` ignore rule.
+
+### The other examples
+
+`examples/hooks/` holds four more, each usable as it stands and meant to be
+edited into whatever the project actually needs.
+
+| Hook | Event | Needs | What it does |
+| --- | --- | --- | --- |
+| `deny-command.sh` | `PreToolUse`, matcher `bash` | `jq` | Refuses force-pushes, `reset --hard`, `terraform apply`, cluster deletes, package publishes, and recursive deletes above the checkout. |
+| `protect-paths.sh` | `PreToolUse`, matchers `edit` and `write` | `jq` | Refuses `.env`, lockfiles, CI config, applied migrations and private keys. |
+| `format-after-edit.sh` | `PostToolUse`, matchers `edit` and `write` | `zig` | Runs `zig fmt` so the model does not spend turns on whitespace. |
+| `block-secrets.sh` | `UserPromptSubmit` | none | Refuses a prompt carrying what looks like a live credential. |
+
+`deny-command.sh` and `protect-paths.sh` decide *never*, which is the part
+`auto_approve_safe_commands` cannot express: that setting chooses between
+running a command and asking about it, and a hook is what removes the option.
+
+`block-secrets.sh` is the counterpart to the redaction synth already applies to
+tool output: that covers a key on the way out of a tool, this covers one pasted
+in on the way to the model.
+
+Both `jq` hooks exit 0 when `jq` is missing, so a checkout without it allows
+rather than blocks. Decide whether that is the tradeoff you want before relying
+on either as policy.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "command": "./examples/hooks/block-secrets.sh" }
+    ],
+    "PreToolUse": [
+      { "matcher": "bash", "command": "./examples/hooks/deny-command.sh" },
+      { "matcher": "edit", "command": "./examples/hooks/protect-paths.sh" },
+      { "matcher": "write", "command": "./examples/hooks/protect-paths.sh" }
+    ],
+    "PostToolUse": [
+      { "matcher": "edit", "command": "./examples/hooks/format-after-edit.sh" },
+      { "matcher": "write", "command": "./examples/hooks/format-after-edit.sh" }
+    ]
+  }
+}
+```
 
 ## Skills
 

@@ -82,7 +82,7 @@ pub fn run(
     try child.useAgent(task.agent);
 
     try child.submit(task.prompt, .{});
-    const outcome = try drive(&child, task.cancelled);
+    const outcome = try drive(&child, task.cancelled, task.progress);
 
     return report(&child, allocator, outcome);
 }
@@ -96,10 +96,19 @@ const Outcome = enum {
 };
 
 /// Poll the child until it stops, the parent gives up, or time runs out.
-fn drive(child: *Loop, cancelled: ?*const std.atomic.Value(bool)) !Outcome {
+fn drive(
+    child: *Loop,
+    cancelled: ?*const std.atomic.Value(bool),
+    progress: ?tool.Progress,
+) !Outcome {
     const started = std.Io.Timestamp.now(child.io, .awake);
 
     while (child.isBusy()) {
+        if (progress) |channel| {
+            var line: [tool.max_progress_bytes]u8 = undefined;
+            channel.report(channel.userdata, describe(child, &line));
+        }
+
         if (cancelled) |flag| {
             if (flag.load(.acquire)) {
                 child.requestStop();
@@ -127,6 +136,31 @@ fn drive(child: *Loop, cancelled: ?*const std.atomic.Value(bool)) !Outcome {
     }
 
     return if (child.steps >= child.agent.steps) .exhausted else .answered;
+}
+
+/// One line saying where the subagent has got to. Repeats are filtered out by
+/// whoever is listening, so this says the same thing until it changes.
+fn describe(child: *const Loop, buffer: *[tool.max_progress_bytes]u8) []const u8 {
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.print("step {d}/{d}: {s}", .{
+        child.steps + 1,
+        child.agent.steps,
+        doing(child),
+    }) catch {};
+    return writer.buffered();
+}
+
+/// What the subagent is up to right now, in a couple of words.
+fn doing(child: *const Loop) []const u8 {
+    return switch (child.state) {
+        .running_hooks => "running hooks",
+        .thinking => "thinking",
+        .compacting => "compacting",
+        .running_tools => child.runningToolName() orelse "running tools",
+        .cancelling => "stopping",
+        .awaiting_approval, .awaiting_answer => "waiting",
+        .idle => "done",
+    };
 }
 
 /// The subagent's answer as the parent should read it: its final prose, with a

@@ -48,6 +48,43 @@
             "default": [],
             "description": "Extra directories to look for skills in, searched in order."
         },
+        "ollama": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "num_ctx": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Window to ask ollama to load a model with. Omit for the model's advertised maximum; 0 leaves the choice to the server."
+                },
+                "host": {
+                    "type": "string",
+                    "deprecated": true,
+                    "description": "Still read so an old config keeps working. Where a provider points lives in the database now."
+                },
+                "model": {
+                    "type": "string",
+                    "deprecated": true,
+                    "description": "Still read so an old config keeps working. The chosen model lives in the database now."
+                },
+                "api_key": {
+                    "type": "string",
+                    "deprecated": true,
+                    "description": "Still read so an old config keeps working. Keys belong in auth.json now."
+                },
+                "think": {
+                    "type": "boolean",
+                    "deprecated": true,
+                    "description": "Still read so an old config keeps working. Use the top-level think instead."
+                },
+                "debug_log": {
+                    "type": "string",
+                    "deprecated": true,
+                    "description": "Still read so an old config keeps working. Use the top-level debug_log instead."
+                }
+            },
+            "description": "Ollama-specific settings. Everything but num_ctx is the old single-provider shape, kept so an existing config still loads."
+        },
         "database_path": {
             "type": "string",
             "default": "synth.db",
@@ -96,6 +133,17 @@
                 }
             },
             "description": "MCP servers. See README."
+        },
+        "web": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "search_api_key": {
+                    "type": "string",
+                    "description": "Brave Search API key for the web_search tool. Without one the tool scrapes DuckDuckGo's HTML results page, which needs no key but is throttled after a handful of searches. BRAVE_API_KEY overrides it."
+                }
+            },
+            "description": "Settings for the web tools."
         }
     },
     "$defs": {

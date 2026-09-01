@@ -8,6 +8,7 @@ const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
 const Provider = @import("../provider/provider.zig");
 const recap = @import("recap.zig");
+const redact = @import("../core/redact.zig");
 const ask_user = @import("../tools/ask.zig");
 const todo_tool = @import("../tools/todo.zig");
 const Registry = @import("../tools/registry.zig");
@@ -148,10 +149,19 @@ tools: ?*ToolRun = null,
 /// How many of the running batch's results have been copied into the
 /// conversation. Advances while the batch runs, so cards settle one at a time.
 tools_adopted: usize = 0,
-/// When the user gave up, on the monotonic clock, and whether the workers have
-/// been signalled since.
-cancel_at_ms: ?i64 = null,
+/// What each running call last said it was doing, refreshed once a poll so a
+/// frame draws a stable set of lines rather than racing the workers.
+notes: []ToolRun.Note = &.{},
+/// Whether the workers have been told to stop and handed to `canceller`.
 signalled: bool = false,
+/// The off-thread wait for the signalled workers, and whether it has finished.
+///
+/// `Io.Future.cancel` blocks until the worker unwinds, re-signalling on a
+/// doubling backoff. On the UI's thread that is the terminal locked up for as
+/// long as a blocked socket read takes to give up, so the wait happens here and
+/// the UI keeps polling `reaped` instead.
+canceller: ?std.Io.Future(void) = null,
+reaped: std.atomic.Value(bool) = .init(false),
 steps: usize = 0,
 /// When this turn started, on the monotonic clock, and what it has spent since.
 /// Both reset by `submit`.
@@ -460,6 +470,7 @@ fn ensureSession(self: *Loop) !i64 {
 pub fn requestStop(self: *Loop) void {
     if (self.request) |request| request.requestStop();
     if (self.tools) |tools| tools.requestStop();
+    if (self.hook_dispatch) |dispatch| dispatch.requestStop();
 }
 
 pub fn deinit(self: *Loop) void {
@@ -467,6 +478,10 @@ pub fn deinit(self: *Loop) void {
     self.session_title = null;
     if (self.session_model_owned) |m| self.allocator.free(m);
     self.session_model_owned = null;
+    if (self.canceller) |*canceller| {
+        canceller.await(self.io);
+        self.canceller = null;
+    }
     if (self.request) |request| {
         request.cancel();
         request.destroy();
@@ -485,6 +500,7 @@ pub fn deinit(self: *Loop) void {
     if (self.pending_submit) |*pending| pending.deinit(self.allocator);
     self.pending_submit = null;
 
+    self.clearNotes();
     self.todos.deinit();
     if (self.hook_notice) |notice| self.allocator.free(notice);
     for (self.steering.items) |text| self.allocator.free(text);
@@ -916,26 +932,35 @@ pub fn cancel(self: *Loop) !void {
     if (!self.isBusy()) return;
     if (self.state == .cancelling) return;
 
-    // Asking is all that happens here. Waiting for the worker to unwind is what
-    // `Io.Future.cancel` does, and it does it on the calling thread - which is
-    // the UI's, so a provider midway through generating would freeze the
-    // terminal until it finished. The worker is reaped in `poll` instead.
+    // `Io.Future.cancel` waits on the calling thread, so `canceller` takes it.
     self.requestStop();
+    self.startReaping();
 
-    self.cancel_at_ms = tool.monotonicMilliseconds(self.io);
-    self.signalled = false;
     self.compacting = false;
     self.state = .cancelling;
 }
 
-/// How long a worker is given to stop because it was asked to, before it is
-/// signalled instead.
-///
-/// Asking is cheap and lets a worker unwind tidily, but it only reaches one
-/// that checks: a provider between chunks, a tool between waits. A worker
-/// blocked in a read that never returns never gets the chance, and waiting for
-/// it is what leaves a turn sitting on `Cancelling` for minutes.
-const cancel_grace_ms: i64 = 250;
+/// Interrupt both workers, waiting for them somewhere other than here.
+fn startReaping(self: *Loop) void {
+    if (self.signalled) return;
+    self.signalled = true;
+    self.reaped.store(false, .release);
+
+    if (self.io.concurrent(reap, .{self})) |future| {
+        self.canceller = future;
+    } else |_| {
+        // No thread for the wait; stalling beats never leaving `Cancelling`.
+        self.reap();
+    }
+}
+
+/// Interrupt both workers and wait for them to unwind, off the UI's thread.
+fn reap(self: *Loop) void {
+    if (self.request) |request| request.cancel();
+    if (self.tools) |tools| tools.cancel();
+    if (self.hook_dispatch) |dispatch| dispatch.cancel();
+    self.reaped.store(true, .release);
+}
 
 /// Reap a cancelled turn once its worker has actually stopped.
 ///
@@ -943,35 +968,34 @@ const cancel_grace_ms: i64 = 250;
 /// provider borrows it, and a tool run writes into results the loop is about to
 /// free.
 fn pollCancelled(self: *Loop) !bool {
+    if (self.canceller) |*canceller| {
+        if (!self.reaped.load(.acquire)) return false;
+        canceller.await(self.io);
+        self.canceller = null;
+    } else if (!self.reaped.load(.acquire)) {
+        // Only when there was no thread for the reaper, and it ran inline.
+        self.startReaping();
+        return false;
+    }
+
     if (self.hook_dispatch) |dispatch| {
-        if (!dispatch.isFinished()) {
-            self.signalStragglers();
-            return false;
-        }
         dispatch.join();
         dispatch.destroy();
         self.hook_dispatch = null;
     }
 
     if (self.request) |request| {
-        if (!request.isFinished()) {
-            self.signalStragglers();
-            return false;
-        }
         request.join();
         request.destroy();
         self.request = null;
     }
 
     if (self.tools) |tools| {
-        if (!tools.isFinished()) {
-            self.signalStragglers();
-            return false;
-        }
         tools.join();
         tools.destroy();
         self.tools = null;
     }
+    self.clearNotes();
 
     try self.abandonPending();
     if (self.pending_submit) |*pending| pending.deinit(self.allocator);
@@ -983,21 +1007,6 @@ fn pollCancelled(self: *Loop) !bool {
 
 /// Mark every call the cancelled turn left unfinished, so the transcript says
 /// what happened to it rather than leaving a row spinning forever.
-/// Signal a worker that has not stopped on its own once the grace period is
-/// up. Signalling interrupts a blocked syscall, which is the only thing that
-/// reaches a worker stuck in a read.
-fn signalStragglers(self: *Loop) void {
-    if (self.signalled) return;
-
-    const since = self.cancel_at_ms orelse return;
-    if (tool.monotonicMilliseconds(self.io) - since < cancel_grace_ms) return;
-
-    self.signalled = true;
-    if (self.hook_dispatch) |dispatch| dispatch.cancel();
-    if (self.request) |request| request.cancel();
-    if (self.tools) |tools| tools.cancel();
-}
-
 fn abandonPending(self: *Loop) !void {
     const index = self.pendingIndex() orelse return;
     for (self.conversation.messages.items[index].tool_calls, 0..) |*call, i| {
@@ -1120,6 +1129,10 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
+
+    // Left raised, these would send the next cancel down the inline join.
+    self.signalled = false;
+    self.reaped.store(false, .release);
 
     // Written down rather than worked out again at each draw: once older
     // messages are trimmed away the turn could no longer be read back, and
@@ -1363,7 +1376,11 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
-    if (self.escapesProject(call)) return false;
+
+    if (self.outsidePath(self.allocator, call) catch null) |path| {
+        defer self.allocator.free(path);
+        return self.coversExactly(call.name, path);
+    }
 
     const definition = self.registry.get(call.name) orelse return false;
     if (definition.read_only) return true;
@@ -1378,37 +1395,64 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
 /// read-only tool. Anything unparseable counts as escaping, so a malformed
 /// argument is asked about rather than waved through.
 fn escapesProject(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    if (call.arguments.len == 0) return false;
+    const outside = self.outsidePath(self.allocator, call) catch return false;
+    if (outside) |path| {
+        self.allocator.free(path);
+        return true;
+    }
+    return false;
+}
+
+/// The path this call names that lies outside the project, resolved so that an
+/// allowance on `/tmp/notes.md` cannot be spent on `/tmp/../etc/passwd`. Null
+/// when the call stays inside, or names no path at all.
+fn outsidePath(
+    self: *const Loop,
+    allocator: std.mem.Allocator,
+    call: *const Conversation.ToolCall,
+) !?[]u8 {
+    if (call.arguments.len == 0) return null;
 
     var scratch: std.heap.ArenaAllocator = .init(self.allocator);
     defer scratch.deinit();
     const arena = scratch.allocator();
 
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return null;
     const fields = switch (parsed) {
         .object => |object| object,
-        else => return false,
+        else => return null,
     };
 
     for ([_][]const u8{ "path", "file" }) |name| {
         const value = fields.get(name) orelse continue;
         if (value != .string) continue;
         if (value.string.len == 0) continue;
-        if (!self.withinProject(arena, value.string)) return true;
+
+        const resolved = self.resolveAgainstProject(arena, value.string) orelse
+            return try allocator.dupe(u8, value.string);
+        if (!self.inside(resolved)) return try allocator.dupe(u8, resolved);
     }
-    return false;
+    return null;
 }
 
-fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
+fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
     const joined = if (std.fs.path.isAbsolute(path))
-        arena.dupe(u8, path) catch return false
+        arena.dupe(u8, path) catch return null
     else
-        std.fs.path.join(arena, &.{ self.project_root, path }) catch return false;
+        std.fs.path.join(arena, &.{ self.project_root, path }) catch return null;
 
-    const resolved = std.fs.path.resolve(arena, &.{joined}) catch return false;
+    return std.fs.path.resolve(arena, &.{joined}) catch null;
+}
+
+fn inside(self: *const Loop, resolved: []const u8) bool {
     if (!std.mem.startsWith(u8, resolved, self.project_root)) return false;
     if (resolved.len == self.project_root.len) return true;
     return resolved[self.project_root.len] == std.fs.path.sep;
+}
+
+fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
+    const resolved = self.resolveAgainstProject(arena, path) orelse return false;
+    return self.inside(resolved);
 }
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
@@ -1430,10 +1474,11 @@ fn isSafe(self: *const Loop, call: *const Conversation.ToolCall) bool {
 
 /// Truncate tool output destined for the model, keeping the head and marking
 /// what was dropped so it does not look like the tool simply stopped.
-fn trimForModel(self: *Loop, result: []const u8) ![]const u8 {
-    if (result.len <= max_tool_result_bytes) return result;
+fn trimForModel(self: *Loop, name: []const u8, result: []const u8) ![]const u8 {
+    const ceiling = self.resultCeiling(name);
+    if (result.len <= ceiling) return result;
 
-    var cut = max_tool_result_bytes;
+    var cut = ceiling;
     if (std.mem.lastIndexOfScalar(u8, result[0..cut], '\n')) |newline| cut = newline;
 
     return std.fmt.allocPrint(
@@ -1443,9 +1488,20 @@ fn trimForModel(self: *Loop, result: []const u8) ![]const u8 {
     );
 }
 
+/// How much of one tool's output the model may see. A tool that says nothing
+/// takes `max_tool_result_bytes`.
+fn resultCeiling(self: *const Loop, name: []const u8) usize {
+    const found = self.registry.get(name) orelse return max_tool_result_bytes;
+    return found.max_result_bytes orelse max_tool_result_bytes;
+}
+
 /// Record an "allow always" for what this call is doing, and persist it.
 fn allow(self: *Loop, call: *const Conversation.ToolCall) !void {
-    const patterns = try approvalPatterns(self.allocator, call.name, call.arguments);
+    const patterns = if (try self.outsidePath(self.allocator, call)) |path| blk: {
+        const out = try self.allocator.alloc([]const u8, 1);
+        out[0] = path;
+        break :blk out;
+    } else try approvalPatterns(self.allocator, call.name, call.arguments);
     defer freePatterns(self.allocator, patterns);
 
     for (patterns) |pattern| {
@@ -1555,6 +1611,15 @@ fn isAllowed(self: *const Loop, call: *const Conversation.ToolCall) bool {
         if (!self.covers(call.name, pattern)) return false;
     }
     return true;
+}
+
+/// Whether an allowance names this pattern outright, ignoring `*`.
+fn coversExactly(self: *const Loop, name: []const u8, pattern: []const u8) bool {
+    for (self.allowed.items) |allowance| {
+        if (!std.mem.eql(u8, allowance.tool, name)) continue;
+        if (std.mem.eql(u8, allowance.pattern, pattern)) return true;
+    }
+    return false;
 }
 
 fn covers(self: *const Loop, name: []const u8, pattern: []const u8) bool {
@@ -1731,6 +1796,50 @@ fn runApproved(self: *Loop) !void {
 /// `tools_adopted` is what keeps this idempotent - each result is taken once,
 /// so the final pass after the worker exits cannot dupe a result twice and
 /// leak the first copy.
+/// The name of the call the running batch is on, for anything that wants to say
+/// what is happening in a couple of words. The first unsettled one: a batch
+/// runs in order, so that is the one still going.
+pub fn runningToolName(self: *const Loop) ?[]const u8 {
+    const tools = self.tools orelse return null;
+    const at = tools.settledCount();
+    if (at >= tools.calls.len) return null;
+    return tools.calls[at].name;
+}
+
+/// What the call at `index` of the message `seq` is doing now, or null when it
+/// is not one of the running batch or has said nothing yet.
+pub fn toolNote(self: *const Loop, seq: u64, index: usize) ?[]const u8 {
+    if (self.pending_seq != seq) return null;
+    if (index >= self.notes.len) return null;
+    const text = self.notes[index].text();
+    return if (text.len == 0) null else text;
+}
+
+/// Take a copy of what every unsettled call is saying. Returns whether any of
+/// them changed, which is what tells the UI to draw again.
+fn refreshNotes(self: *Loop, tools: *ToolRun) !bool {
+    if (self.notes.len != tools.calls.len) {
+        self.allocator.free(self.notes);
+        self.notes = try self.allocator.alloc(ToolRun.Note, tools.calls.len);
+        @memset(self.notes, .{});
+    }
+
+    var changed = false;
+    for (self.notes, 0..) |*note, at| {
+        var fresh: ToolRun.Note = .{};
+        tools.copyNote(at, &fresh);
+        if (fresh.len == note.len and std.mem.eql(u8, fresh.text(), note.text())) continue;
+        note.* = fresh;
+        changed = true;
+    }
+    return changed;
+}
+
+fn clearNotes(self: *Loop) void {
+    self.allocator.free(self.notes);
+    self.notes = &.{};
+}
+
 fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
     const settled = tools.settledCount();
     if (self.tools_adopted >= settled) return;
@@ -1744,7 +1853,7 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
 
         const call = &calls[result.index];
         call.status = if (result.is_error) .failed else .ok;
-        call.result = try self.allocator.dupe(u8, result.content);
+        call.result = try redact.scrub(self.allocator, result.content);
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
     }
@@ -1753,8 +1862,9 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
 fn pollTools(self: *Loop) !bool {
     const tools = self.tools orelse return false;
 
+    const moved = try self.refreshNotes(tools);
     try self.adoptSettled(tools);
-    if (!tools.isFinished()) return false;
+    if (!tools.isFinished()) return moved;
 
     tools.join();
     self.tools = null;
@@ -1762,6 +1872,7 @@ fn pollTools(self: *Loop) !bool {
 
     // Anything that landed between the check above and the worker exiting.
     try self.adoptSettled(tools);
+    self.clearNotes();
 
     try self.persistReads();
 
@@ -1794,7 +1905,7 @@ fn finishToolMessages(self: *Loop) !void {
     }
 
     for (settled[0..count]) |entry| {
-        const trimmed = try self.trimForModel(entry.result);
+        const trimmed = try self.trimForModel(entry.name, entry.result);
         defer if (trimmed.ptr != entry.result.ptr) self.allocator.free(trimmed);
         _ = try self.conversation.addToolResult(entry.name, entry.id, trimmed);
         try self.persistMessage(self.conversation.messages.items.len - 1);
@@ -1823,6 +1934,11 @@ const FakeProvider = struct {
     loop_forever: bool = false,
     /// Reported prompt tokens, for the tests that care what a turn spends.
     prompt_tokens: u32 = 0,
+    /// Spend `latency` in a busy loop rather than a sleep, so the worker is
+    /// deaf to both the stop flag and the signal. Stands in for a provider
+    /// blocked inside a socket read, which is the only case where cancelling
+    /// costs real time.
+    deaf: bool = false,
 
     fn provider(self: *FakeProvider) Provider {
         return .{ .name = "fake", .userdata = self, .respond = respond };
@@ -1837,7 +1953,12 @@ const FakeProvider = struct {
     ) !Provider.Reply {
         const self: *FakeProvider = @ptrCast(@alignCast(ptr));
 
-        try std.Io.sleep(self.io, self.latency, .real);
+        if (self.deaf) {
+            const until = tool.monotonicMilliseconds(self.io) + @as(i64, @intCast(@divTrunc(self.latency.nanoseconds, std.time.ns_per_ms)));
+            while (tool.monotonicMilliseconds(self.io) < until) {}
+        } else {
+            try std.Io.sleep(self.io, self.latency, .real);
+        }
         if (sink) |s| {
             if (s.stopped(s.userdata)) return .{};
             s.onThinking(s.userdata, "thinking about it\n");
@@ -2103,6 +2224,45 @@ test "usage derives rate and context fraction" {
     try testing.expect((Usage{}).tokensPerSecond() == null);
 }
 
+fn leakHandler(ctx: tool.Context, _: tool.Input) anyerror!tool.Output {
+    return tool.Output.ok(try ctx.allocator.dupe(
+        u8,
+        "AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE\n",
+    ));
+}
+
+test "a secret in tool output never reaches the transcript" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try fixture.registry.register(.{
+        .name = "leak",
+        .description = "hands back a secret",
+        .schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = leakHandler,
+        .read_only = true,
+        .parallel = true,
+    });
+    fixture.fake.tool_name = "leak";
+    fixture.fake.tool_arguments = "{}";
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("show me the config", .{});
+    try settle(&loop);
+
+    const secret = "AKIAIOSFODNN7EXAMPLE";
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expect(std.mem.indexOf(u8, call.result.?, secret) == null);
+
+    const result_message = fixture.convo.messages.items[2];
+    try testing.expectEqual(Conversation.Role.tool, result_message.role);
+    try testing.expect(std.mem.indexOf(u8, result_message.text, secret) == null);
+    try testing.expect(std.mem.indexOf(u8, result_message.text, redact.mask) != null);
+    try testing.expect(std.mem.indexOf(u8, result_message.text, "AWS_SECRET_ACCESS_KEY=") != null);
+}
+
 test "oversized tool output is truncated for the model" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -2114,14 +2274,44 @@ test "oversized tool output is truncated for the model" {
     defer testing.allocator.free(big);
     @memset(big, 'x');
 
-    const trimmed = try loop.trimForModel(big);
+    const trimmed = try loop.trimForModel("list", big);
     defer testing.allocator.free(trimmed);
 
     try testing.expect(trimmed.len < big.len);
     try testing.expect(std.mem.indexOf(u8, trimmed, "truncated") != null);
 
     const small = "fine";
-    try testing.expectEqual(small.ptr, (try loop.trimForModel(small)).ptr);
+    try testing.expectEqual(small.ptr, (try loop.trimForModel("list", small)).ptr);
+}
+
+test "a tool asked for a document keeps more of it than the default allows" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    try fixture.registry.register(.{
+        .name = "roomy",
+        .description = "hands back a document",
+        .schema = "{\"type\":\"object\",\"properties\":{}}",
+        .handler = leakHandler,
+        .read_only = true,
+        .parallel = true,
+        .max_result_bytes = max_tool_result_bytes * 4,
+    });
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    const big = try testing.allocator.alloc(u8, max_tool_result_bytes * 2);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+
+    // Under its own ceiling, so it arrives whole.
+    const kept = try loop.trimForModel("roomy", big);
+    try testing.expectEqual(big.ptr, kept.ptr);
+
+    const cut = try loop.trimForModel("list", big);
+    defer testing.allocator.free(cut);
+    try testing.expect(cut.len < big.len);
 }
 
 test "cancel returns while the worker is still running" {
@@ -2743,7 +2933,7 @@ test "an answer offered when nothing was asked is ignored" {
     try testing.expect(loop.pendingQuestion() == null);
 }
 
-test "a worker that ignores the ask is signalled once the grace is up" {
+test "cancelling signals the worker at once, and the turn ends with it" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
 
@@ -2759,22 +2949,56 @@ test "a worker that ignores the ask is signalled once the grace is up" {
     }
 
     try loop.cancel();
-    try testing.expectEqual(State.cancelling, loop.state);
-    try testing.expect(!loop.signalled);
-
-    _ = try loop.poll();
-    try testing.expect(!loop.signalled);
+    try testing.expect(loop.signalled);
 
     const started = tool.monotonicMilliseconds(testing.io);
     while (loop.isBusy()) {
         _ = try loop.poll();
-        if (tool.monotonicMilliseconds(testing.io) - started > 20_000) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(5), .real);
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
     }
+    const spent = tool.monotonicMilliseconds(testing.io) - started;
 
-    try testing.expect(loop.signalled);
     try testing.expectEqual(State.idle, loop.state);
-    try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 20_000);
+    // A worker in a cancellation point goes as soon as it is signalled.
+    try testing.expect(spent < 250);
+}
+
+test "a second cancel reaps off-thread like the first" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    // Deaf to the stop flag, so only the reaper's signal ends the worker.
+    fixture.fake.latency = .fromMilliseconds(500);
+    fixture.fake.deaf = true;
+
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        try loop.submit("go", .{});
+        while (loop.state != .thinking) {
+            _ = try loop.poll();
+            try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+        }
+
+        const started = tool.monotonicMilliseconds(testing.io);
+        try loop.cancel();
+
+        // Without a reaper the turn is joined here, and the screen is gone.
+        try testing.expect(loop.signalled);
+        try testing.expect(loop.canceller != null);
+        try testing.expect(tool.monotonicMilliseconds(testing.io) - started < 50);
+
+        while (loop.isBusy()) {
+            _ = try loop.poll();
+            try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+        }
+        try testing.expectEqual(State.idle, loop.state);
+
+        // Cleared with the turn, so the next cancel starts a reaper of its own.
+        try testing.expect(!loop.signalled);
+    }
 }
 
 test "a plan is applied without a worker, and reads back as progress" {
@@ -3125,4 +3349,66 @@ test "what a turn did survives the session being resumed" {
     const restored = convo.last().?;
     try testing.expectEqual(Conversation.Role.summary, restored.role);
     try testing.expectEqualStrings(said, restored.text);
+}
+
+test "saying always to a path outside the project covers that path again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "read",
+        .arguments = "{\"path\":\"/tmp/hooks.zig\"}",
+    };
+
+    try testing.expect(!loop.needsNoDecision(&call));
+    try loop.allow(&call);
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.arguments = "{\"path\":\"/tmp/other.zig\"}";
+    try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "an allowance outside the project is keyed on the resolved path" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "read",
+        .arguments = "{\"path\":\"/tmp/hooks.zig\"}",
+    };
+    try loop.allow(&call);
+
+    call.arguments = "{\"path\":\"/tmp/nested/../hooks.zig\"}";
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.arguments = "{\"path\":\"/tmp/../etc/passwd\"}";
+    try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "a blanket allowance still stops at the project boundary" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.remember("read", "*");
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "read",
+        .arguments = "{\"path\":\"notes.md\"}",
+    };
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.arguments = "{\"path\":\"/tmp/hooks.zig\"}";
+    try testing.expect(!loop.needsNoDecision(&call));
 }

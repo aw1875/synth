@@ -23,6 +23,7 @@ const Provider = @import("provider/provider.zig");
 const Registry = @import("tools/registry.zig");
 const mcp_tools = @import("tools/mcp.zig");
 const skill_tool = @import("tools/skill.zig");
+const web = @import("tools/web.zig");
 const tool = @import("tools/tool.zig");
 
 const dim = "\x1b[2m";
@@ -67,6 +68,9 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     defer skills.deinit();
     try skill_tool.install(&registry, &skills);
 
+    const web_settings: web.Settings = .{ .search_api_key = config.search_api_key };
+    try web.install(&registry, &web_settings);
+
     var mcp_host: mcp_tools.Host = .init(allocator, io);
     mcp_host.stderr = .inherit;
     defer mcp_host.deinit();
@@ -100,6 +104,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .model = active.model,
         .api_key = active.api_key,
         .want_think = config.think,
+        .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
     });
     defer backend.deinit();

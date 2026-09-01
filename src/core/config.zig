@@ -81,6 +81,15 @@ api_key: ?[]const u8 = null,
 /// settings.
 openai_host: []const u8 = "",
 openai_api_key: ?[]const u8 = null,
+/// Brave Search key for `web_search`, from the `web` block or `BRAVE_API_KEY`.
+/// Without one the tool reads DuckDuckGo's HTML results page instead, which
+/// needs no key but is throttled after a handful of searches.
+search_api_key: ?[]const u8 = null,
+/// Window to ask ollama to load a model with, sent as `num_ctx`. Null asks for
+/// the model's advertised maximum; zero leaves the choice to the server, which
+/// is what `OLLAMA_CONTEXT_LENGTH` or its own default decides. A window larger
+/// than the machine can hold makes the model load slowly or not at all.
+num_ctx: ?u32 = null,
 /// Request reasoning output. Turn off for models that do not support it.
 think: bool = true,
 /// Let the preset list of read-only shell commands run without an approval
@@ -122,6 +131,9 @@ const File = struct {
     max_turn_tokens: ?u64 = null,
     skill_paths: ?[]const []const u8 = null,
     mcp: ?std.json.Value = null,
+    web: ?struct {
+        search_api_key: ?[]const u8 = null,
+    } = null,
     hooks: ?Hooks.File = null,
     hook_timeout_ms: ?u64 = null,
     /// The single-provider shape this file used to have. Still read, so an
@@ -131,6 +143,7 @@ const File = struct {
         host: ?[]const u8 = null,
         model: ?[]const u8 = null,
         api_key: ?[]const u8 = null,
+        num_ctx: ?u32 = null,
         think: ?bool = null,
         debug_log: ?[]const u8 = null,
     } = null,
@@ -235,10 +248,15 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.hooks) |value| self.hooks = value.set();
     if (parsed.hook_timeout_ms) |value| self.hook_timeout_ms = value;
 
+    if (parsed.web) |web| {
+        if (web.search_api_key) |value| self.search_api_key = value;
+    }
+
     if (parsed.ollama) |ollama| {
         if (ollama.host) |value| self.host_override = value;
         if (ollama.model) |value| self.model_override = value;
         if (ollama.api_key) |value| self.api_key = value;
+        if (ollama.num_ctx) |value| self.num_ctx = value;
         if (ollama.think) |value| self.think = value;
         if (ollama.debug_log) |value| self.debug_log = value;
     }
@@ -250,9 +268,14 @@ fn applyEnv(self: *Config, env: *std.process.Environ.Map) !void {
     if (env.get("OLLAMA_HOST")) |value| self.host_override = value;
     if (env.get("OLLAMA_MODEL")) |value| self.model_override = value;
     if (env.get("OLLAMA_API_KEY")) |value| self.api_key = value;
+    if (env.get("OLLAMA_NUM_CTX")) |value| {
+        self.num_ctx = std.fmt.parseInt(u32, value, 10) catch self.num_ctx;
+    }
     if (env.get("OPENAI_BASE_URL")) |value| self.openai_host = value;
     if (env.get("OPENAI_API_KEY")) |value| self.openai_api_key = value;
     if (env.get("SYNTH_DEBUG_LOG")) |value| self.debug_log = value;
+    if (env.get("BRAVE_API_KEY")) |value| self.search_api_key = value;
+    if (env.get("SYNTH_SEARCH_API_KEY")) |value| self.search_api_key = value;
     if (env.get("OLLAMA_THINK")) |value| {
         self.think = !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
     }

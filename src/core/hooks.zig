@@ -69,9 +69,19 @@ pub const Runner = struct {
     root: []const u8,
     set: Set,
     timeout_ms: u64 = default_timeout_ms,
+    /// Raised when the turn is cancelled. Checked between hooks and on every
+    /// slice of the wait for one, so a cancel lands without needing the signal
+    /// that interrupts a blocked syscall to arrive first.
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn givenUp(self: Runner) bool {
+        const flag = self.stop orelse return false;
+        return flag.load(.acquire);
+    }
 
     pub fn dispatch(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !?[]u8 {
         for (self.set.forEvent(invocation.event)) |hook| {
+            if (self.givenUp()) return error.Cancelled;
             if (!matches(hook.matcher, invocation.tool_name)) continue;
             const result = try self.runCommand(allocator, hook.command, invocation);
             defer allocator.free(result.stderr);
@@ -137,6 +147,8 @@ pub const Runner = struct {
         var stderr_done = false;
 
         while (!stderr_done or !input.done.load(.acquire)) {
+            // Returning runs the `killGroup` defer, taking the whole group.
+            if (self.givenUp()) return error.Cancelled;
             const left = deadline - std.Io.Clock.now(.awake, self.io).toMilliseconds();
             if (left <= 0) return error.Timeout;
             const slice = @min(poll_slice_ms, @as(u64, @intCast(left)));
@@ -209,6 +221,10 @@ pub const Dispatch = struct {
     failed: ?anyerror = null,
     future: std.Io.Future(void) = undefined,
     done: std.atomic.Value(bool) = .init(false),
+    /// Whether the future has been awaited. Cancelling and joining race when a
+    /// turn is cancelled off-thread, and the first one there does the wait.
+    reaped: bool = false,
+    stop: std.atomic.Value(bool) = .init(false),
 
     pub fn start(allocator: std.mem.Allocator, runner: Runner, invocation: Invocation) !*Dispatch {
         const self = try allocator.create(Dispatch);
@@ -218,8 +234,15 @@ pub const Dispatch = struct {
             .runner = runner,
             .invocation = invocation,
         };
+        self.runner.stop = &self.stop;
         self.future = try runner.io.concurrent(run, .{self});
         return self;
+    }
+
+    /// Ask the hooks to stop without waiting for them. Cheap, and safe from
+    /// the thread drawing the screen.
+    pub fn requestStop(self: *Dispatch) void {
+        self.stop.store(true, .release);
     }
 
     pub fn isFinished(self: *Dispatch) bool {
@@ -227,10 +250,18 @@ pub const Dispatch = struct {
     }
 
     pub fn join(self: *Dispatch) void {
+        if (self.reaped) return;
+        self.reaped = true;
         self.future.await(self.runner.io);
     }
 
+    /// Interrupt the hooks and wait for them to unwind. Blocks for as long as
+    /// a hook command takes to give up, so never call it from the thread
+    /// drawing the screen.
     pub fn cancel(self: *Dispatch) void {
+        if (self.reaped) return;
+        self.reaped = true;
+        self.requestStop();
         self.future.cancel(self.runner.io);
     }
 
@@ -309,6 +340,50 @@ test "a matching pre-tool hook can block" {
     defer if (reason) |text| testing.allocator.free(text);
     try testing.expectEqualStrings("blocked by policy", reason.?);
 }
+
+test "raising the stop flag ends a hook that would otherwise run on" {
+    const testing = std.testing;
+    if (!posix_signals) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
+
+    // Outlasts both the test and the timeout, so only the flag can end it.
+    const hook = Hook{ .command = "read payload; sleep 30" };
+    var stop: std.atomic.Value(bool) = .init(false);
+    const runner: Runner = .{
+        .io = testing.io,
+        .root = root,
+        .set = .{ .user_prompt_submit = &.{hook} },
+        .timeout_ms = 60_000,
+        .stop = &stop,
+    };
+
+    var raiser: StopAfter = .{ .io = testing.io, .flag = &stop };
+    var future = try testing.io.concurrent(StopAfter.run, .{&raiser});
+    defer future.await(testing.io);
+
+    const started: std.Io.Timestamp = .now(testing.io, .awake);
+    try testing.expectError(
+        error.Cancelled,
+        runner.dispatch(testing.allocator, .{ .event = .user_prompt_submit, .prompt = "go" }),
+    );
+    const elapsed = started.durationTo(.now(testing.io, .awake)).nanoseconds;
+    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+}
+
+/// Raises a stop flag once the command under test is certainly running.
+const StopAfter = struct {
+    io: std.Io,
+    flag: *std.atomic.Value(bool),
+
+    fn run(self: *StopAfter) void {
+        std.Io.sleep(self.io, .fromMilliseconds(150), .awake) catch {};
+        self.flag.store(true, .release);
+    }
+};
 
 test "a matcher leaves other tools alone" {
     const testing = std.testing;

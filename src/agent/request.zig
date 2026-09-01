@@ -20,6 +20,9 @@ thoughts: Thought.Stream,
 content: Thought.Stream,
 
 future: std.Io.Future(void) = undefined,
+/// Whether the future has been awaited and freed. Awaiting twice is undefined,
+/// and cancelling happens on a worker thread while the owner still holds this.
+reaped: bool = false,
 done: std.atomic.Value(bool) = .init(false),
 /// A cooperative nudge, checked by the provider between chunks. Cancellation
 /// proper is `cancel`; this is the cheap non-blocking half, and it covers the
@@ -77,11 +80,19 @@ pub fn requestStop(self: *Request) void {
 }
 
 pub fn join(self: *Request) void {
+    if (self.reaped) return;
+    self.reaped = true;
     self.future.await(self.io);
 }
 
 /// Interrupt the turn and wait for it to unwind.
+///
+/// Blocks for as long as the worker takes to notice, which for a provider
+/// midway through a socket read is not bounded by anything this side controls.
+/// Never call it from the thread drawing the screen.
 pub fn cancel(self: *Request) void {
+    if (self.reaped) return;
+    self.reaped = true;
     self.requestStop();
     self.future.cancel(self.io);
 }

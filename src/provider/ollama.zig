@@ -71,6 +71,13 @@ context_limit: u32 = 0,
 /// default - and it is usually far below what the metadata advertises. Zero
 /// until a turn has run, or when the server is too old to report it.
 runtime_limit: u32 = 0,
+/// The window to ask the server to load the model with, sent as `num_ctx`.
+///
+/// Without it the server picks, and what it picks - `OLLAMA_CONTEXT_LENGTH`, or
+/// its own default - is usually far below what the model can do. Null asks for
+/// the model's advertised maximum; zero asks for nothing and leaves the choice
+/// to the server.
+num_ctx: ?u32 = null,
 /// What ollama said when it last turned a request down, owned by this struct.
 /// Written on the worker thread as a turn fails and read on the UI thread once
 /// that turn has been joined, so no lock: the failure is the handoff.
@@ -606,6 +613,7 @@ fn respond(
             .stream = true,
             .think = if (self.think) .{ .bool = true } else null,
             .tools = tools,
+            .options = if (self.requestedContext()) |n| .{ .num_ctx = n } else null,
         };
 
         break self.client.chat(request) catch |err| {
@@ -654,7 +662,7 @@ fn respond(
 
         if (chunk.message.tool_calls) |tool_calls| {
             for (tool_calls) |call| {
-                try calls.append(allocator, try toolCall(allocator, calls.items.len, call));
+                try calls.append(allocator, try toolCall(allocator, call));
             }
         }
 
@@ -758,7 +766,6 @@ fn outboundToolCalls(
 /// the turn. It only has to be unique within the message.
 fn toolCall(
     allocator: std.mem.Allocator,
-    index: usize,
     call: Ollama.ToolCall,
 ) !Conversation.ToolCall {
     var arguments: std.Io.Writer.Allocating = .init(allocator);
@@ -766,7 +773,7 @@ fn toolCall(
     try std.json.Stringify.value(call.function.arguments, .{}, &arguments.writer);
 
     return .{
-        .id = try std.fmt.allocPrint(allocator, "call_{d}", .{index}),
+        .id = try Conversation.ToolCall.synthesizeId(allocator),
         .name = try allocator.dupe(u8, call.function.name),
         .arguments = try arguments.toOwnedSlice(),
     };
@@ -843,6 +850,16 @@ fn buildMessages(
     return messages[0..next];
 }
 
+/// The window to ask for, or null to let the server decide.
+///
+/// A runner already loaded with a different window is reloaded to match, so
+/// asking for more than the machine has costs a load that fails or spills to
+/// the CPU. `/api/ps` is what says which one actually happened.
+pub fn requestedContext(self: *const OllamaProvider) ?u32 {
+    if (self.num_ctx) |asked| return if (asked == 0) null else asked;
+    return if (self.context_limit > 0) self.context_limit else null;
+}
+
 /// The context window to plan against: what the loaded runner actually has,
 /// falling back to what the model says it could have.
 pub fn effectiveLimit(self: *const OllamaProvider) u32 {
@@ -885,6 +902,41 @@ fn runnerContextLength(allocator: std.mem.Allocator, raw: []const u8, model: []c
 
 fn contextBudget(self: *OllamaProvider) usize {
     return window.budgetFor(self.effectiveLimit());
+}
+
+test "the window asked for is the model's own unless configured otherwise" {
+    var self: OllamaProvider = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .host = "",
+        .model = "",
+    };
+
+    try std.testing.expect(self.requestedContext() == null);
+
+    self.context_limit = 500_000;
+    try std.testing.expectEqual(@as(u32, 500_000), self.requestedContext().?);
+
+    self.num_ctx = 32_768;
+    try std.testing.expectEqual(@as(u32, 32_768), self.requestedContext().?);
+
+    self.num_ctx = 0;
+    try std.testing.expect(self.requestedContext() == null);
+}
+
+test "the runner's window wins over what the model advertises" {
+    var self: OllamaProvider = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .host = "",
+        .model = "",
+    };
+
+    self.context_limit = 262_144;
+    try std.testing.expectEqual(@as(u32, 262_144), self.effectiveLimit());
+
+    self.runtime_limit = 32_768;
+    try std.testing.expectEqual(@as(u32, 32_768), self.effectiveLimit());
 }
 
 test "a text-only model gets a note where the image was" {

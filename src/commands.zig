@@ -515,7 +515,7 @@ fn debugServer(
     });
     try out.flush();
 
-    try probeInitialize(allocator, io, store, name, http.url, arena, out);
+    try probeInitialize(allocator, io, store, name, http.url, http.headers, arena, out);
 }
 
 /// Walk the real opening sequence and print what each step came back with.
@@ -531,6 +531,7 @@ fn probeInitialize(
     store: *mcp.Auth,
     name: []const u8,
     url: []const u8,
+    extra: []const std.http.Header,
     arena: std.mem.Allocator,
     out: *std.Io.Writer,
 ) !void {
@@ -545,11 +546,19 @@ fn probeInitialize(
     else
         "";
 
-    try out.print("\n  {s}sent as{s}    {s}\n", .{
+    // Naming both: a configured header is the whole reason a server with no
+    // registration endpoint can be reached at all, and a probe that quietly
+    // left it out would report a refusal the real client never gets.
+    try out.print("\n  {s}sent as{s}    {s}", .{
         dim,
         reset,
-        if (authorization.len > 0) "bearer token" else "no credentials",
+        if (authorization.len > 0) "bearer token" else "no token",
     });
+    if (extra.len > 0) {
+        try out.print("{s} + {d} configured header(s):{s}", .{ dim, extra.len, reset });
+        for (extra) |header| try out.print(" {s}", .{header.name});
+    }
+    try out.writeAll("\n");
 
     var sid: ?[]const u8 = null;
 
@@ -557,13 +566,13 @@ fn probeInitialize(
         \\{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25","capabilities":{{}},"clientInfo":{{"name":"{s}","version":"{s}"}}}}}}
     , .{ pkg.name, pkg.version });
 
-    if (!try probeStep(allocator, arena, io, out, "initialize", url, authorization, &sid, initialize)) return;
+    if (!try probeStep(allocator, arena, io, out, "initialize", url, authorization, extra, &sid, initialize)) return;
 
-    if (!try probeStep(allocator, arena, io, out, "initialized", url, authorization, &sid,
+    if (!try probeStep(allocator, arena, io, out, "initialized", url, authorization, extra, &sid,
         \\{"jsonrpc":"2.0","method":"notifications/initialized"}
     )) return;
 
-    _ = try probeStep(allocator, arena, io, out, "tools/list", url, authorization, &sid,
+    _ = try probeStep(allocator, arena, io, out, "tools/list", url, authorization, extra, &sid,
         \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
     );
 }
@@ -578,21 +587,28 @@ fn probeStep(
     label: []const u8,
     url: []const u8,
     authorization: []const u8,
+    extra: []const std.http.Header,
     sid: *?[]const u8,
     body: []const u8,
 ) !bool {
-    var headers: [3]std.http.Header = undefined;
+    var built: [3]std.http.Header = undefined;
     var count: usize = 0;
-    headers[count] = .{ .name = "accept", .value = "application/json, text/event-stream" };
+    built[count] = .{ .name = "accept", .value = "application/json, text/event-stream" };
     count += 1;
     if (authorization.len > 0) {
-        headers[count] = .{ .name = "authorization", .value = authorization };
+        built[count] = .{ .name = "authorization", .value = authorization };
         count += 1;
     }
     if (sid.*) |value| {
-        headers[count] = .{ .name = "mcp-session-id", .value = value };
+        built[count] = .{ .name = "mcp-session-id", .value = value };
         count += 1;
     }
+
+    // The same order the transport uses, so what this probe sends is what the
+    // client sends.
+    const headers = try arena.alloc(std.http.Header, count + extra.len);
+    @memcpy(headers[0..count], built[0..count]);
+    @memcpy(headers[count..], extra);
 
     var client: std.http.Client = .{ .io = io, .allocator = allocator };
     defer client.deinit();
@@ -600,7 +616,7 @@ fn probeStep(
     var request = client.request(.POST, try std.Uri.parse(url), .{
         .keep_alive = false,
         .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = headers[0..count],
+        .extra_headers = headers,
     }) catch |err| {
         try out.print("\n  {s}{s}{s} could not send ({s})\n", .{ bold, label, reset, @errorName(err) });
         return false;
