@@ -1375,7 +1375,12 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
-    if (self.escapesProject(call)) return false;
+
+    if (self.outsidePath(self.allocator, call) catch null) |path| {
+        defer self.allocator.free(path);
+        if (!self.agent.allows(call.name)) return false;
+        return self.coversExactly(call.name, path);
+    }
 
     const definition = self.registry.get(call.name) orelse return false;
     if (definition.read_only) return true;
@@ -1390,37 +1395,64 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
 /// read-only tool. Anything unparseable counts as escaping, so a malformed
 /// argument is asked about rather than waved through.
 fn escapesProject(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    if (call.arguments.len == 0) return false;
+    const outside = self.outsidePath(self.allocator, call) catch return false;
+    if (outside) |path| {
+        self.allocator.free(path);
+        return true;
+    }
+    return false;
+}
+
+/// The path this call names that lies outside the project, resolved so that an
+/// allowance on `/tmp/notes.md` cannot be spent on `/tmp/../etc/passwd`. Null
+/// when the call stays inside, or names no path at all.
+fn outsidePath(
+    self: *const Loop,
+    allocator: std.mem.Allocator,
+    call: *const Conversation.ToolCall,
+) !?[]u8 {
+    if (call.arguments.len == 0) return null;
 
     var scratch: std.heap.ArenaAllocator = .init(self.allocator);
     defer scratch.deinit();
     const arena = scratch.allocator();
 
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.arguments, .{}) catch return null;
     const fields = switch (parsed) {
         .object => |object| object,
-        else => return false,
+        else => return null,
     };
 
     for ([_][]const u8{ "path", "file" }) |name| {
         const value = fields.get(name) orelse continue;
         if (value != .string) continue;
         if (value.string.len == 0) continue;
-        if (!self.withinProject(arena, value.string)) return true;
+
+        const resolved = self.resolveAgainstProject(arena, value.string) orelse
+            return try allocator.dupe(u8, value.string);
+        if (!self.inside(resolved)) return try allocator.dupe(u8, resolved);
     }
-    return false;
+    return null;
 }
 
-fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
+fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) ?[]const u8 {
     const joined = if (std.fs.path.isAbsolute(path))
-        arena.dupe(u8, path) catch return false
+        arena.dupe(u8, path) catch return null
     else
-        std.fs.path.join(arena, &.{ self.project_root, path }) catch return false;
+        std.fs.path.join(arena, &.{ self.project_root, path }) catch return null;
 
-    const resolved = std.fs.path.resolve(arena, &.{joined}) catch return false;
+    return std.fs.path.resolve(arena, &.{joined}) catch null;
+}
+
+fn inside(self: *const Loop, resolved: []const u8) bool {
     if (!std.mem.startsWith(u8, resolved, self.project_root)) return false;
     if (resolved.len == self.project_root.len) return true;
     return resolved[self.project_root.len] == std.fs.path.sep;
+}
+
+fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
+    const resolved = self.resolveAgainstProject(arena, path) orelse return false;
+    return self.inside(resolved);
 }
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
@@ -1457,7 +1489,11 @@ fn trimForModel(self: *Loop, result: []const u8) ![]const u8 {
 
 /// Record an "allow always" for what this call is doing, and persist it.
 fn allow(self: *Loop, call: *const Conversation.ToolCall) !void {
-    const patterns = try approvalPatterns(self.allocator, call.name, call.arguments);
+    const patterns = if (try self.outsidePath(self.allocator, call)) |path| blk: {
+        const out = try self.allocator.alloc([]const u8, 1);
+        out[0] = path;
+        break :blk out;
+    } else try approvalPatterns(self.allocator, call.name, call.arguments);
     defer freePatterns(self.allocator, patterns);
 
     for (patterns) |pattern| {
@@ -1567,6 +1603,15 @@ fn isAllowed(self: *const Loop, call: *const Conversation.ToolCall) bool {
         if (!self.covers(call.name, pattern)) return false;
     }
     return true;
+}
+
+/// Whether an allowance names this pattern outright, ignoring `*`.
+fn coversExactly(self: *const Loop, name: []const u8, pattern: []const u8) bool {
+    for (self.allowed.items) |allowance| {
+        if (!std.mem.eql(u8, allowance.tool, name)) continue;
+        if (std.mem.eql(u8, allowance.pattern, pattern)) return true;
+    }
+    return false;
 }
 
 fn covers(self: *const Loop, name: []const u8, pattern: []const u8) bool {
@@ -3229,4 +3274,66 @@ test "what a turn did survives the session being resumed" {
     const restored = convo.last().?;
     try testing.expectEqual(Conversation.Role.summary, restored.role);
     try testing.expectEqualStrings(said, restored.text);
+}
+
+test "saying always to a path outside the project covers that path again" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "read",
+        .arguments = "{\"path\":\"/tmp/hooks.zig\"}",
+    };
+
+    try testing.expect(!loop.needsNoDecision(&call));
+    try loop.allow(&call);
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.arguments = "{\"path\":\"/tmp/other.zig\"}";
+    try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "an allowance outside the project is keyed on the resolved path" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "read",
+        .arguments = "{\"path\":\"/tmp/hooks.zig\"}",
+    };
+    try loop.allow(&call);
+
+    call.arguments = "{\"path\":\"/tmp/nested/../hooks.zig\"}";
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.arguments = "{\"path\":\"/tmp/../etc/passwd\"}";
+    try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "a blanket allowance still stops at the project boundary" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.remember("read", "*");
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "read",
+        .arguments = "{\"path\":\"notes.md\"}",
+    };
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.arguments = "{\"path\":\"/tmp/hooks.zig\"}";
+    try testing.expect(!loop.needsNoDecision(&call));
 }
