@@ -16,9 +16,8 @@ const bell = @import("bell.zig");
 /// cannot be pasted into a prompt whole.
 const max_draft_bytes: std.Io.Limit = .limited(1 << 20);
 
-/// The file the draft is written to. Suffixed so an editor picks a markdown
-/// mode: a prompt is prose, and soft wrapping is what makes it readable.
-const draft_name = "synth-draft.md";
+/// Longest name `draftName` writes.
+const draft_name_bytes = 64;
 
 pub const Error = error{ NoEditor, EditorFailed };
 
@@ -38,11 +37,22 @@ pub fn edit(
     var dir = try std.Io.Dir.openDirAbsolute(io, tempRoot(environ), .{});
     defer dir.close(io);
 
-    try dir.writeFile(io, .{ .sub_path = draft_name, .data = draft });
-    defer dir.deleteFile(io, draft_name) catch {};
+    var name_buffer: [draft_name_bytes]u8 = undefined;
+    const name = draftName(io, &name_buffer);
+
+    // Exclusive: an existing name is an error, not a write through a symlink.
+    {
+        var file = try dir.createFile(io, name, .{ .exclusive = true });
+        defer file.close(io);
+        var write_buffer: [4096]u8 = undefined;
+        var writer = file.writer(io, &write_buffer);
+        try writer.interface.writeAll(draft);
+        try writer.interface.flush();
+    }
+    defer dir.deleteFile(io, name) catch {};
 
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = path_buffer[0..try dir.realPathFile(io, draft_name, &path_buffer)];
+    const path = path_buffer[0..try dir.realPathFile(io, name, &path_buffer)];
 
     {
         var handed = HandOver.take(app);
@@ -50,7 +60,7 @@ pub fn edit(
         try run(allocator, io, command, path);
     }
 
-    const edited = try dir.readFileAlloc(io, draft_name, allocator, max_draft_bytes);
+    const edited = try dir.readFileAlloc(io, name, allocator, max_draft_bytes);
     errdefer allocator.free(edited);
 
     // A trailing newline is right for a file and wrong for a prompt.
@@ -59,6 +69,18 @@ pub fn edit(
 
     defer allocator.free(edited);
     return allocator.dupe(u8, trimmed);
+}
+
+/// A name no other synth is writing at the same moment. `.md`-suffixed so an
+/// editor picks a markdown mode: a prompt is prose, and soft wrapping is what
+/// makes it readable.
+fn draftName(io: std.Io, buffer: *[draft_name_bytes]u8) []const u8 {
+    var salt: [4]u8 = undefined;
+    io.random(&salt);
+
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.print("synth-draft-{x}.md", .{std.mem.readInt(u32, &salt, .little)}) catch unreachable;
+    return writer.buffered();
 }
 
 /// `$VISUAL` first: it is the one meant for a full-screen editor, which is what
@@ -171,7 +193,15 @@ test "the draft goes out to the editor and what it wrote comes back" {
     // Trimmed, so the prompt is what was written rather than what was saved.
     try testing.expectEqualStrings("the draft and more", out);
 
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, draft_name, .{}));
+    // The draft file is gone: only the editor script it ran is left behind.
+    var left: usize = 0;
+    var walk = try tmp.dir.openDir(io, ".", .{ .iterate = true });
+    defer walk.close(io);
+    var it = walk.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "synth-draft-")) left += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), left);
 }
 
 test "no editor configured is reported rather than guessed at" {

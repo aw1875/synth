@@ -121,6 +121,9 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `mcp` | object | none | MCP servers. See below. |
 | `hooks` | object | none | Commands run on selected agent lifecycle events. See below. |
 | `hook_timeout_ms` | number | `30000` | How long a hook command may run before it is killed. |
+| `web` | object | none | Settings for the web tools. See below. |
+| `prune` | object | shed after 30 days | What a prune throws away. See below. |
+| `bell` | string | `unfocused` | When a finished turn says so: `unfocused`, `always` or `never`. See below. |
 
 ```json
 {

@@ -268,8 +268,9 @@ environ: ?*std.process.Environ.Map = null,
 bell: Config.Bell = .unfocused,
 /// What the terminal last said about focus, or null if it has said nothing.
 focused: ?bool = null,
-/// Whether a turn was running at the last tick, so its ending can be noticed.
-was_busy: bool = false,
+/// Turns already announced, so a finished one rings once and a compaction
+/// settling back to idle rings not at all.
+rung_for: usize = 0,
 
 /// Rows the transcript is scrolled back from the newest message. Zero pins the
 /// view to the bottom, which is where it returns whenever a message arrives.

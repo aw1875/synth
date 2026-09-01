@@ -202,6 +202,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     model.prune_policy = config.prune;
     model.bell = config.bell;
     tui_bell.askForFocusReports(&app);
+    defer tui_bell.stopFocusReports(&app);
 
     // Into the model's registry, which is the one the loop was built with, and
     // before `useAgent` builds the tool schema from it - a tool registered after

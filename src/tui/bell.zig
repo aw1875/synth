@@ -15,6 +15,7 @@ const bel = "\x07";
 /// Focus reporting, which vaxis does not enable on its own. A terminal that
 /// does not know the mode ignores it, and never reports focus either way.
 pub const focus_set = "\x1b[?1004h";
+const focus_reset = "\x1b[?1004l";
 
 /// Whether a turn that just ended should ring, given what the terminal has said
 /// about focus. `focused` is null when it has said nothing.
@@ -73,6 +74,15 @@ fn notification(said: []const u8, wrapped: bool) []const u8 {
     return table.get(said) orelse table.get("done").?;
 }
 
+/// Stop the terminal reporting focus, so whatever runs next is not sent events
+/// it never asked for.
+pub fn stopFocusReports(app: *vxfw.App) void {
+    if (builtin.os.tag == .windows or builtin.is_test) return;
+    const writer = app.tty.writer();
+    writer.writeAll(focus_reset) catch {};
+    writer.flush() catch {};
+}
+
 /// Ask the terminal to report focus. Sent at startup, and again whenever the
 /// screen is handed back after a child process had it.
 pub fn askForFocusReports(app: *vxfw.App) void {
@@ -91,8 +101,7 @@ test "a notification is wrapped for tmux and bare outside it" {
         plain,
     );
 
-    // tmux forwards the payload only inside its own DCS wrapper, with every
-    // ESC doubled.
+    // tmux forwards a payload only inside its DCS wrapper, every ESC doubled.
     const wrapped = notification("cancelled", true);
     try testing.expect(std.mem.startsWith(u8, wrapped, "\x1bPtmux;"));
     try testing.expect(std.mem.endsWith(u8, wrapped, "\x1b\\"));

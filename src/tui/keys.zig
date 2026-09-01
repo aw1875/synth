@@ -506,11 +506,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
     }
 }
 
-/// Say so once, on the tick where a turn stops running.
+/// Say so once, for each turn that reaches the end of the loop.
 fn ringIfFinished(self: *Model) void {
-    const busy = self.loop.isBusy();
-    defer self.was_busy = busy;
-    if (busy or !self.was_busy) return;
+    if (self.loop.finished == self.rung_for) return;
+    self.rung_for = self.loop.finished;
 
     if (!bell.shouldRing(self.bell, self.focused)) return;
     const app = self.app orelse return;

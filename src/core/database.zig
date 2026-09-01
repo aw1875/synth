@@ -902,7 +902,8 @@ pub const Policy = struct {
     delete_after_days: u32 = 0,
     /// Sessions idle longer than this keep their transcript but lose the
     /// stored reasoning and the full tool output behind each card. What the
-    /// model was actually shown stays on `tool_call.result`.
+    /// model was shown stays on `tool_call.result`, and a pasted image stays
+    /// whatever its age.
     shed_after_days: u32 = 0,
 
     pub fn any(self: Policy) bool {
@@ -949,7 +950,9 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
 
     if (policy.shed_after_days > 0) {
         const cutoff = now_ms - dayMs(policy.shed_after_days);
-        const scope = "FROM blob WHERE message_id IN (SELECT m.id FROM message m" ++
+        // An allowlist: machine output goes, a hand-pasted image stays.
+        const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result')" ++
+            " AND message_id IN (SELECT m.id FROM message m" ++
             " JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)";
         if (try self.conn.row("SELECT count(*), coalesce(sum(length(body)), 0) " ++ scope, .{cutoff})) |row| {
             defer row.deinit();
@@ -1068,6 +1071,7 @@ fn agedFixture(dir: *std.testing.TmpDir, ages: []const u32) !Database {
         const session_id = try db.createSession(project_id, "/repo", "a-model");
         const message_id = try db.appendMessage(session_id, 0, "assistant", "a message", null, 0);
         try db.appendToolCall(message_id, 0, "call_0", "read", "{}", "ok", "short", 5);
+        try db.appendBlob(message_id, 1, "image", "a pasted screenshot");
         try db.appendBlob(message_id, 0, "tool_result", "the whole of a long result");
         try db.appendBlob(message_id, 0, "reasoning", "some thinking");
 
@@ -1193,7 +1197,7 @@ test "a prune with no policy leaves everything alone" {
     const done = try db.prune(.{}, db.nowMs());
     try std.testing.expect(!done.any());
     try std.testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM session"));
-    try std.testing.expectEqual(@as(i64, 4), try countOf(&db, "SELECT count(*) FROM blob"));
+    try std.testing.expectEqual(@as(i64, 6), try countOf(&db, "SELECT count(*) FROM blob"));
 }
 
 test "shedding drops stored payloads but keeps the transcript" {
@@ -1213,8 +1217,26 @@ test "shedding drops stored payloads but keeps the transcript" {
     // Both sessions and both transcripts survive; only the old one's blobs go.
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM session"));
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM message"));
-    try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(@as(i64, 4), try countOf(&db, "SELECT count(*) FROM blob"));
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM tool_call"));
+}
+
+test "shedding keeps a pasted image however old the session is" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{100});
+    defer db.deinit();
+
+    _ = try db.prune(.{ .shed_after_days = 30 }, db.nowMs());
+
+    // An image was pasted in by hand; the other two are machine output.
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(
+        @as(i64, 1),
+        try countOf(&db, "SELECT count(*) FROM blob WHERE kind = 'image'"),
+    );
 }
 
 test "deleting takes the whole session with it" {
@@ -1232,7 +1254,7 @@ test "deleting takes the whole session with it" {
 
     try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM session"));
     try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM message"));
-    try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(@as(i64, 3), try countOf(&db, "SELECT count(*) FROM blob"));
     try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM tool_call"));
 }
 
