@@ -53,6 +53,7 @@ pub const Command = union(enum) {
         list,
         show: []const u8,
         remove: []const u8,
+        search: []const u8,
     };
 
     /// Looking after the database the transcripts live in.
@@ -91,8 +92,8 @@ const mcp_params = clap.parseParamsComptime(
 
 const session_params = clap.parseParamsComptime(
     \\-h, --help    show this help and exit
-    \\<str>         list, show <id>, or rm <id>
-    \\<str>         the session handle, for show and rm
+    \\<str>         list, show <id>, rm <id>, or search <text>
+    \\<str>         the session handle, or the text to search for
     \\
 );
 
@@ -239,6 +240,9 @@ fn parseSession(
     if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "delete")) {
         return .{ .session = .{ .remove = try allocator.dupe(u8, handle) } };
     }
+    if (std.mem.eql(u8, verb, "search") or std.mem.eql(u8, verb, "grep")) {
+        return .{ .session = .{ .search = try allocator.dupe(u8, handle) } };
+    }
     return error.UnknownSessionCommand;
 }
 
@@ -337,6 +341,7 @@ const help_sections: []const Section = &.{
             .{ .left = "session list", .right = "sessions for this project, newest first" },
             .{ .left = "session show <id>", .right = "print a session's transcript" },
             .{ .left = "session rm <id>", .right = "delete a session" },
+            .{ .left = "session search <text>", .right = "find messages in this project's transcripts" },
             .{ .left = "mcp list", .right = "configured MCP servers and their state" },
             .{ .left = "mcp auth <name>", .right = "sign in to a remote MCP server" },
             .{ .left = "mcp logout <name>", .right = "forget a server's credentials" },

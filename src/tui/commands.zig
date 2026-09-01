@@ -21,6 +21,9 @@ const Model = @import("model.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const Slash = @import("slash.zig");
+
+/// Most transcript hits `/search` will show at once.
+const search_limit: usize = 20;
 const theme = @import("theme.zig");
 const themes = @import("themes.zig");
 const humanize = @import("../core/humanize.zig");
@@ -37,6 +40,10 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         _ = try self.conversation.append(.{ .role = .assistant, .text = text });
         self.scroll = 0;
         ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.startsWith(u8, line, "/search")) {
+        try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
         return true;
     }
     if (std.mem.eql(u8, line, "/prune")) {
@@ -169,6 +176,46 @@ pub fn themeId(self: *Model) []const u8 {
 pub fn keepTheme(self: *Model, id: []const u8) void {
     const chosen = themes.apply(id);
     if (self.loop.database()) |db| db.setSetting("theme", chosen.id) catch {};
+}
+
+/// Find text in this project's transcripts, and write the hits into the view.
+fn searchTranscripts(self: *Model, ctx: *vxfw.EventContext, query: []const u8) !void {
+    if (query.len == 0) {
+        try self.notification.show(ctx, .info, "Give /search something to look for");
+        return;
+    }
+
+    const db = self.loop.database() orelse return;
+    const project_id = self.loop.project_id orelse return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const hits = db.search(arena, project_id, query, search_limit) catch {
+        try self.notification.show(ctx, .warn, "Could not search the transcripts");
+        return;
+    };
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    if (hits.len == 0) {
+        try out.writer.print("Nothing matching `{s}`.", .{query});
+    } else {
+        try out.writer.print("{d} message(s) matching `{s}`:\n", .{ hits.len, query });
+        for (hits) |hit| {
+            const named = if (hit.title.len > 0) hit.title else hit.public_id;
+            try out.writer.print("\n**{s}** ({s})\n{s}: {s}\n", .{
+                named,
+                hit.public_id,
+                hit.role,
+                hit.excerpt,
+            });
+        }
+    }
+
+    _ = try self.conversation.append(.{ .role = .assistant, .text = out.written() });
+    self.scroll = 0;
+    ctx.redraw = true;
 }
 
 /// Apply the configured policy now, and say what it took out.

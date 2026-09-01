@@ -207,6 +207,135 @@ pub fn listSessions(
     return list.toOwnedSlice(allocator);
 }
 
+/// One message matching a search, with enough around it to recognise.
+pub const Hit = struct {
+    session_id: i64,
+    public_id: []const u8,
+    title: []const u8,
+    seq: i64,
+    role: []const u8,
+    created_at: i64,
+    /// The match with a little either side, on one line.
+    excerpt: []const u8,
+
+    pub fn deinit(self: *const Hit, allocator: std.mem.Allocator) void {
+        allocator.free(self.public_id);
+        allocator.free(self.title);
+        allocator.free(self.role);
+        allocator.free(self.excerpt);
+    }
+};
+
+/// Characters of context kept either side of a match.
+const excerpt_margin: usize = 48;
+
+/// Messages in this project whose text contains `query`.
+///
+/// What was said comes before what a tool printed, then newest first: a search
+/// is usually looking for the conversation, and tool output is long enough to
+/// bury it.
+///
+/// A scan rather than an index: the transcript is bounded by pruning, and at
+/// the size it stays a full pass costs a few milliseconds. FTS5 would want a
+/// build flag on the sqlite amalgamation, a virtual table, triggers to keep it
+/// honest, and a backfill, which is a lot of machinery to buy that back.
+pub fn search(
+    self: *Database,
+    allocator: std.mem.Allocator,
+    project_id: i64,
+    query: []const u8,
+    limit: usize,
+) ![]Hit {
+    const trimmed = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed.len == 0) return &.{};
+
+    const needle = try escapeLike(allocator, trimmed);
+    defer allocator.free(needle);
+
+    var rows = try self.conn.rows(
+        \\SELECT s.id, s.public_id, s.title, m.seq, m.role, m.created_at, m.text
+        \\FROM message m
+        \\JOIN session s ON m.session_id = s.id
+        \\WHERE s.project_id = ? AND m.text LIKE '%' || ? || '%' ESCAPE '\'
+        \\ORDER BY m.role = 'tool', m.created_at DESC, m.seq DESC
+        \\LIMIT ?
+    , .{ project_id, needle, @as(i64, @intCast(limit)) });
+    defer rows.deinit();
+
+    var list: std.ArrayList(Hit) = .empty;
+    errdefer {
+        for (list.items) |hit| hit.deinit(allocator);
+        list.deinit(allocator);
+    }
+
+    while (rows.next()) |row| {
+        const public_id = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(public_id);
+        const title = try allocator.dupe(u8, row.text(2));
+        errdefer allocator.free(title);
+        const role = try allocator.dupe(u8, row.text(4));
+        errdefer allocator.free(role);
+
+        try list.append(allocator, .{
+            .session_id = row.int(0),
+            .public_id = public_id,
+            .title = title,
+            .seq = row.int(3),
+            .role = role,
+            .created_at = row.int(5),
+            .excerpt = try excerpt(allocator, row.text(6), trimmed),
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// `query` with LIKE's own wildcards defanged, so searching for `100%` does not
+/// match everything.
+fn escapeLike(allocator: std.mem.Allocator, query: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (query) |c| {
+        if (c == '%' or c == '_' or c == '\\') try out.writer.writeByte('\\');
+        try out.writer.writeByte(c);
+    }
+    return out.toOwnedSlice();
+}
+
+/// The line around the first match, collapsed to one line and elided either
+/// side, so a hit reads in a list without carrying a whole message with it.
+fn excerpt(allocator: std.mem.Allocator, text: []const u8, query: []const u8) ![]const u8 {
+    const at = indexOfIgnoreCase(text, query) orelse 0;
+    const start = at -| excerpt_margin;
+    const end = @min(text.len, at + query.len + excerpt_margin);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+
+    if (start > 0) try out.writer.writeAll("...");
+    var spaced = false;
+    for (text[start..end]) |c| {
+        if (c == '\n' or c == '\r' or c == '\t') {
+            if (!spaced) try out.writer.writeByte(' ');
+            spaced = true;
+            continue;
+        }
+        spaced = false;
+        try out.writer.writeByte(c);
+    }
+    if (end < text.len) try out.writer.writeAll("...");
+
+    return out.toOwnedSlice();
+}
+
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
 /// The session a `--session` handle names, within this project.
 pub fn findSession(self: *Database, project_id: i64, public_id: []const u8) !?i64 {
     const row = try self.conn.row(
@@ -955,6 +1084,103 @@ fn countOf(db: *Database, sql: [:0]const u8) !i64 {
     const row = try db.conn.row(sql, .{}) orelse return 0;
     defer row.deinit();
     return row.int(0);
+}
+
+fn searchFixture(dir: *std.testing.TmpDir) !struct { db: Database, project_id: i64 } {
+    const testing = std.testing;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dir.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.joinZ(testing.allocator, &.{ buf[0..n], "search.db" });
+    defer testing.allocator.free(db_path);
+
+    var db = try init(testing.allocator, testing.io, db_path);
+    errdefer db.deinit();
+
+    const project_id = try db.resolveProject("/repo", "git", "repo");
+    const session_id = try db.createSession(project_id, "/repo", "a-model");
+
+    _ = try db.appendMessage(session_id, 0, "user", "how do I cancel a turn?", null, 0);
+    _ = try db.appendMessage(session_id, 1, "assistant", "Press esc to CANCEL it.", null, 0);
+    _ = try db.appendMessage(session_id, 2, "user", "what about 100% of the time", null, 0);
+    _ = try db.appendMessage(session_id, 3, "user", "a line\nwith a needle in it\nand more", null, 0);
+
+    // A second project, to prove a search does not reach across them.
+    const other = try db.resolveProject("/elsewhere", "git", "elsewhere");
+    const other_session = try db.createSession(other, "/elsewhere", "a-model");
+    _ = try db.appendMessage(other_session, 0, "user", "cancel this too", null, 0);
+
+    return .{ .db = db, .project_id = project_id };
+}
+
+test "a search finds messages whatever their case, within the project" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "cancel", 20);
+    defer {
+        for (hits) |hit| hit.deinit(testing.allocator);
+        testing.allocator.free(hits);
+    }
+
+    try testing.expectEqual(@as(usize, 2), hits.len);
+    for (hits) |hit| try testing.expect(hit.public_id.len > 0);
+}
+
+test "a wildcard in the query is matched as itself" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "100%", 20);
+    defer {
+        for (hits) |hit| hit.deinit(testing.allocator);
+        testing.allocator.free(hits);
+    }
+
+    try testing.expectEqual(@as(usize, 1), hits.len);
+
+    const none = try fixture.db.search(testing.allocator, fixture.project_id, "%%%", 20);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "an excerpt is one line, elided around the match" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "needle", 20);
+    defer {
+        for (hits) |hit| hit.deinit(testing.allocator);
+        testing.allocator.free(hits);
+    }
+
+    try testing.expectEqual(@as(usize, 1), hits.len);
+    try testing.expect(std.mem.indexOfScalar(u8, hits[0].excerpt, '\n') == null);
+    try testing.expect(std.mem.indexOf(u8, hits[0].excerpt, "needle") != null);
+}
+
+test "an empty query finds nothing rather than everything" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+
+    const hits = try fixture.db.search(testing.allocator, fixture.project_id, "   ", 20);
+    defer testing.allocator.free(hits);
+    try testing.expectEqual(@as(usize, 0), hits.len);
 }
 
 test "a prune with no policy leaves everything alone" {

@@ -46,6 +46,7 @@ provider.
 synth [project]                start the TUI (default)
 synth run [--allow] <message>  one headless turn, no TUI
 synth session list|show|rm     sessions for this project
+synth session search <text>    find text in this project's transcripts
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
@@ -170,6 +171,15 @@ both halves need turning on, and neither is the default:
 set -g focus-events on
 set -g allow-passthrough on
 ```
+
+### Searching
+
+`synth session search <text>`, or `/search <text>` inside the TUI, looks through
+every transcript in the project. What was said comes first and tool output
+after, since a search is usually after the conversation rather than a file a
+tool printed.
+
+The match is plain text, not a query language, so `100%` searches for `100%`.
 
 ### Pruning
 

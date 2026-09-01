@@ -85,6 +85,31 @@ pub fn session(init_process: std.process.Init, sub: cli.Command.Session) !void {
         .list => try listSessions(&ctx, out),
         .show => |handle| try showSession(&ctx, out, handle),
         .remove => |handle| try removeSession(&ctx, out, handle),
+        .search => |text| try searchSessions(&ctx, out, text),
+    }
+}
+
+fn searchSessions(ctx: *Context, out: *std.Io.Writer, query: []const u8) !void {
+    const hits = try ctx.db.search(ctx.allocator, ctx.project_id, query, list_limit);
+    defer {
+        for (hits) |hit| hit.deinit(ctx.allocator);
+        ctx.allocator.free(hits);
+    }
+
+    if (hits.len == 0) {
+        try out.print("nothing matching \"{s}\"\n", .{query});
+        return;
+    }
+
+    var when: [humanize.duration_bytes]u8 = undefined;
+    for (hits) |hit| {
+        const named = if (hit.title.len > 0) hit.title else "untitled";
+        try out.print("{s}  {s}  {s}\n", .{
+            hit.public_id,
+            named,
+            try ago(&when, ctx.io, hit.created_at),
+        });
+        try out.print("  {s}: {s}\n\n", .{ hit.role, hit.excerpt });
     }
 }
 
