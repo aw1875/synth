@@ -69,9 +69,19 @@ pub const Runner = struct {
     root: []const u8,
     set: Set,
     timeout_ms: u64 = default_timeout_ms,
+    /// Raised when the turn is cancelled. Checked between hooks and on every
+    /// slice of the wait for one, so a cancel lands without needing the signal
+    /// that interrupts a blocked syscall to arrive first.
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn givenUp(self: Runner) bool {
+        const flag = self.stop orelse return false;
+        return flag.load(.acquire);
+    }
 
     pub fn dispatch(self: Runner, allocator: std.mem.Allocator, invocation: Invocation) !?[]u8 {
         for (self.set.forEvent(invocation.event)) |hook| {
+            if (self.givenUp()) return error.Cancelled;
             if (!matches(hook.matcher, invocation.tool_name)) continue;
             const result = try self.runCommand(allocator, hook.command, invocation);
             defer allocator.free(result.stderr);
@@ -212,6 +222,7 @@ pub const Dispatch = struct {
     /// Whether the future has been awaited. Cancelling and joining race when a
     /// turn is cancelled off-thread, and the first one there does the wait.
     reaped: bool = false,
+    stop: std.atomic.Value(bool) = .init(false),
 
     pub fn start(allocator: std.mem.Allocator, runner: Runner, invocation: Invocation) !*Dispatch {
         const self = try allocator.create(Dispatch);
@@ -221,8 +232,15 @@ pub const Dispatch = struct {
             .runner = runner,
             .invocation = invocation,
         };
+        self.runner.stop = &self.stop;
         self.future = try runner.io.concurrent(run, .{self});
         return self;
+    }
+
+    /// Ask the hooks to stop without waiting for them. Cheap, and safe from
+    /// the thread drawing the screen.
+    pub fn requestStop(self: *Dispatch) void {
+        self.stop.store(true, .release);
     }
 
     pub fn isFinished(self: *Dispatch) bool {
@@ -241,6 +259,7 @@ pub const Dispatch = struct {
     pub fn cancel(self: *Dispatch) void {
         if (self.reaped) return;
         self.reaped = true;
+        self.requestStop();
         self.future.cancel(self.runner.io);
     }
 
