@@ -158,6 +158,19 @@ Search key in `BRAVE_API_KEY` switches it to an API that does not throttle.
 A debug build keeps all three files in the working directory, so a checkout
 never touches installed state.
 
+`"bell"` decides when a finished turn says so: `unfocused` (the default),
+`always`, or `never`. It sends both a desktop notification and BEL, because
+neither lands everywhere.
+
+The default needs the terminal to report focus, which synth asks for at startup;
+a terminal that does not answer never rings, so use `always` there. Under tmux
+both halves need turning on, and neither is the default:
+
+```
+set -g focus-events on
+set -g allow-passthrough on
+```
+
 ### Pruning
 
 The database keeps every transcript, and most of its weight is stored tool

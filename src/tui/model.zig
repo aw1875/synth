@@ -264,6 +264,12 @@ quit_confirm: Confirm = .{ .window_ms = quit_confirm_ms },
 app: ?*vxfw.App = null,
 /// The process environment, for the editor `ctrl+e` shells out to.
 environ: ?*std.process.Environ.Map = null,
+/// When a finished turn is worth a noise, as config.json set it.
+bell: Config.Bell = .unfocused,
+/// What the terminal last said about focus, or null if it has said nothing.
+focused: ?bool = null,
+/// Whether a turn was running at the last tick, so its ending can be noticed.
+was_busy: bool = false,
 
 /// Rows the transcript is scrolled back from the newest message. Zero pins the
 /// view to the bottom, which is where it returns whenever a message arrives.

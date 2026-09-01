@@ -12,6 +12,7 @@ const vxfw = vaxis.vxfw;
 
 const agents = @import("../agent/agent.zig");
 const commands = @import("commands.zig");
+const bell = @import("bell.zig");
 const editor = @import("editor.zig");
 const Model = @import("model.zig");
 const Selection = @import("selection.zig");
@@ -202,6 +203,14 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeEvent();
             }
         },
+        .focus_in => {
+            self.focused = true;
+            return;
+        },
+        .focus_out => {
+            self.focused = false;
+            return;
+        },
         .tick => {
             self.tick_pending = false;
             commands.checkModel(self, ctx);
@@ -229,6 +238,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
+            ringIfFinished(self);
             if (self.loop.isBusy()) {
                 self.thinking.stream = self.loop.thoughts();
                 self.thinking.label = self.loop.label();
@@ -496,6 +506,19 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
     }
 }
 
+/// Say so once, on the tick where a turn stops running.
+fn ringIfFinished(self: *Model) void {
+    const busy = self.loop.isBusy();
+    defer self.was_busy = busy;
+    if (busy or !self.was_busy) return;
+
+    if (!bell.shouldRing(self.bell, self.focused)) return;
+    const app = self.app orelse return;
+
+    const said = if (self.loop.outcome) |outcome| outcome.label() else "done";
+    bell.ring(app, self.environ, said);
+}
+
 /// Compose the draft in `$EDITOR`, and take back what was written.
 fn openEditor(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.loop.isBusy()) return;
@@ -537,6 +560,7 @@ pub fn suspendToShell(self: *Model) void {
     app.vx.setMouseMode(writer, true) catch {};
     app.vx.setBracketedPaste(writer, true) catch {};
     app.vx.subscribeToColorSchemeUpdates(writer) catch {};
+    writer.writeAll(bell.focus_set) catch {};
     if (in_band_resize) {
         writer.writeAll(vaxis.ctlseqs.in_band_resize_set) catch {};
         app.vx.state.in_band_resize = true;

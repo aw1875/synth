@@ -29,6 +29,7 @@ const skill_tool = @import("tools/skill.zig");
 const web = @import("tools/web.zig");
 const tui_app = @import("tui/app.zig");
 const Model = @import("tui/model.zig");
+const tui_bell = @import("tui/bell.zig");
 const tui_commands = @import("tui/commands.zig");
 const Input = @import("tui/input.zig");
 const themes = @import("tui/themes.zig");
@@ -199,6 +200,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     model.loop.delegate = runner.delegate();
     model.mcp = &mcp_host;
     model.prune_policy = config.prune;
+    model.bell = config.bell;
+    tui_bell.askForFocusReports(&app);
 
     // Into the model's registry, which is the one the loop was built with, and
     // before `useAgent` builds the tool schema from it - a tool registered after

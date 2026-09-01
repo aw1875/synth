@@ -10,6 +10,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+const bell = @import("bell.zig");
+
 /// Ceiling on what comes back, so a stray `$EDITOR` pointed at something huge
 /// cannot be pasted into a prompt whole.
 const max_draft_bytes: std.Io.Limit = .limited(1 << 20);
@@ -127,6 +129,7 @@ const HandOver = struct {
         app.vx.setMouseMode(writer, true) catch {};
         app.vx.setBracketedPaste(writer, true) catch {};
         app.vx.subscribeToColorSchemeUpdates(writer) catch {};
+        writer.writeAll(bell.focus_set) catch {};
         if (self.in_band_resize) {
             writer.writeAll(vaxis.ctlseqs.in_band_resize_set) catch {};
             app.vx.state.in_band_resize = true;
