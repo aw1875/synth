@@ -39,6 +39,11 @@ pub const max_repeats: usize = 3;
 /// legitimately takes a while. Zero turns it off.
 pub const default_turn_ms: i64 = 30 * std.time.ms_per_min;
 
+/// How long the provider may deliver nothing at all before the turn is given
+/// up on. Generous, because the gap before the first token is real work on a
+/// long prompt; the failure this catches sits at fifteen minutes without it.
+pub const default_stall_ms: i64 = 2 * std.time.ms_per_min;
+
 /// Tokens one turn may spend, prompt and completion together. The whole
 /// transcript is resent every step, so a long turn's cost grows with the square
 /// of its length; this is what notices. Zero turns it off.
@@ -173,6 +178,12 @@ steering: std.ArrayList([]const u8) = .empty,
 /// The turn's limits. Zero disables either one.
 max_turn_ms: i64 = default_turn_ms,
 max_turn_tokens: u64 = default_turn_tokens,
+/// How long the provider may go silent before the turn is abandoned. Zero
+/// disables it.
+max_stall_ms: i64 = default_stall_ms,
+/// Whether the turn now unwinding is one the stall check gave up on, so the
+/// outcome can say the connection died rather than blame the user for it.
+timed_out: bool = false,
 /// `seq` of the assistant message whose tool calls are being decided. A seq
 /// rather than an index: trimming the transcript shifts indices down and paging
 /// history back in shifts them up, either of which would leave a decision
@@ -930,6 +941,22 @@ fn overBudget(self: *Loop) ?[]const u8 {
     return null;
 }
 
+/// Abandon a turn whose provider has stopped sending.
+///
+/// Interrupted the same way the user's cancel interrupts it, because a worker
+/// blocked on a socket read unwinds for nothing short of cancelling its future.
+fn giveUpIfStalled(self: *Loop, request: *Request) bool {
+    if (!request.stalled(self.max_stall_ms)) return false;
+
+    self.timed_out = true;
+    self.requestStop();
+    self.startReaping();
+
+    self.compacting = false;
+    self.state = .cancelling;
+    return true;
+}
+
 /// Abandon the turn, discarding whatever the worker had produced.
 pub fn cancel(self: *Loop) !void {
     if (!self.isBusy()) return;
@@ -1004,6 +1031,15 @@ fn pollCancelled(self: *Loop) !bool {
     if (self.pending_submit) |*pending| pending.deinit(self.allocator);
     self.pending_submit = null;
 
+    if (self.timed_out) {
+        self.last_error = error.Timeout;
+        const text = "Request failed - the provider stopped responding.";
+        _ = try self.conversation.addAssistant(text, null, null);
+        try self.persistMessage(self.conversation.messages.items.len - 1);
+        self.finish(.failed);
+        return true;
+    }
+
     self.finish(.cancelled);
     return true;
 }
@@ -1037,7 +1073,7 @@ pub fn poll(self: *Loop) !bool {
 
 fn pollRequest(self: *Loop) !bool {
     const request = self.request orelse return false;
-    if (!request.isFinished()) return false;
+    if (!request.isFinished()) return self.giveUpIfStalled(request);
 
     request.join();
     self.request = null;
@@ -1133,6 +1169,8 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
+
+    self.timed_out = false;
 
     // Left raised, these would send the next cancel down the inline join.
     self.signalled = false;
@@ -2955,6 +2993,81 @@ test "an answer offered when nothing was asked is ignored" {
     try loop.answer("nobody asked");
     try testing.expectEqual(State.idle, loop.state);
     try testing.expect(loop.pendingQuestion() == null);
+}
+
+test "a provider that goes quiet is given up on rather than waited out" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    // Sends nothing for far longer than the turn is allowed to stay silent.
+    fixture.fake.latency = .fromMilliseconds(30_000);
+    loop.max_stall_ms = 40;
+
+    try loop.submit("go", .{});
+
+    while (loop.isBusy()) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Outcome.failed, loop.outcome.?);
+    try testing.expectEqual(error.Timeout, loop.last_error.?);
+
+    // The transcript says what happened, since nobody asked for this one.
+    const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last.text, "stopped responding") != null);
+}
+
+test "a stall is measured from the last chunk, not from the start" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    // Slower than the stall limit overall, but talking the whole way.
+    fixture.fake.latency = .fromMilliseconds(120);
+    loop.max_stall_ms = 60;
+
+    try loop.submit("go", .{});
+
+    var request = loop.request.?;
+    var ticks: usize = 0;
+    while (ticks < 12) : (ticks += 1) {
+        request.progress_ms.store(tool.monotonicMilliseconds(testing.io), .release);
+        try testing.expect(!request.stalled(loop.max_stall_ms));
+        try std.Io.sleep(testing.io, .fromMilliseconds(20), .real);
+    }
+
+    try loop.cancel();
+    while (loop.isBusy()) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    try testing.expectEqual(Outcome.cancelled, loop.outcome.?);
+}
+
+test "a zero stall limit leaves the turn alone" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    fixture.fake.latency = .fromMilliseconds(200);
+    loop.max_stall_ms = 0;
+
+    try loop.submit("go", .{});
+    while (loop.isBusy()) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+
+    try testing.expectEqual(Outcome.done, loop.outcome.?);
 }
 
 test "cancelling signals the worker at once, and the turn ends with it" {

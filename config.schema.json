@@ -40,6 +40,12 @@
             "minimum": 0,
             "description": "Tokens one turn may spend, prompt and completion together. 0 disables it."
         },
+        "max_stall_ms": {
+            "type": "number",
+            "default": 120000,
+            "minimum": 0,
+            "description": "How long the provider may send nothing before the turn is given up on. 0 disables it."
+        },
         "skill_paths": {
             "type": "array",
             "items": {
