@@ -67,8 +67,7 @@ jobs:
           draft: false
           fail_on_unmatched_files: true
           body: |
-            The latest build of `master`, replaced on every green run. Not a
-            supported release: use it to try something before it ships.
+            The latest build of `master`, replaced on every green run. Not a supported release: use it to try something before it ships.
 
             **Build ${{ steps.vars.outputs.build }}** from ${{ steps.vars.outputs.short }}
           token: ${{ secrets.GITHUB_TOKEN }}
