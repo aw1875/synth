@@ -3051,7 +3051,7 @@ test "a stall is measured from the last chunk, not from the start" {
     try testing.expectEqual(Outcome.cancelled, loop.outcome.?);
 }
 
-test "a zero stall limit leaves the turn alone" {
+test "a stall limit of zero or less leaves the turn alone" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
 
@@ -3059,15 +3059,19 @@ test "a zero stall limit leaves the turn alone" {
     defer loop.deinit();
 
     fixture.fake.latency = .fromMilliseconds(200);
-    loop.max_stall_ms = 0;
 
-    try loop.submit("go", .{});
-    while (loop.isBusy()) {
-        _ = try loop.poll();
-        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    // A negative limit reads as disabled too, the way the turn budgets do.
+    for ([_]i64{ 0, -1 }) |limit| {
+        loop.max_stall_ms = limit;
+
+        try loop.submit("go", .{});
+        while (loop.isBusy()) {
+            _ = try loop.poll();
+            try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+        }
+
+        try testing.expectEqual(Outcome.done, loop.outcome.?);
     }
-
-    try testing.expectEqual(Outcome.done, loop.outcome.?);
 }
 
 test "cancelling signals the worker at once, and the turn ends with it" {

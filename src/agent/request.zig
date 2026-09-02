@@ -88,9 +88,9 @@ pub fn requestStop(self: *Request) void {
 /// Non-blocking check for the owning thread. True once nothing has arrived for
 /// `limit_ms`, which from this side is what a dead connection looks like: the
 /// kernel keeps retransmitting into it for a quarter of an hour before the read
-/// fails on its own. Zero disables the check.
+/// fails on its own. Zero or less disables the check, matching the turn budgets.
 pub fn stalled(self: *Request, limit_ms: i64) bool {
-    if (limit_ms == 0) return false;
+    if (limit_ms <= 0) return false;
     if (self.isFinished()) return false;
     const quiet = tool.monotonicMilliseconds(self.io) - self.progress_ms.load(.acquire);
     return quiet >= limit_ms;
