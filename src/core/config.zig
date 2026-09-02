@@ -101,6 +101,9 @@ auto_approve_safe_commands: bool = true,
 /// runaway turn costs is the loop's business, not this file's.
 max_turn_ms: ?i64 = null,
 max_turn_tokens: ?u64 = null,
+/// How long the provider may send nothing before the turn is given up on.
+/// Zero turns it off, null takes the loop's default.
+max_stall_ms: ?i64 = null,
 /// Append every request and reply to this file, for debugging.
 debug_log: ?[]const u8 = null,
 database_path: []const u8 = database_file,
@@ -138,6 +141,7 @@ const File = struct {
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
+    max_stall_ms: ?i64 = null,
     skill_paths: ?[]const []const u8 = null,
     mcp: ?std.json.Value = null,
     web: ?struct {
@@ -257,6 +261,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.debug_log) |value| self.debug_log = value;
     if (parsed.max_turn_ms) |value| self.max_turn_ms = value;
     if (parsed.max_turn_tokens) |value| self.max_turn_tokens = value;
+    if (parsed.max_stall_ms) |value| self.max_stall_ms = value;
     if (parsed.skill_paths) |value| self.skill_paths = value;
     if (parsed.mcp) |value| self.mcp = value;
     if (parsed.hooks) |value| self.hooks = value.set();

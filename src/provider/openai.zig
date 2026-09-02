@@ -342,7 +342,10 @@ fn get(self: *OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]u8 
     const url = try self.endpoint(arena, path);
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
-    var request = try self.client.request(.GET, uri, .{ .headers = self.requestHeaders(false) });
+    var request = try self.client.request(.GET, uri, .{
+        .headers = self.requestHeaders(false),
+        .keep_alive = false,
+    });
     defer request.deinit();
     try request.sendBodiless();
 
@@ -384,7 +387,10 @@ fn respond(
     while (true) {
         const body = try self.buildRequest(arena, convo, turn);
 
-        var request = try self.client.request(.POST, uri, .{ .headers = self.requestHeaders(true) });
+        var request = try self.client.request(.POST, uri, .{
+            .headers = self.requestHeaders(true),
+            .keep_alive = false,
+        });
         defer request.deinit();
         try request.sendBodyComplete(body);
 

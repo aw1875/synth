@@ -31,7 +31,7 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          buildInputs = [
+          packages = [
             zig.packages.${system}."0.16.0"
             zls.packages.${system}.zls
           ];

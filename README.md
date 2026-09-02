@@ -116,6 +116,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
+| `max_stall_ms` | number | `120000` | How long the provider may send nothing before the turn is given up on. `0` disables it. |
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See below. |

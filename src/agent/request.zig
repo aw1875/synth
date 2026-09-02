@@ -5,6 +5,7 @@ const std = @import("std");
 const Provider = @import("../provider/provider.zig");
 const Conversation = @import("../core/conversation.zig");
 const Thought = @import("thought.zig");
+const tool = @import("../tools/tool.zig");
 
 const Request = @This();
 
@@ -28,6 +29,10 @@ done: std.atomic.Value(bool) = .init(false),
 /// proper is `cancel`; this is the cheap non-blocking half, and it covers the
 /// case where a provider swallows `error.Canceled` from an inner call.
 stop: std.atomic.Value(bool) = .init(false),
+/// When a chunk last arrived, on the monotonic clock. A connection that died
+/// mid-stream looks exactly like a model still thinking, and the only thing
+/// that tells them apart is how long the silence has run.
+progress_ms: std.atomic.Value(i64) = .init(0),
 /// Allocated with `allocator`; ownership passes to whoever calls `join`.
 reply: ?Provider.Reply = null,
 failed: ?anyerror = null,
@@ -56,6 +61,7 @@ pub fn start(
         },
         .thoughts = .init(allocator, io),
         .content = .init(allocator, io),
+        .progress_ms = .init(tool.monotonicMilliseconds(io)),
     };
     errdefer {
         self.freeTurn();
@@ -77,6 +83,17 @@ pub fn isFinished(self: *Request) bool {
 /// the check. Pair it with `cancel`.
 pub fn requestStop(self: *Request) void {
     self.stop.store(true, .release);
+}
+
+/// Non-blocking check for the owning thread. True once nothing has arrived for
+/// `limit_ms`, which from this side is what a dead connection looks like: the
+/// kernel keeps retransmitting into it for a quarter of an hour before the read
+/// fails on its own. Zero or less disables the check, matching the turn budgets.
+pub fn stalled(self: *Request, limit_ms: i64) bool {
+    if (limit_ms <= 0) return false;
+    if (self.isFinished()) return false;
+    const quiet = tool.monotonicMilliseconds(self.io) - self.progress_ms.load(.acquire);
+    return quiet >= limit_ms;
 }
 
 pub fn join(self: *Request) void {
@@ -136,13 +153,20 @@ fn run(self: *Request) void {
 /// Worker thread, via the provider's sink.
 fn onThinking(ptr: *anyopaque, bytes: []const u8) void {
     const self: *Request = @ptrCast(@alignCast(ptr));
+    self.markProgress();
     self.thoughts.append(bytes);
 }
 
 /// Worker thread, via the provider's sink.
 fn onText(ptr: *anyopaque, bytes: []const u8) void {
     const self: *Request = @ptrCast(@alignCast(ptr));
+    self.markProgress();
     self.content.append(bytes);
+}
+
+/// Worker thread. Says the connection is still delivering.
+fn markProgress(self: *Request) void {
+    self.progress_ms.store(tool.monotonicMilliseconds(self.io), .release);
 }
 
 /// Worker thread, via the provider's sink.
