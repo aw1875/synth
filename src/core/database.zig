@@ -997,10 +997,12 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
 
     if (policy.shed_after_days > 0) {
         const cutoff = now_ms - dayMs(policy.shed_after_days);
-        // An allowlist: machine output goes, a hand-pasted image stays.
+        // An allowlist, aged by the parent: a child's own clock stops on landing.
         const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result')" ++
             " AND message_id IN (SELECT m.id FROM message m" ++
-            " JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)";
+            " JOIN session s ON m.session_id = s.id" ++
+            " LEFT JOIN session p ON s.parent_session_id = p.id" ++
+            " WHERE coalesce(p.updated_at, s.updated_at) < ?)";
         if (try self.conn.row("SELECT count(*), coalesce(sum(length(body)), 0) " ++ scope, .{cutoff})) |row| {
             defer row.deinit();
             out.blobs_dropped = @intCast(row.int(0));
@@ -1022,13 +1024,13 @@ fn sessionPayload(self: *Database, cutoff: i64) !u64 {
     const row = try self.conn.row(
         \\SELECT
         \\  (SELECT coalesce(sum(length(m.text)), 0) FROM message m
-        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)
+        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
         \\+ (SELECT coalesce(sum(length(b.body)), 0) FROM blob b
         \\     JOIN message m ON b.message_id = m.id
-        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)
+        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
         \\+ (SELECT coalesce(sum(length(t.result)), 0) FROM tool_call t
         \\     JOIN message m ON t.message_id = m.id
-        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ?)
+        \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
     , .{ cutoff, cutoff, cutoff }) orelse return 0;
     defer row.deinit();
     return @intCast(row.int(0));
@@ -1402,6 +1404,34 @@ test "pruning leaves a live session's subagent transcript alone" {
     try testing.expectEqual(@as(u64, 0), dropped.sessions_deleted);
     try testing.expectEqual(@as(u64, 1), try db.countMessages(child));
     try testing.expectEqual(child, (try db.subagentSession(call)).?);
+}
+
+test "a subagent's blobs are shed with its parent, not before" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+    var db = &fixture.db;
+
+    const parent = try db.latestSession(fixture.project_id) orelse unreachable;
+    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4);
+    const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
+    const child_message = try db.appendMessage(child, 0, "assistant", "found it", null, 8);
+    try db.appendBlob(child_message, 0, "reasoning", "a long think");
+
+    // Old on its own clock, which stops the moment the run lands.
+    try db.conn.exec("UPDATE session SET updated_at = ? WHERE id = ?", .{ @as(i64, 0), child });
+
+    const quiet = try db.prune(.{ .shed_after_days = 1 }, db.nowMs());
+    try testing.expectEqual(@as(u64, 0), quiet.blobs_dropped);
+
+    // Once the parent is old too, both go.
+    try db.conn.exec("UPDATE session SET updated_at = ? WHERE id = ?", .{ @as(i64, 0), parent });
+    const dropped = try db.prune(.{ .shed_after_days = 1 }, db.nowMs());
+    try testing.expect(dropped.blobs_dropped > 0);
 }
 
 test "deleting a session takes its subagent transcripts with it" {
