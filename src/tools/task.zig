@@ -56,6 +56,7 @@ fn run(ctx: Context, input: Input) !Output {
         .agent = agent_id,
         .prompt = prompt,
         .label = input.string("description") orelse "",
+        .index = ctx.call_index,
         .cancelled = ctx.cancelled,
         .progress = ctx.progress,
     }) catch |err| {

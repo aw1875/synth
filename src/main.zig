@@ -198,6 +198,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     // a loop, and the loop must not need the thing that runs one.
     var runner: subagent.Runner = .{ .parent = &model.loop };
     model.loop.delegate = runner.delegate();
+    model.loop.transcripts = runner.transcripts();
+    defer runner.deinit();
     model.mcp = &mcp_host;
     model.prune_policy = config.prune;
     model.bell = config.bell;

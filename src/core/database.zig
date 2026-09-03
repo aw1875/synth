@@ -722,6 +722,16 @@ pub fn updateToolCall(
     );
 }
 
+/// The row a tool call was stored as, for anything that has to point at it.
+pub fn toolCallId(self: *Database, message_id: i64, seq: i64) !?i64 {
+    const row = try self.conn.row(
+        "SELECT id FROM tool_call WHERE message_id = ? AND seq = ?",
+        .{ message_id, seq },
+    ) orelse return null;
+    defer row.deinit();
+    return row.int(0);
+}
+
 /// Load up to `limit` messages with `seq < before_seq`, in descending order
 /// (newest first), along with their tool calls and reasoning previews. The
 /// caller reverses them before prepending. Owned by the caller; free each

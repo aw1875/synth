@@ -32,11 +32,64 @@ pub const Runner = struct {
     /// Blocked inside a tool call for as long as the subagent runs, which is
     /// what makes sharing the provider safe.
     parent: *Loop,
+    /// Transcripts finished but not yet collected, keyed by the parent call.
+    /// Written on a tool worker and drained on the UI thread, so it locks.
+    mutex: std.Io.Mutex = .init,
+    kept: std.ArrayList(Kept) = .empty,
+
+    const Kept = struct { index: usize, convo: *Conversation };
 
     pub fn delegate(self: *Runner) tool.Delegate {
         return .{ .userdata = self, .run = erasedRun };
     }
+
+    pub fn transcripts(self: *Runner) Loop.Transcripts {
+        return .{ .userdata = self, .take = erasedTake, .release = erasedRelease };
+    }
+
+    /// Free anything nobody came back for, which is what a cancelled turn
+    /// leaves behind.
+    pub fn deinit(self: *Runner) void {
+        self.mutex.lockUncancelable(self.parent.io);
+        defer self.mutex.unlock(self.parent.io);
+
+        for (self.kept.items) |entry| destroy(self.parent.allocator, entry.convo);
+        self.kept.deinit(self.parent.allocator);
+    }
+
+    fn keep(self: *Runner, index: usize, convo: *Conversation) !void {
+        self.mutex.lockUncancelable(self.parent.io);
+        defer self.mutex.unlock(self.parent.io);
+        try self.kept.append(self.parent.allocator, .{ .index = index, .convo = convo });
+    }
+
+    fn take(self: *Runner, index: usize) ?*Conversation {
+        self.mutex.lockUncancelable(self.parent.io);
+        defer self.mutex.unlock(self.parent.io);
+
+        for (self.kept.items, 0..) |entry, at| {
+            if (entry.index != index) continue;
+            _ = self.kept.orderedRemove(at);
+            return entry.convo;
+        }
+        return null;
+    }
 };
+
+fn erasedTake(ptr: *anyopaque, index: usize) ?*Conversation {
+    const self: *Runner = @ptrCast(@alignCast(ptr));
+    return self.take(index);
+}
+
+fn erasedRelease(ptr: *anyopaque, convo: *Conversation) void {
+    const self: *Runner = @ptrCast(@alignCast(ptr));
+    destroy(self.parent.allocator, convo);
+}
+
+fn destroy(allocator: std.mem.Allocator, convo: *Conversation) void {
+    convo.deinit();
+    allocator.destroy(convo);
+}
 
 fn erasedRun(
     ptr: *anyopaque,
@@ -44,17 +97,20 @@ fn erasedRun(
     task: tool.Delegate.Task,
 ) anyerror![]const u8 {
     const self: *Runner = @ptrCast(@alignCast(ptr));
-    return run(self.parent, allocator, task);
+    return run(self, allocator, task);
 }
 
 /// Run `task` to completion and return what the subagent finished with.
 pub fn run(
-    parent: *Loop,
+    runner: *Runner,
     allocator: std.mem.Allocator,
     task: tool.Delegate.Task,
 ) ![]const u8 {
-    var convo: Conversation = .init(parent.allocator);
-    defer convo.deinit();
+    const parent = runner.parent;
+
+    const convo = try parent.allocator.create(Conversation);
+    convo.* = .init(parent.allocator);
+    errdefer destroy(parent.allocator, convo);
 
     // A ReadLog of its own: a file the subagent read is not a file the parent
     // may edit, because the parent never saw the contents it would be editing.
@@ -66,7 +122,7 @@ pub fn run(
         parent.io,
         parent.provider,
         parent.registry,
-        &convo,
+        convo,
         &reads,
         parent.project_root,
     );
@@ -87,7 +143,12 @@ pub fn run(
     try child.submit(task.prompt, .{});
     const outcome = try drive(&child, task);
 
-    return report(&child, allocator, outcome);
+    const answer = try report(&child, allocator, outcome);
+    errdefer allocator.free(answer);
+
+    // Handed over rather than freed: the parent stores it once the call settles.
+    try runner.keep(task.index, convo);
+    return answer;
 }
 
 const Outcome = enum {
@@ -261,7 +322,7 @@ test "a subagent loops through its own tools and returns only the answer" {
         .{ .text = "the parser is at src/parse.zig:40" },
     };
 
-    const answer = try run(&harness.parent, testing.allocator, .{
+    const answer = try run(&harness.runner, testing.allocator, .{
         .agent = "task",
         .prompt = "where is the parser",
     });
@@ -280,7 +341,7 @@ test "a subagent that says nothing returns nothing for the tool to report" {
 
     harness.fake.script = &.{.{ .text = "" }};
 
-    const answer = try run(&harness.parent, testing.allocator, .{
+    const answer = try run(&harness.runner, testing.allocator, .{
         .agent = "task",
         .prompt = "find nothing",
     });
@@ -296,7 +357,7 @@ test "a cancelled parent ends the subagent" {
     harness.fake.script = &.{.{ .text = "working on it" }};
 
     var stop: std.atomic.Value(bool) = .init(true);
-    const answer = try run(&harness.parent, testing.allocator, .{
+    const answer = try run(&harness.runner, testing.allocator, .{
         .agent = "task",
         .prompt = "take your time",
         .cancelled = &stop,
@@ -317,7 +378,7 @@ test "a halted subagent reports its work, not the loop's stop line" {
         .said = "the parser is at src/parse.zig:40",
     } }};
 
-    const answer = try run(&harness.parent, testing.allocator, .{
+    const answer = try run(&harness.runner, testing.allocator, .{
         .agent = "task",
         .prompt = "keep going forever",
     });
@@ -339,13 +400,45 @@ test "a subagent that answers gets no note, however many steps it spent" {
         .{ .text = "done" },
     };
 
-    const answer = try run(&harness.parent, testing.allocator, .{
+    const answer = try run(&harness.runner, testing.allocator, .{
         .agent = "task",
         .prompt = "be quick",
     });
     defer testing.allocator.free(answer);
 
     try testing.expectEqualStrings("done", answer);
+}
+
+test "a subagent leaves its transcript for the parent to collect" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+
+    harness.fake.script = &.{
+        .{ .call = .{ .name = "list", .arguments = "{\"path\":\".\"}" } },
+        .{ .text = "found it" },
+    };
+
+    const answer = try run(&harness.runner, testing.allocator, .{
+        .agent = "task",
+        .prompt = "where is it",
+        .index = 3,
+    });
+    defer testing.allocator.free(answer);
+
+    // Keyed by the call that started it, so it reaches the right card.
+    try testing.expect(harness.runner.take(0) == null);
+
+    const kept = harness.runner.take(3) orelse return error.NothingKept;
+    defer {
+        kept.deinit();
+        testing.allocator.destroy(kept);
+    }
+
+    try testing.expectEqualStrings("where is it", kept.messages.items[0].text);
+    try testing.expect(kept.messages.items.len > 2);
+
+    // Taken once: a second collector gets nothing rather than a double free.
+    try testing.expect(harness.runner.take(3) == null);
 }
 
 test "a subagent cannot reach a tool its agent record leaves out" {
@@ -357,7 +450,7 @@ test "a subagent cannot reach a tool its agent record leaves out" {
         .{ .text = "I could not write anything" },
     };
 
-    const answer = try run(&harness.parent, testing.allocator, .{
+    const answer = try run(&harness.runner, testing.allocator, .{
         .agent = "task",
         .prompt = "write a file",
     });
@@ -379,6 +472,7 @@ const Harness = struct {
     reads: tool.ReadLog,
     fake: Fake,
     parent: Loop,
+    runner: Runner,
 
     /// On the heap, because the loop borrows pointers to these fields and a
     /// value returned from here would leave every one of them dangling.
@@ -390,6 +484,7 @@ const Harness = struct {
             .reads = .init(testing.allocator),
             .fake = .{},
             .parent = undefined,
+            .runner = undefined,
         };
         self.parent = .init(
             testing.allocator,
@@ -400,10 +495,12 @@ const Harness = struct {
             &self.reads,
             ".",
         );
+        self.runner = .{ .parent = &self.parent };
         return self;
     }
 
     fn deinit(self: *Harness) void {
+        self.runner.deinit();
         self.parent.deinit();
         self.reads.deinit();
         self.registry.deinit();

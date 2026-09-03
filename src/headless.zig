@@ -138,6 +138,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     defer loop.deinit();
     var runner: subagent.Runner = .{ .parent = &loop };
     loop.delegate = runner.delegate();
+    loop.transcripts = runner.transcripts();
+    defer runner.deinit();
     loop.auto_approve_safe = config.auto_approve_safe_commands;
     if (config.max_turn_ms) |ms| loop.max_turn_ms = ms;
     if (config.max_stall_ms) |ms| loop.max_stall_ms = ms;
