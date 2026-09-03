@@ -25,7 +25,7 @@ const poll_interval_ms: u64 = 2;
 /// Wall-clock ceiling on one subagent, whatever its step count says. A model
 /// that stalls mid-turn would otherwise hold the parent's tool call open for as
 /// long as it liked.
-const deadline_ms: i128 = 10 * std.time.ms_per_min;
+const deadline_ms: i128 = tool.subagent_deadline_ms;
 
 pub const Runner = struct {
     /// The loop the subagent borrows its provider, registry and project from.
@@ -77,12 +77,15 @@ pub fn run(
     child.system_prompt = parent.system_prompt;
     // Nothing it may call needs a decision, so nothing may auto-approve one.
     child.auto_approve_safe = false;
+    child.max_turn_ms = parent.max_turn_ms;
+    child.max_turn_tokens = parent.max_turn_tokens;
+    child.max_stall_ms = parent.max_stall_ms;
     // No database: a subagent's steps are not a session, and persisting them
     // would put in the transcript exactly what delegating keeps out of it.
     try child.useAgent(task.agent);
 
     try child.submit(task.prompt, .{});
-    const outcome = try drive(&child, task.cancelled, task.progress);
+    const outcome = try drive(&child, task);
 
     return report(&child, allocator, outcome);
 }
@@ -100,20 +103,16 @@ const Outcome = enum {
 };
 
 /// Poll the child until it stops, the parent gives up, or time runs out.
-fn drive(
-    child: *Loop,
-    cancelled: ?*const std.atomic.Value(bool),
-    progress: ?tool.Progress,
-) !Outcome {
+fn drive(child: *Loop, task: tool.Delegate.Task) !Outcome {
     const started = std.Io.Timestamp.now(child.io, .awake);
 
     while (child.isBusy()) {
-        if (progress) |channel| {
+        if (task.progress) |channel| {
             var line: [tool.max_progress_bytes]u8 = undefined;
-            channel.report(channel.userdata, describe(child, &line));
+            channel.report(channel.userdata, describe(child, task.label, &line));
         }
 
-        if (cancelled) |flag| {
+        if (task.cancelled) |flag| {
             if (flag.load(.acquire)) {
                 child.requestStop();
                 return .cancelled;
@@ -150,8 +149,9 @@ fn drive(
 
 /// One line saying where the subagent has got to. Repeats are filtered out by
 /// whoever is listening, so this says the same thing until it changes.
-fn describe(child: *const Loop, buffer: *[tool.max_progress_bytes]u8) []const u8 {
+fn describe(child: *const Loop, label: []const u8, buffer: *[tool.max_progress_bytes]u8) []const u8 {
     var writer: std.Io.Writer = .fixed(buffer);
+    if (label.len > 0) writer.print("{s} - ", .{label}) catch {};
     writer.print("step {d}/{d}: {s}", .{
         child.steps + 1,
         child.agent.steps,

@@ -95,6 +95,14 @@ pub const Progress = struct {
 /// nobody is going to type does not hold the turn open forever.
 pub const default_timeout_ms: u64 = 120_000;
 
+/// Wall-clock ceiling on one subagent. Named here rather than beside either
+/// user so the two stay ordered: a subagent that gives up first reports what it
+/// found, where a tool call timing out first reports nothing at all.
+pub const subagent_deadline_ms: u64 = 10 * std.time.ms_per_min;
+
+/// Slack between a subagent's own deadline and the tool call wrapping it.
+pub const subagent_timeout_ms: u64 = subagent_deadline_ms + 5 * std.time.ms_per_min;
+
 /// The monotonic clock, in milliseconds. `.awake` rather than `.real` because
 /// a deadline has to survive the system clock being set backwards.
 pub fn monotonicMilliseconds(io: std.Io) i64 {
@@ -118,6 +126,8 @@ pub const Delegate = struct {
         agent: []const u8,
         /// What it is being asked to do, as its first user message.
         prompt: []const u8,
+        /// A few words naming the task, for the line the person watches.
+        label: []const u8 = "",
         /// The parent's give-up flag, so cancelling a turn also ends the
         /// subagent rather than waiting for it.
         cancelled: ?*const std.atomic.Value(bool) = null,

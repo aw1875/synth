@@ -35,7 +35,7 @@ pub const all: []const tool.Tool = &.{
         // parent's provider, and the parent being blocked here is what makes
         // that safe.
         .parallel = false,
-        .timeout_ms = 15 * std.time.ms_per_min,
+        .timeout_ms = tool.subagent_timeout_ms,
     },
 };
 
@@ -55,6 +55,7 @@ fn run(ctx: Context, input: Input) !Output {
     const answer = delegate.run(delegate.userdata, ctx.allocator, .{
         .agent = agent_id,
         .prompt = prompt,
+        .label = input.string("description") orelse "",
         .cancelled = ctx.cancelled,
         .progress = ctx.progress,
     }) catch |err| {
