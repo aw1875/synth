@@ -9,8 +9,8 @@
             .hash = "vaxis-0.6.0-BWNV_LC4CwBka_bJk8SOXqzCM-nyQH00jzdL0kUhGwRE",
         },
         .ollama = .{
-            .url = "git+https://github.com/aw1875/ollama.zig#952e595ef06dd088d8e149bca446adb945ffbcdf",
-            .hash = "ollama-1.0.1-sOWbqZOhAADrIy09f-n2nhbgMiGBRNmdx3nebw05fFq1",
+            .url = "git+https://github.com/aw1875/ollama.zig#2ffba4a86ef8e77c3c4e95bed5a8323c5257a218",
+            .hash = "ollama-1.0.2-sOWbqaGkAADnxqFuXIR53qQE_bDQxV5xvxO9VZa7yOsX",
         },
         .zqlite = .{
             .url = "git+https://github.com/karlseguin/zqlite.zig#b519eea9b1a2b5fcad68af6d0629e717e8746684",
