@@ -224,6 +224,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             if (self.mentions.isScanning()) try self.scheduleTick(ctx);
             const nested = if (self.subagents) |runner| try runner.poll() else false;
+            if (nested) self.refreshViewing();
             const changed = try self.loop.poll() or nested;
             if (self.loop.takeHookNotice()) |notice| {
                 defer self.allocator.free(notice);
@@ -240,9 +241,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
             ringIfFinished(self);
-            if (self.loop.isBusy()) {
-                self.thinking.stream = self.loop.thoughts();
-                self.thinking.label = self.loop.label();
+            const watched = self.shownLoop();
+            if (watched.isBusy()) {
+                self.thinking.stream = watched.thoughts();
+                self.thinking.label = watched.label();
                 self.thinking.frame +%= 1;
                 try self.scheduleTick(ctx);
             } else {

@@ -384,14 +384,30 @@ pub fn clearThoughtRows(self: *Model) void {
 /// A subagent's transcript, loaded from the database and shown in place of the
 /// session's own. Read-only: the run it records is over.
 pub const Viewing = struct {
-    convo: Conversation,
+    /// Where a shown transcript comes from.
+    pub const Source = union(enum) {
+        /// Looked up by call index every time rather than held: the run it
+        /// belongs to is freed the moment its tool call collects the answer.
+        live,
+        stored: Conversation,
+    };
+
+    /// Where the transcript comes from. A running subagent's is borrowed and
+    /// grows while it is read; a finished one is a copy from the database.
+    source: Source,
+    /// The call this belongs to, for finding it again once it is written down.
+    key: u64,
+    index: usize,
     title: []u8,
     /// Owned by the model rather than a frame's arena: the prompt reads it on
     /// every draw, and an arena string would be gone by the second one.
     hint: []u8,
 
     fn deinit(self: *Viewing, allocator: std.mem.Allocator) void {
-        self.convo.deinit();
+        switch (self.source) {
+            .stored => |*convo| convo.deinit(),
+            .live => {},
+        }
         allocator.free(self.title);
         allocator.free(self.hint);
     }
@@ -400,13 +416,19 @@ pub const Viewing = struct {
 /// Whether this call left a subagent transcript. Looked up once and then
 /// remembered, including the answer that there is none.
 pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_index: usize) bool {
-    if (self.subagent_sessions.get(key)) |id| return id != 0;
-
-    const db = self.loop.db orelse return false;
     if (self.viewing != null) return false;
 
-    // Not while it runs: the transcript lands when the call settles, and a
-    // "no" cached before then would outlive the transcript arriving.
+    // A run still going is in memory, not the database, so it is asked every time.
+    if (self.subagents) |runner| {
+        if (self.loop.pending_seq) |pending| {
+            if (msg.seq == pending and runner.viewable(call_index) != null) return true;
+        }
+    }
+
+    if (self.subagent_sessions.get(key)) |id| return id != 0;
+    const db = self.loop.db orelse return false;
+
+    // A "no" cached before the call settles would outlive the transcript landing.
     const call = msg.tool_calls[call_index];
     if (call.status != .ok and call.status != .failed) return false;
 
@@ -421,8 +443,53 @@ pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_inde
 
 /// The transcript on screen, which is a subagent's while one is open.
 pub fn shown(self: *Model) *Conversation {
-    if (self.viewing) |*view| return &view.convo;
+    if (self.viewing) |*view| {
+        switch (view.source) {
+            .stored => |*convo| return convo,
+            .live => {
+                if (self.subagents) |runner| {
+                    if (runner.viewable(view.index)) |child| return &child.convo;
+                }
+            },
+        }
+    }
     return &self.conversation;
+}
+
+/// The loop whose progress belongs on screen: a subagent's while its transcript
+/// is open, the session's own otherwise.
+pub fn shownLoop(self: *Model) *AgentLoop {
+    if (self.viewing) |*view| {
+        if (view.source == .live) {
+            if (self.subagents) |runner| {
+                if (runner.viewable(view.index)) |child| {
+                    if (child.started) return &child.loop;
+                }
+            }
+        }
+    }
+    return &self.loop;
+}
+
+/// Follow a subagent past the end of its run.
+///
+/// Its transcript lives in memory only until the tool call collects the answer,
+/// and is in the database from that moment, so the view swaps sources rather
+/// than emptying out under whoever is reading it.
+pub fn refreshViewing(self: *Model) void {
+    const view = if (self.viewing) |*v| v else return;
+    if (view.source != .live) return;
+
+    const runner = self.subagents orelse return;
+    if (runner.viewable(view.index) != null) return;
+
+    const key = view.key;
+    const title = self.allocator.dupe(u8, view.title) catch return;
+    defer self.allocator.free(title);
+
+    _ = self.subagent_sessions.remove(key);
+    const opened = self.openSubagent(key, view.index, title) catch false;
+    if (!opened) self.closeSubagent();
 }
 
 /// Whether a subagent's transcript is what the person is reading.
@@ -448,19 +515,30 @@ pub fn viewKey(self: *const Model, seq: u64) u64 {
 
 /// A card was clicked. Errors are swallowed: a transcript that will not load is
 /// a card that does nothing, which is what it did before it could be opened.
-pub fn openFromCard(ptr: *anyopaque, key: u64, name: []const u8) void {
+pub fn openFromCard(ptr: *anyopaque, key: u64, index: usize, name: []const u8) void {
     const self: *Model = @ptrCast(@alignCast(ptr));
-    _ = self.openSubagent(key, name) catch return;
+    _ = self.openSubagent(key, index, name) catch return;
 }
 
 /// Show the transcript a tool call left behind. Silent when it left none.
-pub fn openSubagent(self: *Model, key: u64, title: []const u8) !bool {
-    const db = self.loop.db orelse return false;
-    const session = self.subagent_sessions.get(key) orelse return false;
+pub fn openSubagent(self: *Model, key: u64, index: usize, title: []const u8) !bool {
+    const source: Viewing.Source = live: {
+        if (self.subagents) |runner| {
+            if (runner.viewable(index) != null) break :live .live;
+        }
 
-    var convo: Conversation = .init(self.allocator);
-    errdefer convo.deinit();
-    try loadInto(db, session, &convo);
+        const db = self.loop.db orelse return false;
+        const session = self.subagent_sessions.get(key) orelse return false;
+
+        var convo: Conversation = .init(self.allocator);
+        errdefer convo.deinit();
+        try loadInto(db, session, &convo);
+        break :live .{ .stored = convo };
+    };
+    errdefer if (source == .stored) {
+        var owned_convo = source.stored;
+        owned_convo.deinit();
+    };
 
     const owned = try self.allocator.dupe(u8, title);
     errdefer self.allocator.free(owned);
@@ -473,7 +551,13 @@ pub fn openSubagent(self: *Model, key: u64, title: []const u8) !bool {
     errdefer self.allocator.free(hint);
 
     self.closeSubagent();
-    self.viewing = .{ .convo = convo, .title = owned, .hint = hint };
+    self.viewing = .{
+        .source = source,
+        .key = key,
+        .index = index,
+        .title = owned,
+        .hint = hint,
+    };
     return true;
 }
 
@@ -1003,6 +1087,64 @@ pub fn pageHistoryIfNeeded(self: *Model) !void {
     _ = try self.loop.pageHistory(history_page_size);
 }
 
+test "a running subagent can be read before it has finished" {
+    const testing = std.testing;
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+    };
+    defer model.conversation.deinit();
+    defer model.input.deinit();
+    defer model.subagent_sessions.deinit(testing.allocator);
+    defer model.closeSubagent();
+
+    model.loop.db = null;
+    model.loop.pending_seq = null;
+
+    var child: Subagent.Child = .{
+        .agent = "task",
+        .prompt = "where is it",
+        .label = "find it",
+        .index = 2,
+        .cancelled = null,
+        .progress = null,
+        .convo = .init(testing.allocator),
+        .reads = .init(testing.allocator),
+    };
+    defer child.convo.deinit();
+    defer child.reads.deinit();
+    _ = try child.convo.addUser("where is it", &.{}, &.{});
+
+    var runner: Subagent.Runner = .{ .parent = &model.loop };
+    defer runner.active.deinit(testing.allocator);
+    try runner.active.append(testing.allocator, &child);
+    model.subagents = &runner;
+
+    // Borrowed, not copied: what the run writes next is what the reader sees.
+    try testing.expect(try model.openSubagent(0, 2, "task"));
+    try testing.expectEqual(&child.convo, model.shown());
+    try testing.expectEqual(@as(usize, 1), model.shown().messages.items.len);
+
+    _ = try child.convo.addAssistant("still looking", null, null);
+    try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
+
+    // Its progress, not the parent's, which is stuck on "running tools".
+    try testing.expectEqual(&model.loop, model.shownLoop());
+    child.started = true;
+    child.loop = model.loop;
+    try testing.expectEqual(&child.loop, model.shownLoop());
+
+    // Once the run is gone and nothing was written down, the view lets go.
+    _ = runner.active.orderedRemove(0);
+    model.refreshViewing();
+    try testing.expect(!model.inSubagent());
+    try testing.expectEqual(&model.conversation, model.shown());
+}
+
 test "a task card only offers its transcript once the call has settled" {
     const testing = std.testing;
 
@@ -1089,7 +1231,7 @@ test "a subagent transcript takes over the view, and ctrl+b gives it back" {
     try testing.expect(!model.inSubagent());
     try testing.expectEqual(&model.conversation, model.shown());
 
-    try testing.expect(try model.openSubagent(key, "task"));
+    try testing.expect(try model.openSubagent(key, 0, "task"));
     try testing.expect(model.inSubagent());
     try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
     try testing.expectEqualStrings("where is the parser", model.shown().messages.items[0].text);
@@ -1100,7 +1242,7 @@ test "a subagent transcript takes over the view, and ctrl+b gives it back" {
     try testing.expectEqual(&model.conversation, model.shown());
 
     // A call that left nothing behind stays where it is.
-    try testing.expect(!try model.openSubagent(99, "task"));
+    try testing.expect(!try model.openSubagent(99, 7, "task"));
 }
 
 test "a confirmation lapses if the second press never comes" {

@@ -385,7 +385,7 @@ fn drawBlock(
         .thinking => return try self.thinking.widget().draw(constraints),
 
         .streaming => {
-            const stream = self.loop.streamingText() orelse return null;
+            const stream = self.shownLoop().streamingText() orelse return null;
             const partial = try stream.snapshot(ctx.arena);
             if (partial.len == 0) return null;
             return try messageBlock(self, ctx, .{ .role = .assistant, .text = partial }, width);
@@ -478,8 +478,9 @@ pub fn drawTranscript(
     height: u16,
 ) !?vxfw.Surface {
     const messages = self.shown().messages.items;
-    const pending: usize = if (self.loop.isBusy() and
-        self.loop.state != .awaiting_approval) 1 else 0;
+    const watched = self.shownLoop();
+    const pending: usize = if (watched.isBusy() and
+        watched.state != .awaiting_approval) 1 else 0;
     if (height == 0 or messages.len + pending + self.loop.pendingSteering().len == 0) return null;
 
     const constraints = ctx.withConstraints(
@@ -546,9 +547,7 @@ pub fn drawTranscript(
 
     std.mem.reverse(Placed, shown.items);
 
-    // The scroll offset counts rows back from the newest content, so anything
-    // appended at the bottom slides the view. While a turn streams, hold the
-    // reader's place by growing the offset in step with the tail.
+    // The offset counts back from the newest row, so a growing tail slides the view.
     if (self.scroll > 0 and tail > self.tail_height) {
         const growth: u16 = @intCast(@min(tail - @as(i32, self.tail_height), std.math.maxInt(u16)));
         self.scroll +|= growth;
@@ -1247,8 +1246,7 @@ test "a long name is trimmed from the end, a path from the front" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // The marker is part of the width, so the result never overflows what it
-    // was asked to fit.
+    // The marker is part of the width, so the result never overflows.
     try std.testing.expectEqualStrings("...", fitLeft(arena, "/home/dev", 3));
     try std.testing.expectEqualStrings("...v", fitLeft(arena, "/home/dev", 4));
     try std.testing.expectEqualStrings("...dev", fitLeft(arena, "/home/dev", 6));
