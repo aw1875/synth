@@ -135,11 +135,15 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     try out.flush();
 
     var loop: Loop = .init(allocator, io, provider, &registry, &convo, &reads, project.root);
-    defer loop.deinit();
     var runner: subagent.Runner = .{ .parent = &loop };
     loop.delegate = runner.delegate();
     loop.transcripts = runner.transcripts();
-    defer runner.deinit();
+
+    // Ordered: the loop joins the workers still writing to the runner.
+    defer {
+        loop.deinit();
+        runner.deinit();
+    }
     loop.auto_approve_safe = config.auto_approve_safe_commands;
     if (config.max_turn_ms) |ms| loop.max_turn_ms = ms;
     if (config.max_stall_ms) |ms| loop.max_stall_ms = ms;

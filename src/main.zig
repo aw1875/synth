@@ -147,8 +147,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     else
         try allocator.dupe(u8, path);
 
-    // Declared before the model so it is torn down after it: the registry holds
-    // pointers into this host, and the model owns the registry.
+    // Declared before the model so it is torn down after the registry that points here.
     var mcp_host: mcp_tools.Host = .init(allocator, io);
     defer mcp_host.deinit();
 
@@ -191,24 +190,25 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .auth = &auth,
         .backend = &backend,
     };
-    defer model.deinit();
     try tui_app.wire(model);
 
-    // Installed from here rather than inside the loop: running a subagent needs
-    // a loop, and the loop must not need the thing that runs one.
+    // Installed here so the loop never needs the thing that runs a subagent.
     var runner: subagent.Runner = .{ .parent = &model.loop };
     model.loop.delegate = runner.delegate();
     model.loop.transcripts = runner.transcripts();
-    defer runner.deinit();
+
+    // Ordered: the loop joins the workers still writing to the runner.
+    defer {
+        model.deinit();
+        runner.deinit();
+    }
     model.mcp = &mcp_host;
     model.prune_policy = config.prune;
     model.bell = config.bell;
     tui_bell.askForFocusReports(&app);
     defer tui_bell.stopFocusReports(&app);
 
-    // Into the model's registry, which is the one the loop was built with, and
-    // before `useAgent` builds the tool schema from it - a tool registered after
-    // that is one the model is never told about.
+    // Before `useAgent` builds the schema; a tool added after is never advertised.
     if (config.mcp) |block| {
         const servers = try mcp_tools.serversFromJson(init.arena.allocator(), block);
         try mcp_host.beginConnectAll(servers, .{
