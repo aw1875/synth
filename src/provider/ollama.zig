@@ -104,6 +104,18 @@ pub fn start(self: *OllamaProvider) !void {
     if (self.model.len > 0) self.probe();
 }
 
+/// Start a second client on the same server, taking what `other` already
+/// learned rather than asking again. What a nested run needs: same host, same
+/// model, same answers, and no round trip to rediscover them.
+pub fn startLike(self: *OllamaProvider, other: *const OllamaProvider) !void {
+    try self.startWithoutProbe();
+    self.context_limit = other.context_limit;
+    self.runtime_limit = other.runtime_limit;
+    self.think = other.think;
+    self.supports_tools = other.supports_tools;
+    self.supports_vision = other.supports_vision;
+}
+
 /// Read what this model can do and how much it can hold. Failures leave the
 /// defaults in place: a server that will not answer `show` is a problem the
 /// first request reports better than startup can.

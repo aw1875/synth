@@ -99,6 +99,17 @@ fn startWithoutProbe(self: *OpenAIProvider) !void {
     self.started = true;
 }
 
+/// Start a second client on the same server, taking what `other` already
+/// learned rather than asking again. What a nested run needs: same host, same
+/// model, same answers, and no round trip to rediscover them.
+pub fn startLike(self: *OpenAIProvider, other: *const OpenAIProvider) !void {
+    try self.startWithoutProbe();
+    self.context_limit = other.context_limit;
+    self.supports_tools = other.supports_tools;
+    self.supports_vision = other.supports_vision;
+    self.send_stream_options = other.send_stream_options;
+}
+
 /// Read the context window for the current model. Failures leave the table's
 /// guess in place: a server that will not answer `/v1/models` is a problem the
 /// first request reports better than startup can.
