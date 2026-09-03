@@ -40,6 +40,7 @@ const unlabelled_skill = "run this skill";
 /// Everything `/` offers. Kept in the order it should be read, not
 /// alphabetically: the ones that change what the model sees come first.
 pub const commands: []const Command = &.{
+    .{ .name = "clear", .description = "clear the transcript and start a fresh session" },
     .{ .name = "compact", .description = "summarise the conversation so far, freeing context" },
     .{ .name = "model", .description = "switch the model this session runs on", .argument = "[name]" },
     .{ .name = "sessions", .description = "switch to another session" },

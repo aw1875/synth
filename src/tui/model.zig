@@ -354,7 +354,10 @@ pub fn plainWidget(self: *Model) vxfw.Widget {
     return self.plain_vtable;
 }
 
-pub fn clearToolCards(self: *Model) void {
+fn clearMessageWidgets(self: *Model) void {
+    var thoughts = self.thought_rows.valueIterator();
+    while (thoughts.next()) |row| self.allocator.destroy(row.*);
+    self.thought_rows.clearRetainingCapacity();
     var cards = self.tool_cards.valueIterator();
     while (cards.next()) |card| self.allocator.destroy(card.*);
     self.tool_cards.clearRetainingCapacity();
@@ -365,11 +368,7 @@ pub fn clearToolCards(self: *Model) void {
     while (toggles.next()) |toggle| self.allocator.destroy(toggle.*);
     self.paste_toggles.clearRetainingCapacity();
     self.diff_starts.clearRetainingCapacity();
-}
-pub fn clearThoughtRows(self: *Model) void {
-    var it = self.thought_rows.valueIterator();
-    while (it.next()) |row| self.allocator.destroy(row.*);
-    self.thought_rows.clearRetainingCapacity();
+    self.block_heights.clearRetainingCapacity();
 }
 
 pub fn deinit(self: *Model) void {
@@ -377,7 +376,7 @@ pub fn deinit(self: *Model) void {
     self.registry.deinit();
     self.reads.deinit();
     self.thinking.stream = null;
-    clearThoughtRows(self);
+    clearMessageWidgets(self);
     self.thought_rows.deinit(self.allocator);
     self.mentions.deinit();
     self.held.deinit();
@@ -394,14 +393,8 @@ pub fn deinit(self: *Model) void {
     self.history.deinit(self.allocator);
     self.paste_buffer.deinit(self.allocator);
     self.selection.deinit();
-    var cards = self.tool_cards.valueIterator();
-    while (cards.next()) |card| self.allocator.destroy(card.*);
     self.tool_cards.deinit(self.allocator);
-    var attachment_cards = self.attachment_cards.valueIterator();
-    while (attachment_cards.next()) |card| self.allocator.destroy(card.*);
     self.attachment_cards.deinit(self.allocator);
-    var toggles = self.paste_toggles.valueIterator();
-    while (toggles.next()) |toggle| self.allocator.destroy(toggle.*);
     self.paste_toggles.deinit(self.allocator);
     self.diff_starts.deinit(self.allocator);
     self.input.deinit();
@@ -674,14 +667,28 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
 
     try self.loop.resumeSession(session_id, resume_messages);
 
-    clearToolCards(self);
-    clearThoughtRows(self);
+    clearMessageWidgets(self);
     self.thinking.stream = null;
     self.loop.dropSteering();
     try self.seedHistory();
     self.input.clear();
     self.held.clear();
     self.scroll = 0;
+}
+
+/// Clear the visible transcript and start an empty session in this TUI.
+pub fn clearSession(self: *Model) bool {
+    if (!self.loop.resetForNewSession()) return false;
+
+    clearMessageWidgets(self);
+    self.thinking = .{};
+    self.clearHistory();
+    self.input.clear();
+    self.held.clear();
+    self.mentions.close();
+    self.selection.clear();
+    self.scroll = 0;
+    return true;
 }
 
 /// Keep a sent prompt for up-arrow recall. Consecutive duplicates are not worth

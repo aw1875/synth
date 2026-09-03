@@ -366,6 +366,27 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     try self.restoreTodos(session_id);
 }
 
+/// Leave the saved session intact and make the next prompt start a new one.
+/// The provider, model, agent and project-scoped approvals stay in use.
+pub fn resetForNewSession(self: *Loop) bool {
+    if (self.isBusy()) return false;
+
+    self.conversation.clear();
+    self.session_id = null;
+    if (self.session_title) |old| self.allocator.free(old);
+    self.session_title = null;
+    self.message_ids.clearRetainingCapacity();
+    self.pending_seq = null;
+    self.pending_index = 0;
+    self.todos.clear();
+    self.dropSteering();
+    self.usage = .{};
+    self.outcome = null;
+    self.turn_start_seq = null;
+    self.last_error = null;
+    return true;
+}
+
 /// Bring back the steps the session was working through.
 fn restoreTodos(self: *Loop, session_id: i64) !void {
     const db = self.db orelse return;
@@ -475,6 +496,7 @@ fn ensureSession(self: *Loop) !i64 {
     const project_id = self.project_id orelse return error.NoProject;
     const id = try db.createSession(project_id, self.session_cwd, self.session_model);
     self.session_id = id;
+    try db.setSessionAgent(id, self.agent.id);
     return id;
 }
 
@@ -2621,6 +2643,54 @@ test "a session comes back in the mode it was left in" {
     try resumed.resumeSession(session_id, 50);
 
     try testing.expectEqualStrings("review", resumed.agent.id);
+}
+
+test "a new session preserves the old one and resets its state" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    try loop.useAgent("review");
+    try loop.submit("first", .{});
+    try settle(&loop);
+    try loop.rename("old work");
+    try loop.todos.replace(&.{.{ .text = "old step", .status = .done }});
+    loop.pending_seq = 0;
+    loop.pending_index = 1;
+
+    const old_session = loop.session_id.?;
+    const old_messages = try db.countMessages(old_session);
+    try testing.expect(old_messages > 0);
+    try testing.expect(loop.usage.calls > 0);
+
+    try testing.expect(loop.resetForNewSession());
+    try testing.expect(loop.session_id == null);
+    try testing.expectEqualStrings("", loop.title());
+    try testing.expectEqual(@as(u64, 0), fixture.convo.totalCount());
+    try testing.expectEqual(@as(usize, 0), loop.message_ids.count());
+    try testing.expect(loop.pending_seq == null);
+    try testing.expectEqual(@as(usize, 0), loop.pending_index);
+    try testing.expectEqual(@as(usize, 0), loop.todos.items.items.len);
+    try testing.expectEqual(@as(u32, 0), loop.usage.calls);
+    try testing.expectEqualStrings("review", loop.agent.id);
+    try testing.expectEqual(old_messages, try db.countMessages(old_session));
+
+    try loop.submit("second", .{});
+    try settle(&loop);
+
+    const new_session = loop.session_id.?;
+    try testing.expect(new_session != old_session);
+    try testing.expectEqual(@as(u64, 0), fixture.convo.messages.items[0].seq);
+
+    const stored_agent = try db.sessionAgent(new_session, testing.allocator);
+    defer testing.allocator.free(stored_agent);
+    try testing.expectEqualStrings("review", stored_agent);
 }
 
 test "the same call three times running stops the turn" {

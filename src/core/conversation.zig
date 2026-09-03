@@ -193,8 +193,16 @@ pub fn firstSeq(self: *const Conversation) ?u64 {
 }
 
 pub fn deinit(self: *Conversation) void {
-    for (self.messages.items) |*msg| msg.deinit(self.allocator);
+    self.clear();
     self.messages.deinit(self.allocator);
+}
+
+/// Empty the transcript and restart its sequence numbers for a new session.
+pub fn clear(self: *Conversation) void {
+    for (self.messages.items) |*msg| msg.deinit(self.allocator);
+    self.messages.clearRetainingCapacity();
+    self.next_seq = 0;
+    self.dropped = 0;
 }
 
 /// Append a plain text message.
@@ -341,8 +349,7 @@ fn trim(self: *Conversation) void {
 /// older ones left in the database. Ownership of every string passes here.
 /// Used by resume, where the conversation starts part way through a session.
 pub fn adopt(self: *Conversation, messages: []Conversation.Message, dropped_count: u64) !void {
-    for (self.messages.items) |*msg| msg.deinit(self.allocator);
-    self.messages.clearRetainingCapacity();
+    self.clear();
 
     try self.messages.appendSlice(self.allocator, messages);
     self.dropped = dropped_count;
