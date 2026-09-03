@@ -164,7 +164,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     try loop.submit(prompt, .{});
 
     var printed: usize = 0;
-    while (loop.isBusy()) {
+    while (loop.isBusy() or runner.busy()) {
         _ = try runner.poll();
         _ = try loop.poll();
 

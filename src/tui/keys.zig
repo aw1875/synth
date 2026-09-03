@@ -248,6 +248,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             } else {
                 self.thinking.stream = null;
             }
+            if (self.loop.isBusy()) try self.scheduleTick(ctx);
+            if (self.subagents) |runner| {
+                if (runner.busy()) try self.scheduleTick(ctx);
+            }
             if (changed) self.scroll = 0;
             ctx.redraw = true;
         },

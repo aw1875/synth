@@ -60,6 +60,9 @@ pub const Child = struct {
     /// Whether the waiting call has taken the answer and gone. Raised on the
     /// worker, read on the tick.
     collected: std.atomic.Value(bool) = .init(false),
+    /// Whether it has been told to stop, so it is told once rather than every
+    /// tick until it unwinds.
+    stopping: bool = false,
 
     fn describeTo(self: *Child, buffer: *[tool.max_progress_bytes]u8) []const u8 {
         return describe(&self.loop, self.label, buffer);
@@ -86,6 +89,11 @@ pub const Runner = struct {
         self.mutex.lockUncancelable(self.parent.io);
         defer self.mutex.unlock(self.parent.io);
 
+        // Signalled together, so their reapers unwind at once.
+        for (self.active.items) |child| {
+            if (child.started) self.stop(child) catch {};
+        }
+
         for (self.inbox.items) |child| destroy(self.parent.allocator, child);
         self.inbox.deinit(self.parent.allocator);
         for (self.active.items) |child| destroy(self.parent.allocator, child);
@@ -102,6 +110,14 @@ pub const Runner = struct {
         while (at < self.active.items.len) {
             const child = self.active.items[at];
             if (child.collected.load(.acquire)) {
+                // Tearing down a busy loop blocks; this is the drawing thread.
+                if (child.started and child.loop.isBusy()) {
+                    try self.stop(child);
+                    _ = try child.loop.poll();
+                    at += 1;
+                    moved = true;
+                    continue;
+                }
                 _ = self.active.orderedRemove(at);
                 destroy(self.parent.allocator, child);
                 moved = true;
@@ -124,6 +140,16 @@ pub const Runner = struct {
         return true;
     }
 
+    /// Whether anything still needs polling. A child left unpolled never
+    /// unwinds, and its teardown then lands on whoever exits.
+    pub fn busy(self: *Runner) bool {
+        if (self.active.items.len > 0) return true;
+
+        self.mutex.lockUncancelable(self.parent.io);
+        defer self.mutex.unlock(self.parent.io);
+        return self.inbox.items.len > 0;
+    }
+
     /// The transcripts a person can read right now, newest last. Tick only.
     pub fn live(self: *Runner) []const *Child {
         return self.active.items;
@@ -133,6 +159,17 @@ pub const Runner = struct {
     pub fn running(self: *Runner, index: usize) ?*Child {
         for (self.active.items) |child| {
             if (child.index == index and !child.done.load(.acquire)) return child;
+        }
+        return null;
+    }
+
+    /// The subagent whose transcript can still be read from memory.
+    ///
+    /// Outlives `running`: a finished child stays until the call collects it,
+    /// and a reader part way through it should not lose the page.
+    pub fn viewable(self: *Runner, index: usize) ?*Child {
+        for (self.active.items) |child| {
+            if (child.index == index) return child;
         }
         return null;
     }
@@ -154,25 +191,19 @@ pub const Runner = struct {
             channel.report(channel.userdata, child.describeTo(&line));
         }
 
-        if (self.givenUp(child)) {
-            child.loop.requestStop();
-            try self.finish(child, .cancelled);
-            return true;
-        }
-
-        if (tool.monotonicMilliseconds(self.parent.io) - child.started_ms > deadline_ms) {
-            child.loop.requestStop();
-            try self.finish(child, .timed_out);
-            return true;
-        }
+        const over_time = tool.monotonicMilliseconds(self.parent.io) - child.started_ms > deadline_ms;
+        if (self.givenUp(child) or over_time) try self.stop(child);
 
         const moved = try child.loop.poll();
         if (child.loop.isBusy()) {
-            // Nobody can see a subagent's approval prompt, so an agent record
-            // that can reach one has nowhere to go. Today none can.
+            // Nobody can see a subagent's approval prompt, so it has nowhere to go.
             if (child.loop.state != .awaiting_approval) return moved;
-            child.loop.requestStop();
-            try self.finish(child, .halted);
+            try self.stop(child);
+            return true;
+        }
+
+        if (child.stopping) {
+            try self.finish(child, if (self.givenUp(child)) .cancelled else .timed_out);
             return true;
         }
 
@@ -227,6 +258,14 @@ pub const Runner = struct {
         child.done.store(true, .release);
     }
 
+    /// Wind a subagent down the way the person's own cancel does: asked once,
+    /// waited for on its reaper rather than here.
+    fn stop(_: *Runner, child: *Child) !void {
+        if (child.stopping) return;
+        child.stopping = true;
+        child.loop.cancel() catch child.loop.requestStop();
+    }
+
     fn givenUp(_: *Runner, child: *Child) bool {
         const flag = child.cancelled orelse return false;
         return flag.load(.acquire);
@@ -270,29 +309,47 @@ pub fn run(
 ) ![]const u8 {
     const gpa = runner.parent.allocator;
 
-    const child = try gpa.create(Child);
-    child.* = .{
-        .agent = try gpa.dupe(u8, task.agent),
-        .prompt = try gpa.dupe(u8, task.prompt),
-        .label = try gpa.dupe(u8, task.label),
-        .index = task.index,
-        .cancelled = task.cancelled,
-        .progress = task.progress,
-        .convo = .init(gpa),
-        .reads = .init(gpa),
+    const child = try build(gpa, task);
+
+    runner.add(child) catch |err| {
+        destroy(gpa, child);
+        return err;
     };
-    errdefer destroy(gpa, child);
 
-    try runner.add(child);
-
+    // Handed over: freeing it here would double free what the tick owns.
     while (!child.done.load(.acquire)) {
-        try std.Io.sleep(runner.parent.io, .fromMilliseconds(wait_slice_ms), .real);
+        std.Io.sleep(runner.parent.io, .fromMilliseconds(wait_slice_ms), .real) catch |err| {
+            child.collected.store(true, .release);
+            return err;
+        };
     }
 
     // Copied before the flag that lets the tick free the child.
     defer child.collected.store(true, .release);
     if (child.failed) |err| return err;
     return allocator.dupe(u8, child.answer orelse "");
+}
+
+fn build(gpa: std.mem.Allocator, task: tool.Delegate.Task) !*Child {
+    const agent = try gpa.dupe(u8, task.agent);
+    errdefer gpa.free(agent);
+    const prompt = try gpa.dupe(u8, task.prompt);
+    errdefer gpa.free(prompt);
+    const label = try gpa.dupe(u8, task.label);
+    errdefer gpa.free(label);
+
+    const child = try gpa.create(Child);
+    child.* = .{
+        .agent = agent,
+        .prompt = prompt,
+        .label = label,
+        .index = task.index,
+        .cancelled = task.cancelled,
+        .progress = task.progress,
+        .convo = .init(gpa),
+        .reads = .init(gpa),
+    };
+    return child;
 }
 
 const Outcome = enum {
@@ -519,6 +576,66 @@ test "a subagent that answers gets no note, however many steps it spent" {
     try testing.expectEqualStrings("done", answer);
 }
 
+test "quitting tears a running subagent down rather than waiting it out" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+
+    // Deaf to every signal, which is what a blocked socket read looks like.
+    harness.fake.deaf_ms = 1_200;
+    harness.fake.script = &.{.{ .text = "found it" }};
+
+    const child = try build(testing.allocator, .{
+        .agent = "task",
+        .prompt = "where is it",
+        .index = 1,
+    });
+    try harness.runner.add(child);
+    _ = try harness.runner.poll();
+    try testing.expect(harness.runner.active.items[0].started);
+
+    const started = tool.monotonicMilliseconds(testing.io);
+    harness.runner.deinit();
+    const spent = tool.monotonicMilliseconds(testing.io) - started;
+    harness.runner = .{ .parent = &harness.parent };
+
+    // Everything freed, and without sitting through the rest of the answer.
+    try testing.expect(spent < 2_000);
+}
+
+test "a wait that is cancelled leaves the child to the runner" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+
+    harness.fake.script = &.{.{ .text = "found it" }};
+
+    const child = try build(testing.allocator, .{
+        .agent = "task",
+        .prompt = "where is it",
+        .index = 1,
+    });
+    try harness.runner.add(child);
+
+    // Taken out of the inbox, so what follows is about the tick's own list.
+    _ = try harness.runner.poll();
+    try testing.expect(harness.runner.active.items.len == 1);
+
+    // What a cancelled tool worker does: stops waiting, frees nothing.
+    child.collected.store(true, .release);
+
+    // Still needs polling, which is what keeps the tick alive to wind it down.
+    try testing.expect(harness.runner.busy());
+
+    var spins: usize = 0;
+    while (harness.runner.active.items.len > 0 and spins < 500) : (spins += 1) {
+        _ = try harness.runner.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    try testing.expectEqual(@as(usize, 0), harness.runner.active.items.len);
+
+    harness.runner.deinit();
+    harness.runner = .{ .parent = &harness.parent };
+}
+
 test "a running subagent is visible before it has answered" {
     const harness = try Harness.init();
     defer harness.deinit();
@@ -572,8 +689,7 @@ test "a subagent cannot reach a tool its agent record leaves out" {
 
     try testing.expectEqualStrings("I could not write anything", answer);
 
-    // The call was turned down rather than queued for a person, which is what
-    // keeps a blocking subagent from deadlocking on an approval nobody sees.
+    // Turned down rather than queued, so a subagent cannot deadlock on approval.
     const messages = harness.parent.conversation.messages.items;
     try testing.expectEqual(@as(usize, 0), messages.len);
 }
@@ -654,6 +770,9 @@ const Harness = struct {
 const Fake = struct {
     script: []const Step = &.{},
     at: usize = 0,
+    /// Time spent in a busy loop rather than a sleep, so the worker is deaf to
+    /// both the stop flag and the signal. Stands in for a blocked socket read.
+    deaf_ms: u64 = 0,
 
     const Provider = @import("../provider/provider.zig");
 
@@ -675,6 +794,10 @@ const Fake = struct {
         _: ?Provider.Sink,
     ) anyerror!Provider.Reply {
         const self: *Fake = @ptrCast(@alignCast(ptr));
+        if (self.deaf_ms > 0) {
+            const until = tool.monotonicMilliseconds(testing.io) + @as(i64, @intCast(self.deaf_ms));
+            while (tool.monotonicMilliseconds(testing.io) < until) {}
+        }
         if (self.script.len == 0) return .{ .text = try allocator.dupe(u8, "") };
 
         // Past the end the last step repeats, so a script can outlast a limit.
