@@ -1717,7 +1717,7 @@ fn persistMessage(self: *Loop, index: usize) !void {
     self.conversation.shrinkAttachments(max_resident_attachment_bytes);
 
     for (msg.tool_calls, 0..) |call, i| {
-        try db.appendToolCall(
+        _ = try db.appendToolCall(
             message_id,
             @intCast(i),
             call.id,
