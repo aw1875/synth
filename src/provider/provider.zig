@@ -36,6 +36,13 @@ reconnect: ?*const fn (*anyopaque, Connection) anyerror!Current = null,
 /// Turn an error from `respond` into something a person can act on. Optional;
 /// without it the caller has only the error name.
 describe_error: ?*const fn (*anyopaque, anyerror, std.mem.Allocator) anyerror![]const u8 = null,
+/// Break off whatever `respond` is waiting on, from another thread.
+///
+/// Signalling a worker parked in a socket read does not wake it; the read
+/// returns when the response does, which for a model mid-answer is however
+/// long it has left. Shutting the socket down is what makes it return now.
+/// Null for a backend with nothing to break off.
+abort: ?*const fn (*anyopaque) void = null,
 
 /// Everything one call needs that is not the transcript. Assembled by the
 /// caller: which agent is in force, what it may call and what it was told are

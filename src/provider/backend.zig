@@ -90,6 +90,65 @@ pub fn deinit(self: *Backend) void {
     }
 }
 
+/// A backend of its own, pointed at the same server as this one.
+///
+/// A nested run cannot share a client: the feature flags a provider flips
+/// mid-request and the rejection it leaves behind are single-writer, and two
+/// turns at once would tear them.
+pub const Spawned = struct {
+    /// Holds the settings the child borrows, since the parent is free to switch
+    /// model or host while the child is still running.
+    arena: std.heap.ArenaAllocator,
+    backend: Backend,
+
+    pub fn deinit(self: *Spawned) void {
+        const allocator = self.arena.child_allocator;
+        self.backend.deinit();
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+
+    pub fn provider(self: *Spawned) Provider {
+        return self.backend.provider();
+    }
+};
+
+/// Build one, on the heap because a client borrows its own fields.
+pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
+    const child = try allocator.create(Spawned);
+    errdefer allocator.destroy(child);
+
+    child.arena = .init(allocator);
+    errdefer child.arena.deinit();
+    const arena = child.arena.allocator();
+
+    var options = self.options;
+    options.host = try arena.dupe(u8, self.currentHost());
+    options.label = try arena.dupe(u8, self.options.label);
+    options.model = try arena.dupe(u8, self.model());
+    if (self.currentKey()) |value| options.api_key = try arena.dupe(u8, value);
+
+    child.backend = .init(std.meta.activeTag(self.client), options);
+    switch (child.backend.client) {
+        .ollama => |*client| try client.startLike(&self.client.ollama),
+        .openai => |*client| try client.startLike(&self.client.openai),
+    }
+    return child;
+}
+
+/// The host this is pointed at, which a runtime connect may have replaced.
+pub fn currentHost(self: *Backend) []const u8 {
+    return switch (self.client) {
+        inline else => |*client| client.host,
+    };
+}
+
+fn currentKey(self: *Backend) ?[]const u8 {
+    return switch (self.client) {
+        inline else => |*client| client.api_key,
+    };
+}
+
 pub fn provider(self: *Backend) Provider {
     return switch (self.client) {
         inline else => |*client| client.provider(),
@@ -200,6 +259,64 @@ test "a catalog entry chooses the client that speaks its protocol" {
         try testing.expectEqualStrings(entry.label, backend.provider().name);
         try testing.expectEqualStrings("", backend.model());
     }
+}
+
+test "a spawned backend shares the settings but not the client" {
+    const testing = std.testing;
+
+    var parent: Backend = .init(.openai, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "https://api.example/v1",
+        .label = "Example",
+        .model = "a-model",
+        .api_key = "secret",
+    });
+    defer parent.deinit();
+    try parent.client.openai.startLike(&parent.client.openai);
+    parent.client.openai.context_limit = 12345;
+    parent.client.openai.supports_vision = false;
+
+    const child = try parent.spawn(testing.allocator);
+    defer child.deinit();
+
+    try testing.expectEqualStrings(parent.model(), child.backend.model());
+    try testing.expectEqualStrings(parent.currentHost(), child.backend.currentHost());
+
+    // What the parent already learned, without asking the server again.
+    try testing.expectEqual(@as(u32, 12345), child.backend.client.openai.context_limit);
+    try testing.expect(!child.backend.client.openai.supports_vision);
+
+    // Separate clients: a flag one turn flips cannot reach the other.
+    try testing.expect(&child.backend.client.openai != &parent.client.openai);
+    child.backend.client.openai.supports_tools = false;
+    try testing.expect(parent.client.openai.supports_tools);
+
+    // Its own copies, so the parent switching model does not dangle them.
+    try testing.expect(child.backend.model().ptr != parent.model().ptr);
+}
+
+test "a spawned ollama backend carries the window its parent probed" {
+    const testing = std.testing;
+
+    var parent: Backend = .init(.ollama, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "http://localhost:11434",
+        .label = "Ollama",
+        .model = "qwen3",
+    });
+    defer parent.deinit();
+    try parent.client.ollama.startLike(&parent.client.ollama);
+    parent.client.ollama.context_limit = 8192;
+    parent.client.ollama.think = false;
+
+    const child = try parent.spawn(testing.allocator);
+    defer child.deinit();
+
+    try testing.expectEqual(@as(u32, 8192), child.backend.client.ollama.context_limit);
+    try testing.expect(!child.backend.client.ollama.think);
+    try testing.expectEqualStrings("qwen3", child.backend.model());
 }
 
 test "an ollama tag matches loosely, an openai id exactly" {

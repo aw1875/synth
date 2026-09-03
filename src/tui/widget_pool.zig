@@ -91,7 +91,7 @@ pub fn attachmentCard(
     index: usize,
     attachment: *const Conversation.Attachment,
 ) !*AttachmentCard {
-    const key = (msg.seq << 32) | @as(u64, index);
+    const key = self.widgetKey(msg.seq, index);
 
     const entry = try self.attachment_cards.getOrPut(self.allocator, key);
     if (!entry.found_existing) {
@@ -111,7 +111,7 @@ pub fn attachmentCard(
     card.body = attachment.content;
 
     if (card.expanded and attachment.shortened()) {
-        self.loop.loadAttachment(msg, index) catch {};
+        if (!self.inSubagent()) self.loop.loadAttachment(msg, index) catch {};
         card.body = attachment.content;
     }
 
@@ -127,7 +127,7 @@ pub fn toolCard(
     call_index: usize,
     call: *Conversation.ToolCall,
 ) !*ToolCard {
-    const key = (msg.seq << 32) | @as(u64, call_index);
+    const key = self.widgetKey(msg.seq, call_index);
 
     const entry = try self.tool_cards.getOrPut(self.allocator, key);
     if (!entry.found_existing) {
@@ -143,11 +143,15 @@ pub fn toolCard(
     card.result = call.result;
     card.note = self.loop.toolNote(msg.seq, call_index);
     card.status = call.status;
+    card.open = if (self.hasSubagent(key, msg, call_index))
+        .{ .userdata = self, .key = key, .seq = msg.seq, .index = call_index, .call = Model.openFromCard }
+    else
+        null;
 
     if (card.expanded and call.result_bytes > Conversation.preview_bytes) {
         if (call.result) |r| {
             if (r.len < call.result_bytes) {
-                self.loop.loadToolResult(msg, call_index) catch {};
+                if (!self.inSubagent()) self.loop.loadToolResult(msg, call_index) catch {};
                 card.result = call.result;
             }
         }
@@ -163,7 +167,7 @@ pub fn thoughtRow(self: *Model, msg: *Conversation.Message) !?*ThoughtView.View 
     const thinking = msg.thinking orelse return null;
     if (thinking.len == 0) return null;
 
-    const entry = try self.thought_rows.getOrPut(self.allocator, msg.seq);
+    const entry = try self.thought_rows.getOrPut(self.allocator, self.viewKey(msg.seq));
     if (!entry.found_existing) {
         const row = try self.allocator.create(ThoughtView.View);
         row.* = .{};
@@ -177,7 +181,7 @@ pub fn thoughtRow(self: *Model, msg: *Conversation.Message) !?*ThoughtView.View 
     if (row.expanded and msg.thinking_bytes > Conversation.preview_bytes) {
         if (msg.thinking) |t| {
             if (t.len < msg.thinking_bytes) {
-                self.loop.loadThinking(msg) catch {};
+                if (!self.inSubagent()) self.loop.loadThinking(msg) catch {};
                 row.text = msg.thinking.?;
             }
         }

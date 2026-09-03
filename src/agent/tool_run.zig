@@ -296,6 +296,7 @@ fn runOne(self: *ToolRun, index: usize) void {
         .cancelled = &self.stop,
         .allow_outside = call.allow_outside,
         .progress = .{ .userdata = &self.reporters[index], .report = Reporter.report },
+        .call_index = call.index,
     };
 
     if (self.hooks) |runner| {
