@@ -150,11 +150,6 @@ pub const Runner = struct {
         return self.inbox.items.len > 0;
     }
 
-    /// The transcripts a person can read right now, newest last. Tick only.
-    pub fn live(self: *Runner) []const *Child {
-        return self.active.items;
-    }
-
     /// The subagent a parent tool call is waiting on, if it is still running.
     pub fn running(self: *Runner, index: usize) ?*Child {
         for (self.active.items) |child| {
@@ -254,7 +249,10 @@ pub const Runner = struct {
             child.done.store(true, .release);
             return;
         };
-        self.parent.storeSubagent(child.index, &child.convo) catch {};
+        // Said out loud: collecting frees the child, so this is the only chance.
+        self.parent.storeSubagent(child.index, &child.convo) catch |err| {
+            self.parent.say("Could not store the subagent transcript: {s}", .{@errorName(err)});
+        };
         child.done.store(true, .release);
     }
 
@@ -756,8 +754,9 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
-        self.runner.deinit();
+        // The loop joins the workers still writing to the runner. See `runTui`.
         self.parent.deinit();
+        self.runner.deinit();
         self.reads.deinit();
         self.registry.deinit();
         self.convo.deinit();

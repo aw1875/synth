@@ -144,7 +144,7 @@ pub fn toolCard(
     card.note = self.loop.toolNote(msg.seq, call_index);
     card.status = call.status;
     card.open = if (self.hasSubagent(key, msg, call_index))
-        .{ .userdata = self, .key = key, .index = call_index, .call = Model.openFromCard }
+        .{ .userdata = self, .key = key, .seq = msg.seq, .index = call_index, .call = Model.openFromCard }
     else
         null;
 

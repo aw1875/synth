@@ -1730,6 +1730,13 @@ fn persistMessage(self: *Loop, index: usize) !void {
     }
 }
 
+/// Say something the UI will surface once. Replaces whatever was pending.
+pub fn say(self: *Loop, comptime fmt: []const u8, args: anytype) void {
+    const said = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+    if (self.hook_notice) |old| self.allocator.free(old);
+    self.hook_notice = said;
+}
+
 /// Write a subagent's messages into a session of its own, hung off the call
 /// that produced it. Read back by whatever reads any other session.
 pub fn storeSubagent(self: *Loop, call_index: usize, convo: *Conversation) !void {

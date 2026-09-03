@@ -210,8 +210,6 @@ fn abortErased(ptr: *anyopaque) void {
     self.abort();
 }
 
-
-
 /// What this provider is pointed at, as the UI should show it.
 pub fn current(self: *OpenAIProvider) Provider.Current {
     return .{

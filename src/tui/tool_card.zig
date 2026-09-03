@@ -51,10 +51,12 @@ capped: bool = false,
 pub const Open = struct {
     userdata: *anyopaque,
     key: u64,
+    /// The message this call belongs to, for finding its stored transcript.
+    seq: u64,
     /// Where the call sits in its message, which is how a run still going is
     /// found: it is not in the database yet to be looked up by key.
     index: usize,
-    call: *const fn (*anyopaque, u64, usize, []const u8) void,
+    call: *const fn (*anyopaque, u64, u64, usize, []const u8) void,
 };
 
 pub fn widget(self: *ToolCard) vxfw.Widget {
@@ -76,7 +78,7 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
             }
             if (mouse.type != .press) return;
             if (self.open) |open| {
-                open.call(open.userdata, open.key, open.index, self.name);
+                open.call(open.userdata, open.key, open.seq, open.index, self.name);
                 return ctx.consumeAndRedraw();
             }
             if (self.result != null or self.capped) {
