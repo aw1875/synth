@@ -39,9 +39,8 @@ pub const max_repeats: usize = 3;
 /// legitimately takes a while. Zero turns it off.
 pub const default_turn_ms: i64 = 30 * std.time.ms_per_min;
 
-/// How long the provider may deliver nothing at all before the turn is given
-/// up on. Generous, because the gap before the first token is real work on a
-/// long prompt; the failure this catches sits at fifteen minutes without it.
+/// How long the provider may deliver nothing before the turn is given up on.
+/// Generous, because the gap before the first token is real work.
 pub const default_stall_ms: i64 = 2 * std.time.ms_per_min;
 
 /// Tokens one turn may spend, prompt and completion together. The whole
@@ -54,6 +53,9 @@ pub const default_turn_tokens: u64 = 2_000_000;
 /// a subagent handing up its answer - has to tell it from something the model
 /// meant to say.
 pub const no_reply = "(no reply)";
+
+/// How every reason the loop halts on opens. A subagent's caller strips it.
+pub const halt_prefix = "Stopped: ";
 
 /// Messages whose pasted images stay in memory. Older ones keep their token in
 /// the text but stop being resent; the bodies remain in the blob table.
@@ -181,8 +183,7 @@ max_turn_tokens: u64 = default_turn_tokens,
 /// How long the provider may go silent before the turn is abandoned. Zero
 /// disables it.
 max_stall_ms: i64 = default_stall_ms,
-/// Whether the turn now unwinding is one the stall check gave up on, so the
-/// outcome can say the connection died rather than blame the user for it.
+/// Whether the turn now unwinding is one the stall check gave up on.
 timed_out: bool = false,
 /// `seq` of the assistant message whose tool calls are being decided. A seq
 /// rather than an index: trimming the transcript shifts indices down and paging
@@ -943,8 +944,8 @@ fn overBudget(self: *Loop) ?[]const u8 {
 
 /// Abandon a turn whose provider has stopped sending.
 ///
-/// Interrupted the same way the user's cancel interrupts it, because a worker
-/// blocked on a socket read unwinds for nothing short of cancelling its future.
+/// Interrupted the way cancelling interrupts it: a worker blocked on a socket
+/// read unwinds for nothing short of its future being cancelled.
 fn giveUpIfStalled(self: *Loop, request: *Request) bool {
     if (!request.stalled(self.max_stall_ms)) return false;
 
@@ -1199,6 +1200,7 @@ fn recordSummary(self: *Loop, outcome: Outcome) !void {
 /// End the turn with a message saying why. The message is an assistant turn, so
 /// the model sees it too and a later turn is not left guessing.
 fn stop(self: *Loop, reason: []const u8) !void {
+    std.debug.assert(std.mem.startsWith(u8, reason, halt_prefix));
     _ = try self.conversation.addAssistant(reason, null, null);
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.finish(.halted);
@@ -3002,7 +3004,6 @@ test "a provider that goes quiet is given up on rather than waited out" {
     var loop = fixture.loop();
     defer loop.deinit();
 
-    // Sends nothing for far longer than the turn is allowed to stay silent.
     fixture.fake.latency = .fromMilliseconds(30_000);
     loop.max_stall_ms = 40;
 
@@ -3017,7 +3018,6 @@ test "a provider that goes quiet is given up on rather than waited out" {
     try testing.expectEqual(Outcome.failed, loop.outcome.?);
     try testing.expectEqual(error.Timeout, loop.last_error.?);
 
-    // The transcript says what happened, since nobody asked for this one.
     const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
     try testing.expect(std.mem.indexOf(u8, last.text, "stopped responding") != null);
 }
@@ -3029,7 +3029,6 @@ test "a stall is measured from the last chunk, not from the start" {
     var loop = fixture.loop();
     defer loop.deinit();
 
-    // Slower than the stall limit overall, but talking the whole way.
     fixture.fake.latency = .fromMilliseconds(120);
     loop.max_stall_ms = 60;
 

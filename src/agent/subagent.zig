@@ -91,8 +91,12 @@ const Outcome = enum {
     answered,
     /// The parent gave up, so the subagent was asked to stop.
     cancelled,
-    /// The agent's step ceiling or the wall clock ran out first.
-    exhausted,
+    /// Its own wall clock ran out.
+    timed_out,
+    /// The loop called it: the step ceiling, a budget, or a repeat loop.
+    halted,
+    /// The turn failed outright, so there may be nothing above at all.
+    failed,
 };
 
 /// Poll the child until it stops, the parent gives up, or time runs out.
@@ -119,7 +123,7 @@ fn drive(
         const now = std.Io.Timestamp.now(child.io, .awake);
         if (started.durationTo(now).toMilliseconds() > deadline_ms) {
             child.requestStop();
-            return .exhausted;
+            return .timed_out;
         }
 
         _ = try child.poll();
@@ -129,13 +133,19 @@ fn drive(
         // not something to wait on: nothing it may call needs one.
         if (child.state == .awaiting_approval) {
             child.requestStop();
-            return .exhausted;
+            return .halted;
         }
 
         try std.Io.sleep(child.io, .fromMilliseconds(poll_interval_ms), .real);
     }
 
-    return if (child.steps >= child.agent.steps) .exhausted else .answered;
+    // A step count read back afterwards cannot tell a last step from one too many.
+    return switch (child.outcome orelse .done) {
+        .done => .answered,
+        .cancelled => .cancelled,
+        .halted => .halted,
+        .failed => .failed,
+    };
 }
 
 /// One line saying where the subagent has got to. Repeats are filtered out by
@@ -166,12 +176,16 @@ fn doing(child: *const Loop) []const u8 {
 /// The subagent's answer as the parent should read it: its final prose, with a
 /// note when it stopped for a reason other than being finished.
 fn report(child: *Loop, allocator: std.mem.Allocator, outcome: Outcome) ![]const u8 {
-    const answer = lastAnswer(child);
+    const halt = haltReason(child);
+    const answer = lastAnswer(child, halt.at);
 
+    var buffer: [halt_note_bytes]u8 = undefined;
     const note: []const u8 = switch (outcome) {
         .answered => "",
         .cancelled => "\n\n<note>The subagent was cancelled before it finished.</note>",
-        .exhausted => "\n\n<note>The subagent ran out of steps before it finished. What is above is partial.</note>",
+        .timed_out => "\n\n<note>The subagent ran out of time before it finished. What is above is partial.</note>",
+        .failed => "\n\n<note>The subagent's request failed before it finished. What is above is partial.</note>",
+        .halted => haltNote(&buffer, halt.reason),
     };
 
     if (answer.len == 0 and note.len == 0) return allocator.dupe(u8, "");
@@ -181,13 +195,52 @@ fn report(child: *Loop, allocator: std.mem.Allocator, outcome: Outcome) ![]const
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ answer, note });
 }
 
-/// The last thing the subagent said, rather than the last message: a transcript
-/// ending in tool results has the answer further back.
-fn lastAnswer(child: *Loop) []const u8 {
+/// Room for the longest reason the loop halts with, and the note around it.
+const halt_note_bytes = 256;
+
+/// The note for a halted subagent, naming the limit it hit.
+fn haltNote(buffer: *[halt_note_bytes]u8, reason: []const u8) []const u8 {
+    const partial = " What is above is partial.</note>";
+    if (reason.len == 0) return "\n\n<note>The subagent stopped before it finished." ++ partial;
+
+    const said = if (std.mem.startsWith(u8, reason, Loop.halt_prefix)) reason[Loop.halt_prefix.len..] else reason;
+    var writer: std.Io.Writer = .fixed(buffer);
+    writer.print("\n\n<note>The subagent stopped early: {s}" ++ partial, .{said}) catch {
+        return "\n\n<note>The subagent stopped before it finished." ++ partial;
+    };
+    return writer.buffered();
+}
+
+/// The reason a halted loop gave, and where it sits in the transcript.
+fn haltReason(child: *Loop) Halt {
+    if (child.outcome != .halted) return .{};
+
     const messages = child.conversation.messages.items;
     var at = messages.len;
     while (at > 0) {
         at -= 1;
+        const msg = messages[at];
+        if (msg.role != .assistant) continue;
+
+        const text = std.mem.trim(u8, msg.text, " \t\r\n");
+        if (!std.mem.startsWith(u8, text, Loop.halt_prefix)) return .{};
+        return .{ .reason = text, .at = at };
+    }
+    return .{};
+}
+
+const Halt = struct { reason: []const u8 = "", at: ?usize = null };
+
+/// The last thing the subagent said, rather than the last message: a transcript
+/// ending in tool results has the answer further back.
+///
+/// `skip` is the halt reason's index, which reads as an answer but is not one.
+fn lastAnswer(child: *Loop, skip: ?usize) []const u8 {
+    const messages = child.conversation.messages.items;
+    var at = messages.len;
+    while (at > 0) {
+        at -= 1;
+        if (skip) |halt| if (at == halt) continue;
         const msg = messages[at];
         if (msg.role != .assistant) continue;
         const text = std.mem.trim(u8, msg.text, " \t\r\n");
@@ -251,6 +304,48 @@ test "a cancelled parent ends the subagent" {
     defer testing.allocator.free(answer);
 
     try testing.expect(std.mem.indexOf(u8, answer, "cancelled") != null);
+}
+
+test "a halted subagent reports its work, not the loop's stop line" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+
+    // The same call every time, which the loop halts on.
+    harness.fake.script = &.{.{ .call = .{
+        .name = "list",
+        .arguments = "{\"path\":\".\"}",
+        .said = "the parser is at src/parse.zig:40",
+    } }};
+
+    const answer = try run(&harness.parent, testing.allocator, .{
+        .agent = "task",
+        .prompt = "keep going forever",
+    });
+    defer testing.allocator.free(answer);
+
+    try testing.expect(std.mem.indexOf(u8, answer, "src/parse.zig:40") != null);
+    try testing.expect(std.mem.indexOf(u8, answer, "partial") != null);
+
+    try testing.expect(std.mem.indexOf(u8, answer, "stopped early: the same tool call") != null);
+    try testing.expect(!std.mem.startsWith(u8, answer, Loop.halt_prefix));
+}
+
+test "a subagent that answers gets no note, however many steps it spent" {
+    const harness = try Harness.init();
+    defer harness.deinit();
+
+    harness.fake.script = &.{
+        .{ .call = .{ .name = "list", .arguments = "{\"path\":\".\"}" } },
+        .{ .text = "done" },
+    };
+
+    const answer = try run(&harness.parent, testing.allocator, .{
+        .agent = "task",
+        .prompt = "be quick",
+    });
+    defer testing.allocator.free(answer);
+
+    try testing.expectEqualStrings("done", answer);
 }
 
 test "a subagent cannot reach a tool its agent record leaves out" {
@@ -327,7 +422,8 @@ const Fake = struct {
 
     const Step = union(enum) {
         text: []const u8,
-        call: struct { name: []const u8, arguments: []const u8 },
+        /// `said` rides along with the call, since calls alone end no turn.
+        call: struct { name: []const u8, arguments: []const u8, said: []const u8 = "" },
     };
 
     fn provider(self: *Fake) Provider {
@@ -342,9 +438,10 @@ const Fake = struct {
         _: ?Provider.Sink,
     ) anyerror!Provider.Reply {
         const self: *Fake = @ptrCast(@alignCast(ptr));
-        if (self.at >= self.script.len) return .{ .text = try allocator.dupe(u8, "") };
+        if (self.script.len == 0) return .{ .text = try allocator.dupe(u8, "") };
 
-        const step = self.script[self.at];
+        // Past the end the last step repeats, so a script can outlast a limit.
+        const step = self.script[@min(self.at, self.script.len - 1)];
         self.at += 1;
 
         return switch (step) {
@@ -356,7 +453,7 @@ const Fake = struct {
                     .name = try allocator.dupe(u8, wanted.name),
                     .arguments = try allocator.dupe(u8, wanted.arguments),
                 };
-                break :blk .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
+                break :blk .{ .text = try allocator.dupe(u8, wanted.said), .tool_calls = calls };
             },
         };
     }
