@@ -386,6 +386,12 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (key.matches('b', .{ .ctrl = true }) and self.inSubagent()) {
+                self.closeSubagent();
+                widget_pool.pruneWidgets(self);
+                return ctx.consumeAndRedraw();
+            }
+
             if (key.matches(vaxis.Key.page_up, .{})) {
                 self.scrollBy(ctx, Model.page_scroll_rows);
                 try self.pageHistoryIfNeeded();

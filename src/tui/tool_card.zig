@@ -37,9 +37,22 @@ start_line: usize = 1,
 
 expanded: bool = false,
 has_mouse: bool = false,
+/// Set when this call left a subagent transcript, so the card opens it rather
+/// than unfolding in place.
+open: ?Open = null,
 /// Set during the draw: a diff card is expandable even before it has a result,
 /// since what is worth expanding is the change, not the output.
 capped: bool = false,
+
+/// How a card hands a click back to whoever can act on it.
+///
+/// A direct call rather than a flag polled later: an idle app schedules no
+/// ticks, so a flag would sit raised until something else woke the loop.
+pub const Open = struct {
+    userdata: *anyopaque,
+    key: u64,
+    call: *const fn (*anyopaque, u64, []const u8) void,
+};
 
 pub fn widget(self: *ToolCard) vxfw.Widget {
     return .{
@@ -58,7 +71,12 @@ fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.
                 .left => {},
                 else => return ctx.consumeEvent(),
             }
-            if (mouse.type == .press and (self.result != null or self.capped)) {
+            if (mouse.type != .press) return;
+            if (self.open) |open| {
+                open.call(open.userdata, open.key, self.name);
+                return ctx.consumeAndRedraw();
+            }
+            if (self.result != null or self.capped) {
                 self.expanded = !self.expanded;
                 return ctx.consumeAndRedraw();
             }
@@ -111,7 +129,12 @@ pub fn draw(self: *ToolCard, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw
     var col = w.writeText(surface, indent, 0, self.status.glyph(), theme.on_card(accent).bold().cell);
     col = w.writeText(surface, col + 1, 0, self.name, theme.on_card(accent).bold().cell);
 
-    if (self.result != null) {
+    if (self.open != null) {
+        col = w.writeText(surface, col, 0, "  \u{bb}", theme.on_card(theme.fg_dim).cell);
+        if (self.has_mouse) {
+            _ = w.writeText(surface, col, 0, " click to open transcript", theme.on_card(theme.fg_dim).cell);
+        }
+    } else if (self.result != null) {
         const marker = if (self.expanded) "  ▾" else "  ▸";
         col = w.writeText(surface, col, 0, marker, theme.on_card(theme.fg_dim).cell);
         if (self.has_mouse) {

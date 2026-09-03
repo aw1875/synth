@@ -91,7 +91,7 @@ pub fn attachmentCard(
     index: usize,
     attachment: *const Conversation.Attachment,
 ) !*AttachmentCard {
-    const key = (msg.seq << 32) | @as(u64, index);
+    const key = self.widgetKey(msg.seq, index);
 
     const entry = try self.attachment_cards.getOrPut(self.allocator, key);
     if (!entry.found_existing) {
@@ -127,7 +127,7 @@ pub fn toolCard(
     call_index: usize,
     call: *Conversation.ToolCall,
 ) !*ToolCard {
-    const key = (msg.seq << 32) | @as(u64, call_index);
+    const key = self.widgetKey(msg.seq, call_index);
 
     const entry = try self.tool_cards.getOrPut(self.allocator, key);
     if (!entry.found_existing) {
@@ -143,6 +143,10 @@ pub fn toolCard(
     card.result = call.result;
     card.note = self.loop.toolNote(msg.seq, call_index);
     card.status = call.status;
+    card.open = if (self.hasSubagent(key, msg, call_index))
+        .{ .userdata = self, .key = key, .call = Model.openFromCard }
+    else
+        null;
 
     if (card.expanded and call.result_bytes > Conversation.preview_bytes) {
         if (call.result) |r| {

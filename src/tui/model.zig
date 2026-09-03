@@ -169,6 +169,11 @@ thought_rows: std.AutoHashMapUnmanaged(u64, *ThoughtView.View) = .empty,
 /// state survives redraws and trimming. Individually allocated: each is a
 /// widget whose address is baked into its `userdata`.
 tool_cards: std.AutoHashMapUnmanaged(u64, *ToolCard) = .empty,
+/// Which tool calls left a subagent transcript, keyed like `tool_cards`. Looked
+/// up once per call rather than once per frame.
+subagent_sessions: std.AutoHashMapUnmanaged(u64, i64) = .empty,
+/// A subagent's transcript, shown in place of this session's own.
+viewing: ?Viewing = null,
 /// Expandable cards for the files an `@path` mention pulled in, keyed by
 /// `(message seq << 32) | attachment index`.
 attachment_cards: std.AutoHashMapUnmanaged(u64, *AttachmentCard) = .empty,
@@ -372,7 +377,114 @@ pub fn clearThoughtRows(self: *Model) void {
     self.thought_rows.clearRetainingCapacity();
 }
 
+/// A subagent's transcript, loaded from the database and shown in place of the
+/// session's own. Read-only: the run it records is over.
+pub const Viewing = struct {
+    convo: Conversation,
+    title: []u8,
+    /// Owned by the model rather than a frame's arena: the prompt reads it on
+    /// every draw, and an arena string would be gone by the second one.
+    hint: []u8,
+
+    fn deinit(self: *Viewing, allocator: std.mem.Allocator) void {
+        self.convo.deinit();
+        allocator.free(self.title);
+        allocator.free(self.hint);
+    }
+};
+
+/// Whether this call left a subagent transcript. Looked up once and then
+/// remembered, including the answer that there is none.
+pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_index: usize) bool {
+    if (self.subagent_sessions.get(key)) |id| return id != 0;
+
+    const db = self.loop.db orelse return false;
+    if (self.viewing != null) return false;
+
+    // Not while it runs: the transcript lands when the call settles, and a
+    // "no" cached before then would outlive the transcript arriving.
+    const call = msg.tool_calls[call_index];
+    if (call.status != .ok and call.status != .failed) return false;
+
+    const message_id = self.loop.message_ids.get(msg.seq) orelse return false;
+    const found = db.toolCallId(message_id, @intCast(call_index)) catch return false;
+    const call_row = found orelse return false;
+    const session = db.subagentSession(call_row) catch return false;
+
+    self.subagent_sessions.put(self.allocator, key, session orelse 0) catch return false;
+    return session != null;
+}
+
+/// The transcript on screen, which is a subagent's while one is open.
+pub fn shown(self: *Model) *Conversation {
+    if (self.viewing) |*view| return &view.convo;
+    return &self.conversation;
+}
+
+/// Whether a subagent's transcript is what the person is reading.
+pub fn inSubagent(self: *const Model) bool {
+    return self.viewing != null;
+}
+
+/// Which view a widget belongs to, so a subagent's `seq 0` and the session's
+/// own do not share a cached card.
+pub fn viewTag(self: *const Model) u64 {
+    return if (self.viewing != null) 1 << 63 else 0;
+}
+
+/// The cache key for one widget of a message.
+pub fn widgetKey(self: *const Model, seq: u64, index: usize) u64 {
+    return self.viewTag() | (seq << 32) | @as(u64, index);
+}
+
+/// A card was clicked. Errors are swallowed: a transcript that will not load is
+/// a card that does nothing, which is what it did before it could be opened.
+pub fn openFromCard(ptr: *anyopaque, key: u64, name: []const u8) void {
+    const self: *Model = @ptrCast(@alignCast(ptr));
+    _ = self.openSubagent(key, name) catch return;
+}
+
+/// Show the transcript a tool call left behind. Silent when it left none.
+pub fn openSubagent(self: *Model, key: u64, title: []const u8) !bool {
+    const db = self.loop.db orelse return false;
+    const session = self.subagent_sessions.get(key) orelse return false;
+
+    var convo: Conversation = .init(self.allocator);
+    errdefer convo.deinit();
+    try loadInto(db, session, &convo);
+
+    const owned = try self.allocator.dupe(u8, title);
+    errdefer self.allocator.free(owned);
+
+    const hint = try std.fmt.allocPrint(
+        self.allocator,
+        "reading the {s} subagent \u{b7} ctrl+b to go back",
+        .{owned},
+    );
+    errdefer self.allocator.free(hint);
+
+    self.closeSubagent();
+    self.viewing = .{ .convo = convo, .title = owned, .hint = hint };
+    return true;
+}
+
+/// Back to the session's own transcript.
+pub fn closeSubagent(self: *Model) void {
+    if (self.viewing) |*view| view.deinit(self.allocator);
+    self.viewing = null;
+}
+
+fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
+    const loaded = try db.loadMessages(convo.allocator, session, std.math.maxInt(i64), max_transcript_messages);
+    defer convo.allocator.free(loaded);
+
+    for (loaded) |message| try convo.messages.append(convo.allocator, message);
+    std.mem.reverse(Conversation.Message, convo.messages.items);
+}
+
 pub fn deinit(self: *Model) void {
+    self.closeSubagent();
+    self.subagent_sessions.deinit(self.allocator);
     self.loop.deinit();
     self.registry.deinit();
     self.reads.deinit();
@@ -865,6 +977,106 @@ pub fn pageHistoryIfNeeded(self: *Model) !void {
     if (self.scroll < self.max_scroll) return;
     if (self.conversation.dropped == 0) return;
     _ = try self.loop.pageHistory(history_page_size);
+}
+
+test "a task card only offers its transcript once the call has settled" {
+    const testing = std.testing;
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const parent = try db.createSession(project, "/repo", "model");
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+    };
+    defer model.conversation.deinit();
+    defer model.input.deinit();
+    defer model.subagent_sessions.deinit(testing.allocator);
+    defer model.closeSubagent();
+
+    // Only the fields this path reads; the loop itself needs no wiring here.
+    model.loop.db = &db;
+    model.loop.message_ids = .empty;
+    defer model.loop.message_ids.deinit(testing.allocator);
+
+    var calls = [_]Conversation.ToolCall{.{
+        .id = "call_0",
+        .name = "task",
+        .arguments = "{}",
+        .status = .running,
+    }};
+    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+
+    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
+    const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
+    try model.loop.message_ids.put(testing.allocator, msg.seq, message_id);
+    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "running", null, 0);
+
+    const key = model.widgetKey(msg.seq, 0);
+
+    // Still running, so nothing is looked up and nothing is remembered.
+    try testing.expect(!model.hasSubagent(key, msg, 0));
+    try testing.expect(model.subagent_sessions.get(key) == null);
+
+    _ = try db.createSubagentSession(project, "/repo", "model", parent, call_row);
+    msg.tool_calls[0].status = .ok;
+
+    try testing.expect(model.hasSubagent(key, msg, 0));
+}
+
+test "a subagent transcript takes over the view, and ctrl+b gives it back" {
+    const testing = std.testing;
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const parent = try db.createSession(project, "/repo", "model");
+    const message = try db.appendMessage(parent, 0, "assistant", "", null, 0);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8);
+    const child = try db.createSubagentSession(project, "/repo", "model", parent, call);
+    _ = try db.appendMessage(child, 0, "user", "where is the parser", null, 0);
+    _ = try db.appendMessage(child, 1, "assistant", "src/parse.zig:40", null, 0);
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+    };
+    defer model.conversation.deinit();
+    defer model.input.deinit();
+    defer model.subagent_sessions.deinit(testing.allocator);
+    defer model.closeSubagent();
+
+    model.loop.db = &db;
+    _ = try model.conversation.addUser("go", &.{}, &.{});
+
+    const key: u64 = 0;
+    try model.subagent_sessions.put(testing.allocator, key, child);
+
+    try testing.expect(!model.inSubagent());
+    try testing.expectEqual(&model.conversation, model.shown());
+
+    try testing.expect(try model.openSubagent(key, "task"));
+    try testing.expect(model.inSubagent());
+    try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
+    try testing.expectEqualStrings("where is the parser", model.shown().messages.items[0].text);
+    try testing.expect(std.mem.indexOf(u8, model.viewing.?.hint, "ctrl+b") != null);
+
+    model.closeSubagent();
+    try testing.expect(!model.inSubagent());
+    try testing.expectEqual(&model.conversation, model.shown());
+
+    // A call that left nothing behind stays where it is.
+    try testing.expect(!try model.openSubagent(99, "task"));
 }
 
 test "a confirmation lapses if the second press never comes" {

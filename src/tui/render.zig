@@ -281,9 +281,9 @@ const Block = union(enum) {
 fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Block {
     var blocks: std.ArrayList(Block) = .empty;
 
-    if (self.conversation.dropped > 0) try blocks.append(arena, .notice);
+    if (self.shown().dropped > 0) try blocks.append(arena, .notice);
 
-    for (self.conversation.messages.items) |*msg| {
+    for (self.shown().messages.items) |*msg| {
         if (msg.role == .tool) continue;
 
         if (msg.role == .system) {
@@ -343,12 +343,12 @@ fn drawBlock(
         .notice => return try noticeBlock(self, ctx, try std.fmt.allocPrint(
             ctx.arena,
             "... {d} earlier message(s) - scroll up to load",
-            .{self.conversation.dropped},
+            .{self.shown().dropped},
         ), width),
 
         .summary => |msg| {
             var summarised: usize = 0;
-            for (self.conversation.messages.items) |*earlier| {
+            for (self.shown().messages.items) |*earlier| {
                 if (earlier.seq >= msg.seq) break;
                 summarised += 1;
             }
@@ -356,7 +356,7 @@ fn drawBlock(
                 .path = try std.fmt.allocPrint(
                     ctx.arena,
                     "context compacted \u{b7} {d} messages summarised",
-                    .{summarised + self.conversation.dropped},
+                    .{summarised + self.shown().dropped},
                 ),
                 .content = msg.text,
             });
@@ -423,7 +423,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
     switch (block) {
         .notice => {
             std.hash.autoHash(&hasher, @as(u8, 1));
-            std.hash.autoHash(&hasher, self.conversation.dropped);
+            std.hash.autoHash(&hasher, self.shown().dropped);
         },
         .summary => |msg| {
             std.hash.autoHash(&hasher, @as(u8, 2));
@@ -446,7 +446,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
             std.hash.autoHash(&hasher, @as(u8, 5));
             std.hash.autoHash(&hasher, at.msg.seq);
             std.hash.autoHash(&hasher, at.index);
-            if (self.attachment_cards.get((at.msg.seq << 32) | at.index)) |card| {
+            if (self.attachment_cards.get(self.widgetKey(at.msg.seq, at.index))) |card| {
                 std.hash.autoHash(&hasher, card.expanded);
             }
         },
@@ -458,7 +458,7 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
             std.hash.autoHash(&hasher, call.status);
             std.hash.autoHash(&hasher, call.result_bytes);
             std.hash.autoHash(&hasher, call.arguments.len);
-            if (self.tool_cards.get((at.msg.seq << 32) | at.index)) |card| {
+            if (self.tool_cards.get(self.widgetKey(at.msg.seq, at.index))) |card| {
                 std.hash.autoHash(&hasher, card.expanded);
             }
         },
@@ -474,7 +474,7 @@ pub fn drawTranscript(
     width: u16,
     height: u16,
 ) !?vxfw.Surface {
-    const messages = self.conversation.messages.items;
+    const messages = self.shown().messages.items;
     const pending: usize = if (self.loop.isBusy() and
         self.loop.state != .awaiting_approval) 1 else 0;
     if (height == 0 or messages.len + pending + self.loop.pendingSteering().len == 0) return null;
@@ -859,13 +859,18 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
     for (0..height) |row| {
         surface.writeCell(0, @intCast(row), .{
             .char = .{ .grapheme = "▌", .width = 1 },
-            .style = theme.on_card(Model.agentColor(self.loop.agent.id)).cell,
+            .style = theme.on_card(if (self.inSubagent())
+                theme.fg_dim
+            else
+                Model.agentColor(self.loop.agent.id)).cell,
         });
     }
 
     self.input_cursor = null;
     if (inner > 0) {
-        self.input.placeholder = if (self.loop.state == .awaiting_answer)
+        self.input.placeholder = if (self.viewing) |view|
+            view.hint
+        else if (self.loop.state == .awaiting_answer)
             "Answer to continue..."
         else if (self.loop.isBusy())
             "Type to queue a message..."
