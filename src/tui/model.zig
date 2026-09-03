@@ -477,6 +477,19 @@ pub fn openSubagent(self: *Model, key: u64, title: []const u8) !bool {
 pub fn closeSubagent(self: *Model) void {
     if (self.viewing) |*view| view.deinit(self.allocator);
     self.viewing = null;
+    forgetWidgets(self);
+}
+
+/// Drop every cached widget and measurement.
+///
+/// Called whenever the transcript on screen changes. The view tag separates a
+/// subagent's widgets from the session's, but one bit cannot separate two
+/// subagents, and a tagged key outlives the view that made it: `pruneWidgets`
+/// evicts by seq, and every tagged key is larger than any seq.
+fn forgetWidgets(self: *Model) void {
+    clearToolCards(self);
+    clearThoughtRows(self);
+    self.block_heights.clearRetainingCapacity();
 }
 
 fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
