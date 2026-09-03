@@ -988,11 +988,11 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
     if (policy.delete_after_days > 0) {
         const cutoff = now_ms - dayMs(policy.delete_after_days);
         out.bytes_freed += try self.sessionPayload(cutoff);
-        if (try self.conn.row("SELECT count(*) FROM session WHERE updated_at < ?", .{cutoff})) |row| {
+        if (try self.conn.row("SELECT count(*) " ++ aged, .{cutoff})) |row| {
             defer row.deinit();
             out.sessions_deleted = @intCast(row.int(0));
         }
-        if (apply) try self.conn.exec("DELETE FROM session WHERE updated_at < ?", .{cutoff});
+        if (apply) try self.conn.exec("DELETE " ++ aged, .{cutoff});
     }
 
     if (policy.shed_after_days > 0) {
@@ -1013,6 +1013,11 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
 }
 
 /// Every byte a session holds, for reporting what a delete reclaimed.
+/// Sessions old enough to drop. A subagent's is written once and never touched
+/// again, so it would age out from under a parent still in use; it goes when
+/// the parent does, by cascade.
+const aged = "FROM session WHERE updated_at < ? AND parent_tool_call IS NULL";
+
 fn sessionPayload(self: *Database, cutoff: i64) !u64 {
     const row = try self.conn.row(
         \\SELECT
@@ -1375,6 +1380,30 @@ test "a subagent transcript stays out of every listing" {
     try testing.expectEqual(child, (try db.subagentSession(call)).?);
 }
 
+test "pruning leaves a live session's subagent transcript alone" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var fixture = try searchFixture(&tmp);
+    defer fixture.db.deinit();
+    var db = &fixture.db;
+
+    const parent = try db.latestSession(fixture.project_id) orelse unreachable;
+    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4);
+    const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
+    _ = try db.appendMessage(child, 0, "user", "find it", null, 0);
+
+    // Written once and never touched, so it looks older than its live parent.
+    try db.conn.exec("UPDATE session SET updated_at = ? WHERE id = ?", .{ @as(i64, 0), child });
+
+    const dropped = try db.prune(.{ .delete_after_days = 1 }, db.nowMs());
+    try testing.expectEqual(@as(u64, 0), dropped.sessions_deleted);
+    try testing.expectEqual(@as(u64, 1), try db.countMessages(child));
+    try testing.expectEqual(child, (try db.subagentSession(call)).?);
+}
+
 test "deleting a session takes its subagent transcripts with it" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
@@ -1452,8 +1481,7 @@ test "an older database is brought forward, keeping what it held" {
 
     try testing.expectEqual(migrations.current, try db.userVersion());
 
-    // The row written before the migration is still there, and reads back with
-    // the new column at its default.
+    // The pre-migration row is still there, with the new column at its default.
     const agent = try db.sessionAgent(session_id, testing.allocator);
     defer testing.allocator.free(agent);
     try testing.expectEqualStrings("", agent);

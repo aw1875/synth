@@ -420,6 +420,9 @@ const Placed = struct {
 fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
     var hasher = std.hash.Wyhash.init(width);
 
+    // A subagent and a session message share a seq, so not the measured height.
+    std.hash.autoHash(&hasher, self.viewTag());
+
     switch (block) {
         .notice => {
             std.hash.autoHash(&hasher, @as(u8, 1));
@@ -434,13 +437,13 @@ fn blockKey(self: *Model, block: Block, width: u16) ?u64 {
             std.hash.autoHash(&hasher, @as(u8, 3));
             std.hash.autoHash(&hasher, msg.seq);
             std.hash.autoHash(&hasher, msg.thinking_bytes);
-            if (self.thought_rows.get(msg.seq)) |row| std.hash.autoHash(&hasher, row.expanded);
+            if (self.thought_rows.get(self.viewKey(msg.seq))) |row| std.hash.autoHash(&hasher, row.expanded);
         },
         .text => |msg| {
             std.hash.autoHash(&hasher, @as(u8, 4));
             std.hash.autoHash(&hasher, msg.seq);
             std.hash.autoHash(&hasher, msg.text.len);
-            if (self.paste_toggles.get(msg.seq)) |toggle| std.hash.autoHash(&hasher, toggle.expanded);
+            if (self.paste_toggles.get(self.viewKey(msg.seq))) |toggle| std.hash.autoHash(&hasher, toggle.expanded);
         },
         .attachment => |at| {
             std.hash.autoHash(&hasher, @as(u8, 5));
@@ -630,7 +633,7 @@ pub fn expandPastes(arena: std.mem.Allocator, msg: *const Conversation.Message) 
 }
 
 pub fn pasteToggle(self: *Model, seq: u64) !*Model.PasteToggle {
-    const entry = try self.paste_toggles.getOrPut(self.allocator, seq);
+    const entry = try self.paste_toggles.getOrPut(self.allocator, self.viewKey(seq));
     if (!entry.found_existing) {
         const toggle = try self.allocator.create(Model.PasteToggle);
         toggle.* = .{};

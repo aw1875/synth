@@ -111,7 +111,7 @@ pub fn attachmentCard(
     card.body = attachment.content;
 
     if (card.expanded and attachment.shortened()) {
-        self.loop.loadAttachment(msg, index) catch {};
+        if (!self.inSubagent()) self.loop.loadAttachment(msg, index) catch {};
         card.body = attachment.content;
     }
 
@@ -151,7 +151,7 @@ pub fn toolCard(
     if (card.expanded and call.result_bytes > Conversation.preview_bytes) {
         if (call.result) |r| {
             if (r.len < call.result_bytes) {
-                self.loop.loadToolResult(msg, call_index) catch {};
+                if (!self.inSubagent()) self.loop.loadToolResult(msg, call_index) catch {};
                 card.result = call.result;
             }
         }
@@ -167,7 +167,7 @@ pub fn thoughtRow(self: *Model, msg: *Conversation.Message) !?*ThoughtView.View 
     const thinking = msg.thinking orelse return null;
     if (thinking.len == 0) return null;
 
-    const entry = try self.thought_rows.getOrPut(self.allocator, msg.seq);
+    const entry = try self.thought_rows.getOrPut(self.allocator, self.viewKey(msg.seq));
     if (!entry.found_existing) {
         const row = try self.allocator.create(ThoughtView.View);
         row.* = .{};
@@ -181,7 +181,7 @@ pub fn thoughtRow(self: *Model, msg: *Conversation.Message) !?*ThoughtView.View 
     if (row.expanded and msg.thinking_bytes > Conversation.preview_bytes) {
         if (msg.thinking) |t| {
             if (t.len < msg.thinking_bytes) {
-                self.loop.loadThinking(msg) catch {};
+                if (!self.inSubagent()) self.loop.loadThinking(msg) catch {};
                 row.text = msg.thinking.?;
             }
         }

@@ -437,6 +437,11 @@ pub fn widgetKey(self: *const Model, seq: u64, index: usize) u64 {
     return self.viewTag() | (seq << 32) | @as(u64, index);
 }
 
+/// The cache key for a whole message, for the widgets there is one of.
+pub fn viewKey(self: *const Model, seq: u64) u64 {
+    return self.viewTag() | seq;
+}
+
 /// A card was clicked. Errors are swallowed: a transcript that will not load is
 /// a card that does nothing, which is what it did before it could be opened.
 pub fn openFromCard(ptr: *anyopaque, key: u64, name: []const u8) void {
@@ -788,6 +793,8 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
 
     clearToolCards(self);
     clearThoughtRows(self);
+    self.closeSubagent();
+    self.subagent_sessions.clearRetainingCapacity();
     self.thinking.stream = null;
     self.loop.dropSteering();
     try self.seedHistory();
