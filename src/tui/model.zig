@@ -439,11 +439,14 @@ pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_inde
 
 /// The stored transcript a call left, straight from the database.
 ///
-/// Asked rather than cached wherever the answer has to be right now: nothing
-/// populates the cache while a view is open, since `hasSubagent` returns early.
+/// Resolved through the session rather than `message_ids`: that map holds only
+/// what this run persisted, so a resumed transcript is absent from it entirely.
 fn resolveSubagent(self: *Model, seq: u64, call_index: usize) ?i64 {
     const db = self.loop.db orelse return null;
-    const message_id = self.loop.message_ids.get(seq) orelse return null;
+    const session = self.loop.session_id orelse return null;
+
+    const message = db.messageId(session, @intCast(seq)) catch return null;
+    const message_id = message orelse return null;
     const found = db.toolCallId(message_id, @intCast(call_index)) catch return null;
     const call_row = found orelse return null;
     return db.subagentSession(call_row) catch null;
@@ -1178,8 +1181,7 @@ test "a finishing subagent hands its reader over to the stored transcript" {
     defer model.closeSubagent();
 
     model.loop.db = &db;
-    model.loop.message_ids = .empty;
-    defer model.loop.message_ids.deinit(testing.allocator);
+    model.loop.session_id = parent;
 
     var calls = [_]Conversation.ToolCall{.{
         .id = "call_0",
@@ -1191,7 +1193,6 @@ test "a finishing subagent hands its reader over to the stored transcript" {
     const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
 
     const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
-    try model.loop.message_ids.put(testing.allocator, msg.seq, message_id);
     const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "ok", "done", 4);
 
     var child: Subagent.Child = .{
@@ -1254,8 +1255,7 @@ test "a task card only offers its transcript once the call has settled" {
 
     // Only the fields this path reads; the loop itself needs no wiring here.
     model.loop.db = &db;
-    model.loop.message_ids = .empty;
-    defer model.loop.message_ids.deinit(testing.allocator);
+    model.loop.session_id = parent;
 
     var calls = [_]Conversation.ToolCall{.{
         .id = "call_0",
@@ -1267,7 +1267,6 @@ test "a task card only offers its transcript once the call has settled" {
 
     const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
     const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
-    try model.loop.message_ids.put(testing.allocator, msg.seq, message_id);
     const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "running", null, 0);
 
     const key = model.widgetKey(msg.seq, 0);
@@ -1280,6 +1279,61 @@ test "a task card only offers its transcript once the call has settled" {
     msg.tool_calls[0].status = .ok;
 
     try testing.expect(model.hasSubagent(key, msg, 0));
+}
+
+test "a resumed session still offers the transcripts it stored" {
+    const testing = std.testing;
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    const project = try db.resolveProject("/repo", "git", "repo");
+
+    // An earlier run: a task call that stored a transcript, and a second
+    // session whose seqs start over at the same numbers.
+    const earlier = try db.createSession(project, "/repo", "model");
+    const earlier_msg = try db.appendMessage(earlier, 0, "assistant", "", null, 0);
+    const earlier_call = try db.appendToolCall(earlier_msg, 0, "c", "task", "{}", "ok", "done", 4);
+    const earlier_child = try db.createSubagentSession(project, "/repo", "model", earlier, earlier_call);
+    _ = try db.appendMessage(earlier_child, 0, "assistant", "the earlier answer", null, 0);
+
+    const resumed = try db.createSession(project, "/repo", "model");
+    const resumed_msg = try db.appendMessage(resumed, 0, "assistant", "", null, 0);
+    const resumed_call = try db.appendToolCall(resumed_msg, 0, "c", "task", "{}", "ok", "done", 4);
+    const resumed_child = try db.createSubagentSession(project, "/repo", "model", resumed, resumed_call);
+    _ = try db.appendMessage(resumed_child, 0, "assistant", "the resumed answer", null, 0);
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+    };
+    defer model.conversation.deinit();
+    defer model.input.deinit();
+    defer model.subagent_sessions.deinit(testing.allocator);
+    defer model.closeSubagent();
+
+    // Nothing persisted this run, which is what a resumed transcript looks like.
+    model.loop.db = &db;
+    model.loop.session_id = resumed;
+
+    var calls = [_]Conversation.ToolCall{.{
+        .id = "c",
+        .name = "task",
+        .arguments = "{}",
+        .status = .ok,
+    }};
+    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
+
+    const key = model.widgetKey(msg.seq, 0);
+    try testing.expect(model.hasSubagent(key, msg, 0));
+
+    // And it is this session's transcript, not the one at the same seq before it.
+    try testing.expect(try model.openSubagent(key, msg.seq, 0, "task"));
+    try testing.expectEqualStrings("the resumed answer", model.shown().messages.items[0].text);
 }
 
 test "a subagent transcript takes over the view, and ctrl+b gives it back" {

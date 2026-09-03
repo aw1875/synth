@@ -350,6 +350,9 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     const db = self.db orelse return error.NoDatabase;
 
     const total = try db.countMessages(session_id);
+    // Seqs restart per session, so old entries point at another session's rows.
+    self.message_ids.clearRetainingCapacity();
+
     const loaded = try db.loadMessages(self.allocator, session_id, std.math.maxInt(i64), limit);
     defer self.allocator.free(loaded);
 

@@ -722,6 +722,17 @@ pub fn updateToolCall(
     );
 }
 
+/// The row a message was stored as. Asked by seq rather than remembered: a
+/// resumed transcript was written by a previous run, which left no map behind.
+pub fn messageId(self: *Database, session_id: i64, seq: i64) !?i64 {
+    const row = try self.conn.row(
+        "SELECT id FROM message WHERE session_id = ? AND seq = ?",
+        .{ session_id, seq },
+    ) orelse return null;
+    defer row.deinit();
+    return row.int(0);
+}
+
 /// The row a tool call was stored as, for anything that has to point at it.
 pub fn toolCallId(self: *Database, message_id: i64, seq: i64) !?i64 {
     const row = try self.conn.row(
