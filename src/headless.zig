@@ -135,9 +135,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     try out.flush();
 
     var loop: Loop = .init(allocator, io, provider, &registry, &convo, &reads, project.root);
-    var runner: subagent.Runner = .{ .parent = &loop };
+    var runner: subagent.Runner = .{ .parent = &loop, .backend = &backend };
     loop.delegate = runner.delegate();
-    loop.transcripts = runner.transcripts();
 
     // Ordered: the loop joins the workers still writing to the runner.
     defer {
@@ -166,6 +165,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     var printed: usize = 0;
     while (loop.isBusy()) {
+        _ = try runner.poll();
         _ = try loop.poll();
 
         if (loop.state == .awaiting_approval) {

@@ -1,10 +1,10 @@
-//! Running one nested agent for the `task` tool.
+//! Running nested agents for the `task` tool.
 //!
-//! A subagent is an ordinary `Loop` with its own transcript, driven to a stop
-//! on the worker thread that is already blocked inside the tool call. Nothing
-//! about it is special-cased in the parent: it borrows the provider, the
-//! registry and the project, and everything it may do comes from the agent
-//! record it runs as.
+//! A subagent is an ordinary `Loop` with its own transcript, its own client and
+//! its own read log, driven by the same tick that drives the parent. The tool
+//! call that asked for it waits on a worker thread; the loop behind it never
+//! leaves the thread every other loop is polled on, which is what lets the
+//! person read it while it runs.
 //!
 //! This file imports the loop; the loop does not import this file. The parent
 //! is handed a `tool.Delegate` from outside, which is what keeps the dependency
@@ -13,82 +13,243 @@
 const std = @import("std");
 const testing = std.testing;
 
+const Backend = @import("../provider/backend.zig");
 const Conversation = @import("../core/conversation.zig");
 const tool = @import("../tools/tool.zig");
 const agents = @import("agent.zig");
 const Loop = @import("loop.zig");
 
-/// How often the runner looks at a subagent that is still working. The work is
-/// on other threads, so this is a sleep rather than a spin.
-const poll_interval_ms: u64 = 2;
+/// How long a waiting tool call sleeps between looks at its subagent.
+const wait_slice_ms: u64 = 5;
 
 /// Wall-clock ceiling on one subagent, whatever its step count says. A model
 /// that stalls mid-turn would otherwise hold the parent's tool call open for as
 /// long as it liked.
-const deadline_ms: i128 = tool.subagent_deadline_ms;
+const deadline_ms: i64 = @intCast(tool.subagent_deadline_ms);
+
+/// One nested run, from the request to the answer.
+///
+/// Written by two threads at different times, never at once: the tool worker
+/// fills the request and then waits, and the tick that owns `loop` fills the
+/// answer and raises `done`. `done` is the handoff.
+pub const Child = struct {
+    /// What was asked for, owned by this struct.
+    agent: []const u8,
+    prompt: []const u8,
+    label: []const u8,
+    /// Which of the parent's tool calls is waiting on it.
+    index: usize,
+    /// The parent's give-up flag, so cancelling a turn ends this too.
+    cancelled: ?*const std.atomic.Value(bool),
+    progress: ?tool.Progress,
+
+    /// Built on the first tick that sees this, so everything the loop touches
+    /// belongs to the thread that polls it.
+    started: bool = false,
+    backend: ?*Backend.Spawned = null,
+    convo: Conversation,
+    reads: tool.ReadLog,
+    loop: Loop = undefined,
+    started_ms: i64 = 0,
+
+    /// Raised once `answer` or `failed` is set, and nothing writes either after.
+    done: std.atomic.Value(bool) = .init(false),
+    answer: ?[]const u8 = null,
+    failed: ?anyerror = null,
+
+    /// Whether the waiting call has taken the answer and gone. Raised on the
+    /// worker, read on the tick.
+    collected: std.atomic.Value(bool) = .init(false),
+
+    fn describeTo(self: *Child, buffer: *[tool.max_progress_bytes]u8) []const u8 {
+        return describe(&self.loop, self.label, buffer);
+    }
+};
 
 pub const Runner = struct {
-    /// The loop the subagent borrows its provider, registry and project from.
-    /// Blocked inside a tool call for as long as the subagent runs, which is
-    /// what makes sharing the provider safe.
+    /// The loop a subagent takes its registry, project and settings from.
     parent: *Loop,
-    /// Transcripts finished but not yet collected, keyed by the parent call.
-    /// Written on a tool worker and drained on the UI thread, so it locks.
+    /// Where a child's own client comes from. Null leaves subagents sharing the
+    /// parent's, which is only safe while nothing else is using it.
+    backend: ?*Backend = null,
+    /// Where a tool worker leaves a request. Guarded, and drained by the tick
+    /// into `active`, which nothing but the tick ever touches.
     mutex: std.Io.Mutex = .init,
-    kept: std.ArrayList(Kept) = .empty,
-
-    const Kept = struct { index: usize, convo: *Conversation };
+    inbox: std.ArrayList(*Child) = .empty,
+    active: std.ArrayList(*Child) = .empty,
 
     pub fn delegate(self: *Runner) tool.Delegate {
         return .{ .userdata = self, .run = erasedRun };
     }
 
-    pub fn transcripts(self: *Runner) Loop.Transcripts {
-        return .{ .userdata = self, .take = erasedTake, .release = erasedRelease };
-    }
-
-    /// Free anything nobody came back for, which is what a cancelled turn
-    /// leaves behind.
     pub fn deinit(self: *Runner) void {
         self.mutex.lockUncancelable(self.parent.io);
         defer self.mutex.unlock(self.parent.io);
 
-        for (self.kept.items) |entry| destroy(self.parent.allocator, entry.convo);
-        self.kept.deinit(self.parent.allocator);
+        for (self.inbox.items) |child| destroy(self.parent.allocator, child);
+        self.inbox.deinit(self.parent.allocator);
+        for (self.active.items) |child| destroy(self.parent.allocator, child);
+        self.active.deinit(self.parent.allocator);
     }
 
-    fn keep(self: *Runner, index: usize, convo: *Conversation) !void {
-        self.mutex.lockUncancelable(self.parent.io);
-        defer self.mutex.unlock(self.parent.io);
-        try self.kept.append(self.parent.allocator, .{ .index = index, .convo = convo });
+    /// Drive every subagent one step, on the thread that owns them.
+    ///
+    /// Returns true if anything moved, so the caller knows to redraw.
+    pub fn poll(self: *Runner) !bool {
+        var moved = try self.collect();
+
+        var at: usize = 0;
+        while (at < self.active.items.len) {
+            const child = self.active.items[at];
+            if (child.collected.load(.acquire)) {
+                _ = self.active.orderedRemove(at);
+                destroy(self.parent.allocator, child);
+                moved = true;
+                continue;
+            }
+            moved = try self.step(child) or moved;
+            at += 1;
+        }
+        return moved;
     }
 
-    fn take(self: *Runner, index: usize) ?*Conversation {
+    /// Take whatever the workers left, so the rest of a poll needs no lock.
+    fn collect(self: *Runner) !bool {
         self.mutex.lockUncancelable(self.parent.io);
         defer self.mutex.unlock(self.parent.io);
+        if (self.inbox.items.len == 0) return false;
 
-        for (self.kept.items, 0..) |entry, at| {
-            if (entry.index != index) continue;
-            _ = self.kept.orderedRemove(at);
-            return entry.convo;
+        try self.active.appendSlice(self.parent.allocator, self.inbox.items);
+        self.inbox.clearRetainingCapacity();
+        return true;
+    }
+
+    /// The transcripts a person can read right now, newest last. Tick only.
+    pub fn live(self: *Runner) []const *Child {
+        return self.active.items;
+    }
+
+    /// The subagent a parent tool call is waiting on, if it is still running.
+    pub fn running(self: *Runner, index: usize) ?*Child {
+        for (self.active.items) |child| {
+            if (child.index == index and !child.done.load(.acquire)) return child;
         }
         return null;
     }
+
+    fn step(self: *Runner, child: *Child) !bool {
+        if (child.done.load(.acquire)) return false;
+
+        if (!child.started) {
+            self.begin(child) catch |err| {
+                child.failed = err;
+                child.done.store(true, .release);
+                return true;
+            };
+            return true;
+        }
+
+        if (child.progress) |channel| {
+            var line: [tool.max_progress_bytes]u8 = undefined;
+            channel.report(channel.userdata, child.describeTo(&line));
+        }
+
+        if (self.givenUp(child)) {
+            child.loop.requestStop();
+            try self.finish(child, .cancelled);
+            return true;
+        }
+
+        if (tool.monotonicMilliseconds(self.parent.io) - child.started_ms > deadline_ms) {
+            child.loop.requestStop();
+            try self.finish(child, .timed_out);
+            return true;
+        }
+
+        const moved = try child.loop.poll();
+        if (child.loop.isBusy()) {
+            // Nobody can see a subagent's approval prompt, so an agent record
+            // that can reach one has nowhere to go. Today none can.
+            if (child.loop.state != .awaiting_approval) return moved;
+            child.loop.requestStop();
+            try self.finish(child, .halted);
+            return true;
+        }
+
+        try self.finish(child, outcomeOf(&child.loop));
+        return true;
+    }
+
+    /// Build the loop, on the tick, so nothing it owns is touched by two
+    /// threads.
+    fn begin(self: *Runner, child: *Child) !void {
+        const parent = self.parent;
+
+        var provider = parent.provider;
+        if (self.backend) |backend| {
+            child.backend = try backend.spawn(parent.allocator);
+            provider = child.backend.?.provider();
+        }
+
+        child.loop = .init(
+            parent.allocator,
+            parent.io,
+            provider,
+            parent.registry,
+            &child.convo,
+            &child.reads,
+            parent.project_root,
+        );
+        child.loop.project = parent.project;
+        child.loop.skills = parent.skills;
+        child.loop.system_prompt = parent.system_prompt;
+        child.loop.delegate = null;
+        // A standing allowance is the person's, not something to inherit.
+        child.loop.auto_approve_safe = false;
+        child.loop.max_turn_ms = parent.max_turn_ms;
+        child.loop.max_turn_tokens = parent.max_turn_tokens;
+        child.loop.max_stall_ms = parent.max_stall_ms;
+
+        try child.loop.useAgent(child.agent);
+        child.started_ms = tool.monotonicMilliseconds(parent.io);
+        child.started = true;
+        try child.loop.submit(child.prompt, .{});
+    }
+
+    fn finish(self: *Runner, child: *Child, outcome: Outcome) !void {
+        const allocator = self.parent.allocator;
+        child.answer = report(&child.loop, allocator, outcome) catch |err| {
+            child.failed = err;
+            child.done.store(true, .release);
+            return;
+        };
+        self.parent.storeSubagent(child.index, &child.convo) catch {};
+        child.done.store(true, .release);
+    }
+
+    fn givenUp(_: *Runner, child: *Child) bool {
+        const flag = child.cancelled orelse return false;
+        return flag.load(.acquire);
+    }
+
+    fn add(self: *Runner, child: *Child) !void {
+        self.mutex.lockUncancelable(self.parent.io);
+        defer self.mutex.unlock(self.parent.io);
+        try self.inbox.append(self.parent.allocator, child);
+    }
 };
 
-fn erasedTake(ptr: *anyopaque, index: usize) ?*Conversation {
-    const self: *Runner = @ptrCast(@alignCast(ptr));
-    return self.take(index);
-}
-
-fn erasedRelease(ptr: *anyopaque, convo: *Conversation) void {
-    const self: *Runner = @ptrCast(@alignCast(ptr));
-    destroy(self.parent.allocator, convo);
-}
-
-fn destroy(allocator: std.mem.Allocator, convo: *Conversation) void {
-    convo.deinit();
-    allocator.destroy(convo);
+/// Free a child and everything it built.
+fn destroy(allocator: std.mem.Allocator, child: *Child) void {
+    if (child.started) child.loop.deinit();
+    if (child.backend) |spawned| spawned.deinit();
+    child.convo.deinit();
+    child.reads.deinit();
+    if (child.answer) |answer| allocator.free(answer);
+    allocator.free(child.agent);
+    allocator.free(child.prompt);
+    allocator.free(child.label);
+    allocator.destroy(child);
 }
 
 fn erasedRun(
@@ -100,55 +261,38 @@ fn erasedRun(
     return run(self, allocator, task);
 }
 
-/// Run `task` to completion and return what the subagent finished with.
+/// Ask for a subagent and wait for it. Runs on a tool worker; everything the
+/// nested loop touches happens on the tick instead.
 pub fn run(
     runner: *Runner,
     allocator: std.mem.Allocator,
     task: tool.Delegate.Task,
 ) ![]const u8 {
-    const parent = runner.parent;
+    const gpa = runner.parent.allocator;
 
-    const convo = try parent.allocator.create(Conversation);
-    convo.* = .init(parent.allocator);
-    errdefer destroy(parent.allocator, convo);
+    const child = try gpa.create(Child);
+    child.* = .{
+        .agent = try gpa.dupe(u8, task.agent),
+        .prompt = try gpa.dupe(u8, task.prompt),
+        .label = try gpa.dupe(u8, task.label),
+        .index = task.index,
+        .cancelled = task.cancelled,
+        .progress = task.progress,
+        .convo = .init(gpa),
+        .reads = .init(gpa),
+    };
+    errdefer destroy(gpa, child);
 
-    // A ReadLog of its own: a file the subagent read is not a file the parent
-    // may edit, because the parent never saw the contents it would be editing.
-    var reads: tool.ReadLog = .init(parent.allocator);
-    defer reads.deinit();
+    try runner.add(child);
 
-    var child: Loop = .init(
-        parent.allocator,
-        parent.io,
-        parent.provider,
-        parent.registry,
-        convo,
-        &reads,
-        parent.project_root,
-    );
-    defer child.deinit();
+    while (!child.done.load(.acquire)) {
+        try std.Io.sleep(runner.parent.io, .fromMilliseconds(wait_slice_ms), .real);
+    }
 
-    child.project = parent.project;
-    child.skills = parent.skills;
-    child.system_prompt = parent.system_prompt;
-    // Nothing it may call needs a decision, so nothing may auto-approve one.
-    child.auto_approve_safe = false;
-    child.max_turn_ms = parent.max_turn_ms;
-    child.max_turn_tokens = parent.max_turn_tokens;
-    child.max_stall_ms = parent.max_stall_ms;
-    // No database: a subagent's steps are not a session, and persisting them
-    // would put in the transcript exactly what delegating keeps out of it.
-    try child.useAgent(task.agent);
-
-    try child.submit(task.prompt, .{});
-    const outcome = try drive(&child, task);
-
-    const answer = try report(&child, allocator, outcome);
-    errdefer allocator.free(answer);
-
-    // Handed over rather than freed: the parent stores it once the call settles.
-    try runner.keep(task.index, convo);
-    return answer;
+    // Copied before the flag that lets the tick free the child.
+    defer child.collected.store(true, .release);
+    if (child.failed) |err| return err;
+    return allocator.dupe(u8, child.answer orelse "");
 }
 
 const Outcome = enum {
@@ -163,43 +307,9 @@ const Outcome = enum {
     failed,
 };
 
-/// Poll the child until it stops, the parent gives up, or time runs out.
-fn drive(child: *Loop, task: tool.Delegate.Task) !Outcome {
-    const started = std.Io.Timestamp.now(child.io, .awake);
-
-    while (child.isBusy()) {
-        if (task.progress) |channel| {
-            var line: [tool.max_progress_bytes]u8 = undefined;
-            channel.report(channel.userdata, describe(child, task.label, &line));
-        }
-
-        if (task.cancelled) |flag| {
-            if (flag.load(.acquire)) {
-                child.requestStop();
-                return .cancelled;
-            }
-        }
-
-        const now = std.Io.Timestamp.now(child.io, .awake);
-        if (started.durationTo(now).toMilliseconds() > deadline_ms) {
-            child.requestStop();
-            return .timed_out;
-        }
-
-        _ = try child.poll();
-        if (!child.isBusy()) break;
-
-        // A subagent that stopped for a decision is a bug in its agent record,
-        // not something to wait on: nothing it may call needs one.
-        if (child.state == .awaiting_approval) {
-            child.requestStop();
-            return .halted;
-        }
-
-        try std.Io.sleep(child.io, .fromMilliseconds(poll_interval_ms), .real);
-    }
-
-    // A step count read back afterwards cannot tell a last step from one too many.
+/// What the loop settled on. A step count read back afterwards cannot tell a
+/// last step from one too many.
+fn outcomeOf(child: *Loop) Outcome {
     return switch (child.outcome orelse .done) {
         .done => .answered,
         .cancelled => .cancelled,
@@ -322,7 +432,7 @@ test "a subagent loops through its own tools and returns only the answer" {
         .{ .text = "the parser is at src/parse.zig:40" },
     };
 
-    const answer = try run(&harness.runner, testing.allocator, .{
+    const answer = try runTask(harness, .{
         .agent = "task",
         .prompt = "where is the parser",
     });
@@ -341,7 +451,7 @@ test "a subagent that says nothing returns nothing for the tool to report" {
 
     harness.fake.script = &.{.{ .text = "" }};
 
-    const answer = try run(&harness.runner, testing.allocator, .{
+    const answer = try runTask(harness, .{
         .agent = "task",
         .prompt = "find nothing",
     });
@@ -357,7 +467,7 @@ test "a cancelled parent ends the subagent" {
     harness.fake.script = &.{.{ .text = "working on it" }};
 
     var stop: std.atomic.Value(bool) = .init(true);
-    const answer = try run(&harness.runner, testing.allocator, .{
+    const answer = try runTask(harness, .{
         .agent = "task",
         .prompt = "take your time",
         .cancelled = &stop,
@@ -378,7 +488,7 @@ test "a halted subagent reports its work, not the loop's stop line" {
         .said = "the parser is at src/parse.zig:40",
     } }};
 
-    const answer = try run(&harness.runner, testing.allocator, .{
+    const answer = try runTask(harness, .{
         .agent = "task",
         .prompt = "keep going forever",
     });
@@ -400,7 +510,7 @@ test "a subagent that answers gets no note, however many steps it spent" {
         .{ .text = "done" },
     };
 
-    const answer = try run(&harness.runner, testing.allocator, .{
+    const answer = try runTask(harness, .{
         .agent = "task",
         .prompt = "be quick",
     });
@@ -409,7 +519,7 @@ test "a subagent that answers gets no note, however many steps it spent" {
     try testing.expectEqualStrings("done", answer);
 }
 
-test "a subagent leaves its transcript for the parent to collect" {
+test "a running subagent is visible before it has answered" {
     const harness = try Harness.init();
     defer harness.deinit();
 
@@ -418,27 +528,31 @@ test "a subagent leaves its transcript for the parent to collect" {
         .{ .text = "found it" },
     };
 
-    const answer = try run(&harness.runner, testing.allocator, .{
+    var job: Job = .{ .harness = harness, .task = .{
         .agent = "task",
         .prompt = "where is it",
         .index = 3,
-    });
+    } };
+    var future = try testing.io.concurrent(Job.go, .{&job});
+
+    var seen_running = false;
+    while (harness.runner.active.items.len == 0 or !job.finished.load(.acquire)) {
+        _ = try harness.runner.poll();
+        if (harness.runner.running(3) != null) seen_running = true;
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    future.await(testing.io);
+
+    const answer = try job.result;
     defer testing.allocator.free(answer);
 
-    // Keyed by the call that started it, so it reaches the right card.
-    try testing.expect(harness.runner.take(0) == null);
+    // Reachable while it worked, which is the whole point of the move.
+    try testing.expect(seen_running);
+    try testing.expectEqualStrings("found it", answer);
 
-    const kept = harness.runner.take(3) orelse return error.NothingKept;
-    defer {
-        kept.deinit();
-        testing.allocator.destroy(kept);
-    }
-
-    try testing.expectEqualStrings("where is it", kept.messages.items[0].text);
-    try testing.expect(kept.messages.items.len > 2);
-
-    // Taken once: a second collector gets nothing rather than a double free.
-    try testing.expect(harness.runner.take(3) == null);
+    // And gone once the call collected it.
+    _ = try harness.runner.poll();
+    try testing.expect(harness.runner.running(3) == null);
 }
 
 test "a subagent cannot reach a tool its agent record leaves out" {
@@ -450,7 +564,7 @@ test "a subagent cannot reach a tool its agent record leaves out" {
         .{ .text = "I could not write anything" },
     };
 
-    const answer = try run(&harness.runner, testing.allocator, .{
+    const answer = try runTask(harness, .{
         .agent = "task",
         .prompt = "write a file",
     });
@@ -463,6 +577,32 @@ test "a subagent cannot reach a tool its agent record leaves out" {
     const messages = harness.parent.conversation.messages.items;
     try testing.expectEqual(@as(usize, 0), messages.len);
 }
+
+/// Runs a task the way the app does: the call waits on a worker while the
+/// runner is polled here, which on a real run is the tick's job.
+fn runTask(harness: *Harness, task: tool.Delegate.Task) ![]const u8 {
+    var job: Job = .{ .harness = harness, .task = task };
+    var future = try testing.io.concurrent(Job.go, .{&job});
+
+    while (harness.runner.active.items.len == 0 or !job.finished.load(.acquire)) {
+        _ = try harness.runner.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    future.await(testing.io);
+    return job.result;
+}
+
+const Job = struct {
+    harness: *Harness,
+    task: tool.Delegate.Task,
+    result: anyerror![]const u8 = undefined,
+    finished: std.atomic.Value(bool) = .init(false),
+
+    fn go(self: *Job) void {
+        self.result = run(&self.harness.runner, testing.allocator, self.task);
+        self.finished.store(true, .release);
+    }
+};
 
 /// A parent loop backed by a scripted provider, which is all a subagent needs
 /// to borrow.

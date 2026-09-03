@@ -57,20 +57,6 @@ pub const no_reply = "(no reply)";
 /// How every reason the loop halts on opens. A subagent's caller strips it.
 pub const halt_prefix = "Stopped: ";
 
-/// Where a subagent leaves the transcript it built, for the parent to store.
-///
-/// The mirror of `tool.Delegate`: that seam lets a tool start a nested run
-/// without naming the loop, and this one lets the loop collect what the run
-/// left without naming the runner.
-pub const Transcripts = struct {
-    userdata: *anyopaque,
-    /// The conversation the call at `index` produced, handed over. Null when
-    /// that call was not a subagent, or kept nothing.
-    take: *const fn (*anyopaque, usize) ?*Conversation,
-    /// Give one back once there is nothing more to read from it.
-    release: *const fn (*anyopaque, *Conversation) void,
-};
-
 /// Messages whose pasted images stay in memory. Older ones keep their token in
 /// the text but stop being resent; the bodies remain in the blob table.
 const max_resident_images: usize = 2;
@@ -215,9 +201,6 @@ auto_approve_safe: bool = true,
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
 delegate: ?tool.Delegate = null,
-/// Where subagent transcripts are collected from. Null leaves them to whoever
-/// kept them, which is what a headless run wants.
-transcripts: ?Transcripts = null,
 /// What the model may do this turn. The tool schema sent with every request is
 /// this agent's list, and the gate refuses anything outside it.
 agent: agents.Agent = agents.all[0],
@@ -1747,20 +1730,13 @@ fn persistMessage(self: *Loop, index: usize) !void {
     }
 }
 
-/// Store the transcript a subagent left for this call, if it left one.
-///
-/// Taken whether or not there is a database to put it in: the runner is holding
-/// it either way, and dropping it here is what stops it accumulating.
-fn adoptTranscript(self: *Loop, message_index: usize, call_index: usize) !void {
-    const sink = self.transcripts orelse return;
-    const convo = sink.take(sink.userdata, call_index) orelse return;
-    defer sink.release(sink.userdata, convo);
-
-    try self.persistSubagent(message_index, call_index, convo);
-}
-
 /// Write a subagent's messages into a session of its own, hung off the call
 /// that produced it. Read back by whatever reads any other session.
+pub fn storeSubagent(self: *Loop, call_index: usize, convo: *Conversation) !void {
+    const message_index = self.pendingIndex() orelse return;
+    return self.persistSubagent(message_index, call_index, convo);
+}
+
 fn persistSubagent(
     self: *Loop,
     message_index: usize,
@@ -1982,7 +1958,6 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
         call.result = try redact.scrub(self.allocator, result.content);
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
-        try self.adoptTranscript(message_index, result.index);
     }
 }
 
@@ -2693,14 +2668,18 @@ test "a subagent transcript is stored as a session of its own" {
     _ = try kept.addUser("where is the parser", &.{}, &.{});
     _ = try kept.addAssistant("src/parse.zig:40", "thinking about it", 12);
 
-    var sink: StubTranscripts = .{ .convo = &kept };
-
     var loop = fixture.loop();
     defer loop.deinit();
-    loop.transcripts = sink.sink();
 
     try loop.attachDatabase(&db, "project", fixture.root, "model");
     try loop.submit("go", .{});
+
+    // While the call is pending, which is when a subagent finishes.
+    while (loop.state != .running_tools and loop.isBusy()) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    try loop.storeSubagent(0, &kept);
     try settle(&loop);
 
     const parent = loop.session_id.?;
@@ -2710,33 +2689,7 @@ test "a subagent transcript is stored as a session of its own" {
     const child = try db.subagentSession(call_row) orelse return error.NoSubagentSession;
     try testing.expect(child != parent);
     try testing.expectEqual(@as(u64, 2), try db.countMessages(child));
-
-    // Handed back once stored, so nothing is holding it after the turn.
-    try testing.expect(sink.released);
 }
-
-/// Stands in for the runner, handing the loop one transcript for call zero.
-const StubTranscripts = struct {
-    convo: *Conversation,
-    released: bool = false,
-    taken: bool = false,
-
-    fn sink(self: *StubTranscripts) Transcripts {
-        return .{ .userdata = self, .take = take, .release = release };
-    }
-
-    fn take(ptr: *anyopaque, index: usize) ?*Conversation {
-        const self: *StubTranscripts = @ptrCast(@alignCast(ptr));
-        if (index != 0 or self.taken) return null;
-        self.taken = true;
-        return self.convo;
-    }
-
-    fn release(ptr: *anyopaque, _: *Conversation) void {
-        const self: *StubTranscripts = @ptrCast(@alignCast(ptr));
-        self.released = true;
-    }
-};
 
 test "a session comes back in the mode it was left in" {
     const fixture = try Fixture.init();

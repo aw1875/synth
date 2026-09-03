@@ -10,6 +10,7 @@ const Database = @import("../core/database.zig");
 const Conversation = @import("../core/conversation.zig");
 const Role = Conversation.Role;
 const AgentLoop = @import("../agent/loop.zig");
+const Subagent = @import("../agent/subagent.zig");
 const mention = @import("../core/mention.zig");
 const Auth = @import("../core/auth.zig");
 const Config = @import("../core/config.zig");
@@ -174,6 +175,9 @@ tool_cards: std.AutoHashMapUnmanaged(u64, *ToolCard) = .empty,
 subagent_sessions: std.AutoHashMapUnmanaged(u64, i64) = .empty,
 /// A subagent's transcript, shown in place of this session's own.
 viewing: ?Viewing = null,
+/// The nested runs, which this model drives on its own tick. Null where
+/// subagents are not available at all.
+subagents: ?*Subagent.Runner = null,
 /// Expandable cards for the files an `@path` mention pulled in, keyed by
 /// `(message seq << 32) | attachment index`.
 attachment_cards: std.AutoHashMapUnmanaged(u64, *AttachmentCard) = .empty,

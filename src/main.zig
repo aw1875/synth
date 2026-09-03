@@ -193,9 +193,9 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try tui_app.wire(model);
 
     // Installed here so the loop never needs the thing that runs a subagent.
-    var runner: subagent.Runner = .{ .parent = &model.loop };
+    var runner: subagent.Runner = .{ .parent = &model.loop, .backend = &backend };
     model.loop.delegate = runner.delegate();
-    model.loop.transcripts = runner.transcripts();
+    model.subagents = &runner;
 
     // Ordered: the loop joins the workers still writing to the runner.
     defer {
