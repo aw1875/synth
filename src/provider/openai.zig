@@ -53,6 +53,13 @@ auth_value: []const u8 = "",
 
 client: std.http.Client = undefined,
 started: bool = false,
+/// The socket the turn in flight is reading. Guarded rather than atomic: the
+/// shutdown has to happen while the handle is still owned. See `abort`.
+live_socket: std.posix.fd_t = -1,
+socket_lock: std.Io.Mutex = .init,
+/// Whether a cancel arrived. Kept because one can land before the request has
+/// a socket to shut down, and a no-op then would be a cancel that never took.
+aborted: bool = false,
 /// Set when the model, host, key or label was changed at runtime: the borrowed
 /// field then points here rather than at the config, and this is what has to be
 /// freed.
@@ -148,8 +155,62 @@ pub fn provider(self: *OpenAIProvider) Provider {
         .describe_error = describeErrorErased,
         .refresh = currentErased,
         .reconnect = reconnectErased,
+        .abort = abortErased,
     };
 }
+
+/// No request in flight.
+const no_socket: std.posix.fd_t = -1;
+
+/// Break off the request in flight. Safe to call when there is none.
+///
+/// Under the lock the worker holds while the handle is live, so the socket
+/// cannot be closed underneath the shutdown and land on a reused descriptor.
+pub fn abort(self: *OpenAIProvider) void {
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+
+    self.aborted = true;
+    self.shutdownLocked();
+}
+
+fn shutdownLocked(self: *OpenAIProvider) void {
+    if (self.live_socket == no_socket) return;
+    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
+    self.live_socket = no_socket;
+}
+
+/// Worker thread. What `abort` shuts down until `forgetSocket` takes it back.
+fn watch(self: *OpenAIProvider, request: *std.http.Client.Request) void {
+    const connection = request.connection orelse return;
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+
+    self.live_socket = connection.stream_reader.stream.socket.handle;
+    if (self.aborted) self.shutdownLocked();
+}
+
+/// Worker thread. A new turn is not the cancelled one.
+fn armSocket(self: *OpenAIProvider) void {
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+    self.aborted = false;
+    self.live_socket = no_socket;
+}
+
+/// Worker thread. Must run before the request is torn down.
+fn forgetSocket(self: *OpenAIProvider) void {
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+    self.live_socket = no_socket;
+}
+
+fn abortErased(ptr: *anyopaque) void {
+    const self: *OpenAIProvider = @ptrCast(@alignCast(ptr));
+    self.abort();
+}
+
+
 
 /// What this provider is pointed at, as the UI should show it.
 pub fn current(self: *OpenAIProvider) Provider.Current {
@@ -394,6 +455,8 @@ fn respond(
     const url = try self.endpoint(arena, "/chat/completions");
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
+    self.armSocket();
+
     var attempt: usize = 1;
     while (true) {
         const body = try self.buildRequest(arena, convo, turn);
@@ -402,14 +465,17 @@ fn respond(
             .headers = self.requestHeaders(true),
             .keep_alive = false,
         });
-        defer request.deinit();
+        defer {
+            self.forgetSocket();
+            request.deinit();
+        }
         try request.sendBodyComplete(body);
+        self.watch(&request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
 
-        // Read before the body reader is built: taking one invalidates every
-        // string in the head, `content_type` among them.
+        // Read before the body reader is built, which invalidates the head.
         const sse = streamed(response.head.content_type);
         const asked_for = retry.retryAfterMs(headerValue(response.head, "retry-after"));
 
@@ -1529,6 +1595,32 @@ test "a delay longer than a turn is worth is not waited out" {
 
     try testing.expect(backend.waitAndRetry(.too_many_requests, 1, 500, null));
     try testing.expect(!backend.waitAndRetry(.too_many_requests, 1, 60_000, null));
+}
+
+test "a cancel with no request in flight shuts nothing down" {
+    var backend: OpenAIProvider = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "https://api.example/v1",
+        .label = "Example",
+        .model = "a-model",
+    };
+    defer backend.deinit();
+
+    // Nothing in flight: a no-op rather than a shutdown of whatever -1 is.
+    backend.abort();
+
+    // What the worker does when its request ends, before the socket is closed.
+    backend.forgetSocket();
+    backend.abort();
+    try testing.expectEqual(no_socket, backend.live_socket);
+
+    // A cancel landing before there is a socket still takes, on the next watch.
+    try testing.expect(backend.aborted);
+
+    // And a new turn is not the cancelled one.
+    backend.armSocket();
+    try testing.expect(!backend.aborted);
 }
 
 test "a turn the user gave up on is not retried" {

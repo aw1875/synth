@@ -54,6 +54,13 @@ auth_header: [1]std.http.Header = undefined,
 auth_value: []const u8 = "",
 
 client: Ollama = undefined,
+/// The socket the turn in flight is reading. Guarded rather than atomic: the
+/// shutdown has to happen while the handle is still owned. See `abort`.
+live_socket: std.posix.fd_t = -1,
+socket_lock: std.Io.Mutex = .init,
+/// Whether a cancel arrived. Kept because one can land before the request has
+/// a socket to shut down, and a no-op then would be a cancel that never took.
+aborted: bool = false,
 started: bool = false,
 /// Set when the model was switched at runtime: `model` then points here rather
 /// than at the config, and this is what has to be freed.
@@ -99,6 +106,7 @@ pub fn start(self: *OllamaProvider) !void {
     self.client = Ollama.init(self.io, self.allocator, .{
         .host = self.host,
         .headers = headers,
+        .on_request = self.observer(),
     });
     self.started = true;
     if (self.model.len > 0) self.probe();
@@ -200,7 +208,11 @@ fn startWithoutProbe(self: *OllamaProvider) !void {
         self.auth_header[0] = .{ .name = "Authorization", .value = self.auth_value };
         headers = self.auth_header[0..1];
     }
-    self.client = Ollama.init(self.io, self.allocator, .{ .host = self.host, .headers = headers });
+    self.client = Ollama.init(self.io, self.allocator, .{
+        .host = self.host,
+        .headers = headers,
+        .on_request = self.observer(),
+    });
     self.started = true;
 }
 
@@ -270,7 +282,70 @@ pub fn provider(self: *OllamaProvider) Provider {
         .describe_error = describeErrorErased,
         .refresh = currentErased,
         .reconnect = reconnectErased,
+        .abort = abortErased,
     };
+}
+
+/// No request in flight.
+const no_socket: std.posix.fd_t = -1;
+
+/// Break off the request in flight. Safe to call when there is none.
+///
+/// Under the lock the worker holds while the handle is live, so the socket
+/// cannot be closed underneath the shutdown and land on a reused descriptor.
+pub fn abort(self: *OllamaProvider) void {
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+
+    self.aborted = true;
+    self.shutdownLocked();
+}
+
+fn shutdownLocked(self: *OllamaProvider) void {
+    if (self.live_socket == no_socket) return;
+    self.io.vtable.netShutdown(self.io.userdata, self.live_socket, .both) catch {};
+    self.live_socket = no_socket;
+}
+
+/// Worker thread. What `abort` shuts down until `forgetSocket` takes it back.
+fn watch(self: *OllamaProvider, request: *std.http.Client.Request) void {
+    const connection = request.connection orelse return;
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+
+    self.live_socket = connection.stream_reader.stream.socket.handle;
+    if (self.aborted) self.shutdownLocked();
+}
+
+/// Subscribes to the request going out, which is the only moment before the
+/// wait for a response when there is a socket to remember.
+fn observer(self: *OllamaProvider) Ollama.OnRequest {
+    return .{ .userdata = self, .call = watchErased };
+}
+
+fn watchErased(ptr: *anyopaque, request: *std.http.Client.Request) void {
+    const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+    self.watch(request);
+}
+
+/// Worker thread. A new turn is not the cancelled one.
+fn armSocket(self: *OllamaProvider) void {
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+    self.aborted = false;
+    self.live_socket = no_socket;
+}
+
+/// Worker thread. Must run before the request is torn down.
+fn forgetSocket(self: *OllamaProvider) void {
+    self.socket_lock.lockUncancelable(self.io);
+    defer self.socket_lock.unlock(self.io);
+    self.live_socket = no_socket;
+}
+
+fn abortErased(ptr: *anyopaque) void {
+    const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+    self.abort();
 }
 
 fn listModelsErased(ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![][]const u8 {
@@ -613,6 +688,7 @@ fn respond(
     };
 
     self.clearRejection();
+    self.armSocket();
 
     var messages: []Ollama.Message = undefined;
     var attempt: u8 = 0;
@@ -645,8 +721,10 @@ fn respond(
             return err;
         };
     };
-    defer stream.deinit();
-
+    defer {
+        self.forgetSocket();
+        stream.deinit();
+    }
     self.clearRejection();
 
     var text: std.ArrayList(u8) = .empty;

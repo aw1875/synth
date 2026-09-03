@@ -77,11 +77,13 @@ pub fn isFinished(self: *Request) bool {
     return self.done.load(.acquire);
 }
 
-/// Ask the provider to give up between chunks. Non-blocking, and on its own
-/// no guarantee: a provider blocked waiting for the first byte never reaches
-/// the check. Pair it with `cancel`.
+/// Ask the provider to give up, and break off whatever it is waiting on.
+///
+/// Non-blocking. The flag is checked between chunks; the abort is what reaches
+/// a worker parked in a socket read, which no flag ever does.
 pub fn requestStop(self: *Request) void {
     self.stop.store(true, .release);
+    if (self.provider.abort) |abort| abort(self.provider.userdata);
 }
 
 /// Non-blocking check for the owning thread. True once nothing has arrived for
