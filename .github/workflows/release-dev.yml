@@ -38,12 +38,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          short=$(git rev-parse --short HEAD)
+          build=$(git rev-list --count HEAD)
+
+          # A dev build is a prerelease of whatever ships next, so it sorts below it.
+          base=$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",$/\1/p' build.zig.zon)
+
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
-          echo "build=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "version=${base}-dev.${build}+${short}" >> "$GITHUB_OUTPUT"
 
       - name: Build every target
-        run: zig build release
+        run: zig build release -Dversion=${{ steps.vars.outputs.version }}
 
       - name: Package the distributed targets
         run: ./.github/scripts/package.sh dev

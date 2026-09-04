@@ -13,12 +13,10 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Everything the program calls itself comes from `build.zig.zon`: the
-    // binary's name, the XDG directories it stores things in, and the name it
-    // prints. Renaming the project is a one-line change there.
+    // What the program calls itself, from `build.zig.zon`: binary name, XDG dirs, prints.
     const options = b.addOptions();
     options.addOption([]const u8, "name", @tagName(pkg.name));
-    options.addOption([]const u8, "version", pkg.version);
+    options.addOption([]const u8, "version", b.option([]const u8, "version", "The compiled binary version, if overriding the build.zig.zon version") orelse pkg.version);
 
     const exe = binary(b, target, optimize, options);
     b.installArtifact(exe);
@@ -39,11 +37,7 @@ pub fn build(b: *std.Build) !void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    // The mcp package is its own build, compiled against `std` and `oauth2`
-    // alone. Running its tests from here rather than through its own
-    // `zig build test` keeps one command honest about the whole tree, and a
-    // module that stopped compiling on its own is caught before the program
-    // that imports it hides the breakage behind its own dependencies.
+    // Run mcp's own tests here so one command covers the whole tree.
     const mcp = b.dependency("mcp", .{ .target = target, .optimize = optimize });
     const mcp_tests = b.addTest(.{
         .root_module = mcp.module("mcp"),
@@ -70,9 +64,7 @@ pub fn build(b: *std.Build) !void {
     const archive = @tagName(pkg.name) ++ ".tar.gz";
     const tar_step = b.step("tar", "Package what `release` built into " ++ archive);
 
-    // One archive holding every target's directory, written to the project
-    // root. `-C` makes the paths inside it `<triple>/synth` rather than the
-    // whole install prefix.
+    // `-C` makes the paths inside `<triple>/synth` rather than the install prefix.
     var tar_argv: std.ArrayList([]const u8) = .empty;
     try tar_argv.appendSlice(b.allocator, &.{
         "tar",
