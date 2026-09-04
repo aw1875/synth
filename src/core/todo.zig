@@ -31,12 +31,13 @@ pub const Status = enum {
         return null;
     }
 
-    /// What marks the step in the sidebar.
+    /// What marks the step in the sidebar: a box still to tick, the step in
+    /// hand, and a tick. One cell each, so the text beside them lines up.
     pub fn mark(self: Status) []const u8 {
         return switch (self) {
-            .pending => "○",
-            .active => "◐",
-            .done => "●",
+            .pending => "□",
+            .active => "▸",
+            .done => "✓",
         };
     }
 };

@@ -393,9 +393,13 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
-            if (key.matches('b', .{ .ctrl = true }) and self.inSubagent()) {
-                self.closeSubagent();
-                widget_pool.pruneWidgets(self);
+            if (key.matches('b', .{ .ctrl = true })) {
+                if (self.inSubagent()) {
+                    self.closeSubagent();
+                    widget_pool.pruneWidgets(self);
+                } else {
+                    self.sidebar_open = !self.sidebar_open;
+                }
                 return ctx.consumeAndRedraw();
             }
 

@@ -47,7 +47,10 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     // The title row and the rule under it, which the frame starts below.
     const title_h: u16 = 2;
 
-    const sidebar_w: u16 = if (max.width >= Model.sidebar_min_term_width) Model.sidebar_width else 0;
+    const sidebar_w: u16 = if (self.sidebar_open and max.width >= Model.sidebar_min_term_width)
+        Model.sidebar_width
+    else
+        0;
     const main_w = max.width - sidebar_w;
     self.sidebar_col = if (sidebar_w > 0) main_w else max.width;
     const column_w = main_w -| (Model.gutter * 2);
@@ -107,11 +110,15 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     drawTitleBar(self, ctx, root, max.width);
 
     if (sidebar_w > 0) {
-        const sidebar = try drawSidebar(self, ctx, sidebar_w, body_h);
+        const sidebar = try drawSidebar(self, ctx, sidebar_w, body_h, title_h);
         try children.append(ctx.arena, .{
             .origin = .{ .row = title_h, .col = @intCast(main_w) },
             .surface = sidebar,
         });
+    } else {
+        // Nothing drew the plan, so last frame's rows would catch a stray click.
+        self.plan_top = 0;
+        self.plan_bottom = 0;
     }
 
     var dialog_open = false;
@@ -978,7 +985,15 @@ pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, wid
     if (width <= Model.gutter * 2) return;
     const room = width - Model.gutter * 2;
 
-    const answering = if (self.provider.model.len > 0) self.provider.model else self.provider.name;
+    // Both: the same model tag is served by a local process and by a cloud.
+    const answering = if (self.provider.model.len > 0)
+        std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{
+            self.provider.model,
+            w.separator,
+            self.provider.name,
+        }) catch self.provider.name
+    else
+        self.provider.name;
     const answering_w = w.textWidth(answering);
     const gap = w.textWidth(w.separator);
 
@@ -1012,88 +1027,115 @@ pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, wid
     }
 }
 
-pub const Section = struct {
-    title: []const u8,
-    lines: []const []const u8,
-};
+/// A label and its value, set against the two edges of the rail the way the
+/// design's context rows are.
+fn railRow(
+    surface: vxfw.Surface,
+    left: u16,
+    inner: u16,
+    row: u16,
+    label: []const u8,
+    value: []const u8,
+    style: vaxis.Cell.Style,
+) void {
+    _ = w.writeText(surface, left, row, label, style);
+    const value_w = w.textWidth(value);
+    if (value_w > inner) return;
+    _ = w.writeText(surface, left + inner - value_w, row, value, style);
+}
 
-pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16) !vxfw.Surface {
+/// How full the context window is, as a bar of its own width.
+fn railBar(surface: vxfw.Surface, left: u16, inner: u16, row: u16, fraction: f64) void {
+    w.fillRow(surface, row, left, inner, theme.on(theme.border, theme.border).cell);
+
+    const clamped = std.math.clamp(fraction, 0, 1);
+    const filled: u16 = @intFromFloat(@round(clamped * @as(f64, @floatFromInt(inner))));
+    if (filled == 0) return;
+    w.fillRow(surface, row, left, filled, theme.on(theme.accent, theme.accent).cell);
+}
+
+/// The rule between one part of the rail and the next.
+fn railSeparator(surface: vxfw.Surface, left: u16, inner: u16, row: u16) void {
+    w.rule(surface, row, left, inner, theme.on_bg(theme.border).cell);
+}
+
+/// The right-hand rail: how much room is left, then what the model is working
+/// through. No ground of its own - a border down its edge is what divides it
+/// from the transcript.
+pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16, top: u16) !vxfw.Surface {
     const surface = try w.surfaceClamped(ctx.arena, self.plainWidget(), .{
         .width = width,
         .height = height,
     });
-    w.fill(surface, theme.card.cell);
+    w.fill(surface, theme.base.cell);
+
+    for (0..height) |row| {
+        surface.writeCell(0, @intCast(row), .{
+            .char = .{ .grapheme = w.solid_rule, .width = 1 },
+            .style = theme.on_bg(theme.border).cell,
+        });
+    }
 
     const left: u16 = 2;
     const inner = width -| (left + 1);
     if (inner == 0 or height == 0) return surface;
 
+    const faint = theme.on_bg(theme.fg_dim).cell;
     const usage = self.loop.usage;
     const limit = self.provider.context_limit;
 
-    var context_lines: std.ArrayList([]const u8) = .empty;
-    if (usage.context_tokens == 0) {
-        try context_lines.append(ctx.arena, "no requests yet");
-    } else if (limit > 0) {
-        try context_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{s} / {s}", .{
-            try compact(ctx.arena, usage.context_tokens),
-            try compact(ctx.arena, limit),
-        }));
-        if (usage.contextFraction(limit)) |fraction| {
-            try context_lines.append(ctx.arena, try std.fmt.allocPrint(
-                ctx.arena,
-                "{d:.0}% used",
-                .{fraction * 100},
-            ));
-        }
-    } else {
-        try context_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{s} tokens", .{
-            try compact(ctx.arena, usage.context_tokens),
-        }));
-    }
-
-    var session_lines: std.ArrayList([]const u8) = .empty;
-    try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{s} in · {s} out", .{
-        try compact(ctx.arena, usage.input_tokens),
-        try compact(ctx.arena, usage.output_tokens),
-    }));
-    try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{d} model calls", .{usage.calls}));
-    if (usage.tokensPerSecond()) |rate| {
-        try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{d:.0} tok/s", .{rate}));
-    }
-
-    // No model section: the title row carries it now.
-    const sections = [_]Section{
-        .{ .title = "Context", .lines = context_lines.items },
-        .{ .title = "Session", .lines = session_lines.items },
-    };
-
     var row: u16 = 1;
-    const heading_row = if (self.loop.title().len > 0)
-        fitRight(self.loop.title(), inner)
-    else
-        fitLeft(ctx.arena, projectName(self), inner);
-    _ = w.writeText(surface, left, row, heading_row, theme.on_card(theme.fg).bold().cell);
-    row += 2;
+    _ = w.writeHeading(surface, left, row, "context", faint, theme.fg_dim);
+    row += 1;
 
-    for (sections) |section| {
-        if (row >= height) break;
-        _ = w.writeHeading(surface, left, row, section.title, theme.on_card(theme.fg).bold().cell, theme.border);
+    if (usage.context_tokens == 0) {
+        railRow(surface, left, inner, row, "no requests yet", "", faint);
         row += 1;
-        for (section.lines) |line| {
-            if (row >= height) break;
-            _ = w.writeText(surface, left, row, fitLeft(ctx.arena, line, inner), theme.on_card(theme.fg_dim).cell);
+    } else if (limit > 0) {
+        railRow(
+            surface,
+            left,
+            inner,
+            row,
+            try std.fmt.allocPrint(ctx.arena, "{s} used", .{try compact(ctx.arena, usage.context_tokens)}),
+            try compact(ctx.arena, limit),
+            faint,
+        );
+        row += 1;
+        if (usage.contextFraction(limit)) |fraction| {
+            railBar(surface, left, inner, row, fraction);
             row += 1;
         }
+    } else {
+        railRow(surface, left, inner, row, "used", try compact(ctx.arena, usage.context_tokens), faint);
         row += 1;
     }
 
-    _ = try drawPlan(self, ctx, surface, left, inner, height -| 2, row);
+    row += 1;
+    railRow(surface, left, inner, row, "in", try compact(ctx.arena, usage.input_tokens), faint);
+    row += 1;
+    railRow(surface, left, inner, row, "out", try compact(ctx.arena, usage.output_tokens), faint);
+    row += 1;
+    railRow(surface, left, inner, row, "model calls", try std.fmt.allocPrint(ctx.arena, "{d}", .{usage.calls}), faint);
+    row += 1;
+    if (usage.tokensPerSecond()) |rate| {
+        railRow(surface, left, inner, row, "tok/s", try std.fmt.allocPrint(ctx.arena, "{d:.0}", .{rate}), faint);
+        row += 1;
+    }
+
+    if (self.loop.todos.any() and row + 2 < height) {
+        row += 1;
+        railSeparator(surface, left, inner, row);
+        row += 2;
+        _ = try drawPlan(self, ctx, surface, left, inner, height -| 2, row, top);
+    } else {
+        self.plan_top = 0;
+        self.plan_bottom = 0;
+    }
 
     if (height >= 3) {
-        const col = w.writeText(surface, left, height - 2, "• ", theme.on_card(theme.accent).cell);
-        const title_col = w.writeText(surface, col, height - 2, pkg.name ++ " ", theme.on_card(theme.fg_muted).cell);
-        _ = w.writeText(surface, title_col, height - 2, pkg.version, theme.on_card(theme.fg_dim).cell);
+        const at = w.writeText(surface, left, height - 2, pkg.name ++ " ", theme.on_bg(theme.fg_dim).cell);
+        _ = w.writeText(surface, at, height - 2, pkg.version, theme.on_bg(theme.fg_dim).cell);
     }
 
     return surface;
@@ -1113,6 +1155,9 @@ fn drawPlan(
     inner: u16,
     height: u16,
     start: u16,
+    /// Screen row the rail is drawn at. The rows recorded for the hit test are
+    /// the ones a mouse event arrives in, not the rail's own.
+    top: u16,
 ) !u16 {
     const list = &self.loop.todos;
     self.plan_top = 0;
@@ -1120,15 +1165,16 @@ fn drawPlan(
     if (!list.any() or start >= height) return start;
 
     var row = start;
-    const title = w.writeHeading(surface, left, row, "Plan", theme.on_card(theme.fg).bold().cell, theme.border);
+    const faint = theme.on_bg(theme.fg_dim).cell;
+    const title = w.writeHeading(surface, left, row, "plan", faint, theme.fg_dim);
     const counted = w.writeText(surface, title + 1, row, try std.fmt.allocPrint(
         ctx.arena,
         "{d}/{d}",
         .{ list.done(), list.items.items.len },
-    ), theme.on_card(theme.fg_dim).cell);
+    ), faint);
     if (self.plan_hover) {
         const hint = if (list.expanded) " hide" else " show";
-        _ = w.writeText(surface, counted, row, hint, theme.on_card(theme.fg_dim).cell);
+        _ = w.writeText(surface, counted, row, hint, faint);
     }
     row += 1;
 
@@ -1141,8 +1187,8 @@ fn drawPlan(
         row = drawStep(surface, left, inner, height, row, item);
     }
 
-    self.plan_top = start;
-    self.plan_bottom = row;
+    self.plan_top = top + start;
+    self.plan_bottom = top + row;
     return row + 1;
 }
 
@@ -1156,13 +1202,19 @@ fn drawStep(
     start: u16,
     item: todo.Item,
 ) u16 {
+    // The marks carry the state, so a done step is struck through, not coloured.
     const style = switch (item.status) {
-        .active => theme.on_card(theme.accent).bold(),
-        .done => theme.on_card(theme.fg_dim).strikethrough(),
-        .pending => theme.on_card(theme.fg_muted),
+        .active => theme.on_bg(theme.fg),
+        .done => theme.on_bg(theme.fg_dim).strikethrough(),
+        .pending => theme.on_bg(theme.fg_muted),
+    };
+    const mark = switch (item.status) {
+        .active => theme.on_bg(theme.accent),
+        .done => theme.on_bg(theme.success),
+        .pending => theme.on_bg(theme.fg_dim),
     };
 
-    _ = w.writeText(surface, left, start, item.status.mark(), style.cell);
+    _ = w.writeText(surface, left, start, item.status.mark(), mark.cell);
 
     const text_col = left + 2;
     const text_width = inner -| 2;
@@ -1212,7 +1264,7 @@ pub fn compact(arena: std.mem.Allocator, value: anytype) ![]const u8 {
     const n: u64 = @intCast(value);
     if (n < 1000) return std.fmt.allocPrint(arena, "{d}", .{n});
 
-    const units = [_][]const u8{ "K", "M", "B" };
+    const units = [_][]const u8{ "k", "M", "B" };
     var scaled: f64 = @floatFromInt(n);
     var unit: usize = 0;
     while (scaled >= 1000 and unit + 1 < units.len) : (unit += 1) {
@@ -1283,10 +1335,10 @@ test "token counts read at a glance" {
 
     try std.testing.expectEqualStrings("0", try compact(arena, @as(u32, 0)));
     try std.testing.expectEqualStrings("999", try compact(arena, @as(u32, 999)));
-    try std.testing.expectEqualStrings("1.0K", try compact(arena, @as(u32, 1000)));
-    try std.testing.expectEqualStrings("19.2K", try compact(arena, @as(u32, 19_210)));
-    try std.testing.expectEqualStrings("32.8K", try compact(arena, @as(u32, 32_768)));
-    try std.testing.expectEqualStrings("142K", try compact(arena, @as(u32, 142_000)));
+    try std.testing.expectEqualStrings("1.0k", try compact(arena, @as(u32, 1000)));
+    try std.testing.expectEqualStrings("19.2k", try compact(arena, @as(u32, 19_210)));
+    try std.testing.expectEqualStrings("32.8k", try compact(arena, @as(u32, 32_768)));
+    try std.testing.expectEqualStrings("142k", try compact(arena, @as(u32, 142_000)));
     try std.testing.expectEqualStrings("1.2M", try compact(arena, @as(u64, 1_234_567)));
 }
 
@@ -1596,9 +1648,9 @@ test "the title row names the session, the path, and the branch it is on" {
     try testing.expect(std.mem.indexOf(u8, row, "~/dev/zig/harness") != null);
     try testing.expect(std.mem.indexOf(u8, row, "on fix/flaky-session-test") != null);
 
-    // The backend's name stays out of it: the row says which model, not whose.
+    // The backend beside it: the same model tag is served from more than one.
     try testing.expect(std.mem.indexOf(u8, row, "qwen3-coder:30b") != null);
-    try testing.expect(std.mem.indexOf(u8, row, "ollama") == null);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, row, " "), "ollama"));
 
     // Session and path both in the text colour; only the separator is faint.
     const at = std.mem.indexOf(u8, row, "~/dev").?;
@@ -1633,7 +1685,7 @@ test "the branch keeps its room when the path has to be trimmed" {
     var model = try chromeFixture(testing.allocator, &userdata, &project);
     defer model.deinit();
 
-    const width: u16 = 64;
+    const width: u16 = 73;
     const ctx: vxfw.DrawContext = .{
         .arena = arena,
         .min = .{},
@@ -1669,7 +1721,7 @@ test "a title row too narrow for everything keeps the session and the model" {
     var model = try chromeFixture(testing.allocator, &userdata, &project);
     defer model.deinit();
 
-    const width: u16 = 34;
+    const width: u16 = 43;
     const ctx: vxfw.DrawContext = .{
         .arena = arena,
         .min = .{},
@@ -1791,5 +1843,242 @@ test "the frame runs from the title rule down to the composer rule" {
     for (root.children) |child| {
         if (child.origin.col != @as(i17, @intCast(size.width - Model.sidebar_width))) continue;
         try testing.expectEqual(bottom.origin.row, child.origin.row + @as(i17, @intCast(child.surface.size.height)));
+    }
+}
+
+test "the rail divides itself from the transcript with a border, not a ground" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    const width: u16 = Model.sidebar_width;
+    const height: u16 = 20;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const rail = try drawSidebar(&model, ctx, width, height, 0);
+
+    for (0..height) |row| {
+        const edge = rail.buffer[row * width];
+        try testing.expectEqualStrings(w.solid_rule, edge.char.grapheme);
+        try testing.expectEqual(theme.border, edge.style.fg);
+        try testing.expectEqual(theme.bg, edge.style.bg);
+
+        // Nothing raised behind it: the rail is the app's own ground.
+        try testing.expectEqual(theme.bg, rail.buffer[row * width + width - 1].style.bg);
+    }
+}
+
+test "the rail counts the context down before it lists the plan" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    model.provider.context_limit = 200_000;
+    model.loop.usage = .{ .context_tokens = 42_300, .input_tokens = 12_100, .output_tokens = 3_400, .calls = 7 };
+    try model.loop.todos.replace(&.{
+        .{ .text = "add fake clock helper", .status = .done },
+        .{ .text = "run 20x to confirm no flake", .status = .active },
+        .{ .text = "apply same fix to token.spec.ts", .status = .pending },
+    });
+    model.loop.todos.expanded = true;
+
+    const width: u16 = Model.sidebar_width;
+    const height: u16 = 26;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const rail = try drawSidebar(&model, ctx, width, height, 0);
+
+    var context_row: ?usize = null;
+    var plan_row: ?usize = null;
+    var bar_row: ?usize = null;
+    for (0..height) |row| {
+        const text = try rowText(arena, rail, @intCast(row));
+        if (std.mem.indexOf(u8, text, "context") != null) context_row = row;
+        if (std.mem.indexOf(u8, text, "plan") != null) plan_row = row;
+        if (std.meta.eql(rail.buffer[row * width + 2].style.bg, theme.accent)) bar_row = row;
+    }
+
+    // Context first: how much room is left outranks what is being done with it.
+    const context_at = context_row orelse return error.TestUnexpectedResult;
+    const plan_at = plan_row orelse return error.TestUnexpectedResult;
+    try testing.expect(context_at < plan_at);
+
+    // Both headed the way every rail heading is.
+    const heading = try rowText(arena, rail, @intCast(context_at));
+    try testing.expect(std.mem.indexOf(u8, heading, w.rail_head) != null);
+    try testing.expectEqual(theme.fg_dim, rail.buffer[context_at * width + 2].style.fg);
+
+    // The bar is drawn to the fraction used, not to the whole width.
+    const bar = bar_row orelse return error.TestUnexpectedResult;
+    try testing.expect(bar > context_at and bar < plan_at);
+    const inner = width - 3;
+    const filled: u16 = @intFromFloat(@round(0.2115 * @as(f64, @floatFromInt(inner))));
+    try testing.expectEqual(theme.accent, rail.buffer[bar * width + 2 + filled - 1].style.bg);
+    try testing.expectEqual(theme.border, rail.buffer[bar * width + 2 + filled].style.bg);
+
+    // A step in hand reads plainly; a finished one is struck through.
+    const steps = try rowText(arena, rail, @intCast(plan_at + 2));
+    try testing.expect(std.mem.indexOf(u8, steps, "\u{25b8} run 20x") != null);
+    try testing.expect(rail.buffer[(plan_at + 1) * width + 2 + 2].style.strikethrough);
+}
+
+test "the rows the plan records are the ones a click arrives in" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    try model.loop.todos.replace(&.{
+        .{ .text = "add fake clock helper", .status = .done },
+        .{ .text = "run 20x to confirm no flake", .status = .active },
+    });
+    model.loop.todos.expanded = false;
+
+    const size: vxfw.Size = .{ .width = Model.sidebar_min_term_width, .height = 30 };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = size.width, .height = size.height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const root = try draw(&model, ctx);
+    try testing.expect(model.plan_bottom > model.plan_top);
+
+    var rail: ?vxfw.SubSurface = null;
+    for (root.children) |child| {
+        if (child.origin.col == @as(i17, @intCast(size.width - Model.sidebar_width))) rail = child;
+    }
+    const sidebar = rail orelse return error.TestUnexpectedResult;
+
+    // Collapsed it is two rows, so a click recorded in the wrong space misses.
+    const local = model.plan_top - @as(u16, @intCast(sidebar.origin.row));
+    const heading = try rowText(arena, sidebar.surface, local);
+    try testing.expect(std.mem.indexOf(u8, heading, "plan") != null);
+    try testing.expectEqual(@as(u16, 2), model.plan_bottom - model.plan_top);
+}
+
+test "the rail is narrow enough to be the design's and wide enough for its numbers" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    model.provider.context_limit = 200_000;
+    model.loop.usage = .{ .context_tokens = 142_300, .input_tokens = 12_100, .output_tokens = 3_400, .calls = 7 };
+
+    const width: u16 = Model.sidebar_width;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 20 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const rail = try drawSidebar(&model, ctx, width, 20, 0);
+
+    // A label and its value share one row, and the value keeps the inner edge.
+    const row = try rowText(arena, rail, 2);
+    try testing.expect(std.mem.indexOf(u8, row, "142k used") != null);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, row, " "), "200k"));
+    try testing.expectEqualStrings("k", rail.buffer[2 * width + width - 2].char.grapheme);
+}
+
+test "the rail can be sent away, and takes its click targets with it" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    _ = try model.conversation.addUser("hello", &.{}, &.{});
+    try model.loop.todos.replace(&.{.{ .text = "run the suite", .status = .active }});
+
+    const size: vxfw.Size = .{ .width = Model.sidebar_min_term_width, .height = 24 };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = size.width, .height = size.height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    _ = try draw(&model, ctx);
+    try testing.expect(model.plan_bottom > model.plan_top);
+    try testing.expectEqual(size.width - Model.sidebar_width, model.sidebar_col);
+
+    model.sidebar_open = false;
+    const root = try draw(&model, ctx);
+
+    // The transcript takes the frame, and nothing is left at the rail's column.
+    try testing.expectEqual(size.width, model.sidebar_col);
+    try testing.expectEqual(@as(u16, 0), model.plan_bottom);
+    for (root.children) |child| {
+        try testing.expect(child.origin.col < @as(i17, @intCast(size.width - Model.sidebar_width)));
     }
 }

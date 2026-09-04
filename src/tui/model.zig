@@ -49,8 +49,9 @@ const w = @import("widgets.zig");
 
 const Model = @This();
 
-/// Width of the right-hand sidebar, including its own left inset.
-pub const sidebar_width: u16 = 48;
+/// Width of the right-hand rail, its own border and inset included. The
+/// design's 240px at the 12px it sets its rail text in.
+pub const sidebar_width: u16 = 33;
 /// Sidebar is dropped entirely below this terminal width.
 pub const sidebar_min_term_width: u16 = 80;
 /// Horizontal inset of the main column's content.
@@ -149,6 +150,9 @@ plan_bottom: u16 = 0,
 /// Whether the pointer is over the plan, which is the only thing that says it
 /// can be clicked at all.
 plan_hover: bool = false,
+/// Whether the right-hand rail is showing. Off gives the transcript the whole
+/// frame, which is what a narrow terminal or a long diff wants.
+sidebar_open: bool = true,
 /// Every skill found at startup, for `/skills`. Borrowed, and null where
 /// nothing looked.
 skills: ?*const skill.Set = null,
