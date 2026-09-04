@@ -49,6 +49,11 @@ pub const block_rule = "\u{258c}";
 pub const solid_rule = "\u{2502}";
 /// The same spine, broken, for a block the reader is meant to skim past.
 pub const dashed_rule = "\u{2506}";
+/// What marks a turn the reader typed, the way a shell marks the line it was
+/// handed. It sits at the head of the turn rather than running down its side:
+/// what the reader wrote is where the transcript starts, not something the
+/// rows below hang off.
+pub const prompt_mark = "\u{203a}";
 
 pub const PanelOptions = struct {
     /// Background/foreground of the panel itself.
@@ -62,6 +67,9 @@ pub const PanelOptions = struct {
     /// The bar's glyph. A block reads as a card's edge, a rule as the spine a
     /// nested block hangs off.
     rule: []const u8 = block_rule,
+    /// Drawn on the first row instead of the rule, leaving the rows below it
+    /// bare. For a block marked at its head rather than down its whole side.
+    mark: ?[]const u8 = null,
     /// Defaults to the full available width.
     width: ?u16 = null,
     min_height: u16 = 0,
@@ -109,8 +117,9 @@ pub fn wrap(ctx: vxfw.DrawContext, child_surface: vxfw.Surface, opts: PanelOptio
 
     if (opts.accent) |color| {
         for (0..height) |row| {
+            const glyph = if (opts.mark) |mark| (if (row == 0) mark else " ") else opts.rule;
             surface.writeCell(0, @intCast(row), .{
-                .char = .{ .grapheme = opts.rule, .width = 1 },
+                .char = .{ .grapheme = glyph, .width = 1 },
                 .style = .{ .fg = color, .bg = opts.style.bg },
             });
         }

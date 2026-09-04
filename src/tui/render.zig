@@ -604,9 +604,7 @@ pub fn drawTranscript(
     };
 }
 
-/// User turns are raised cards with an accent rule; assistant turns are plain
-/// text on the app background, the way a reply reads in a chat log.
-/// A message bubble, with its held-back pastes folded in when the message has
+/// A message block, with its held-back pastes folded in when the message has
 /// been clicked open.
 pub fn userOrPlainBlock(
     self: *Model,
@@ -665,16 +663,19 @@ pub fn pasteToggle(self: *Model, seq: u64) !*Model.PasteToggle {
 /// Click target for a message carrying a paste: it holds nothing but whether
 /// that message is currently showing the full text.
 pub fn messageBlock(self: *Model, ctx: vxfw.DrawContext, msg: Conversation.Message, width: u16) !vxfw.Surface {
-    const on_card = msg.role == .user;
-    const style = if (on_card) theme.card.cell else theme.base.cell;
+    const mine = msg.role == .user;
     const invoked = invokedSkill(msg);
 
+    // What the reader typed is what the rest of the turn is answering.
+    const style = if (mine) theme.base.cell else theme.on_bg(theme.fg_muted).cell;
+
     const opts: w.PanelOptions = .{
-        .style = style,
-        .left = if (on_card) 2 else 1,
+        .style = theme.base.cell,
+        .left = 1,
         .right = 2,
-        .accent = if (invoked != null) theme.accent_alt else if (on_card) theme.accent else theme.border,
-        .rule = if (on_card or invoked != null) w.block_rule else w.solid_rule,
+        .accent = if (invoked != null) theme.accent_alt else if (mine) theme.accent else theme.accent,
+        .rule = w.solid_rule,
+        .mark = if (mine) w.prompt_mark else null,
         .width = width,
     };
 
@@ -684,7 +685,7 @@ pub fn messageBlock(self: *Model, ctx: vxfw.DrawContext, msg: Conversation.Messa
 
     const content = if (invoked) |id|
         try skillLine(self, ctx, id, arguments(msg.text), style, inner_width)
-    else if (msg.role == .user)
+    else if (mine)
         try plainText(ctx, msg.text, style, inner_width)
     else
         try markdown.draw(constraints, self.plainWidget(), msg.text, style, inner_width);
@@ -726,10 +727,10 @@ fn skillLine(
     const surface = try w.surfaceClamped(ctx.arena, self.plainWidget(), .{ .width = width, .height = 1 });
     w.fill(surface, style);
 
-    var col = w.writeText(surface, 0, 0, "skill", theme.on_card(theme.fg_dim).cell);
-    col = w.writeText(surface, col + 1, 0, id, theme.on_card(theme.accent_alt).bold().cell);
+    var col = w.writeText(surface, 0, 0, "skill", theme.on_bg(theme.fg_dim).cell);
+    col = w.writeText(surface, col + 1, 0, id, theme.on_bg(theme.accent_alt).bold().cell);
     if (args.len > 0) {
-        _ = w.writeText(surface, col + 1, 0, args, theme.on_card(theme.fg_muted).cell);
+        _ = w.writeText(surface, col + 1, 0, args, theme.on_bg(theme.fg_muted).cell);
     }
     return surface;
 }
@@ -1332,7 +1333,6 @@ test "a step breaks at a space, and mid-word only when it has to" {
     try std.testing.expectEqual(@as(usize, 0), wrapPoint("supercalifragilistic", 0));
 }
 
-
 test "a reply hangs off a rule, and its text sits one level in" {
     const testing = std.testing;
 
@@ -1375,5 +1375,112 @@ test "a reply hangs off a rule, and its text sits one level in" {
     try testing.expectEqual(theme.border, surface.buffer[0].style.fg);
 
     // Its text starts a level in, which is where a call it made hangs its rule.
+    try testing.expectEqual(@as(i17, w.nest), surface.children[0].origin.col);
+}
+
+/// The style of the first cell in `surface`, or anything under it, carrying a
+/// visible grapheme.
+fn firstTextStyle(surface: vxfw.Surface) ?vaxis.Cell.Style {
+    for (surface.buffer) |cell| {
+        if (cell.char.grapheme.len == 0) continue;
+        if (std.mem.eql(u8, cell.char.grapheme, " ")) continue;
+        return cell.style;
+    }
+    for (surface.children) |child| {
+        if (firstTextStyle(child.surface)) |style| return style;
+    }
+    return null;
+}
+
+test "a reply is set a step back from the words it answers" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = undefined,
+        .plain_vtable = .{ .userdata = &userdata, .drawFn = Dummy.drawFn },
+    };
+    defer model.conversation.deinit();
+
+    const width: u16 = 40;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const reply = try messageBlock(&model, ctx, .{ .role = .assistant, .text = "checked" }, width);
+    const mine = try messageBlock(&model, ctx, .{ .role = .user, .text = "check it" }, width);
+
+    // Told apart by weight, not only by their rules.
+    try testing.expectEqual(theme.fg_muted, firstTextStyle(reply.children[0].surface).?.fg);
+    try testing.expectEqual(theme.fg, firstTextStyle(mine.children[0].surface).?.fg);
+}
+
+test "your own turn is marked at its head, not down its side" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = undefined,
+        .plain_vtable = .{ .userdata = &userdata, .drawFn = Dummy.drawFn },
+    };
+    defer model.conversation.deinit();
+
+    const width: u16 = 20;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const text = "a message long enough to want a second row";
+    const surface = try messageBlock(&model, ctx, .{ .role = .user, .text = text }, width);
+    try testing.expect(surface.size.height > 1);
+
+    try testing.expectEqualStrings(w.prompt_mark, surface.buffer[0].char.grapheme);
+    try testing.expectEqual(theme.accent, surface.buffer[0].style.fg);
+
+    // Nothing below it: the mark opens the turn rather than fencing it in.
+    for (1..surface.size.height) |row| {
+        try testing.expectEqualStrings(" ", surface.buffer[row * width].char.grapheme);
+    }
+
+    // On the app background, like every other block in the transcript.
+    try testing.expectEqual(theme.bg, surface.buffer[0].style.bg);
     try testing.expectEqual(@as(i17, w.nest), surface.children[0].origin.col);
 }
