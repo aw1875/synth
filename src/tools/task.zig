@@ -28,12 +28,9 @@ pub const all: []const tool.Tool = &.{
         \\{"type":"object","properties":{"prompt":{"type":"string","description":"The whole task: what to find, where to look if you know, and what to report back"},"description":{"type":"string","description":"A few words naming the task, for the transcript"}},"required":["prompt"]}
         ,
         .handler = run,
-        // The subagent's own agent record is read-only, so nothing it does
-        // needs a decision from the user, and neither does starting it.
+        // The subagent's own agent record is read-only, so starting it asks nothing.
         .read_only = true,
-        // Read-only but never beside another call: a subagent borrows the
-        // parent's provider, and the parent being blocked here is what makes
-        // that safe.
+        // Never beside another call: a subagent borrows the parent's provider.
         .parallel = false,
         .timeout_ms = tool.subagent_timeout_ms,
     },

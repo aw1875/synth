@@ -363,7 +363,16 @@ pub fn plainWidget(self: *Model) vxfw.Widget {
     return self.plain_vtable;
 }
 
-pub fn clearToolCards(self: *Model) void {
+/// Drop every cached widget and measurement.
+///
+/// Called whenever the transcript on screen changes. The view tag separates a
+/// subagent's widgets from the session's, but one bit cannot separate two
+/// subagents, and a tagged key outlives the view that made it: `pruneWidgets`
+/// evicts by seq, and every tagged key is larger than any seq.
+fn clearMessageWidgets(self: *Model) void {
+    var thoughts = self.thought_rows.valueIterator();
+    while (thoughts.next()) |row| self.allocator.destroy(row.*);
+    self.thought_rows.clearRetainingCapacity();
     var cards = self.tool_cards.valueIterator();
     while (cards.next()) |card| self.allocator.destroy(card.*);
     self.tool_cards.clearRetainingCapacity();
@@ -374,11 +383,7 @@ pub fn clearToolCards(self: *Model) void {
     while (toggles.next()) |toggle| self.allocator.destroy(toggle.*);
     self.paste_toggles.clearRetainingCapacity();
     self.diff_starts.clearRetainingCapacity();
-}
-pub fn clearThoughtRows(self: *Model) void {
-    var it = self.thought_rows.valueIterator();
-    while (it.next()) |row| self.allocator.destroy(row.*);
-    self.thought_rows.clearRetainingCapacity();
+    self.block_heights.clearRetainingCapacity();
 }
 
 /// A subagent's transcript, loaded from the database and shown in place of the
@@ -579,19 +584,7 @@ pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []con
 pub fn closeSubagent(self: *Model) void {
     if (self.viewing) |*view| view.deinit(self.allocator);
     self.viewing = null;
-    forgetWidgets(self);
-}
-
-/// Drop every cached widget and measurement.
-///
-/// Called whenever the transcript on screen changes. The view tag separates a
-/// subagent's widgets from the session's, but one bit cannot separate two
-/// subagents, and a tagged key outlives the view that made it: `pruneWidgets`
-/// evicts by seq, and every tagged key is larger than any seq.
-fn forgetWidgets(self: *Model) void {
-    clearToolCards(self);
-    clearThoughtRows(self);
-    self.block_heights.clearRetainingCapacity();
+    clearMessageWidgets(self);
 }
 
 fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
@@ -609,7 +602,7 @@ pub fn deinit(self: *Model) void {
     self.registry.deinit();
     self.reads.deinit();
     self.thinking.stream = null;
-    clearThoughtRows(self);
+    clearMessageWidgets(self);
     self.thought_rows.deinit(self.allocator);
     self.mentions.deinit();
     self.held.deinit();
@@ -626,14 +619,8 @@ pub fn deinit(self: *Model) void {
     self.history.deinit(self.allocator);
     self.paste_buffer.deinit(self.allocator);
     self.selection.deinit();
-    var cards = self.tool_cards.valueIterator();
-    while (cards.next()) |card| self.allocator.destroy(card.*);
     self.tool_cards.deinit(self.allocator);
-    var attachment_cards = self.attachment_cards.valueIterator();
-    while (attachment_cards.next()) |card| self.allocator.destroy(card.*);
     self.attachment_cards.deinit(self.allocator);
-    var toggles = self.paste_toggles.valueIterator();
-    while (toggles.next()) |toggle| self.allocator.destroy(toggle.*);
     self.paste_toggles.deinit(self.allocator);
     self.diff_starts.deinit(self.allocator);
     self.input.deinit();
@@ -906,16 +893,32 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
 
     try self.loop.resumeSession(session_id, resume_messages);
 
-    clearToolCards(self);
-    clearThoughtRows(self);
     self.closeSubagent();
     self.subagent_sessions.clearRetainingCapacity();
+    clearMessageWidgets(self);
     self.thinking.stream = null;
     self.loop.dropSteering();
     try self.seedHistory();
     self.input.clear();
     self.held.clear();
     self.scroll = 0;
+}
+
+/// Clear the visible transcript and start an empty session in this TUI.
+pub fn clearSession(self: *Model) bool {
+    if (!self.loop.resetForNewSession()) return false;
+
+    self.closeSubagent();
+    self.subagent_sessions.clearRetainingCapacity();
+    clearMessageWidgets(self);
+    self.thinking = .{};
+    self.clearHistory();
+    self.input.clear();
+    self.held.clear();
+    self.mentions.close();
+    self.selection.clear();
+    self.scroll = 0;
+    return true;
 }
 
 /// Keep a sent prompt for up-arrow recall. Consecutive duplicates are not worth
@@ -1289,8 +1292,7 @@ test "a resumed session still offers the transcripts it stored" {
 
     const project = try db.resolveProject("/repo", "git", "repo");
 
-    // An earlier run: a task call that stored a transcript, and a second
-    // session whose seqs start over at the same numbers.
+    // An earlier run, plus a second session whose seqs start over at the same numbers.
     const earlier = try db.createSession(project, "/repo", "model");
     const earlier_msg = try db.appendMessage(earlier, 0, "assistant", "", null, 0);
     const earlier_call = try db.appendToolCall(earlier_msg, 0, "c", "task", "{}", "ok", "done", 4);
@@ -1527,4 +1529,46 @@ test "a paste for a one-line field arrives as one line" {
         try flattenPaste(arena, "  http://localhost:11434\r\n"),
     );
     try testing.expectEqualStrings("", try flattenPaste(arena, "\n\t  \r\n"));
+}
+
+test "a cleared session forgets the subagents the old one left" {
+    const testing = std.testing;
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const parent = try db.createSession(project, "/repo", "model");
+    const message = try db.appendMessage(parent, 0, "assistant", "", null, 0);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8);
+    const child = try db.createSubagentSession(project, "/repo", "model", parent, call);
+    _ = try db.appendMessage(child, 0, "user", "where is the parser", null, 0);
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+        .cwd = try testing.allocator.dupe(u8, "/repo"),
+        .cwd_display = try testing.allocator.dupe(u8, "/repo"),
+    };
+    try model.wire();
+    defer model.deinit();
+
+    model.loop.db = &db;
+    model.loop.session_id = parent;
+    _ = try model.conversation.addUser("go", &.{}, &.{});
+
+    const key: u64 = 0;
+    try model.subagent_sessions.put(testing.allocator, key, child);
+    try testing.expect(try model.openSubagent(key, 0, 0, "task"));
+    try testing.expect(model.inSubagent());
+
+    try testing.expect(model.clearSession());
+
+    try testing.expect(!model.inSubagent());
+    try testing.expectEqual(&model.conversation, model.shown());
+    try testing.expectEqual(@as(usize, 0), model.subagent_sessions.count());
+    try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);
 }

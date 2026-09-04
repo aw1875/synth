@@ -54,6 +54,13 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         try self.startCompaction(ctx);
         return true;
     }
+    if (std.mem.eql(u8, line, "/clear")) {
+        if (!self.clearSession()) {
+            try self.notification.show(ctx, .info, "Finish the turn first");
+        }
+        ctx.redraw = true;
+        return true;
+    }
     if (std.mem.eql(u8, line, "/sessions")) {
         if (self.loop.database()) |db| {
             if (self.loop.project_id) |project_id| {

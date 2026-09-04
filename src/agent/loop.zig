@@ -370,6 +370,27 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     try self.restoreTodos(session_id);
 }
 
+/// Leave the saved session intact and make the next prompt start a new one.
+/// The provider, model, agent and project-scoped approvals stay in use.
+pub fn resetForNewSession(self: *Loop) bool {
+    if (self.isBusy()) return false;
+
+    self.conversation.clear();
+    self.session_id = null;
+    if (self.session_title) |old| self.allocator.free(old);
+    self.session_title = null;
+    self.message_ids.clearRetainingCapacity();
+    self.pending_seq = null;
+    self.pending_index = 0;
+    self.todos.clear();
+    self.dropSteering();
+    self.usage = .{};
+    self.outcome = null;
+    self.turn_start_seq = null;
+    self.last_error = null;
+    return true;
+}
+
 /// Bring back the steps the session was working through.
 fn restoreTodos(self: *Loop, session_id: i64) !void {
     const db = self.db orelse return;
@@ -479,6 +500,7 @@ fn ensureSession(self: *Loop) !i64 {
     const project_id = self.project_id orelse return error.NoProject;
     const id = try db.createSession(project_id, self.session_cwd, self.session_model);
     self.session_id = id;
+    try db.setSessionAgent(id, self.agent.id);
     return id;
 }
 
@@ -1180,9 +1202,7 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.signalled = false;
     self.reaped.store(false, .release);
 
-    // Written down rather than worked out again at each draw: once older
-    // messages are trimmed away the turn could no longer be read back, and
-    // what a turn did does not change after it has ended.
+    // Written down now: trimming older messages would make the turn unreadable.
     self.recordSummary(outcome) catch {};
 }
 
@@ -2076,8 +2096,7 @@ const FakeProvider = struct {
             s.onThinking(s.userdata, "thinking about it\n");
         }
 
-        // A one-off instruction is a question, not a turn: answer it rather
-        // than reaching for a tool.
+        // A one-off instruction is a question, not a turn.
         if (asked.instruction.len > 0) {
             return .{
                 .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}),
@@ -2226,8 +2245,7 @@ test "a read-only tool call runs without asking" {
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqual(Conversation.ToolCall.Status.ok, calls[0].status);
 
-    // The user's prompt, the call, its result, the reply, and the summary the
-    // harness writes once the turn is over.
+    // Prompt, call, result, reply, and the summary written once the turn ends.
     try testing.expectEqual(@as(usize, 5), fixture.convo.messages.items.len);
     try testing.expectEqual(Conversation.Role.tool, fixture.convo.messages.items[2].role);
     try testing.expectEqual(Conversation.Role.summary, fixture.convo.last().?.role);
@@ -2450,8 +2468,7 @@ test "cancel returns while the worker is still running" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
 
-    // Long enough that the worker is certainly still inside `respond` when
-    // cancel is called, short enough that reaping it does not slow the suite.
+    // Long enough that the worker is still inside `respond` when cancel lands.
     fixture.fake.latency = .fromMilliseconds(300);
 
     var loop = fixture.loop();
@@ -2464,8 +2481,7 @@ test "cancel returns while the worker is still running" {
     try loop.cancel();
     const elapsed = started.durationTo(.now(testing.io, .awake)).nanoseconds;
 
-    // The point of the whole thing: asking costs nothing. Waiting for the
-    // worker on this thread is what used to freeze the UI.
+    // The point of the whole thing: asking costs nothing.
     try testing.expect(elapsed < 50 * std.time.ns_per_ms);
     try testing.expectEqual(State.cancelling, loop.state);
     try testing.expect(loop.request != null);
@@ -2728,6 +2744,54 @@ test "a session comes back in the mode it was left in" {
     try testing.expectEqualStrings("review", resumed.agent.id);
 }
 
+test "a new session preserves the old one and resets its state" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    try loop.useAgent("review");
+    try loop.submit("first", .{});
+    try settle(&loop);
+    try loop.rename("old work");
+    try loop.todos.replace(&.{.{ .text = "old step", .status = .done }});
+    loop.pending_seq = 0;
+    loop.pending_index = 1;
+
+    const old_session = loop.session_id.?;
+    const old_messages = try db.countMessages(old_session);
+    try testing.expect(old_messages > 0);
+    try testing.expect(loop.usage.calls > 0);
+
+    try testing.expect(loop.resetForNewSession());
+    try testing.expect(loop.session_id == null);
+    try testing.expectEqualStrings("", loop.title());
+    try testing.expectEqual(@as(u64, 0), fixture.convo.totalCount());
+    try testing.expectEqual(@as(usize, 0), loop.message_ids.count());
+    try testing.expect(loop.pending_seq == null);
+    try testing.expectEqual(@as(usize, 0), loop.pending_index);
+    try testing.expectEqual(@as(usize, 0), loop.todos.items.items.len);
+    try testing.expectEqual(@as(u32, 0), loop.usage.calls);
+    try testing.expectEqualStrings("review", loop.agent.id);
+    try testing.expectEqual(old_messages, try db.countMessages(old_session));
+
+    try loop.submit("second", .{});
+    try settle(&loop);
+
+    const new_session = loop.session_id.?;
+    try testing.expect(new_session != old_session);
+    try testing.expectEqual(@as(u64, 0), fixture.convo.messages.items[0].seq);
+
+    const stored_agent = try db.sessionAgent(new_session, testing.allocator);
+    defer testing.allocator.free(stored_agent);
+    try testing.expectEqualStrings("review", stored_agent);
+}
+
 test "the same call three times running stops the turn" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -2837,9 +2901,7 @@ test "compaction summarises the transcript into a system message" {
     try testing.expectEqual(Conversation.Role.system, summary.role);
     try testing.expect(summary.text.len > 0);
 
-    // The fake echoes what it was asked, so this is the only proof that the
-    // instruction reached the model at all rather than being dropped on the
-    // way, which is what happened while it travelled as an unused argument.
+    // The fake echoes its input, so this is the only proof the instruction arrived.
     try testing.expect(std.mem.indexOf(u8, summary.text, "Summarise this conversation") != null);
 }
 
@@ -2858,8 +2920,7 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
     try testing.expect(std.mem.indexOf(u8, planning.tools_json, "\"write\"") == null);
     try testing.expectEqualStrings("", planning.instruction);
 
-    // With a project the agent's own instructions are folded in, and the
-    // assembled text is what the backend is handed.
+    // With a project the agent's own instructions are folded in.
     var project = try Project.detect(testing.allocator, testing.io, fixture.root);
     defer project.deinit(testing.allocator);
     loop.project = &project;
@@ -3516,8 +3577,7 @@ test "a finished turn says how it ended and what it did" {
     var did = try loop.lastTurn(testing.allocator);
     defer did.deinit(testing.allocator);
 
-    // The fixture's model asks for one `list`, which is a read: counted, and
-    // not worth a line of its own.
+    // The fixture's model asks for one `list`, which counts as a read.
     try testing.expectEqual(@as(usize, 1), did.ok);
     try testing.expectEqual(@as(usize, 0), did.changed);
     try testing.expect(did.any());

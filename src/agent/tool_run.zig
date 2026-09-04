@@ -128,8 +128,7 @@ pub fn start(
 
     const reporters = try allocator.alloc(Reporter, approved.len);
     errdefer allocator.free(reporters);
-    // Not left to the worker: a call cancelled before its handler ran writes
-    // nothing, and index 0 would then be adopted as call 0's answer.
+    // A call cancelled before its handler ran writes nothing, so seed every slot.
     for (results, calls) |*result, call| {
         result.* = .{ .index = call.index, .content = "", .is_error = true };
     }
@@ -232,8 +231,7 @@ fn run(self: *ToolRun) void {
         } else {
             self.runGroup(start_index, group);
         }
-        // The whole group is written by the time the count is published, and
-        // `.release` is what makes it visible.
+        // `.release` publishes the group's writes along with the count.
         _ = self.settled.fetchAdd(group, .release);
         start_index += group;
     }

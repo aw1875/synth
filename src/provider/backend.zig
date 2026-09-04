@@ -213,9 +213,7 @@ pub fn connect(
 
     if (entry.kind != std.meta.activeTag(self.client)) {
         self.deinit();
-        // Built empty and then reconnected, rather than built with these
-        // strings: `connection` borrows the caller's, and only `reconnect`
-        // takes copies the client can keep.
+        // Built empty then reconnected: only `reconnect` copies the strings.
         self.client = build(entry.kind, .{
             .allocator = self.options.allocator,
             .io = self.options.io,
