@@ -25,6 +25,7 @@ const pkg = @import("pkg");
 const Input = @import("input.zig");
 const markdown = @import("markdown.zig");
 const Selection = @import("selection.zig");
+const scrim = @import("scrim.zig");
 const theme = @import("theme.zig");
 const ThoughtView = @import("thought_view.zig");
 const w = @import("widgets.zig");
@@ -107,7 +108,10 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
         });
     }
 
+    var dialog_open = false;
+
     if (try self.sessions.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
             .surface = dialog.surface,
@@ -117,6 +121,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     if (try self.models.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
             .surface = dialog.surface,
@@ -126,6 +131,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     if (try self.mcp_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
             .surface = dialog.surface,
@@ -135,6 +141,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     if (try self.theme_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
             .surface = dialog.surface,
@@ -144,6 +151,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     if (try self.connect.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
             .surface = dialog.surface,
@@ -153,6 +161,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     if (try self.rename.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
             .surface = dialog.surface,
@@ -175,6 +184,17 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     root.children = children.items;
 
     try self.selection.capture(root);
+
+    if (dialog_open) {
+        if (try scrim.draw(ctx.arena, self.plainWidget(), root, max)) |dim| {
+            try children.append(ctx.arena, .{
+                .origin = .{ .row = 0, .col = 0 },
+                .surface = dim,
+                .z_index = 2,
+            });
+            root.children = children.items;
+        }
+    }
 
     if (self.selection.isActive()) {
         if (try drawSelectionOverlay(self, ctx, max)) |overlay| {

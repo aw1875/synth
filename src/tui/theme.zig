@@ -169,3 +169,57 @@ pub const Style = struct {
         return Cell.Style.eql(a.cell, b.cell);
     }
 };
+
+/// `color` moved `amount`/255 of the way toward `target`.
+///
+/// A terminal cell has no alpha, so a translucent layer over the frame is not
+/// something the renderer can composite. Baking the blend into the colors is
+/// the same picture by another route. A cell painted in one of the terminal's
+/// own colors has no channels to mix, so it takes `target` whole.
+pub fn toward(color: Color, target: Color, amount: u8) Color {
+    const from = channels(color) orelse return target;
+    const to = channels(target) orelse return color;
+    return .{ .rgb = .{
+        mix(from[0], to[0], amount),
+        mix(from[1], to[1], amount),
+        mix(from[2], to[2], amount),
+    } };
+}
+
+fn channels(color: Color) ?[3]u8 {
+    return switch (color) {
+        .rgb => |value| value,
+        .default, .index => null,
+    };
+}
+
+fn mix(from: u8, to: u8, amount: u8) u8 {
+    const rest: u16 = 255 - @as(u16, amount);
+    return @intCast((@as(u16, from) * rest + @as(u16, to) * @as(u16, amount)) / 255);
+}
+
+const testing = @import("std").testing;
+
+test "a blend of nothing is the color itself, and of everything the target" {
+    const from = rgbOf(0xff0000);
+    const to = rgbOf(0x0000ff);
+
+    try testing.expectEqual(from, toward(from, to, 0));
+    try testing.expectEqual(to, toward(from, to, 255));
+}
+
+test "a half blend lands between the two" {
+    const mid = toward(rgbOf(0x000000), rgbOf(0xffffff), 128);
+    try testing.expectEqual(@as([3]u8, .{ 128, 128, 128 }), mid.rgb);
+}
+
+test "a terminal color has no channels to mix" {
+    const target = rgbOf(0x102030);
+
+    try testing.expectEqual(target, toward(.default, target, 64));
+    try testing.expectEqual(target, toward(.{ .index = 4 }, target, 64));
+
+    // The other way round there is nothing to move toward, so it stays put.
+    const kept = toward(rgbOf(0xabcdef), .default, 64);
+    try testing.expectEqual(@as([3]u8, .{ 0xab, 0xcd, 0xef }), kept.rgb);
+}
