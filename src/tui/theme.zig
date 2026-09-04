@@ -49,6 +49,10 @@ pub const Palette = struct {
     /// tinted enough to read as added or removed at a glance.
     diff_added_bg: u24,
     diff_removed_bg: u24,
+    /// Diff row text. Separate from the row backgrounds so a theme can colour
+    /// the code itself rather than only the ground it sits on.
+    diff_added_fg: u24,
+    diff_removed_fg: u24,
 };
 
 /// The palette in use. These are `var` rather than `const` so a theme switch is
@@ -72,6 +76,8 @@ pub var selection_bg = rgb(0xa9b1c6);
 
 pub var diff_added_bg = rgb(0x1c2a1e);
 pub var diff_removed_bg = rgb(0x2e1c22);
+pub var diff_added_fg = rgb(0xe7e5dd);
+pub var diff_removed_fg = rgb(0xe7e5dd);
 
 /// Base style for the app background.
 pub var base: Style = .{ .cell = .{ .fg = rgb(0xc5cad4), .bg = rgb(0x14161a) } };
@@ -95,6 +101,8 @@ pub fn apply(palette: Palette) void {
     selection_bg = rgb(palette.selection_bg);
     diff_added_bg = rgb(palette.diff_added_bg);
     diff_removed_bg = rgb(palette.diff_removed_bg);
+    diff_added_fg = rgb(palette.diff_added_fg);
+    diff_removed_fg = rgb(palette.diff_removed_fg);
 
     base = .{ .cell = .{ .fg = fg, .bg = bg } };
     card = .{ .cell = .{ .fg = fg, .bg = surface } };

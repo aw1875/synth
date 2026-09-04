@@ -25,20 +25,22 @@ pub const all: []const Theme = &.{
         .id = "synth",
         .label = "Synth",
         .palette = .{
-            .bg = 0x14161a,
-            .surface = 0x1d2026,
-            .surface_alt = 0x252932,
-            .fg = 0xc5cad4,
-            .fg_muted = 0x9aa3b3,
-            .fg_dim = 0x6e7787,
-            .accent = 0xbb9af7,
-            .accent_alt = 0x7aa2f7,
-            .success = 0x9ece6a,
-            .warning = 0xe0af68,
-            .danger = 0xf7768e,
-            .selection_bg = 0xa9b1c6,
-            .diff_added_bg = 0x1c2a1e,
-            .diff_removed_bg = 0x2e1c22,
+            .bg = 0x16171c,
+            .surface = 0x1c1e25,
+            .surface_alt = 0x22242c,
+            .fg = 0xe7e5dd,
+            .fg_muted = 0x8b8e99,
+            .fg_dim = 0x5c5f6a,
+            .accent = 0xe8a33d,
+            .accent_alt = 0xe8a33d,
+            .success = 0x5fc9a8,
+            .warning = 0xe8a33d,
+            .danger = 0xe2695b,
+            .selection_bg = 0xe7e5dd,
+            .diff_added_bg = 0x212829,
+            .diff_removed_bg = 0x2b2326,
+            .diff_added_fg = 0x6fa88c,
+            .diff_removed_fg = 0xc77b72,
         },
     },
     .{
@@ -59,6 +61,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xc8d3f5,
             .diff_added_bg = 0x20303b,
             .diff_removed_bg = 0x37222c,
+            .diff_added_fg = 0xc8d3f5,
+            .diff_removed_fg = 0xc8d3f5,
         },
     },
     .{
@@ -79,6 +83,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xcdd6f4,
             .diff_added_bg = 0x24312b,
             .diff_removed_bg = 0x3c2a32,
+            .diff_added_fg = 0xcdd6f4,
+            .diff_removed_fg = 0xcdd6f4,
         },
     },
     .{
@@ -99,6 +105,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xebdbb2,
             .diff_added_bg = 0x32302f,
             .diff_removed_bg = 0x322929,
+            .diff_added_fg = 0xebdbb2,
+            .diff_removed_fg = 0xebdbb2,
         },
     },
     .{
@@ -119,6 +127,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xeceff4,
             .diff_added_bg = 0x414a4c,
             .diff_removed_bg = 0x453b47,
+            .diff_added_fg = 0xeceff4,
+            .diff_removed_fg = 0xeceff4,
         },
     },
     .{
@@ -139,6 +149,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xe0def4,
             .diff_added_bg = 0x1f2d3a,
             .diff_removed_bg = 0x3a1f2d,
+            .diff_added_fg = 0xe0def4,
+            .diff_removed_fg = 0xe0def4,
         },
     },
     .{
@@ -159,6 +171,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xabb2bf,
             .diff_added_bg = 0x2c382b,
             .diff_removed_bg = 0x3a2d2f,
+            .diff_added_fg = 0xabb2bf,
+            .diff_removed_fg = 0xabb2bf,
         },
     },
     .{
@@ -179,6 +193,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xd3c6aa,
             .diff_added_bg = 0x20303b,
             .diff_removed_bg = 0x37222c,
+            .diff_added_fg = 0xd3c6aa,
+            .diff_removed_fg = 0xd3c6aa,
         },
     },
     .{
@@ -199,6 +215,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0xf8f8f2,
             .diff_added_bg = 0x1a3a1a,
             .diff_removed_bg = 0x3a1a1a,
+            .diff_added_fg = 0xf8f8f2,
+            .diff_removed_fg = 0xf8f8f2,
         },
     },
     .{
@@ -219,6 +237,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0x24292f,
             .diff_added_bg = 0xdafbe1,
             .diff_removed_bg = 0xffebe9,
+            .diff_added_fg = 0x24292f,
+            .diff_removed_fg = 0x24292f,
         },
     },
     .{
@@ -239,6 +259,8 @@ pub const all: []const Theme = &.{
             .selection_bg = 0x657b83,
             .diff_added_bg = 0xeae7bf,
             .diff_removed_bg = 0xf8d7c6,
+            .diff_added_fg = 0x586e75,
+            .diff_removed_fg = 0x586e75,
         },
     },
 };
@@ -290,4 +312,46 @@ test "applying a theme repaints the palette" {
     const restored = apply("no-such-theme");
     try testing.expectEqualStrings(default_id, restored.id);
     try testing.expectEqual(theme.rgbOf(restored.palette.bg), theme.bg);
+}
+
+test "every theme reaches the palette whole" {
+    const testing = std.testing;
+    defer _ = apply(default_id);
+
+    for (all) |entry| {
+        const applied = apply(entry.id);
+        const palette = applied.palette;
+
+        try testing.expectEqual(theme.rgbOf(palette.bg), theme.bg);
+        try testing.expectEqual(theme.rgbOf(palette.surface), theme.surface);
+        try testing.expectEqual(theme.rgbOf(palette.surface_alt), theme.surface_alt);
+        try testing.expectEqual(theme.rgbOf(palette.fg), theme.fg);
+        try testing.expectEqual(theme.rgbOf(palette.fg_muted), theme.fg_muted);
+        try testing.expectEqual(theme.rgbOf(palette.fg_dim), theme.fg_dim);
+        try testing.expectEqual(theme.rgbOf(palette.accent), theme.accent);
+        try testing.expectEqual(theme.rgbOf(palette.accent_alt), theme.accent_alt);
+        try testing.expectEqual(theme.rgbOf(palette.success), theme.success);
+        try testing.expectEqual(theme.rgbOf(palette.warning), theme.warning);
+        try testing.expectEqual(theme.rgbOf(palette.danger), theme.danger);
+        try testing.expectEqual(theme.rgbOf(palette.selection_bg), theme.selection_bg);
+        try testing.expectEqual(theme.rgbOf(palette.diff_added_bg), theme.diff_added_bg);
+        try testing.expectEqual(theme.rgbOf(palette.diff_removed_bg), theme.diff_removed_bg);
+        try testing.expectEqual(theme.rgbOf(palette.diff_added_fg), theme.diff_added_fg);
+        try testing.expectEqual(theme.rgbOf(palette.diff_removed_fg), theme.diff_removed_fg);
+    }
+}
+
+test "a theme that colours its diff text says so on both sides" {
+    const testing = std.testing;
+
+    const synth = find("synth").?.palette;
+    try testing.expect(synth.diff_added_fg != synth.diff_removed_fg);
+    try testing.expect(synth.diff_added_fg != synth.fg);
+
+    // The rest keep the look they had, which was the transcript's own colour.
+    for (all) |entry| {
+        if (std.mem.startsWith(u8, entry.id, "synth")) continue;
+        try testing.expectEqual(entry.palette.fg, entry.palette.diff_added_fg);
+        try testing.expectEqual(entry.palette.fg, entry.palette.diff_removed_fg);
+    }
 }

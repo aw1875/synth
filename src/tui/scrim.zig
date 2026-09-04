@@ -112,6 +112,8 @@ test "the frame comes back dimmed toward the background" {
         .selection_bg = 0xffffff,
         .diff_added_bg = 0x000000,
         .diff_removed_bg = 0x000000,
+        .diff_added_fg = 0xffffff,
+        .diff_removed_fg = 0xffffff,
     });
 
     const size: vxfw.Size = .{ .width = 4, .height = 2 };

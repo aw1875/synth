@@ -7,6 +7,7 @@ const vxfw = vaxis.vxfw;
 const Cell = vaxis.Cell;
 
 const theme = @import("theme.zig");
+const themes = @import("themes.zig");
 const w = @import("widgets.zig");
 
 /// Past this many lines on either side the quadratic match is skipped and the
@@ -302,7 +303,15 @@ fn drawLine(
     );
 
     const text_col = col + numbers + 4;
-    _ = w.writeText(surface, text_col, row, l.text, fill_style.withFg(theme.fg).cell);
+    _ = w.writeText(surface, text_col, row, l.text, fill_style.withFg(foregroundFor(l.kind)).cell);
+}
+
+fn foregroundFor(kind: Kind) theme.Color {
+    return switch (kind) {
+        .context => theme.fg,
+        .removed => theme.diff_removed_fg,
+        .added => theme.diff_added_fg,
+    };
 }
 
 fn backgroundFor(kind: ?Kind, background: Cell.Style) theme.Style {
@@ -416,4 +425,48 @@ test "each row prints its own line number" {
         const expected = [_][]const u8{ "1", "2", "3", "4" };
         try std.testing.expectEqualStrings(expected[row], cell.char.grapheme);
     }
+}
+
+test "a changed line is written in the colour of its kind" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    const widget: vxfw.Widget = .{ .userdata = &userdata, .drawFn = Dummy.drawFn };
+
+    // The palette is global, so a test that pins it has to hand it back.
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    // One line kept, one replaced, so the row carries a removal and an addition.
+    const diff = try rows(arena, "keep\nold\n", "keep\nnew\n", 1);
+    const width: u16 = 100;
+    const surface = try vxfw.Surface.init(arena, widget, .{ .width = width, .height = 2 });
+    draw(surface, diff, .{ .arena = arena, .row = 0, .col = 0, .width = width });
+
+    const column = (width -| 1) / 2;
+    const text_col = numberWidth(diff) + 4;
+    const context_cell = surface.buffer[text_col];
+    const removed_cell = surface.buffer[width + text_col];
+    const added_cell = surface.buffer[width + column + 1 + text_col];
+
+    try testing.expectEqualStrings("k", context_cell.char.grapheme);
+    try testing.expectEqualStrings("o", removed_cell.char.grapheme);
+    try testing.expectEqualStrings("n", added_cell.char.grapheme);
+
+    try testing.expectEqual(theme.fg, context_cell.style.fg);
+    try testing.expectEqual(theme.diff_removed_fg, removed_cell.style.fg);
+    try testing.expectEqual(theme.diff_added_fg, added_cell.style.fg);
+
+    // The colours are the theme's own, not one shared value standing in.
+    try testing.expect(!std.meta.eql(theme.diff_added_fg, theme.diff_removed_fg));
+    try testing.expect(!std.meta.eql(theme.diff_added_fg, theme.fg));
 }
