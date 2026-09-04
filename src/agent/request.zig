@@ -29,9 +29,8 @@ done: std.atomic.Value(bool) = .init(false),
 /// proper is `cancel`; this is the cheap non-blocking half, and it covers the
 /// case where a provider swallows `error.Canceled` from an inner call.
 stop: std.atomic.Value(bool) = .init(false),
-/// When a chunk last arrived, on the monotonic clock. A connection that died
-/// mid-stream looks exactly like a model still thinking, and the only thing
-/// that tells them apart is how long the silence has run.
+/// When a chunk last arrived, on the monotonic clock. A dead connection and a
+/// thinking model differ only in how long the silence runs.
 progress_ms: std.atomic.Value(i64) = .init(0),
 /// Allocated with `allocator`; ownership passes to whoever calls `join`.
 reply: ?Provider.Reply = null,
@@ -78,17 +77,17 @@ pub fn isFinished(self: *Request) bool {
     return self.done.load(.acquire);
 }
 
-/// Ask the provider to give up between chunks. Non-blocking, and on its own
-/// no guarantee: a provider blocked waiting for the first byte never reaches
-/// the check. Pair it with `cancel`.
+/// Ask the provider to give up, and break off whatever it is waiting on.
+///
+/// Non-blocking. The flag is checked between chunks; the abort is what reaches
+/// a worker parked in a socket read, which no flag ever does.
 pub fn requestStop(self: *Request) void {
     self.stop.store(true, .release);
+    if (self.provider.abort) |abort| abort(self.provider.userdata);
 }
 
 /// Non-blocking check for the owning thread. True once nothing has arrived for
-/// `limit_ms`, which from this side is what a dead connection looks like: the
-/// kernel keeps retransmitting into it for a quarter of an hour before the read
-/// fails on its own. Zero or less disables the check, matching the turn budgets.
+/// `limit_ms`; without it the kernel retransmits for a quarter of an hour.
 pub fn stalled(self: *Request, limit_ms: i64) bool {
     if (limit_ms <= 0) return false;
     if (self.isFinished()) return false;

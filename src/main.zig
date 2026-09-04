@@ -101,7 +101,10 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     timing.mark("auth");
 
     var db = try Database.init(allocator, io, config.database_path);
-    defer db.deinit();
+    defer {
+        db.deinit();
+        timing.mark("exit: database");
+    }
     timing.mark("database");
 
     if (db.prune(config.prune, db.nowMs())) |dropped| {
@@ -122,7 +125,10 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
 
     var buffer: [1024]u8 = undefined;
     var app: vxfw.App = try .init(io, allocator, init.environ_map, &buffer);
-    defer app.deinit();
+    defer {
+        app.deinit();
+        timing.mark("exit: terminal");
+    }
     timing.mark("terminal");
 
     const model = try allocator.create(Model);
@@ -147,10 +153,12 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     else
         try allocator.dupe(u8, path);
 
-    // Declared before the model so it is torn down after it: the registry holds
-    // pointers into this host, and the model owns the registry.
+    // Declared before the model so it is torn down after the registry that points here.
     var mcp_host: mcp_tools.Host = .init(allocator, io);
-    defer mcp_host.deinit();
+    defer {
+        mcp_host.deinit();
+        timing.mark("exit: mcp");
+    }
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
@@ -170,7 +178,10 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
     });
-    defer backend.deinit();
+    defer {
+        backend.deinit();
+        timing.mark("exit: provider");
+    }
 
     try backend.start();
     timing.mark("provider probe");
@@ -191,22 +202,27 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .auth = &auth,
         .backend = &backend,
     };
-    defer model.deinit();
     try tui_app.wire(model);
 
-    // Installed from here rather than inside the loop: running a subagent needs
-    // a loop, and the loop must not need the thing that runs one.
-    var runner: subagent.Runner = .{ .parent = &model.loop };
+    // Installed here so the loop never needs the thing that runs a subagent.
+    var runner: subagent.Runner = .{ .parent = &model.loop, .backend = &backend };
     model.loop.delegate = runner.delegate();
+    model.subagents = &runner;
+
+    // Ordered: the loop joins the workers still writing to the runner.
+    defer {
+        model.deinit();
+        timing.mark("exit: model");
+        runner.deinit();
+        timing.mark("exit: subagents");
+    }
     model.mcp = &mcp_host;
     model.prune_policy = config.prune;
     model.bell = config.bell;
     tui_bell.askForFocusReports(&app);
     defer tui_bell.stopFocusReports(&app);
 
-    // Into the model's registry, which is the one the loop was built with, and
-    // before `useAgent` builds the tool schema from it - a tool registered after
-    // that is one the model is never told about.
+    // Before `useAgent` builds the schema; a tool added after is never advertised.
     if (config.mcp) |block| {
         const servers = try mcp_tools.serversFromJson(init.arena.allocator(), block);
         try mcp_host.beginConnectAll(servers, .{

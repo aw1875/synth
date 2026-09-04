@@ -39,9 +39,8 @@ pub const max_repeats: usize = 3;
 /// legitimately takes a while. Zero turns it off.
 pub const default_turn_ms: i64 = 30 * std.time.ms_per_min;
 
-/// How long the provider may deliver nothing at all before the turn is given
-/// up on. Generous, because the gap before the first token is real work on a
-/// long prompt; the failure this catches sits at fifteen minutes without it.
+/// How long the provider may deliver nothing before the turn is given up on.
+/// Generous, because the gap before the first token is real work.
 pub const default_stall_ms: i64 = 2 * std.time.ms_per_min;
 
 /// Tokens one turn may spend, prompt and completion together. The whole
@@ -54,6 +53,9 @@ pub const default_turn_tokens: u64 = 2_000_000;
 /// a subagent handing up its answer - has to tell it from something the model
 /// meant to say.
 pub const no_reply = "(no reply)";
+
+/// How every reason the loop halts on opens. A subagent's caller strips it.
+pub const halt_prefix = "Stopped: ";
 
 /// Messages whose pasted images stay in memory. Older ones keep their token in
 /// the text but stop being resent; the bodies remain in the blob table.
@@ -181,8 +183,7 @@ max_turn_tokens: u64 = default_turn_tokens,
 /// How long the provider may go silent before the turn is abandoned. Zero
 /// disables it.
 max_stall_ms: i64 = default_stall_ms,
-/// Whether the turn now unwinding is one the stall check gave up on, so the
-/// outcome can say the connection died rather than blame the user for it.
+/// Whether the turn now unwinding is one the stall check gave up on.
 timed_out: bool = false,
 /// `seq` of the assistant message whose tool calls are being decided. A seq
 /// rather than an index: trimming the transcript shifts indices down and paging
@@ -349,6 +350,9 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     const db = self.db orelse return error.NoDatabase;
 
     const total = try db.countMessages(session_id);
+    // Seqs restart per session, so old entries point at another session's rows.
+    self.message_ids.clearRetainingCapacity();
+
     const loaded = try db.loadMessages(self.allocator, session_id, std.math.maxInt(i64), limit);
     defer self.allocator.free(loaded);
 
@@ -965,8 +969,8 @@ fn overBudget(self: *Loop) ?[]const u8 {
 
 /// Abandon a turn whose provider has stopped sending.
 ///
-/// Interrupted the same way the user's cancel interrupts it, because a worker
-/// blocked on a socket read unwinds for nothing short of cancelling its future.
+/// Interrupted the way cancelling interrupts it: a worker blocked on a socket
+/// read unwinds for nothing short of its future being cancelled.
 fn giveUpIfStalled(self: *Loop, request: *Request) bool {
     if (!request.stalled(self.max_stall_ms)) return false;
 
@@ -1198,9 +1202,7 @@ fn finish(self: *Loop, outcome: Outcome) void {
     self.signalled = false;
     self.reaped.store(false, .release);
 
-    // Written down rather than worked out again at each draw: once older
-    // messages are trimmed away the turn could no longer be read back, and
-    // what a turn did does not change after it has ended.
+    // Written down now: trimming older messages would make the turn unreadable.
     self.recordSummary(outcome) catch {};
 }
 
@@ -1221,6 +1223,7 @@ fn recordSummary(self: *Loop, outcome: Outcome) !void {
 /// End the turn with a message saying why. The message is an assistant turn, so
 /// the model sees it too and a later turn is not left guessing.
 fn stop(self: *Loop, reason: []const u8) !void {
+    std.debug.assert(std.mem.startsWith(u8, reason, halt_prefix));
     _ = try self.conversation.addAssistant(reason, null, null);
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.finish(.halted);
@@ -1737,7 +1740,7 @@ fn persistMessage(self: *Loop, index: usize) !void {
     self.conversation.shrinkAttachments(max_resident_attachment_bytes);
 
     for (msg.tool_calls, 0..) |call, i| {
-        try db.appendToolCall(
+        _ = try db.appendToolCall(
             message_id,
             @intCast(i),
             call.id,
@@ -1747,6 +1750,71 @@ fn persistMessage(self: *Loop, index: usize) !void {
             call.result,
             @intCast(call.result_bytes),
         );
+    }
+}
+
+/// Say something the UI will surface once. Replaces whatever was pending.
+pub fn say(self: *Loop, comptime fmt: []const u8, args: anytype) void {
+    const said = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+    if (self.hook_notice) |old| self.allocator.free(old);
+    self.hook_notice = said;
+}
+
+/// Write a subagent's messages into a session of its own, hung off the call
+/// that produced it. Read back by whatever reads any other session.
+pub fn storeSubagent(self: *Loop, call_index: usize, convo: *Conversation) !void {
+    const message_index = self.pendingIndex() orelse return;
+    return self.persistSubagent(message_index, call_index, convo);
+}
+
+fn persistSubagent(
+    self: *Loop,
+    message_index: usize,
+    call_index: usize,
+    convo: *Conversation,
+) !void {
+    const db = self.db orelse return;
+    const project_id = self.project_id orelse return;
+    const parent_session = self.session_id orelse return;
+    if (convo.messages.items.len == 0) return;
+
+    const msg = &self.conversation.messages.items[message_index];
+    const parent_message = self.message_ids.get(msg.seq) orelse return;
+    const call_row = try db.toolCallId(parent_message, @intCast(call_index)) orelse return;
+
+    const session = try db.createSubagentSession(
+        project_id,
+        self.session_cwd,
+        self.session_model,
+        parent_session,
+        call_row,
+    );
+
+    for (convo.messages.items) |child| {
+        const thinking_bytes: i64 = if (child.thinking) |t| @intCast(t.len) else 0;
+        const message_id = try db.appendMessage(
+            session,
+            @intCast(child.seq),
+            @tagName(child.role),
+            child.text,
+            if (child.thinking_ms) |ms| @intCast(ms) else null,
+            thinking_bytes,
+        );
+        if (child.thinking) |thinking| {
+            try db.appendBlob(message_id, 0, "reasoning", thinking);
+        }
+        for (child.tool_calls, 0..) |call, i| {
+            _ = try db.appendToolCall(
+                message_id,
+                @intCast(i),
+                call.id,
+                call.name,
+                call.arguments,
+                @tagName(call.status),
+                call.result,
+                @intCast(call.result_bytes),
+            );
+        }
     }
 }
 
@@ -2028,8 +2096,7 @@ const FakeProvider = struct {
             s.onThinking(s.userdata, "thinking about it\n");
         }
 
-        // A one-off instruction is a question, not a turn: answer it rather
-        // than reaching for a tool.
+        // A one-off instruction is a question, not a turn.
         if (asked.instruction.len > 0) {
             return .{
                 .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}),
@@ -2178,8 +2245,7 @@ test "a read-only tool call runs without asking" {
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqual(Conversation.ToolCall.Status.ok, calls[0].status);
 
-    // The user's prompt, the call, its result, the reply, and the summary the
-    // harness writes once the turn is over.
+    // Prompt, call, result, reply, and the summary written once the turn ends.
     try testing.expectEqual(@as(usize, 5), fixture.convo.messages.items.len);
     try testing.expectEqual(Conversation.Role.tool, fixture.convo.messages.items[2].role);
     try testing.expectEqual(Conversation.Role.summary, fixture.convo.last().?.role);
@@ -2402,8 +2468,7 @@ test "cancel returns while the worker is still running" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
 
-    // Long enough that the worker is certainly still inside `respond` when
-    // cancel is called, short enough that reaping it does not slow the suite.
+    // Long enough that the worker is still inside `respond` when cancel lands.
     fixture.fake.latency = .fromMilliseconds(300);
 
     var loop = fixture.loop();
@@ -2416,8 +2481,7 @@ test "cancel returns while the worker is still running" {
     try loop.cancel();
     const elapsed = started.durationTo(.now(testing.io, .awake)).nanoseconds;
 
-    // The point of the whole thing: asking costs nothing. Waiting for the
-    // worker on this thread is what used to freeze the UI.
+    // The point of the whole thing: asking costs nothing.
     try testing.expect(elapsed < 50 * std.time.ns_per_ms);
     try testing.expectEqual(State.cancelling, loop.state);
     try testing.expect(loop.request != null);
@@ -2618,6 +2682,41 @@ test "a tool outside the agent is refused rather than prompted" {
     try testing.expect(std.mem.indexOf(u8, call.result.?, "not available in Plan mode") != null);
 }
 
+test "a subagent transcript is stored as a session of its own" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    var kept: Conversation = .init(testing.allocator);
+    defer kept.deinit();
+    _ = try kept.addUser("where is the parser", &.{}, &.{});
+    _ = try kept.addAssistant("src/parse.zig:40", "thinking about it", 12);
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    try loop.submit("go", .{});
+
+    // While the call is pending, which is when a subagent finishes.
+    while (loop.state != .running_tools and loop.isBusy()) {
+        _ = try loop.poll();
+        try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
+    }
+    try loop.storeSubagent(0, &kept);
+    try settle(&loop);
+
+    const parent = loop.session_id.?;
+    const message_id = loop.message_ids.get(loop.conversation.messages.items[1].seq).?;
+    const call_row = (try db.toolCallId(message_id, 0)).?;
+
+    const child = try db.subagentSession(call_row) orelse return error.NoSubagentSession;
+    try testing.expect(child != parent);
+    try testing.expectEqual(@as(u64, 2), try db.countMessages(child));
+}
+
 test "a session comes back in the mode it was left in" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -2802,9 +2901,7 @@ test "compaction summarises the transcript into a system message" {
     try testing.expectEqual(Conversation.Role.system, summary.role);
     try testing.expect(summary.text.len > 0);
 
-    // The fake echoes what it was asked, so this is the only proof that the
-    // instruction reached the model at all rather than being dropped on the
-    // way, which is what happened while it travelled as an unused argument.
+    // The fake echoes its input, so this is the only proof the instruction arrived.
     try testing.expect(std.mem.indexOf(u8, summary.text, "Summarise this conversation") != null);
 }
 
@@ -2823,8 +2920,7 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
     try testing.expect(std.mem.indexOf(u8, planning.tools_json, "\"write\"") == null);
     try testing.expectEqualStrings("", planning.instruction);
 
-    // With a project the agent's own instructions are folded in, and the
-    // assembled text is what the backend is handed.
+    // With a project the agent's own instructions are folded in.
     var project = try Project.detect(testing.allocator, testing.io, fixture.root);
     defer project.deinit(testing.allocator);
     loop.project = &project;
@@ -3072,7 +3168,6 @@ test "a provider that goes quiet is given up on rather than waited out" {
     var loop = fixture.loop();
     defer loop.deinit();
 
-    // Sends nothing for far longer than the turn is allowed to stay silent.
     fixture.fake.latency = .fromMilliseconds(30_000);
     loop.max_stall_ms = 40;
 
@@ -3087,7 +3182,6 @@ test "a provider that goes quiet is given up on rather than waited out" {
     try testing.expectEqual(Outcome.failed, loop.outcome.?);
     try testing.expectEqual(error.Timeout, loop.last_error.?);
 
-    // The transcript says what happened, since nobody asked for this one.
     const last = loop.conversation.messages.items[loop.conversation.messages.items.len - 1];
     try testing.expect(std.mem.indexOf(u8, last.text, "stopped responding") != null);
 }
@@ -3099,7 +3193,6 @@ test "a stall is measured from the last chunk, not from the start" {
     var loop = fixture.loop();
     defer loop.deinit();
 
-    // Slower than the stall limit overall, but talking the whole way.
     fixture.fake.latency = .fromMilliseconds(120);
     loop.max_stall_ms = 60;
 
@@ -3484,8 +3577,7 @@ test "a finished turn says how it ended and what it did" {
     var did = try loop.lastTurn(testing.allocator);
     defer did.deinit(testing.allocator);
 
-    // The fixture's model asks for one `list`, which is a read: counted, and
-    // not worth a line of its own.
+    // The fixture's model asks for one `list`, which counts as a read.
     try testing.expectEqual(@as(usize, 1), did.ok);
     try testing.expectEqual(@as(usize, 0), did.changed);
     try testing.expect(did.any());

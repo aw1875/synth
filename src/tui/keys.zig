@@ -223,7 +223,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 ctx.redraw = true;
             }
             if (self.mentions.isScanning()) try self.scheduleTick(ctx);
-            const changed = try self.loop.poll();
+            const nested = if (self.subagents) |runner| try runner.poll() else false;
+            if (nested) self.refreshViewing();
+            const changed = try self.loop.poll() or nested;
             if (self.loop.takeHookNotice()) |notice| {
                 defer self.allocator.free(notice);
                 try self.notification.show(ctx, .warn, notice);
@@ -239,13 +241,18 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
             ringIfFinished(self);
-            if (self.loop.isBusy()) {
-                self.thinking.stream = self.loop.thoughts();
-                self.thinking.label = self.loop.label();
+            const watched = self.shownLoop();
+            if (watched.isBusy()) {
+                self.thinking.stream = watched.thoughts();
+                self.thinking.label = watched.label();
                 self.thinking.frame +%= 1;
                 try self.scheduleTick(ctx);
             } else {
                 self.thinking.stream = null;
+            }
+            if (self.loop.isBusy()) try self.scheduleTick(ctx);
+            if (self.subagents) |runner| {
+                if (runner.busy()) try self.scheduleTick(ctx);
             }
             if (changed) self.scroll = 0;
             ctx.redraw = true;
@@ -383,6 +390,12 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             if (key.matches('e', .{ .ctrl = true })) {
                 try openEditor(self, ctx);
+                return ctx.consumeAndRedraw();
+            }
+
+            if (key.matches('b', .{ .ctrl = true }) and self.inSubagent()) {
+                self.closeSubagent();
+                widget_pool.pruneWidgets(self);
                 return ctx.consumeAndRedraw();
             }
 
