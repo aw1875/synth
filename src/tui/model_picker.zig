@@ -288,7 +288,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
         const y: u16 = @intCast(first_row + i);
         switch (row) {
             .heading => |title| {
-                _ = w.writeText(surface, pad, y, title, theme.on_card(theme.accent_alt).cell);
+                _ = w.writeHeading(surface, pad, y, title, theme.on_card(theme.accent_alt).cell, theme.border);
             },
             .entry => |index| {
                 const entry = self.entries[index];

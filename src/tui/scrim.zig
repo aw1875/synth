@@ -109,6 +109,7 @@ test "the frame comes back dimmed toward the background" {
         .success = 0xffffff,
         .warning = 0xffffff,
         .danger = 0xffffff,
+        .border = 0x000000,
         .selection_bg = 0xffffff,
         .diff_added_bg = 0x000000,
         .diff_removed_bg = 0x000000,

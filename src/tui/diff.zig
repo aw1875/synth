@@ -215,14 +215,19 @@ pub fn draw(surface: vxfw.Surface, diff: []const Row, opts: DrawOptions) void {
     const background = opts.background orelse theme.card.cell;
     const shown = if (opts.max_rows == 0 or diff.len <= opts.max_rows) diff.len else opts.max_rows;
     const numbers = numberWidth(diff);
-    const side_by_side = opts.width >= min_side_by_side_width;
+    const side_by_side = opts.width >= min_side_by_side_width and twoSided(diff);
 
     for (diff[0..shown], 0..) |row, i| {
         const y = opts.row + @as(u16, @intCast(i));
         if (side_by_side) {
             const column = (opts.width -| 1) / 2;
             drawLine(opts.arena, surface, y, opts.col, column, numbers, row.left, background);
-            drawLine(opts.arena, surface, y, opts.col + column + 1, column, numbers, row.right, background);
+            const split = opts.col + column;
+            surface.writeCell(split, y, .{
+                .char = .{ .grapheme = w.solid_rule, .width = 1 },
+                .style = .{ .fg = theme.border, .bg = background.bg },
+            });
+            drawLine(opts.arena, surface, y, split + 1, column, numbers, row.right, background);
         } else {
             const line = row.left orelse row.right;
             drawLine(opts.arena, surface, y, opts.col, opts.width, numbers, line, background);
@@ -254,10 +259,32 @@ pub fn unify(arena: std.mem.Allocator, diff: []const Row) ![]const Row {
         } else if (row.left != null and row.right != null) {
             try out.append(arena, .{ .left = row.left });
         } else {
-            try out.append(arena, row);
+            try out.append(arena, .{ .left = row.left orelse row.right });
         }
     }
     return out.toOwnedSlice(arena);
+}
+
+/// Whether any row has a right side to put opposite its left.
+fn twoSided(diff: []const Row) bool {
+    for (diff) |row| {
+        if (row.right != null) return true;
+    }
+    return false;
+}
+
+/// Whether every row of a diff sits on the same side, which a new or deleted
+/// file is. Side by side then spends half the width on a column that is empty
+/// all the way down, and the change reads as though it had been indented.
+pub fn oneSided(diff: []const Row) bool {
+    var left = false;
+    var right = false;
+    for (diff) |row| {
+        if (row.left) |l| left = left or l.kind != .context;
+        if (row.right) |r| right = right or r.kind != .context;
+        if (left and right) return false;
+    }
+    return true;
 }
 
 fn drawLine(
@@ -273,36 +300,36 @@ fn drawLine(
 ) void {
     if (width == 0) return;
 
-    const kind: ?Kind = if (line) |l| l.kind else null;
-    const fill_style = backgroundFor(kind, background);
-    w.fillRow(surface, row, col, width, fill_style.cell);
+    const ground: theme.Style = .{ .cell = background };
+    w.fillRow(surface, row, col, width, background);
 
     const l = line orelse return;
-    if (width <= numbers + 4) return;
+    if (width <= numbers + 8) return;
 
+    const at = col + 1;
     const marker: []const u8 = switch (l.kind) {
         .context => " ",
         .removed => "-",
         .added => "+",
     };
-    const marker_style = fill_style.withFg(switch (l.kind) {
-        .context => theme.fg_dim,
-        .removed => theme.danger,
-        .added => theme.success,
-    });
-    _ = w.writeText(surface, col, row, marker, marker_style.bold().cell);
+    _ = w.writeText(surface, at, row, marker, ground.withFg(foregroundFor(l.kind)).bold().cell);
 
     const text = std.fmt.allocPrint(arena, "{d}", .{l.number}) catch "";
-    const number_style = fill_style.withFg(theme.fg_dim);
     _ = w.writeText(
         surface,
-        col + 2 + numbers -| @as(u16, @intCast(text.len)),
+        at + 2 + numbers -| @as(u16, @intCast(text.len)),
         row,
         text,
-        number_style.cell,
+        ground.withFg(theme.fg_dim).cell,
     );
 
-    const text_col = col + numbers + 4;
+    // The gutter says which line, which is not what the tint has to report.
+    const rule_at = at + numbers + 3;
+    _ = w.writeText(surface, rule_at, row, w.solid_rule, ground.withFg(theme.border).cell);
+
+    const text_col = rule_at + 2;
+    const fill_style = backgroundFor(l.kind, background);
+    w.fillRow(surface, row, text_col -| 1, col + width -| (text_col -| 1), fill_style.cell);
     _ = w.writeText(surface, text_col, row, l.text, fill_style.withFg(foregroundFor(l.kind)).cell);
 }
 
@@ -421,7 +448,7 @@ test "each row prints its own line number" {
     draw(surface, diff, .{ .arena = arena, .row = 0, .col = 0, .width = 100 });
 
     for (0..4) |row| {
-        const cell = surface.buffer[row * 100 + 4];
+        const cell = surface.buffer[row * 100 + 5];
         const expected = [_][]const u8{ "1", "2", "3", "4" };
         try std.testing.expectEqualStrings(expected[row], cell.char.grapheme);
     }
@@ -453,7 +480,7 @@ test "a changed line is written in the colour of its kind" {
     draw(surface, diff, .{ .arena = arena, .row = 0, .col = 0, .width = width });
 
     const column = (width -| 1) / 2;
-    const text_col = numberWidth(diff) + 4;
+    const text_col = numberWidth(diff) + 6;
     const context_cell = surface.buffer[text_col];
     const removed_cell = surface.buffer[width + text_col];
     const added_cell = surface.buffer[width + column + 1 + text_col];
@@ -469,4 +496,112 @@ test "a changed line is written in the colour of its kind" {
     // The colours are the theme's own, not one shared value standing in.
     try testing.expect(!std.meta.eql(theme.diff_added_fg, theme.diff_removed_fg));
     try testing.expect(!std.meta.eql(theme.diff_added_fg, theme.fg));
+}
+
+test "a new file fills one column rather than only the right half" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const added = try rows(arena, "", "Hello world\nsecond line\n", 1);
+    try testing.expect(oneSided(added));
+
+    const flat = try unify(arena, added);
+    for (flat) |row| {
+        try testing.expect(row.right == null);
+        try testing.expectEqual(Kind.added, row.left.?.kind);
+    }
+
+    // A change with both sides still has something to put opposite it.
+    const edited = try rows(arena, "old\nkeep\n", "new\nkeep\n", 1);
+    try testing.expect(!oneSided(edited));
+}
+
+test "a unified diff stays in one column however wide the pane is" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    const widget: vxfw.Widget = .{ .userdata = &userdata, .drawFn = Dummy.drawFn };
+
+    const width: u16 = min_side_by_side_width + 20;
+    const flat = try unify(arena, try rows(arena, "", "Hello world\n", 1));
+    const surface = try vxfw.Surface.init(arena, widget, .{ .width = width, .height = 1 });
+    draw(surface, flat, .{ .arena = arena, .row = 0, .col = 0, .width = width });
+
+    var text: std.Io.Writer.Allocating = .init(arena);
+    for (0..width) |col| try text.writer.writeAll(surface.buffer[col].char.grapheme);
+    const line = text.written();
+
+    // In the left column, not past the midpoint a second column would force.
+    const at = std.mem.indexOf(u8, line, "Hello world").?;
+    try testing.expect(at < (width -| 1) / 2);
+    try testing.expectEqualStrings("+", line[1..2]);
+
+    // And it has the whole pane, not the half a second column would have left.
+    const long = "x" ** 90;
+    const wide = try unify(arena, try rows(arena, "", long ++ "\n", 1));
+    const room = try vxfw.Surface.init(arena, widget, .{ .width = width, .height = 1 });
+    draw(room, wide, .{ .arena = arena, .row = 0, .col = 0, .width = width });
+
+    var written: usize = 0;
+    for (0..width) |col| {
+        if (std.mem.eql(u8, room.buffer[col].char.grapheme, "x")) written += 1;
+    }
+    try testing.expect(written > (width -| 1) / 2);
+}
+
+test "side by side rules off the gutters and the two halves" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    const widget: vxfw.Widget = .{ .userdata = &userdata, .drawFn = Dummy.drawFn };
+
+    const width: u16 = min_side_by_side_width + 20;
+    const body = try rows(arena, "old line\n", "new line\n", 1);
+    const ground: Cell.Style = .{ .fg = theme.fg, .bg = theme.surface_alt };
+    const surface = try vxfw.Surface.init(arena, widget, .{ .width = width, .height = 1 });
+    w.fill(surface, ground);
+    draw(surface, body, .{ .arena = arena, .row = 0, .col = 0, .width = width, .background = ground });
+
+    var rules: usize = 0;
+    var tinted: usize = 0;
+    for (0..width) |col| {
+        const cell = surface.buffer[col];
+        if (std.mem.eql(u8, cell.char.grapheme, w.solid_rule)) rules += 1;
+        if (!std.meta.eql(cell.style.bg, theme.surface_alt)) tinted += 1;
+    }
+
+    // One down each gutter, and one between the halves.
+    try testing.expectEqual(@as(usize, 3), rules);
+
+    // The tint covers the code and stops short of the whole row.
+    try testing.expect(tinted > 0);
+    try testing.expect(tinted < width - 10);
+
+    // The gutter naming the line is never tinted, so the number reads as fact.
+    const numbers = numberWidth(body);
+    try testing.expectEqual(theme.surface_alt, surface.buffer[3 + numbers].style.bg);
 }

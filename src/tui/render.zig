@@ -27,6 +27,7 @@ const markdown = @import("markdown.zig");
 const Selection = @import("selection.zig");
 const scrim = @import("scrim.zig");
 const theme = @import("theme.zig");
+const themes = @import("themes.zig");
 const ThoughtView = @import("thought_view.zig");
 const w = @import("widgets.zig");
 
@@ -670,9 +671,10 @@ pub fn messageBlock(self: *Model, ctx: vxfw.DrawContext, msg: Conversation.Messa
 
     const opts: w.PanelOptions = .{
         .style = style,
-        .left = if (on_card) 2 else 3,
+        .left = if (on_card) 2 else 1,
         .right = 2,
-        .accent = if (invoked != null) theme.accent_alt else if (on_card) theme.accent else null,
+        .accent = if (invoked != null) theme.accent_alt else if (on_card) theme.accent else theme.border,
+        .rule = if (on_card or invoked != null) w.block_rule else w.solid_rule,
         .width = width,
     };
 
@@ -1046,7 +1048,7 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16)
 
     for (sections) |section| {
         if (row >= height) break;
-        _ = w.writeText(surface, left, row, section.title, theme.on_card(theme.fg).bold().cell);
+        _ = w.writeHeading(surface, left, row, section.title, theme.on_card(theme.fg).bold().cell, theme.border);
         row += 1;
         for (section.lines) |line| {
             if (row >= height) break;
@@ -1088,7 +1090,7 @@ fn drawPlan(
     if (!list.any() or start >= height) return start;
 
     var row = start;
-    const title = w.writeText(surface, left, row, "Plan", theme.on_card(theme.fg).bold().cell);
+    const title = w.writeHeading(surface, left, row, "Plan", theme.on_card(theme.fg).bold().cell, theme.border);
     const counted = w.writeText(surface, title + 1, row, try std.fmt.allocPrint(
         ctx.arena,
         "{d}/{d}",
@@ -1328,4 +1330,50 @@ test "a step breaks at a space, and mid-word only when it has to" {
     try std.testing.expectEqual(@as(usize, 5), wrapPoint("write tests", 5));
     try std.testing.expectEqual(@as(usize, 4), wrapPoint("supercalifragilistic", 4));
     try std.testing.expectEqual(@as(usize, 0), wrapPoint("supercalifragilistic", 0));
+}
+
+
+test "a reply hangs off a rule, and its text sits one level in" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    const Dummy = struct {
+        fn drawFn(_: *anyopaque, _: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
+            unreachable;
+        }
+    };
+    var userdata: u8 = 0;
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = undefined,
+        .plain_vtable = .{ .userdata = &userdata, .drawFn = Dummy.drawFn },
+    };
+    defer model.conversation.deinit();
+
+    const width: u16 = 40;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const msg: Conversation.Message = .{ .role = .assistant, .text = "hello" };
+    const surface = try messageBlock(&model, ctx, msg, width);
+
+    // The rule is the reply's own, at the margin, in the colour rules take.
+    try testing.expectEqualStrings(w.solid_rule, surface.buffer[0].char.grapheme);
+    try testing.expectEqual(theme.border, surface.buffer[0].style.fg);
+
+    // Its text starts a level in, which is where a call it made hangs its rule.
+    try testing.expectEqual(@as(i17, w.nest), surface.children[0].origin.col);
 }

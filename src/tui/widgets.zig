@@ -15,6 +15,41 @@ pub fn fill(surface: vxfw.Surface, style: Cell.Style) void {
     @memset(surface.buffer, .{ .style = style });
 }
 
+/// What one level of nesting indents by: a rule and the space after it.
+///
+/// A reply hangs off a rule at the margin, and a call it made hangs off one
+/// this far in, which puts the call's rule where the reply's text is. That is
+/// what makes the transcript read as a call stack rather than a list of cards.
+pub const nest: u16 = 2;
+
+/// What marks the head of a rail or a group of rows.
+///
+/// A box-drawing corner rather than a bullet or an icon glyph: those are
+/// substitutes for something a terminal cannot draw, and this is a corner the
+/// terminal has. The rule it opens is the section it heads.
+pub const rail_head = "\u{256d}\u{2500}";
+
+/// Write a section heading, marked and set in the colour headings take.
+pub fn writeHeading(
+    surface: vxfw.Surface,
+    col: u16,
+    row: u16,
+    title: []const u8,
+    style: Cell.Style,
+    mark: Cell.Color,
+) u16 {
+    var at = writeText(surface, col, row, rail_head, .{ .fg = mark, .bg = style.bg });
+    at = writeText(surface, at + 1, row, title, style);
+    return at;
+}
+
+/// A card's edge: solid enough to be the block's own boundary.
+pub const block_rule = "\u{258c}";
+/// A spine: what a tool call or a reply hangs off, one step in from the margin.
+pub const solid_rule = "\u{2502}";
+/// The same spine, broken, for a block the reader is meant to skim past.
+pub const dashed_rule = "\u{2506}";
+
 pub const PanelOptions = struct {
     /// Background/foreground of the panel itself.
     style: Cell.Style,
@@ -24,6 +59,9 @@ pub const PanelOptions = struct {
     bottom: u16 = 0,
     /// When set, draws a one-column vertical bar down the left edge.
     accent: ?Cell.Color = null,
+    /// The bar's glyph. A block reads as a card's edge, a rule as the spine a
+    /// nested block hangs off.
+    rule: []const u8 = block_rule,
     /// Defaults to the full available width.
     width: ?u16 = null,
     min_height: u16 = 0,
@@ -72,7 +110,7 @@ pub fn wrap(ctx: vxfw.DrawContext, child_surface: vxfw.Surface, opts: PanelOptio
     if (opts.accent) |color| {
         for (0..height) |row| {
             surface.writeCell(0, @intCast(row), .{
-                .char = .{ .grapheme = "▌", .width = 1 },
+                .char = .{ .grapheme = opts.rule, .width = 1 },
                 .style = .{ .fg = color, .bg = opts.style.bg },
             });
         }

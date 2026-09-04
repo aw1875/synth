@@ -42,6 +42,9 @@ pub const Palette = struct {
     success: u24,
     warning: u24,
     danger: u24,
+    /// Rules and box edges. Darker than the faintest text: a border is meant to
+    /// be found when looked for and ignored otherwise.
+    border: u24,
     /// Selected text: the ink and the ground swap, the way a terminal's own
     /// selection reads.
     selection_bg: u24,
@@ -72,6 +75,7 @@ pub var success = rgb(0x9ece6a);
 pub var warning = rgb(0xe0af68);
 pub var danger = rgb(0xf7768e);
 
+pub var border = rgb(0x34363f);
 pub var selection_bg = rgb(0xa9b1c6);
 
 pub var diff_added_bg = rgb(0x1c2a1e);
@@ -98,6 +102,7 @@ pub fn apply(palette: Palette) void {
     success = rgb(palette.success);
     warning = rgb(palette.warning);
     danger = rgb(palette.danger);
+    border = rgb(palette.border);
     selection_bg = rgb(palette.selection_bg);
     diff_added_bg = rgb(palette.diff_added_bg);
     diff_removed_bg = rgb(palette.diff_removed_bg);
@@ -111,6 +116,11 @@ pub fn apply(palette: Palette) void {
 /// A style on the app background.
 pub fn on_bg(color: Color) Style {
     return .{ .cell = .{ .fg = color, .bg = bg } };
+}
+
+/// A style on whichever ground the caller is painting.
+pub fn on(background: Color, color: Color) Style {
+    return .{ .cell = .{ .fg = color, .bg = background } };
 }
 
 /// A style on a raised surface.
