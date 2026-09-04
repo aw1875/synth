@@ -42,6 +42,13 @@ pub const ToolCall = struct {
     result: ?[]const u8 = null,
     /// Full length of `result` in bytes, or 0 when there is no result.
     result_bytes: u64 = 0,
+    /// How long the call took, once it has finished. Null while it is waiting,
+    /// running, or was rejected without ever running.
+    elapsed_ms: ?u64 = null,
+    /// When it started, on the monotonic clock. Memory only: a run that ends
+    /// with the app still has an answer, and one that does not has no duration
+    /// worth keeping.
+    started_ms: ?i64 = null,
 
     /// A unique id for a call whose provider supplied none.
     ///
@@ -84,6 +91,20 @@ pub const ToolCall = struct {
             };
         }
     };
+
+    /// Start the clock on a call about to run.
+    pub fn begin(self: *ToolCall, now_ms: i64) void {
+        self.status = .running;
+        self.started_ms = now_ms;
+    }
+
+    /// Stop it, keeping how long the call took. A call that never started has
+    /// no duration to keep, which is what a rejected one is.
+    pub fn settle(self: *ToolCall, status: Status, now_ms: i64) void {
+        self.status = status;
+        if (self.started_ms) |at| self.elapsed_ms = @intCast(@max(0, now_ms - at));
+        self.started_ms = null;
+    }
 
     pub fn deinit(self: *ToolCall, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -290,6 +311,8 @@ pub fn append(self: *Conversation, msg: Message) !*Message {
                 .status = call.status,
                 .result = if (call.result) |result| try self.allocator.dupe(u8, result) else null,
                 .result_bytes = call.result_bytes,
+                .elapsed_ms = call.elapsed_ms,
+                .started_ms = call.started_ms,
             };
             built += 1;
         }
@@ -656,4 +679,24 @@ test "a small attachment is left alone whatever the budget" {
     const kept = convo.messages.items[0].attachments[0];
     try std.testing.expectEqualStrings("two lines\nof it\n", kept.content);
     try std.testing.expect(!kept.shortened());
+}
+
+test "a call keeps how long it took, and only once it has run" {
+    const testing = std.testing;
+
+    var call: ToolCall = .{ .id = "", .name = "", .arguments = "" };
+    try testing.expect(call.elapsed_ms == null);
+
+    call.begin(1_000);
+    try testing.expectEqual(ToolCall.Status.running, call.status);
+    try testing.expect(call.elapsed_ms == null);
+
+    call.settle(.ok, 1_250);
+    try testing.expectEqual(@as(?u64, 250), call.elapsed_ms);
+    try testing.expect(call.started_ms == null);
+
+    // Rejected without running, so there is no duration to report.
+    var refused: ToolCall = .{ .id = "", .name = "", .arguments = "" };
+    refused.settle(.rejected, 9_000);
+    try testing.expect(refused.elapsed_ms == null);
 }

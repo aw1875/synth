@@ -44,6 +44,8 @@ result: ?[]const u8 = null,
 /// than its own name.
 note: ?[]const u8 = null,
 status: Conversation.ToolCall.Status = .pending,
+/// How long the call took, once it has finished. Null while it is still going.
+elapsed_ms: ?u64 = null,
 /// Line the diff starts at in the file, resolved by the app from the file on
 /// disk. 1 when it could not be worked out.
 start_line: usize = 1,
@@ -138,7 +140,7 @@ pub fn draw(self: *ToolCard, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw
     });
     w.fill(surface, theme.base.cell);
     drawRule(surface, height);
-    self.drawHeader(surface, width, try summarize(ctx.arena, self.name, self.arguments));
+    self.drawHeader(ctx.arena, surface, width, try summarize(ctx.arena, self.name, self.arguments));
 
     if (body.len == 0) return surface;
 
@@ -205,12 +207,12 @@ fn drawBox(surface: vxfw.Surface, top: u16, rows: u16, width: u16) void {
 
 /// The one line a call reads as: a dot for how it went, what it did, and to
 /// what. `target` is the argument worth showing, already summarized.
-fn drawHeader(self: *ToolCard, surface: vxfw.Surface, width: u16, target: []const u8) void {
+fn drawHeader(self: *ToolCard, arena: std.mem.Allocator, surface: vxfw.Surface, width: u16, target: []const u8) void {
     const style = theme.on_bg(theme.fg);
     var col = w.writeText(surface, text_col, 0, dot, style.withFg(self.accentColor()).cell);
     col = w.writeText(surface, col + 1, 0, self.name, style.bold().cell);
 
-    const trailing = self.trailingText();
+    const trailing = self.trailingText(arena);
     const room = width -| (col + 2 + @as(u16, @intCast(w.textWidth(trailing))));
     if (target.len > 0 and room > 0) {
         col = w.writeText(surface, col + 1, 0, clip(target, room), style.withFg(theme.fg_muted).cell);
@@ -221,21 +223,22 @@ fn drawHeader(self: *ToolCard, surface: vxfw.Surface, width: u16, target: []cons
     if (at > col) _ = w.writeText(surface, at, 0, trailing, style.withFg(theme.fg_dim).cell);
 }
 
-/// What sits at the far right of the header: what the call is doing while it
-/// runs, and the hint while the pointer is over it. Right-aligned, where a
-/// duration will go once a call records one.
-fn trailingText(self: *const ToolCard) []const u8 {
+/// What sits at the far right of the header: how long the call took once it is
+/// over, what it is doing while it is not, and the hint under the pointer.
+fn trailingText(self: *const ToolCard, arena: std.mem.Allocator) []const u8 {
     if (self.has_mouse) {
         if (self.open != null) return "click to open transcript";
         if (self.result != null or self.capped) {
             return if (self.expanded) "click to collapse" else "click to expand";
         }
     }
-    return switch (self.status) {
-        .running => "running...",
-        .pending => "waiting...",
-        else => "",
-    };
+    switch (self.status) {
+        .running => return "running...",
+        .pending => return "waiting...",
+        else => {},
+    }
+    const ms = self.elapsed_ms orelse return "";
+    return w.duration(arena, ms) catch "";
 }
 
 /// An `edit` or `write` call: the header names the file, and the box below it
@@ -265,7 +268,7 @@ fn drawDiff(
     });
     w.fill(surface, theme.base.cell);
     drawRule(surface, height);
-    self.drawHeader(surface, width, change.path);
+    self.drawHeader(ctx.arena, surface, width, change.path);
     drawBox(surface, box_row, rows + failure, width);
 
     diff.draw(surface, body, .{
@@ -773,4 +776,34 @@ test "a call hangs off a rule one level in from the reply that made it" {
     for (0..w.nest) |col| {
         try testing.expectEqualStrings(" ", surface.buffer[col].char.grapheme);
     }
+}
+
+
+test "a finished call reports how long it took, in place of what it was doing" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const width: u16 = 60;
+    var card: ToolCard = .{ .name = "read", .arguments = "{}", .result = "x", .status = .ok, .elapsed_ms = 200 };
+
+    const done = try rowText(arena, try card.draw(drawContext(arena, width)), 0);
+    try testing.expect(std.mem.endsWith(u8, done, "200ms"));
+
+    // Right-aligned, in the column the running state used.
+    const surface = try card.draw(drawContext(arena, width));
+    try testing.expectEqualStrings("2", surface.buffer[width - "200ms".len - 1].char.grapheme);
+
+    // While it is still going there is no duration to report yet.
+    card.status = .running;
+    card.elapsed_ms = null;
+    const going = try rowText(arena, try card.draw(drawContext(arena, width)), 0);
+    try testing.expect(std.mem.endsWith(u8, going, "running..."));
+
+    // A call the user refused never ran, so it says nothing at all.
+    card.status = .rejected;
+    const refused = try rowText(arena, try card.draw(drawContext(arena, width)), 0);
+    try testing.expect(std.mem.endsWith(u8, refused, "read"));
 }

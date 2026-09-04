@@ -23,6 +23,7 @@ const Registry = @import("../tools/registry.zig");
 const image = @import("../core/image.zig");
 const skill = @import("../core/skill.zig");
 const tool = @import("../tools/tool.zig");
+const widget_pool = @import("widget_pool.zig");
 const Approval = @import("approval.zig");
 const AttachmentCard = @import("attachment_card.zig");
 const Attachments = @import("attachments.zig");
@@ -1196,7 +1197,7 @@ test "a finishing subagent hands its reader over to the stored transcript" {
     const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
 
     const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
-    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "ok", "done", 4);
+    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "ok", "done", 4, null);
 
     var child: Subagent.Child = .{
         .agent = "task",
@@ -1270,7 +1271,7 @@ test "a task card only offers its transcript once the call has settled" {
 
     const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
     const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
-    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "running", null, 0);
+    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "running", null, 0, null);
 
     const key = model.widgetKey(msg.seq, 0);
 
@@ -1295,13 +1296,13 @@ test "a resumed session still offers the transcripts it stored" {
     // An earlier run, plus a second session whose seqs start over at the same numbers.
     const earlier = try db.createSession(project, "/repo", "model");
     const earlier_msg = try db.appendMessage(earlier, 0, "assistant", "", null, 0);
-    const earlier_call = try db.appendToolCall(earlier_msg, 0, "c", "task", "{}", "ok", "done", 4);
+    const earlier_call = try db.appendToolCall(earlier_msg, 0, "c", "task", "{}", "ok", "done", 4, null);
     const earlier_child = try db.createSubagentSession(project, "/repo", "model", earlier, earlier_call);
     _ = try db.appendMessage(earlier_child, 0, "assistant", "the earlier answer", null, 0);
 
     const resumed = try db.createSession(project, "/repo", "model");
     const resumed_msg = try db.appendMessage(resumed, 0, "assistant", "", null, 0);
-    const resumed_call = try db.appendToolCall(resumed_msg, 0, "c", "task", "{}", "ok", "done", 4);
+    const resumed_call = try db.appendToolCall(resumed_msg, 0, "c", "task", "{}", "ok", "done", 4, null);
     const resumed_child = try db.createSubagentSession(project, "/repo", "model", resumed, resumed_call);
     _ = try db.appendMessage(resumed_child, 0, "assistant", "the resumed answer", null, 0);
 
@@ -1347,7 +1348,7 @@ test "a subagent transcript takes over the view, and ctrl+b gives it back" {
     const project = try db.resolveProject("/repo", "git", "repo");
     const parent = try db.createSession(project, "/repo", "model");
     const message = try db.appendMessage(parent, 0, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8, null);
     const child = try db.createSubagentSession(project, "/repo", "model", parent, call);
     _ = try db.appendMessage(child, 0, "user", "where is the parser", null, 0);
     _ = try db.appendMessage(child, 1, "assistant", "src/parse.zig:40", null, 0);
@@ -1540,7 +1541,7 @@ test "a cleared session forgets the subagents the old one left" {
     const project = try db.resolveProject("/repo", "git", "repo");
     const parent = try db.createSession(project, "/repo", "model");
     const message = try db.appendMessage(parent, 0, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8, null);
     const child = try db.createSubagentSession(project, "/repo", "model", parent, call);
     _ = try db.appendMessage(child, 0, "user", "where is the parser", null, 0);
 
@@ -1571,4 +1572,39 @@ test "a cleared session forgets the subagents the old one left" {
     try testing.expectEqual(&model.conversation, model.shown());
     try testing.expectEqual(@as(usize, 0), model.subagent_sessions.count());
     try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);
+}
+
+test "a card is handed the duration the call it draws recorded" {
+    const testing = std.testing;
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+        .cwd = try testing.allocator.dupe(u8, "/repo"),
+        .cwd_display = try testing.allocator.dupe(u8, "/repo"),
+    };
+    try model.wire();
+    defer model.deinit();
+
+    var calls = [_]Conversation.ToolCall{.{
+        .id = "c0",
+        .name = "read",
+        .arguments = "{}",
+        .status = .ok,
+        .elapsed_ms = 250,
+    }};
+    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
+
+    const card = try widget_pool.toolCard(&model, msg, 0, &msg.tool_calls[0]);
+    try testing.expectEqual(@as(?u64, 250), card.elapsed_ms);
+
+    // Refreshed every frame, so a call still running clears what it had.
+    msg.tool_calls[0].elapsed_ms = null;
+    msg.tool_calls[0].status = .running;
+    const again = try widget_pool.toolCard(&model, msg, 0, &msg.tool_calls[0]);
+    try testing.expect(again.elapsed_ms == null);
 }
