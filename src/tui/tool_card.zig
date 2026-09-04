@@ -32,7 +32,7 @@ const box_margin: u16 = 1;
 /// Row the box starts on: below the header, clear of the margin.
 const box_row: u16 = 1 + box_margin;
 /// How a call reports itself: one mark, coloured by how it went.
-const dot = "\u{25cf}";
+const dot = w.dot;
 
 /// Borrowed from the conversation and refreshed every frame, since the
 /// conversation owns this memory and may have reallocated it.
@@ -146,9 +146,9 @@ pub fn draw(self: *ToolCard, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw
 
     drawBox(surface, box_row, @intCast(body.len), width);
     const body_style = if (self.status == .failed)
-        theme.on(theme.surface_alt, theme.danger)
+        theme.on(theme.surface, theme.danger)
     else
-        theme.on(theme.surface_alt, theme.fg_muted);
+        theme.on(theme.surface, theme.fg_muted);
 
     for (body, 0..) |line, i| {
         const row: u16 = box_row + 1 + @as(u16, @intCast(i));
@@ -176,33 +176,12 @@ fn drawRule(surface: vxfw.Surface, height: u16) void {
 /// centred in its cell, so the half of that cell facing the contents is painted
 /// too: on the app's ground it reads as a gap between the box and its edge.
 fn drawBox(surface: vxfw.Surface, top: u16, rows: u16, width: u16) void {
-    const right = width -| 1;
-    if (right <= text_col) return;
-
-    const edge = theme.on(theme.surface_alt, theme.border).cell;
-    const inner = theme.on(theme.surface_alt, theme.fg_muted).cell;
-    const bottom = top + rows + 1;
-
-    for (0..rows + 2) |i| {
-        const row = top + @as(u16, @intCast(i));
-        w.fillRow(surface, row, text_col, width -| text_col, inner);
-
-        const corners: [2][]const u8, const span: []const u8 = if (row == top)
-            .{ .{ "\u{250c}", "\u{2510}" }, "\u{2500}" }
-        else if (row == bottom)
-            .{ .{ "\u{2514}", "\u{2518}" }, "\u{2500}" }
-        else
-            .{ .{ "\u{2502}", "\u{2502}" }, "" };
-
-        surface.writeCell(text_col, row, .{ .char = .{ .grapheme = corners[0], .width = 1 }, .style = edge });
-        surface.writeCell(right, row, .{ .char = .{ .grapheme = corners[1], .width = 1 }, .style = edge });
-        if (span.len == 0) continue;
-
-        var col = text_col + 1;
-        while (col < right) : (col += 1) {
-            surface.writeCell(col, row, .{ .char = .{ .grapheme = span, .width = 1 }, .style = edge });
-        }
-    }
+    w.box(
+        surface,
+        .{ .top = top, .left = text_col, .rows = rows, .width = width -| text_col },
+        theme.on(theme.surface, theme.fg_muted).cell,
+        theme.border,
+    );
 }
 
 /// The one line a call reads as: a dot for how it went, what it did, and to
@@ -277,7 +256,7 @@ fn drawDiff(
         .col = text_col + 1,
         .width = body_width,
         .max_rows = cap,
-        .background = theme.on(theme.surface_alt, theme.fg).cell,
+        .background = theme.on(theme.surface, theme.fg).cell,
     });
 
     if (failure > 0) {
@@ -286,7 +265,7 @@ fn drawDiff(
             body_col,
             box_row + rows + failure,
             clip(try oneLine(ctx.arena, self.result.?), body_width),
-            theme.on(theme.surface_alt, theme.danger).cell,
+            theme.on(theme.surface, theme.danger).cell,
         );
     }
 
@@ -581,7 +560,7 @@ test "the frame carries the box's ground, not the app's" {
     for (box_row..surface.size.height - box_margin) |row| {
         for ([_]u16{ text_col, width - 1 }) |col| {
             const cell = surface.buffer[row * width + col];
-            try testing.expectEqual(theme.surface_alt, cell.style.bg);
+            try testing.expectEqual(theme.surface, cell.style.bg);
             try testing.expectEqual(theme.border, cell.style.fg);
         }
     }
@@ -645,8 +624,8 @@ test "the header sits on the app's ground, the boxed output on the raised one" {
     try testing.expectEqual(theme.bg, surface.buffer[width - 1].style.bg);
     // Sampled inside the box but past the output, so the fill is what set it.
     const first = (box_row + 1) * width;
-    try testing.expectEqual(theme.surface_alt, surface.buffer[first + width - 2].style.bg);
-    try testing.expectEqual(theme.surface_alt, surface.buffer[first + body_col].style.bg);
+    try testing.expectEqual(theme.surface, surface.buffer[first + width - 2].style.bg);
+    try testing.expectEqual(theme.surface, surface.buffer[first + body_col].style.bg);
 
     // The margin outside the box stays the app's ground on every row.
     for (0..surface.size.height) |row| {
@@ -730,7 +709,7 @@ test "the box has no ground of its own showing between its edge and its contents
 
         // Squared off: every row reaches the same first and last column.
         for (box_row..surface.size.height - box_margin) |row| {
-            try testing.expectEqual(theme.surface_alt, surface.buffer[row * width + text_col].style.bg);
+            try testing.expectEqual(theme.surface, surface.buffer[row * width + text_col].style.bg);
             try testing.expect(!std.meta.eql(surface.buffer[row * width + width - 1].style.bg, theme.bg));
             try testing.expectEqual(theme.bg, surface.buffer[row * width + text_col - 1].style.bg);
         }
@@ -739,7 +718,7 @@ test "the box has no ground of its own showing between its edge and its contents
     // The tint is the code column's; the gutter keeps the box's own ground.
     const surface = try cards[0].draw(drawContext(arena, width));
     const row = (box_row + 1) * width;
-    try testing.expectEqual(theme.surface_alt, surface.buffer[row + text_col + 1].style.bg);
+    try testing.expectEqual(theme.surface, surface.buffer[row + text_col + 1].style.bg);
     try testing.expectEqual(theme.diff_removed_bg, surface.buffer[row + width - 2].style.bg);
 
     // With no unpainted column left between the code and the box around it.

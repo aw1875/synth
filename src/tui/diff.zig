@@ -581,7 +581,7 @@ test "side by side rules off the gutters and the two halves" {
 
     const width: u16 = min_side_by_side_width + 20;
     const body = try rows(arena, "old line\n", "new line\n", 1);
-    const ground: Cell.Style = .{ .fg = theme.fg, .bg = theme.surface_alt };
+    const ground: Cell.Style = .{ .fg = theme.fg, .bg = theme.surface };
     const surface = try vxfw.Surface.init(arena, widget, .{ .width = width, .height = 1 });
     w.fill(surface, ground);
     draw(surface, body, .{ .arena = arena, .row = 0, .col = 0, .width = width, .background = ground });
@@ -591,7 +591,7 @@ test "side by side rules off the gutters and the two halves" {
     for (0..width) |col| {
         const cell = surface.buffer[col];
         if (std.mem.eql(u8, cell.char.grapheme, w.solid_rule)) rules += 1;
-        if (!std.meta.eql(cell.style.bg, theme.surface_alt)) tinted += 1;
+        if (!std.meta.eql(cell.style.bg, theme.surface)) tinted += 1;
     }
 
     // One down each gutter, and one between the halves.
@@ -603,5 +603,5 @@ test "side by side rules off the gutters and the two halves" {
 
     // The gutter naming the line is never tinted, so the number reads as fact.
     const numbers = numberWidth(body);
-    try testing.expectEqual(theme.surface_alt, surface.buffer[3 + numbers].style.bg);
+    try testing.expectEqual(theme.surface, surface.buffer[3 + numbers].style.bg);
 }

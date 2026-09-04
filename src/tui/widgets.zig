@@ -54,6 +54,67 @@ pub const dashed_rule = "\u{2506}";
 /// what the reader wrote is where the transcript starts, not something the
 /// rows below hang off.
 pub const prompt_mark = "\u{203a}";
+/// A status light: what a call did, or which session is in front of you.
+pub const dot = "\u{25cf}";
+/// What joins two facts written on one line.
+pub const separator = " \u{00b7} ";
+
+/// A hairline box: where it sits, and how big its inside is.
+pub const Box = struct {
+    top: u16,
+    left: u16,
+    /// Rows inside the box. Its drawn height is two more than this.
+    rows: u16,
+    /// Drawn width, borders included.
+    width: u16,
+};
+
+/// Outline `area` in single-width box-drawing glyphs and paint its inside.
+///
+/// The glyphs are drawn on `ground` rather than on whatever is behind them: a
+/// rule is centred in its cell, so a border on one ground beside an inside on
+/// another shows a seam down the middle of every edge cell.
+pub fn box(surface: vxfw.Surface, area: Box, ground: Cell.Style, edge: Cell.Color) void {
+    const right = area.left + area.width -| 1;
+    if (right <= area.left) return;
+
+    const line = Cell.Style{ .fg = edge, .bg = ground.bg };
+    const bottom = area.top + area.rows + 1;
+
+    for (0..area.rows + 2) |i| {
+        const row = area.top + @as(u16, @intCast(i));
+        fillRow(surface, row, area.left, area.width, ground);
+
+        const corners: [2][]const u8, const span: []const u8 = if (row == area.top)
+            .{ .{ "\u{250c}", "\u{2510}" }, "\u{2500}" }
+        else if (row == bottom)
+            .{ .{ "\u{2514}", "\u{2518}" }, "\u{2500}" }
+        else
+            .{ .{ "\u{2502}", "\u{2502}" }, "" };
+
+        surface.writeCell(area.left, row, .{ .char = .{ .grapheme = corners[0], .width = 1 }, .style = line });
+        surface.writeCell(right, row, .{ .char = .{ .grapheme = corners[1], .width = 1 }, .style = line });
+        if (span.len == 0) continue;
+
+        var col = area.left + 1;
+        while (col < right) : (col += 1) {
+            surface.writeCell(col, row, .{ .char = .{ .grapheme = span, .width = 1 }, .style = line });
+        }
+    }
+}
+
+/// A horizontal hairline, the width of what it divides.
+pub fn rule(surface: vxfw.Surface, row: u16, col: u16, width: u16, style: Cell.Style) void {
+    if (row >= surface.size.height) return;
+    const end = @min(col + width, surface.size.width);
+    var x = col;
+    while (x < end) : (x += 1) {
+        surface.writeCell(x, row, .{
+            .char = .{ .grapheme = "\u{2500}", .width = 1 },
+            .style = style,
+        });
+    }
+}
 
 pub const PanelOptions = struct {
     /// Background/foreground of the panel itself.

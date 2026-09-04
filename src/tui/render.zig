@@ -14,6 +14,7 @@ const Conversation = @import("../core/conversation.zig");
 const humanize = @import("../core/humanize.zig");
 const agents = @import("../agent/agent.zig");
 const Model = @import("model.zig");
+const Project = @import("../core/project.zig");
 const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
@@ -43,38 +44,44 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     w.fill(root, theme.base.cell);
     if (max.width == 0 or max.height == 0) return root;
 
-    var children: std.ArrayList(vxfw.SubSurface) = .empty;
+    // The title row and the rule under it, which the frame starts below.
+    const title_h: u16 = 2;
 
     const sidebar_w: u16 = if (max.width >= Model.sidebar_min_term_width) Model.sidebar_width else 0;
     const main_w = max.width - sidebar_w;
     self.sidebar_col = if (sidebar_w > 0) main_w else max.width;
-    const content_h = max.height -| 3;
     const column_w = main_w -| (Model.gutter * 2);
 
-    if (column_w > 0 and content_h > 0) {
-        const prompt = if (self.loop.state == .awaiting_approval)
-            try drawApproval(self, ctx, column_w)
-        else
-            try drawPrompt(self, ctx, column_w);
-        const prompt_row = content_h -| prompt.size.height;
-        try children.append(ctx.arena, .{
-            .origin = .{ .row = @intCast(prompt_row), .col = Model.gutter },
-            .surface = prompt,
-        });
+    // The composer spans the frame, so its rule reads as the frame's own edge.
+    const approving = self.loop.state == .awaiting_approval;
+    const bottom = if (approving)
+        try drawApproval(self, ctx, column_w)
+    else
+        try drawPrompt(self, ctx, max.width);
+    const bottom_col: u16 = if (approving) Model.gutter else 0;
 
-        if (self.input_cursor) |cursor| {
-            root.cursor = .{
-                .row = prompt_row + cursor.row,
-                .col = Model.gutter + cursor.col,
-                .shape = cursor.shape,
-            };
-        }
+    const body_h = max.height -| (title_h + bottom.size.height);
 
+    var children: std.ArrayList(vxfw.SubSurface) = .empty;
+
+    try children.append(ctx.arena, .{
+        .origin = .{ .row = @intCast(title_h + body_h), .col = @intCast(bottom_col) },
+        .surface = bottom,
+    });
+
+    if (self.input_cursor) |cursor| {
+        root.cursor = .{
+            .row = title_h + body_h + cursor.row,
+            .col = bottom_col + cursor.col,
+            .shape = cursor.shape,
+        };
+    }
+
+    if (column_w > 0 and body_h > 0) {
         if (self.slash.isOpen()) {
             const popup = try self.slash.draw(ctx, self.plainWidget(), column_w);
-            const popup_row = prompt_row -| popup.size.height;
             try children.append(ctx.arena, .{
-                .origin = .{ .row = @intCast(popup_row), .col = Model.gutter },
+                .origin = .{ .row = @intCast(title_h + (body_h -| popup.size.height)), .col = Model.gutter },
                 .surface = popup,
                 .z_index = 1,
             });
@@ -82,29 +89,27 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
 
         if (self.mentions.isOpen()) {
             const popup = try self.mentions.draw(ctx, self.plainWidget(), column_w);
-            const popup_row = prompt_row -| popup.size.height;
             try children.append(ctx.arena, .{
-                .origin = .{ .row = @intCast(popup_row), .col = Model.gutter },
+                .origin = .{ .row = @intCast(title_h + (body_h -| popup.size.height)), .col = Model.gutter },
                 .surface = popup,
                 .z_index = 1,
             });
         }
 
-        const transcript_h = prompt_row -| Model.block_gap;
-        if (try drawTranscript(self, ctx, column_w, transcript_h)) |transcript| {
+        if (try drawTranscript(self, ctx, column_w, body_h -| Model.block_gap)) |transcript| {
             try children.append(ctx.arena, .{
-                .origin = .{ .row = 0, .col = Model.gutter },
+                .origin = .{ .row = title_h, .col = Model.gutter },
                 .surface = transcript,
             });
         }
     }
 
-    if (max.height > 0) drawStatusBar(self, ctx, root, main_w, max.height - 2);
+    drawTitleBar(self, ctx, root, max.width);
 
     if (sidebar_w > 0) {
-        const sidebar = try drawSidebar(self, ctx, sidebar_w, max.height);
+        const sidebar = try drawSidebar(self, ctx, sidebar_w, body_h);
         try children.append(ctx.arena, .{
-            .origin = .{ .row = 0, .col = @intCast(main_w) },
+            .origin = .{ .row = title_h, .col = @intCast(main_w) },
             .surface = sidebar,
         });
     }
@@ -171,11 +176,11 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
         root.cursor = dialog.cursor;
     }
 
-    if (column_w > 0 and content_h > 0) {
-        const area: vxfw.Size = .{ .width = column_w, .height = content_h };
+    if (column_w > 0 and body_h > 0) {
+        const area: vxfw.Size = .{ .width = column_w, .height = body_h };
         for (try self.notification.draw(ctx, area)) |toast| {
             try children.append(ctx.arena, .{
-                .origin = .{ .row = toast.origin.row, .col = Model.gutter + toast.origin.col },
+                .origin = .{ .row = title_h + toast.origin.row, .col = Model.gutter + toast.origin.col },
                 .surface = toast.surface,
                 .z_index = 4,
             });
@@ -673,7 +678,7 @@ pub fn messageBlock(self: *Model, ctx: vxfw.DrawContext, msg: Conversation.Messa
         .style = theme.base.cell,
         .left = 1,
         .right = 2,
-        .accent = if (invoked != null) theme.accent_alt else if (mine) theme.accent else theme.accent,
+        .accent = if (invoked != null) theme.accent_alt else if (mine) theme.accent else theme.border,
         .rule = w.solid_rule,
         .mark = if (mine) w.prompt_mark else null,
         .width = width,
@@ -858,15 +863,21 @@ pub fn drawApproval(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surfa
 /// The prompt box: an accent-barred card holding the editable field, with a
 /// provider footer tucked inside the same card.
 pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface {
-    const bar: u16 = 1;
-    const pad_left: u16 = 2;
-    const pad_right: u16 = 2;
-    const text_col = bar + pad_left;
-    const inner = width -| (text_col + pad_right);
+    const text_col = Model.gutter + 2;
 
-    self.input.style = theme.card.cell;
+    const chip = try modeChip(self, ctx.arena);
+    const chip_w = w.textWidth(chip.text);
+    const waiting = if (self.loop.pendingSteering().len > 0)
+        try std.fmt.allocPrint(ctx.arena, "{d} waiting", .{self.loop.pendingSteering().len})
+    else
+        "";
+    const right_w = chip_w + if (waiting.len > 0) w.textWidth(waiting) + 1 else 0;
+
+    self.input.style = theme.base.cell;
     self.input.tokens = self.held.tokens();
-    self.input.token_style = theme.on_card(theme.warning).withBg(theme.surface_alt).cell;
+    self.input.token_style = theme.on_bg(theme.warning).withBg(theme.surface_alt).cell;
+
+    const inner = width -| (text_col + right_w + 1 + Model.gutter);
 
     const rows: u16 = if (inner == 0)
         1
@@ -874,22 +885,21 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
         std.math.clamp(self.input.lineCount(inner), 1, Model.max_input_rows);
     self.input.height = rows;
 
-    const height = 1 + rows + 3;
+    // The rule above it, the rows it takes, and the blank one under it.
+    const height = rows + 2;
 
     var surface = try w.surfaceClamped(ctx.arena, self.input.widget(), .{
         .width = width,
         .height = height,
     });
-    w.fill(surface, theme.card.cell);
-    for (0..height) |row| {
-        surface.writeCell(0, @intCast(row), .{
-            .char = .{ .grapheme = "▌", .width = 1 },
-            .style = theme.on_card(if (self.inSubagent())
-                theme.fg_dim
-            else
-                Model.agentColor(self.loop.agent.id)).cell,
-        });
-    }
+    w.fill(surface, theme.base.cell);
+    w.rule(surface, 0, 0, width, theme.on_bg(theme.border).cell);
+
+    // The mark a sent turn wears, so the composer reads as the next one.
+    _ = w.writeText(surface, Model.gutter, 1, w.prompt_mark, theme.on_bg(if (self.inSubagent())
+        theme.fg_dim
+    else
+        Model.agentColor(self.loop.agent.id)).bold().cell);
 
     self.input_cursor = null;
     if (inner > 0) {
@@ -901,7 +911,7 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
             "Type to queue a message..."
         else
             "Ask anything...    / for commands, @ for files";
-        self.input.placeholder_style = theme.on_card(theme.fg_dim).cell;
+        self.input.placeholder_style = theme.on_bg(theme.fg_dim).cell;
 
         const field = try self.input.draw(ctx.withConstraints(
             .{ .width = inner, .height = rows },
@@ -920,61 +930,85 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
         }
     }
 
-    const footer = height - 2;
-
-    var col = w.writeText(
-        surface,
-        text_col,
-        footer,
-        self.loop.agent.label,
-        theme.on_card(Model.agentColor(self.loop.agent.id)).bold().cell,
-    );
-    col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
-    if (self.provider.model.len > 0) {
-        col = w.writeText(surface, col, footer, self.provider.model, theme.on_card(theme.fg_muted).cell);
-        col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
-    }
-    _ = w.writeText(surface, col, footer, self.provider.name, theme.on_card(theme.fg_muted).cell);
-    if (self.loop.pendingSteering().len > 0) {
-        col = w.writeText(surface, col, footer, " · ", theme.on_card(theme.fg_dim).cell);
-        col = w.writeText(surface, col, footer, try std.fmt.allocPrint(
-            ctx.arena,
-            "{d} waiting",
-            .{self.loop.pendingSteering().len},
-        ), theme.on_card(theme.accent_alt).cell);
+    var col = width -| (Model.gutter + chip_w);
+    if (waiting.len > 0) {
+        _ = w.writeText(surface, col -| (w.textWidth(waiting) + 1), 1, waiting, theme.on_bg(theme.accent_alt).cell);
     }
 
-    const armed = self.quit_confirm.armed(self.io);
-    const carries_image = self.held.imageCount() > 0 or mention.mentionsImage(self.input.text.items);
-    const blind = !self.provider.vision and carries_image;
-    const hint = if (armed)
-        "ctrl+c again to quit"
-    else if (blind)
-        "this model cannot see images · ctrl+o"
-    else
-        "alt+enter to add a line";
-    const hint_style = if (armed or blind)
-        theme.on_card(theme.warning).bold().cell
-    else
-        theme.on_card(theme.fg_dim).cell;
-    w.writeTextRight(surface, footer, pad_right, hint, hint_style);
+    col = w.writeText(surface, col, 1, chip.lead, theme.on_bg(chip.color).cell);
+    _ = w.writeText(surface, col, 1, chip.text[chip.lead.len..], theme.on_bg(theme.fg_dim).cell);
 
     return surface;
 }
 
-/// Bottom status bar: working directory on the left, key hint on the right.
-pub fn drawStatusBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, width: u16, row: u16) void {
-    if (width <= Model.gutter) return;
+/// The chip at the right of the composer: which agent is answering and how to
+/// change it, or whatever the composer needs to say instead.
+const Chip = struct {
+    /// The whole chip, `lead` included.
+    text: []const u8,
+    /// The part set in `color`, which is always what the text starts with.
+    lead: []const u8,
+    color: vaxis.Cell.Color,
+};
 
-    const path = self.cwd_display;
-    const hint = "ctrl+r rename ctrl+c quit";
-    const hint_w = w.textWidth(hint);
-    const path_room = width -| (Model.gutter * 2 + hint_w + 2);
+fn modeChip(self: *Model, arena: std.mem.Allocator) !Chip {
+    if (self.quit_confirm.armed(self.io)) {
+        return .{ .text = "ctrl+c again to quit", .lead = "ctrl+c", .color = theme.warning };
+    }
 
-    _ = w.writeText(root, Model.gutter, row, fitLeft(ctx.arena, path, path_room), theme.on_bg(theme.fg_dim).cell);
+    const carries_image = self.held.imageCount() > 0 or mention.mentionsImage(self.input.text.items);
+    if (!self.provider.vision and carries_image) {
+        return .{ .text = "ctrl+o  this model cannot see images", .lead = "ctrl+o", .color = theme.warning };
+    }
 
-    if (width > hint_w + Model.gutter) {
-        _ = w.writeText(root, width - hint_w - Model.gutter, row, hint, theme.on_bg(theme.fg_dim).cell);
+    const id = self.loop.agent.id;
+    return .{
+        .text = try std.fmt.allocPrint(arena, "{s} mode{s}tab to switch", .{ id, w.separator }),
+        .lead = id,
+        .color = if (self.inSubagent()) theme.fg_dim else Model.agentColor(id),
+    };
+}
+
+/// The top line: which session, where it is, and what is answering.
+///
+/// Everything here is true of the whole run rather than of any one turn, which
+/// is why it sits above the transcript instead of scrolling away inside it.
+pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, width: u16) void {
+    w.rule(root, 1, 0, width, theme.on_bg(theme.border).cell);
+    if (width <= Model.gutter * 2) return;
+    const room = width - Model.gutter * 2;
+
+    const answering = if (self.provider.model.len > 0) self.provider.model else self.provider.name;
+    const answering_w = w.textWidth(answering);
+    const gap = w.textWidth(w.separator);
+
+    // The model gives up its edge before the session gives up any of its own.
+    const right_fits = answering_w > 0 and answering_w + gap < room;
+    const left_room = if (right_fits) room - answering_w - gap else room;
+    const end = Model.gutter + left_room;
+
+    var col = w.writeText(root, Model.gutter, 0, fitRight(projectName(self), left_room), theme.on_bg(theme.fg).bold().cell);
+
+    const branch = if (self.project) |project| project.branch orelse "" else "";
+    const on_branch = if (branch.len > 0)
+        std.fmt.allocPrint(ctx.arena, "on {s}", .{branch}) catch ""
+    else
+        "";
+
+    // The branch takes its room first: a path can be trimmed and still read.
+    const held: u16 = if (on_branch.len > 0) 1 + w.textWidth(on_branch) else 0;
+    const path_room = (end -| col) -| (gap + held);
+    if (path_room > 0 and self.cwd_display.len > 0) {
+        const at = w.writeText(root, col, 0, w.separator, theme.on_bg(theme.fg_dim).cell);
+        col = w.writeText(root, at, 0, fitLeft(ctx.arena, self.cwd_display, path_room), theme.on_bg(theme.fg).cell);
+    }
+
+    if (on_branch.len > 0 and col + held <= end) {
+        col = w.writeText(root, col + 1, 0, on_branch, theme.on_bg(theme.success).cell);
+    }
+
+    if (right_fits) {
+        _ = w.writeText(root, width - Model.gutter - answering_w, 0, answering, theme.on_bg(theme.fg_muted).cell);
     }
 }
 
@@ -1028,15 +1062,10 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16)
         try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{d:.0} tok/s", .{rate}));
     }
 
-    const model_line = if (self.provider.model.len > 0)
-        try std.fmt.allocPrint(ctx.arena, "{s} · {s}", .{ self.provider.model, self.provider.name })
-    else
-        self.provider.name;
-
+    // No model section: the title row carries it now.
     const sections = [_]Section{
         .{ .title = "Context", .lines = context_lines.items },
         .{ .title = "Session", .lines = session_lines.items },
-        .{ .title = "Model", .lines = &.{model_line} },
     };
 
     var row: u16 = 1;
@@ -1483,4 +1512,284 @@ test "your own turn is marked at its head, not down its side" {
     // On the app background, like every other block in the transcript.
     try testing.expectEqual(theme.bg, surface.buffer[0].style.bg);
     try testing.expectEqual(@as(i17, w.nest), surface.children[0].origin.col);
+}
+
+/// One row of a surface as text, for tests.
+fn rowText(arena: std.mem.Allocator, surface: vxfw.Surface, row: u16) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var col: u16 = 0;
+    while (col < surface.size.width) : (col += 1) {
+        const cell = surface.buffer[@as(usize, row) * surface.size.width + col];
+        try out.appendSlice(arena, if (cell.char.grapheme.len == 0) " " else cell.char.grapheme);
+    }
+    return out.items;
+}
+
+/// A model wired up enough to draw chrome against.
+fn chromeFixture(allocator: std.mem.Allocator, userdata: *u8, project: *Project) !Model {
+    var model: Model = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .conversation = .init(allocator),
+        .provider = .{
+            .userdata = userdata,
+            .respond = undefined,
+            .name = "ollama",
+            .model = "qwen3-coder:30b",
+        },
+        .input = .init(allocator),
+        .cwd = try allocator.dupe(u8, "/repo"),
+        .cwd_display = try allocator.dupe(u8, "~/dev/zig/harness"),
+        .project = project,
+        .plain_vtable = .{ .userdata = userdata, .drawFn = undefined },
+    };
+    try model.wire();
+    return model;
+}
+
+
+
+
+
+
+/// A project with a branch, for drawing chrome against.
+fn chromeProject(allocator: std.mem.Allocator, branch: ?[]const u8) !Project {
+    return .{
+        .root = try allocator.dupe(u8, "/repo"),
+        .cwd = try allocator.dupe(u8, "/repo"),
+        .vcs = if (branch == null) .none else .git,
+        .branch = if (branch) |name| try allocator.dupe(u8, name) else null,
+    };
+}
+
+test "the title row names the session, the path, and the branch it is on" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, "fix/flaky-session-test");
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    const width: u16 = 96;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try w.surfaceClamped(arena, model.plainWidget(), .{ .width = width, .height = 2 });
+    w.fill(surface, theme.base.cell);
+    drawTitleBar(&model, ctx, surface, width);
+
+    const row = try rowText(arena, surface, 0);
+    try testing.expect(std.mem.startsWith(u8, std.mem.trimStart(u8, row, " "), "repo"));
+    try testing.expect(std.mem.indexOf(u8, row, "~/dev/zig/harness") != null);
+    try testing.expect(std.mem.indexOf(u8, row, "on fix/flaky-session-test") != null);
+
+    // The backend's name stays out of it: the row says which model, not whose.
+    try testing.expect(std.mem.indexOf(u8, row, "qwen3-coder:30b") != null);
+    try testing.expect(std.mem.indexOf(u8, row, "ollama") == null);
+
+    // Session and path both in the text colour; only the separator is faint.
+    const at = std.mem.indexOf(u8, row, "~/dev").?;
+    try testing.expectEqual(theme.fg, surface.buffer[Model.gutter].style.fg);
+    try testing.expectEqual(theme.fg, surface.buffer[at].style.fg);
+    try testing.expectEqual(theme.fg_dim, surface.buffer[at - 2].style.fg);
+    try testing.expectEqual(theme.success, surface.buffer[std.mem.indexOf(u8, row, "on fix").?].style.fg);
+    try testing.expectEqual(theme.fg_muted, surface.buffer[width - Model.gutter - 1].style.fg);
+
+    // A rule under it, edge to edge, is what divides it from the frame.
+    for (0..width) |col| {
+        const cell = surface.buffer[width + col];
+        try testing.expectEqualStrings("\u{2500}", cell.char.grapheme);
+        try testing.expectEqual(theme.border, cell.style.fg);
+    }
+}
+
+test "the branch keeps its room when the path has to be trimmed" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, "fix/flaky-session-test");
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    const width: u16 = 64;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try w.surfaceClamped(arena, model.plainWidget(), .{ .width = width, .height = 2 });
+    w.fill(surface, theme.base.cell);
+    drawTitleBar(&model, ctx, surface, width);
+
+    // The path is trimmed to make room rather than the branch being dropped.
+    const row = try rowText(arena, surface, 0);
+    try testing.expect(std.mem.indexOf(u8, row, "on fix/flaky-session-test") != null);
+    try testing.expect(std.mem.indexOf(u8, row, marker) != null);
+    try testing.expect(std.mem.indexOf(u8, row, "~/dev/zig/harness") == null);
+}
+
+test "a title row too narrow for everything keeps the session and the model" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, "fix/flaky-session-test");
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    const width: u16 = 34;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try w.surfaceClamped(arena, model.plainWidget(), .{ .width = width, .height = 2 });
+    w.fill(surface, theme.base.cell);
+    drawTitleBar(&model, ctx, surface, width);
+
+    const row = try rowText(arena, surface, 0);
+    try testing.expect(std.mem.indexOf(u8, row, "repo") != null);
+    try testing.expect(std.mem.indexOf(u8, row, "qwen3-coder:30b") != null);
+
+    // Nothing is allowed to run off the edge or wrap onto the frame below.
+    try testing.expect(std.mem.indexOf(u8, row, "on fix") == null);
+    try testing.expect(std.mem.indexOf(u8, row, "~/dev") == null);
+    try testing.expectEqualStrings(" ", surface.buffer[width - 1].char.grapheme);
+}
+
+test "the composer hangs under a rule rather than sitting in a box" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    const width: u16 = 72;
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = width, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try drawPrompt(&model, ctx, width);
+
+    // The rule, the row typed into, and the blank one under it.
+    try testing.expectEqual(@as(u16, 3), surface.size.height);
+
+    for (0..width) |col| {
+        try testing.expectEqualStrings("\u{2500}", surface.buffer[col].char.grapheme);
+        try testing.expectEqual(theme.border, surface.buffer[col].style.fg);
+    }
+
+    // No box: the rule is the only edge the composer has.
+    const typed = try rowText(arena, surface, 1);
+    try testing.expect(std.mem.indexOf(u8, typed, "\u{2502}") == null);
+    try testing.expect(std.mem.indexOf(u8, typed, "\u{250c}") == null);
+
+    // The mark a sent turn wears, in the colour of whichever agent answers.
+    try testing.expectEqualStrings(w.prompt_mark, surface.buffer[width + Model.gutter].char.grapheme);
+    try testing.expectEqual(Model.agentColor(model.loop.agent.id), surface.buffer[width + Model.gutter].style.fg);
+
+    // The mode closes the row, on the same ground as everything else.
+    try testing.expect(std.mem.indexOf(u8, typed, "build mode") != null);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, typed, " "), "tab to switch"));
+    for (0..width) |col| {
+        try testing.expectEqual(theme.bg, surface.buffer[width + col].style.bg);
+    }
+}
+
+test "the frame runs from the title rule down to the composer rule" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    // Something to lay out: with nothing said yet there is no transcript to place.
+    _ = try model.conversation.addUser("hello", &.{}, &.{});
+
+    const size: vxfw.Size = .{ .width = Model.sidebar_min_term_width, .height = 24 };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = size.width, .height = size.height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const root = try draw(&model, ctx);
+
+    // The title is painted onto the root itself, above everything laid out.
+    try testing.expectEqualStrings("\u{2500}", root.buffer[size.width].char.grapheme);
+
+    var composer: ?vxfw.SubSurface = null;
+    for (root.children) |child| {
+        // Everything in the frame starts under the title rule.
+        try testing.expect(child.origin.row >= 2);
+        if (child.origin.col == 0) composer = child;
+    }
+
+    // The composer spans the frame, and the rails stop above its rule.
+    const bottom = composer.?;
+    try testing.expectEqual(@as(u16, size.width), bottom.surface.size.width);
+    try testing.expectEqual(@as(i17, size.height), bottom.origin.row + @as(i17, @intCast(bottom.surface.size.height)));
+
+    for (root.children) |child| {
+        if (child.origin.col != @as(i17, @intCast(size.width - Model.sidebar_width))) continue;
+        try testing.expectEqual(bottom.origin.row, child.origin.row + @as(i17, @intCast(child.surface.size.height)));
+    }
 }

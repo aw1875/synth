@@ -25,9 +25,9 @@ pub const all: []const Theme = &.{
         .id = "synth",
         .label = "Synth",
         .palette = .{
-            .bg = 0x16171c,
-            .surface = 0x1c1e25,
-            .surface_alt = 0x22242c,
+            .bg = 0x1c1e25,
+            .surface = 0x22242c,
+            .surface_alt = 0x3a332e,
             .fg = 0xe7e5dd,
             .fg_muted = 0x8b8e99,
             .fg_dim = 0x5c5f6a,
@@ -366,4 +366,27 @@ test "a theme that colours its diff text says so on both sides" {
         try testing.expectEqual(entry.palette.fg, entry.palette.diff_added_fg);
         try testing.expectEqual(entry.palette.fg, entry.palette.diff_removed_fg);
     }
+}
+
+test "the synth palette is the design's own, variable for variable" {
+    const synth = find("synth").?.palette;
+
+    // --bg-panel: the window. --bg is the page behind it, which a terminal has not got.
+    try std.testing.expectEqual(@as(u24, 0x1c1e25), synth.bg);
+    // --bg-raised: what is lifted off it, dialogs and boxed tool output.
+    try std.testing.expectEqual(@as(u24, 0x22242c), synth.surface);
+    // --sel over that: the row under the cursor, warm rather than lighter.
+    try std.testing.expectEqual(@as(u24, 0x3a332e), synth.surface_alt);
+    try std.testing.expectEqual(@as(u24, 0x34363f), synth.border);
+
+    try std.testing.expectEqual(@as(u24, 0xe7e5dd), synth.fg);
+    try std.testing.expectEqual(@as(u24, 0x8b8e99), synth.fg_muted);
+    try std.testing.expectEqual(@as(u24, 0x5c5f6a), synth.fg_dim);
+
+    // One accent, amber, reserved for what is in progress.
+    try std.testing.expectEqual(@as(u24, 0xe8a33d), synth.accent);
+    try std.testing.expectEqual(@as(u24, 0x5fc9a8), synth.success);
+    try std.testing.expectEqual(@as(u24, 0xe2695b), synth.danger);
+    try std.testing.expectEqual(@as(u24, 0x6fa88c), synth.diff_added_fg);
+    try std.testing.expectEqual(@as(u24, 0xc77b72), synth.diff_removed_fg);
 }
