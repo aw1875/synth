@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const ansi = @import("../core/ansi.zig");
 const ask = @import("ask.zig");
 const filesystem = @import("filesystem.zig");
 const shell = @import("shell.zig");
@@ -85,7 +86,14 @@ pub fn execute(
         scoped.deadline_ms = tool.monotonicMilliseconds(ctx.io) + @as(i64, @intCast(budget));
     }
 
-    return t.handler(scoped, .{ .arguments = arguments });
+    const output = try t.handler(scoped, .{ .arguments = arguments });
+
+    // Every result passes through here, so this is the one place that has to know.
+    if (!ansi.hasControls(output.content)) return output;
+
+    const cleaned = try ansi.clean(ctx.allocator, output.content);
+    ctx.allocator.free(output.content);
+    return .{ .content = cleaned, .is_error = output.is_error };
 }
 
 /// Parse `arguments` as a JSON object, then run. Providers hand tool call
@@ -195,4 +203,37 @@ test "unknown tools and bad arguments come back as errors, not failures" {
     const bad = try registry.executeJson(ctx, "read", "{not json");
     defer std.testing.allocator.free(bad.content);
     try std.testing.expect(bad.is_error);
+}
+
+/// A tool whose output was written for a terminal, for testing what a real one
+/// asked for colour returns.
+fn colourful(ctx: Context, _: tool.Input) anyerror!Output {
+    return Output.ok(try ctx.allocator.dupe(u8, "\x1b[32mok\x1b[0m 3 passed\r\n"));
+}
+
+test "output written for a terminal reaches the caller as text" {
+    var reads: ReadLog = .init(std.testing.allocator);
+    defer reads.deinit();
+
+    var registry = try Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.register(.{
+        .name = "colourful",
+        .description = "",
+        .schema = "{}",
+        .handler = colourful,
+    });
+
+    const ctx: Context = .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .project_root = "/tmp",
+        .reads = &reads,
+    };
+
+    const output = try registry.executeJson(ctx, "colourful", "{}");
+    defer std.testing.allocator.free(output.content);
+
+    try std.testing.expectEqualStrings("ok 3 passed\n", output.content);
 }
