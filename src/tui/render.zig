@@ -11,6 +11,7 @@ const vxfw = vaxis.vxfw;
 const Cell = vaxis.Cell;
 
 const Conversation = @import("../core/conversation.zig");
+const codex_auth = @import("../provider/codex_auth.zig");
 const humanize = @import("../core/humanize.zig");
 const agents = @import("../agent/agent.zig");
 const Model = @import("model.zig");
@@ -923,7 +924,7 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
 
     const armed = self.quit_confirm.armed(self.io);
     const carries_image = self.held.imageCount() > 0 or mention.mentionsImage(self.input.text.items);
-    const blind = !self.provider.vision and carries_image;
+    const blind = !self.provider.supports_vision and carries_image;
     const hint = if (armed)
         "ctrl+c again to quit"
     else if (blind)
@@ -942,6 +943,13 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
 /// Bottom status bar: working directory on the left, key hint on the right.
 pub fn drawStatusBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, width: u16, row: u16) void {
     if (width <= Model.gutter) return;
+
+    if (self.codex_login.activeCode()) |code| {
+        var column = w.writeText(root, Model.gutter, row, "Codex sign-in · code ", theme.on_bg(theme.fg_dim).cell);
+        column = w.writeText(root, column, row, code, theme.on_bg(theme.warning).bold().cell);
+        _ = w.writeText(root, column, row, " · " ++ codex_auth.device_login_url, theme.on_bg(theme.fg_dim).cell);
+        return;
+    }
 
     const path = self.cwd_display;
     const hint = "ctrl+r rename ctrl+c quit";

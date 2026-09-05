@@ -17,6 +17,7 @@ const Config = @import("../core/config.zig");
 const Project = @import("../core/project.zig");
 const mcp_tools = @import("../tools/mcp.zig");
 const catalog = @import("../provider/catalog.zig");
+const codex_auth = @import("../provider/codex_auth.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
@@ -66,8 +67,8 @@ pub const max_measured_blocks: u32 = 4096;
 pub const page_scroll_rows: i32 = 10;
 /// Most rows the prompt box will grow to before it scrolls internally.
 pub const max_input_rows: u16 = 6;
-/// Cap on in-memory transcript messages. Older ones are trimmed and paged back
-/// in from the database when the user scrolls to the top.
+/// Soft cap on in-memory transcript messages. Only summarised history may be
+/// trimmed; the loop compacts before unsummarised history reaches this size.
 const max_transcript_messages: usize = 200;
 /// How many older messages to page in per scroll-to-top.
 const history_page_size: usize = 50;
@@ -100,6 +101,7 @@ const Confirm = struct {
         return true;
     }
 };
+
 /// Queued prompts shown under the transcript before the rest are summarised.
 pub const max_steering_shown: usize = 3;
 
@@ -226,6 +228,8 @@ notification: Notification = undefined,
 /// Where credentials are stored, so connecting a provider can write one.
 /// Borrowed; it outlives the model.
 auth: ?*Auth = null,
+/// Browser sign-in runs off the drawing thread.
+codex_login: codex_auth.Login = undefined,
 /// The client behind `provider`. Borrowed; it outlives the model. Needed
 /// because connecting a provider of another protocol replaces the client, which
 /// the erased `Provider` has no way to do.
@@ -596,6 +600,7 @@ fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
 }
 
 pub fn deinit(self: *Model) void {
+    self.codex_login.deinit();
     self.closeSubagent();
     self.subagent_sessions.deinit(self.allocator);
     self.loop.deinit();
@@ -633,6 +638,7 @@ pub fn deinit(self: *Model) void {
 /// model's fields are initialized.
 /// Build the pieces that need the model's final address, then hook up input.
 pub fn wire(self: *Model) !void {
+    self.codex_login = .init(self.allocator, self.io, self.auth.?);
     self.mentions = .init(self.allocator);
     self.held = .init(self.allocator);
     self.rename = .init(self.allocator);
@@ -889,7 +895,7 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     if (self.loop.session_id) |current| {
         if (current == session_id) return;
     }
-    if (self.loop.isBusy()) try self.loop.cancel();
+    if (self.loop.isBusy()) return;
 
     try self.loop.resumeSession(session_id, resume_messages);
 
@@ -901,6 +907,9 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     try self.seedHistory();
     self.input.clear();
     self.held.clear();
+    self.mentions.close();
+    self.selection.clear();
+    self.reads.clear(self.io);
     self.scroll = 0;
 }
 
@@ -917,6 +926,7 @@ pub fn clearSession(self: *Model) bool {
     self.held.clear();
     self.mentions.close();
     self.selection.clear();
+    self.reads.clear(self.io);
     self.scroll = 0;
     return true;
 }
@@ -1534,6 +1544,8 @@ test "a paste for a one-line field arrives as one line" {
 test "a cleared session forgets the subagents the old one left" {
     const testing = std.testing;
 
+    var auth = Auth.init(testing.allocator, testing.io);
+    defer auth.deinit();
     var db = try Database.init(testing.allocator, testing.io, ":memory:");
     defer db.deinit();
 
@@ -1552,6 +1564,7 @@ test "a cleared session forgets the subagents the old one left" {
         .input = .init(testing.allocator),
         .cwd = try testing.allocator.dupe(u8, "/repo"),
         .cwd_display = try testing.allocator.dupe(u8, "/repo"),
+        .auth = &auth,
     };
     try model.wire();
     defer model.deinit();
@@ -1564,10 +1577,12 @@ test "a cleared session forgets the subagents the old one left" {
     try model.subagent_sessions.put(testing.allocator, key, child);
     try testing.expect(try model.openSubagent(key, 0, 0, "task"));
     try testing.expect(model.inSubagent());
+    try model.reads.record(testing.io, "/repo/old.txt", 1);
 
     try testing.expect(model.clearSession());
 
     try testing.expect(!model.inSubagent());
+    try testing.expect(model.reads.lastRead(testing.io, "/repo/old.txt") == null);
     try testing.expectEqual(&model.conversation, model.shown());
     try testing.expectEqual(@as(usize, 0), model.subagent_sessions.count());
     try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);

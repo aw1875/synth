@@ -15,11 +15,13 @@ pub const Key = enum {
     /// Hosted. Without a key every request is a 401, so the UI says so before
     /// the first turn rather than after it.
     required,
+    /// Browser sign-in; no secret is typed into synth.
+    oauth,
 };
 
 /// Which client answers for a provider: the wire protocol, not the vendor.
 /// `openai` covers every server imitating that API, which is most of them.
-pub const Kind = enum { ollama, openai };
+pub const Kind = enum { ollama, openai, codex };
 
 pub const Entry = struct {
     /// Stable id: the key in `auth.json` and in the config. Never shown.
@@ -38,10 +40,11 @@ pub const Entry = struct {
     kind: Kind = .ollama,
 
     /// Whether this provider has what it needs to be used.
-    pub fn ready(self: Entry, auth: *const Auth) bool {
+    pub fn ready(self: Entry, auth: *Auth) bool {
         return switch (self.key) {
             .optional => true,
             .required => (auth.key(self.id) orelse @as([]const u8, "")).len > 0,
+            .oauth => auth.key(self.id) != null,
         };
     }
 };
@@ -85,6 +88,15 @@ pub const all: []const Entry = &.{
         .key = .optional,
         .kind = .openai,
     },
+    .{
+        .id = "codex",
+        .label = "Codex Subscription",
+        .summary = "ChatGPT plan (browser sign-in)",
+        .host = "https://chatgpt.com/backend-api/codex",
+        .host_editable = false,
+        .key = .oauth,
+        .kind = .codex,
+    },
 };
 
 /// The entry with this id, or null. An id from a config file written by a newer
@@ -115,7 +127,7 @@ pub fn resolve(
     arena: std.mem.Allocator,
     db: *Database,
     config: *const Config,
-    auth: *const Auth,
+    auth: *Auth,
 ) !Active {
     const chosen = try db.activeProvider(arena);
     const entry = findOrDefault(if (config.provider_override.len > 0) config.provider_override else chosen);
@@ -125,6 +137,7 @@ pub fn resolve(
     const from_env: struct { host: []const u8, key: ?[]const u8 } = switch (entry.kind) {
         .ollama => .{ .host = config.host_override, .key = config.api_key },
         .openai => .{ .host = config.openai_host, .key = config.openai_api_key },
+        .codex => .{ .host = "", .key = null },
     };
 
     var host = entry.host;
@@ -141,7 +154,10 @@ pub fn resolve(
         break :blk from_env.key;
     };
 
-    return .{ .entry = entry, .host = host, .model = config.model_override, .api_key = key };
+    const uses_codex_managed_model = entry.kind == .codex;
+    const configured_model = if (uses_codex_managed_model) "" else config.model_override;
+
+    return .{ .entry = entry, .host = host, .model = configured_model, .api_key = key };
 }
 
 test "every provider is findable by the id it stores itself under" {
@@ -160,7 +176,7 @@ test "every provider is findable by the id it stores itself under" {
 test "a hosted provider is not ready until it has a key" {
     const testing = std.testing;
 
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     const local = find("ollama").?;
@@ -210,7 +226,7 @@ test "with nothing chosen, the local server is what answers" {
 
     var config: Config = .{ .arena = .init(testing.allocator) };
     defer config.deinit();
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     const active = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
@@ -230,7 +246,7 @@ test "what the database remembers is what a new run connects to" {
 
     var config: Config = .{ .arena = .init(testing.allocator) };
     defer config.deinit();
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     try fixture.db.setProviderHost("ollama", "http://box:11434");
@@ -261,7 +277,7 @@ test "the environment beats the database, and a stored key beats the config" {
 
     var config: Config = .{ .arena = .init(testing.allocator) };
     defer config.deinit();
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     try fixture.db.setProviderHost("ollama", "http://box:11434");
@@ -301,7 +317,7 @@ test "the environment pair that applies is the one the provider speaks" {
 
     var config: Config = .{ .arena = .init(testing.allocator) };
     defer config.deinit();
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     config.host_override = "http://box:11434";
@@ -324,12 +340,17 @@ test "the environment pair that applies is the one the provider speaks" {
     const hosted = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
     try testing.expectEqualStrings("https://api.openai.com/v1", hosted.host);
     try testing.expectEqualStrings("from-openai-env", hosted.api_key.?);
+
+    config.model_override = "ollama-only";
+    try fixture.db.setActiveProvider("codex");
+    const codex = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings("", codex.model);
 }
 
 test "an OpenAI-compatible server needs no key, and OpenAI itself does" {
     const testing = std.testing;
 
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     const compatible = find("openai-compat").?;

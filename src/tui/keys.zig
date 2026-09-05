@@ -167,6 +167,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         .init => {
             try commands.applyMcp(self, ctx);
             if (self.pending_model_check) try self.scheduleTick(ctx);
+            if (self.backend) |backend| {
+                if (backend.modelsWarming()) try self.scheduleTick(ctx);
+            }
             if (self.mcp) |host| {
                 if (host.connecting()) try self.scheduleTick(ctx);
             }
@@ -213,11 +216,25 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         },
         .tick => {
             self.tick_pending = false;
-            commands.checkModel(self, ctx);
+            if (self.backend) |backend| {
+                if (!self.loop.isBusy()) {
+                    const models_ready = backend.pollModels();
+                    if (models_ready) {
+                        self.loop.syncProvider();
+                        commands.syncProvider(self);
+                        ctx.redraw = true;
+                    }
+                    const refresh_picker = models_ready and self.models.open;
+                    if (refresh_picker) try commands.showModels(self, ctx);
+                }
+                if (backend.modelsWarming()) try self.scheduleTick(ctx);
+            }
+            try commands.pollCodexLogin(self, ctx);
             try commands.applyMcp(self, ctx);
             if (self.mcp) |host| {
                 if (host.connecting()) try self.scheduleTick(ctx);
             }
+            if (self.codex_login.connecting()) try self.scheduleTick(ctx);
             if (self.mentions.poll()) {
                 try self.refreshMentions();
                 ctx.redraw = true;
@@ -226,6 +243,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             const nested = if (self.subagents) |runner| try runner.poll() else false;
             if (nested) self.refreshViewing();
             const changed = try self.loop.poll() or nested;
+            try commands.checkModel(self, ctx);
             if (self.loop.takeHookNotice()) |notice| {
                 defer self.allocator.free(notice);
                 try self.notification.show(ctx, .warn, notice);
@@ -234,9 +252,6 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 widget_pool.pruneWidgets(self);
                 commands.syncProvider(self);
                 self.mentions.invalidate();
-            }
-            if (!self.loop.isBusy() and self.loop.shouldCompact()) {
-                try self.startCompaction(ctx);
             }
             try self.drainSteering(ctx);
             if (!self.loop.isBusy()) self.quit_confirm.reset();
@@ -308,9 +323,14 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 switch (try self.connect.handleKey(ctx, key)) {
                     .none => {},
                     .cancel => self.connect.close(),
+                    .disconnect => |provider_id| {
+                        try commands.disconnectProvider(self, ctx, provider_id);
+                        try commands.showProviders(self);
+                    },
                     .connect => |result| {
-                        try commands.connectProvider(self, result);
+                        try commands.connectProvider(self, ctx, result);
                         self.connect.close();
+                        if (self.codex_login.connecting()) try self.scheduleTick(ctx);
                     },
                 }
                 return ctx.consumeAndRedraw();
@@ -321,7 +341,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.models.close(),
                     .choose => {
-                        if (self.models.selected()) |entry| try commands.switchTo(self, entry);
+                        if (self.models.selected()) |entry| try commands.switchTo(self, ctx, entry);
                         self.models.close();
                     },
                 }
@@ -356,7 +376,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                try commands.showModels(self);
+                try commands.showModels(self, ctx);
                 return ctx.consumeAndRedraw();
             }
 
@@ -420,6 +440,14 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             {
                 try self.loop.cancel();
                 self.thinking.stream = null;
+                try self.scheduleTick(ctx);
+                return ctx.consumeAndRedraw();
+            }
+
+            const pressed_escape = key.matches(vaxis.Key.escape, .{});
+            const canceling_codex_login = pressed_escape and self.codex_login.connecting();
+            if (canceling_codex_login) {
+                self.codex_login.cancel();
                 try self.scheduleTick(ctx);
                 return ctx.consumeAndRedraw();
             }

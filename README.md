@@ -12,8 +12,8 @@ the layout, the tool cards, the slash picker, the modals.
 ## Requirements
 
 - Zig 0.16
-- A model server: [ollama](https://ollama.com), or anything speaking the OpenAI
-  chat API. The model has to support tool calls.
+- A model source: [ollama](https://ollama.com), anything speaking the OpenAI
+  chat API, or a ChatGPT plan with Codex access. The model needs tool calls.
 
 ## Build
 
@@ -39,6 +39,11 @@ With no provider connected it opens the provider picker. Pick one, give it a URL
 and an API key if it needs one, and the key is stored for next time. `ctrl+p`
 reopens that picker later, `ctrl+o` switches models across every connected
 provider.
+
+Selecting Codex Subscription starts browser device sign-in;
+synth reuses OpenAI's Codex CLI OAuth client id and model-catalog compatibility
+version, but identifies itself as synth on backend requests. No API key, proxy,
+or Codex installation is required.
 
 ## Commands
 
@@ -103,7 +108,7 @@ Three files, split by what they hold.
 | file | holds | where |
 | --- | --- | --- |
 | `config.json` | what you set by hand | `$XDG_CONFIG_HOME/synth/` |
-| `auth.json` | API keys, one per provider | `$XDG_DATA_HOME/synth/` |
+| `auth.json` | provider API keys and Codex tokens | `$XDG_DATA_HOME/synth/` |
 | `synth.db` | sessions, messages, approvals, the provider and model in use | `$XDG_DATA_HOME/synth/` |
 
 Every `config.json` key is optional. An absent one keeps the built-in default.

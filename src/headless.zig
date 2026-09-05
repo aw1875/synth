@@ -103,6 +103,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .label = active.entry.label,
         .model = active.model,
         .api_key = active.api_key,
+        .auth = &auth,
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
@@ -111,6 +112,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     try backend.start();
     backend.ensureModel() catch {};
+    backend.warmReferenceMetadata(false) catch {};
     const provider = backend.provider();
 
     try out.print("{s}provider{s} {s}  {s}root{s} {s}\n", .{

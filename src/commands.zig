@@ -343,6 +343,7 @@ pub fn models(init_process: std.process.Init) !void {
         .label = active.entry.label,
         .model = active.model,
         .api_key = active.api_key,
+        .auth = &ctx.auth,
     });
     defer backend.deinit();
 

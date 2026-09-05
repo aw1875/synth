@@ -34,6 +34,8 @@ else
 /// Backing storage for every id and key below.
 arena: std.heap.ArenaAllocator,
 entries: std.StringArrayHashMapUnmanaged(Credential) = .empty,
+io: std.Io,
+mutex: std.Io.Mutex = .init,
 /// The file this was read from, and the one `save` writes back to. Empty for a
 /// store built in memory.
 path: []const u8 = "",
@@ -58,8 +60,8 @@ pub fn open(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.
     return load(allocator, io, path);
 }
 
-pub fn init(allocator: std.mem.Allocator) Auth {
-    return .{ .arena = .init(allocator) };
+pub fn init(allocator: std.mem.Allocator, io: std.Io) Auth {
+    return .{ .arena = .init(allocator), .io = io };
 }
 
 pub fn deinit(self: *Auth) void {
@@ -69,7 +71,7 @@ pub fn deinit(self: *Auth) void {
 /// Read `path`. A missing file is an empty store, not an error: a harness that
 /// only talks to a local server never has one.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Auth {
-    var self: Auth = .init(allocator);
+    var self: Auth = .init(allocator, io);
     errdefer self.deinit();
 
     const arena = self.arena.allocator();
@@ -110,21 +112,28 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Auth {
 }
 
 /// The credential for a provider, or null when it has none.
-pub fn get(self: *const Auth, provider_id: []const u8) ?Credential {
+pub fn get(self: *Auth, provider_id: []const u8) ?Credential {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
     return self.entries.get(provider_id);
 }
 
 /// The key for a provider, or null. What every caller actually wants.
-pub fn key(self: *const Auth, provider_id: []const u8) ?[]const u8 {
-    const credential = self.get(provider_id) orelse return null;
+pub fn key(self: *Auth, provider_id: []const u8) ?[]const u8 {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const credential = self.entries.get(provider_id) orelse return null;
     return credential.key;
 }
 
 /// Record a key, replacing whatever was there. An empty key removes the entry
 /// instead: "no credential" is a state worth being able to get back to.
 pub fn set(self: *Auth, provider_id: []const u8, secret: []const u8) !void {
-    if (secret.len == 0) {
-        _ = self.remove(provider_id);
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const removes_credential = secret.len == 0;
+    if (removes_credential) {
+        _ = self.entries.orderedRemove(provider_id);
         return;
     }
 
@@ -135,17 +144,24 @@ pub fn set(self: *Auth, provider_id: []const u8, secret: []const u8) !void {
 }
 
 pub fn remove(self: *Auth, provider_id: []const u8) bool {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
     return self.entries.orderedRemove(provider_id);
 }
 
 /// Write the store to `path`, atomically and owner-only.
-pub fn save(self: *const Auth, io: std.Io, path: []const u8) !void {
+pub fn save(self: *Auth, io: std.Io, path: []const u8) !void {
     const Config = @import("config.zig");
     try Config.ensureDir(io, path);
 
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+
+    var random_bytes: [8]u8 = undefined;
+    io.random(&random_bytes);
+    const temporary_suffix = std.fmt.bytesToHex(random_bytes, .lower);
     var temp_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len + ".tmp".len > temp_buffer.len) return error.NameTooLong;
-    const temp_path = try std.fmt.bufPrint(&temp_buffer, "{s}.tmp", .{path});
+    const temp_path = std.fmt.bufPrint(&temp_buffer, "{s}.{s}.tmp", .{ path, temporary_suffix }) catch return error.NameTooLong;
 
     {
         const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{ .permissions = owner_only });
@@ -154,8 +170,9 @@ pub fn save(self: *const Auth, io: std.Io, path: []const u8) !void {
 
         var buffer: [1024]u8 = undefined;
         var writer = file.writer(io, &buffer);
-        try self.write(&writer.interface);
+        try self.writeJsonUnlocked(&writer.interface);
         try writer.interface.flush();
+        try file.sync(io);
     }
     errdefer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
 
@@ -164,8 +181,14 @@ pub fn save(self: *const Auth, io: std.Io, path: []const u8) !void {
 
 /// Serialize the store. Split out from `save` so a test can read it without
 /// touching a filesystem.
-fn write(self: *const Auth, out: *std.Io.Writer) !void {
-    var json: std.json.Stringify = .{ .writer = out, .options = .{ .whitespace = .indent_2 } };
+fn writeJson(self: *Auth, writer: *std.Io.Writer) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    try self.writeJsonUnlocked(writer);
+}
+
+fn writeJsonUnlocked(self: *const Auth, writer: *std.Io.Writer) !void {
+    var json: std.json.Stringify = .{ .writer = writer, .options = .{ .whitespace = .indent_2 } };
 
     try json.beginObject();
     var it = self.entries.iterator();
@@ -179,7 +202,7 @@ fn write(self: *const Auth, out: *std.Io.Writer) !void {
         try json.endObject();
     }
     try json.endObject();
-    try out.writeByte('\n');
+    try writer.writeByte('\n');
 }
 
 test "a missing auth file is an empty store" {
@@ -205,7 +228,7 @@ test "credentials survive a save and a load" {
     defer testing.allocator.free(path);
 
     {
-        var auth: Auth = .init(testing.allocator);
+        var auth: Auth = .init(testing.allocator, testing.io);
         defer auth.deinit();
         try auth.set("ollama-cloud", "sk-secret");
         try auth.save(io, path);
@@ -228,7 +251,7 @@ test "credentials survive a save and a load" {
 test "the file is the shape it says it is" {
     const testing = std.testing;
 
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     try auth.set("ollama", "local-key");
@@ -236,7 +259,7 @@ test "the file is the shape it says it is" {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try auth.write(&out.writer);
+    try auth.writeJson(&out.writer);
 
     try testing.expectEqualStrings(
         \\{
@@ -256,7 +279,7 @@ test "the file is the shape it says it is" {
 test "an empty key clears the entry rather than storing a blank one" {
     const testing = std.testing;
 
-    var auth: Auth = .init(testing.allocator);
+    var auth: Auth = .init(testing.allocator, testing.io);
     defer auth.deinit();
 
     try auth.set("ollama-cloud", "sk-secret");

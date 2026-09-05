@@ -441,6 +441,14 @@ pub fn appendBlob(
     , .{ message_id, seq, kind, body });
 }
 
+/// Remove private provider replay data after the provider reports it expired.
+pub fn deleteProviderStateForSession(self: *Database, session_id: i64) !void {
+    try self.conn.exec(
+        "DELETE FROM blob WHERE kind = 'provider_state' AND message_id IN (SELECT id FROM message WHERE session_id = ?)",
+        .{session_id},
+    );
+}
+
 /// Append one file a message carried: an `@path` mention, or the instructions
 /// a skill was invoked with.
 pub fn appendAttachment(
@@ -743,6 +751,16 @@ pub fn toolCallId(self: *Database, message_id: i64, seq: i64) !?i64 {
     return row.int(0);
 }
 
+/// Messages needed to continue, including the latest compaction checkpoint.
+pub fn contextMessageCount(self: *Database, session_id: i64) !usize {
+    const row = try self.conn.row(
+        \\SELECT COUNT(*) FROM message WHERE session_id = ? AND seq >= COALESCE(
+        \\  (SELECT MAX(seq) FROM message WHERE session_id = ? AND role = 'system'), 0)
+    , .{ session_id, session_id }) orelse return 0;
+    defer row.deinit();
+    return @intCast(row.int(0));
+}
+
 /// Load up to `limit` messages with `seq < before_seq`, in descending order
 /// (newest first), along with their tool calls and reasoning previews. The
 /// caller reverses them before prepending. Owned by the caller; free each
@@ -797,6 +815,7 @@ pub fn loadMessages(
                 msg.thinking = preview;
             }
         }
+        msg.provider_state = try self.loadBlob(allocator, id, 0, "provider_state");
 
         msg.tool_calls = try self.loadToolCalls(allocator, id);
         msg.attachments = try self.loadAttachments(allocator, id);
@@ -959,8 +978,8 @@ pub const Policy = struct {
     /// messages, tool calls and read log with them.
     delete_after_days: u32 = 0,
     /// Sessions idle longer than this keep their transcript but lose the
-    /// stored reasoning and the full tool output behind each card. What the
-    /// model was shown stays on `tool_call.result`, and a pasted image stays
+    /// stored reasoning (including provider replay state) and full tool output.
+    /// What the model was shown stays on `tool_call.result`, and a pasted image stays
     /// whatever its age.
     shed_after_days: u32 = 0,
 
@@ -1009,7 +1028,7 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
     if (policy.shed_after_days > 0) {
         const cutoff = now_ms - dayMs(policy.shed_after_days);
         // An allowlist, aged by the parent: a child's own clock stops on landing.
-        const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result')" ++
+        const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result', 'provider_state')" ++
             " AND message_id IN (SELECT m.id FROM message m" ++
             " JOIN session s ON m.session_id = s.id" ++
             " LEFT JOIN session p ON s.parent_session_id = p.id" ++
@@ -1273,16 +1292,20 @@ test "shedding drops stored payloads but keeps the transcript" {
     var db = try agedFixture(&tmp, &.{ 1, 100 });
     defer db.deinit();
 
+    try db.conn.exec("INSERT INTO blob (message_id, seq, kind, body) SELECT id, 0, 'provider_state', 'encrypted state' FROM message", .{});
+    const preview = try db.prunePreview(.{ .shed_after_days = 30 }, db.nowMs());
     const done = try db.prune(.{ .shed_after_days = 30 }, db.nowMs());
 
+    try testing.expectEqualDeep(preview, done);
     try testing.expectEqual(@as(u64, 0), done.sessions_deleted);
-    try testing.expectEqual(@as(u64, 2), done.blobs_dropped);
+    try testing.expectEqual(@as(u64, 3), done.blobs_dropped);
     try testing.expect(done.bytes_freed > 0);
 
     // Both sessions and both transcripts survive; only the old one's blobs go.
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM session"));
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM message"));
-    try testing.expectEqual(@as(i64, 4), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(@as(i64, 5), try countOf(&db, "SELECT count(*) FROM blob"));
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM blob WHERE kind = 'provider_state'"));
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM tool_call"));
 }
 

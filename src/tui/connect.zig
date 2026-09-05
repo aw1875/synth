@@ -84,16 +84,17 @@ pub fn show(self: *Connect, states: []const State) !void {
     self.release();
 
     for (catalog.all, 0..) |entry, i| {
-        const state = find(states, entry.id);
+        const known_state = findProviderState(states, entry.id);
+        const host = if (known_state) |state| state.host else entry.host;
+        const is_connected = if (known_state) |state| state.connected else false;
+        const is_active = if (known_state) |state| state.active else false;
         try self.rows.append(self.allocator, .{
             .entry = entry,
-            .host = try self.allocator.dupe(u8, if (state) |s| s.host else entry.host),
-            .connected = if (state) |s| s.connected else false,
-            .active = if (state) |s| s.active else false,
+            .host = try self.allocator.dupe(u8, host),
+            .connected = is_connected,
+            .active = is_active,
         });
-        if (state) |s| {
-            if (s.active) self.cursor = i;
-        }
+        if (is_active) self.cursor = i;
     }
 
     self.stage = .choosing;
@@ -101,7 +102,7 @@ pub fn show(self: *Connect, states: []const State) !void {
     self.key.clear();
 }
 
-fn find(states: []const State, id: []const u8) ?State {
+fn findProviderState(states: []const State, id: []const u8) ?State {
     for (states) |state| {
         if (std.mem.eql(u8, state.id, id)) return state;
     }
@@ -121,6 +122,7 @@ pub fn close(self: *Connect) void {
 pub const Action = union(enum) {
     none,
     cancel,
+    disconnect: []const u8,
     /// The user finished: connect this provider and store what came back.
     connect: Result,
 };
@@ -135,25 +137,41 @@ pub const Result = struct {
 pub fn handleKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) !Action {
     return switch (self.stage) {
         .closed => .none,
-        .choosing => self.chooseKey(key_press),
-        .host, .key => self.editKey(ctx, key_press),
+        .choosing => self.handleProviderListKey(key_press),
+        .host, .key => self.handleConnectionFieldKey(ctx, key_press),
     };
 }
 
-fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
-    if (key_press.matches(vaxis.Key.escape, .{})) return .cancel;
+fn handleProviderListKey(self: *Connect, key_press: vaxis.Key) Action {
+    const pressed_escape = key_press.matches(vaxis.Key.escape, .{});
+    if (pressed_escape) return .cancel;
 
-    if (key_press.matches(vaxis.Key.up, .{}) or key_press.matches('p', .{ .ctrl = true })) {
-        if (self.cursor > 0) self.cursor -= 1;
+    const row = self.rows.items[self.cursor];
+    const pressed_disconnect = key_press.matches('d', .{});
+    const can_disconnect = row.connected and row.entry.key == .oauth;
+    const requested_disconnect = pressed_disconnect and can_disconnect;
+    if (requested_disconnect) {
+        return .{ .disconnect = row.entry.id };
+    }
+
+    const requested_previous_row = key_press.matches(vaxis.Key.up, .{}) or key_press.matches('p', .{ .ctrl = true });
+    if (requested_previous_row) {
+        const has_previous_row = self.cursor > 0;
+        if (has_previous_row) self.cursor -= 1;
         return .none;
     }
-    if (key_press.matches(vaxis.Key.down, .{}) or key_press.matches('n', .{ .ctrl = true })) {
-        if (self.cursor + 1 < self.rows.items.len) self.cursor += 1;
+    const requested_next_row = key_press.matches(vaxis.Key.down, .{}) or key_press.matches('n', .{ .ctrl = true });
+    if (requested_next_row) {
+        const has_next_row = self.cursor + 1 < self.rows.items.len;
+        if (has_next_row) self.cursor += 1;
         return .none;
     }
-    if (key_press.matches(vaxis.Key.enter, .{})) {
+    const pressed_enter = key_press.matches(vaxis.Key.enter, .{});
+    if (pressed_enter) {
         self.chosen = self.cursor;
-        self.openFields() catch return .none;
+        const uses_browser_sign_in = self.rows.items[self.chosen].entry.key == .oauth;
+        if (uses_browser_sign_in) return self.submitSelection();
+        self.openConnectionFields() catch return .none;
         return .none;
     }
     return .none;
@@ -162,7 +180,7 @@ fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
 /// Move on to whatever the chosen provider has to be asked. A host that is not
 /// the user's to set is skipped; so is a key for a provider that has one
 /// already, which is what makes reconnecting a stored provider a single Enter.
-fn openFields(self: *Connect) !void {
+fn openConnectionFields(self: *Connect) !void {
     const row = self.rows.items[self.chosen];
 
     self.host.clear();
@@ -175,12 +193,12 @@ fn openFields(self: *Connect) !void {
     self.stage = .key;
 }
 
-fn editKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) !Action {
+fn handleConnectionFieldKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) !Action {
     if (key_press.matches(vaxis.Key.escape, .{})) {
-        self.stage = if (self.stage == .key and self.rows.items[self.chosen].entry.host_editable)
-            .host
-        else
-            .choosing;
+        const editing_key = self.stage == .key;
+        const host_is_editable = self.rows.items[self.chosen].entry.host_editable;
+        const should_return_to_host = editing_key and host_is_editable;
+        self.stage = if (should_return_to_host) .host else .choosing;
         return .none;
     }
 
@@ -189,7 +207,7 @@ fn editKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) !Actio
             self.stage = .key;
             return .none;
         }
-        return self.finish();
+        return self.submitSelection();
     }
 
     const editing = self.focus().?;
@@ -201,22 +219,31 @@ fn editKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) !Actio
 /// The result, or a refusal to finish. A hosted provider with no key would be
 /// a connection that fails on its first turn, so the dialog stays open on the
 /// field that is missing.
-fn finish(self: *Connect) Action {
+fn submitSelection(self: *Connect) Action {
     const row = self.rows.items[self.chosen];
-    const typed = trimmed(&self.key);
+    const typed_key = trimmed(&self.key);
 
-    if (row.entry.key == .required and typed.len == 0 and !row.connected) return .none;
+    const requires_api_key = row.entry.key == .required;
+    const key_was_omitted = typed_key.len == 0;
+    const needs_new_credential = !row.connected;
+    const required_key_is_missing = requires_api_key and key_was_omitted and needs_new_credential;
+    if (required_key_is_missing) return .none;
 
     const host = if (row.entry.host_editable) blk: {
-        const value = trimmed(&self.host);
-        break :blk if (value.len > 0) value else row.entry.host;
+        const typed_host = trimmed(&self.host);
+        const has_typed_host = typed_host.len > 0;
+        break :blk if (has_typed_host) typed_host else row.entry.host;
     } else row.entry.host;
+    const accepts_api_key = row.entry.key != .oauth;
+    const has_typed_key = typed_key.len > 0;
+    const should_use_typed_key = accepts_api_key and has_typed_key;
+    const api_key = if (should_use_typed_key) typed_key else null;
 
     return .{
         .connect = .{
             .id = row.entry.id,
             .host = host,
-            .key = if (typed.len > 0) typed else null,
+            .key = api_key,
         },
     };
 }
@@ -280,16 +307,30 @@ fn drawList(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vx
         var x = w.writeText(surface, pad + 2, y, row.entry.label, base.withFg(theme.fg).cell);
         x = w.writeText(surface, x + 1, y, row.entry.summary, base.withFg(theme.fg_dim).cell);
 
-        if (row.entry.key == .required and !row.connected) {
-            _ = w.writeText(surface, x + 1, y, "needs a key", base.withFg(theme.warning).cell);
+        const needs_connection = !row.connected;
+        if (needs_connection) {
+            const requirement_label = switch (row.entry.key) {
+                .optional => "",
+                .required => "needs a key",
+                .oauth => "needs sign-in",
+            };
+            const shows_requirement = requirement_label.len > 0;
+            if (shows_requirement) _ = w.writeText(surface, x + 1, y, requirement_label, base.withFg(theme.warning).cell);
         }
     }
 
     const hint_row = height - 2;
+    const selected = self.rows.items[self.cursor];
     var hint = w.writeText(surface, pad, hint_row, "↑↓", theme.on_card(theme.fg_muted).bold().cell);
     hint = w.writeText(surface, hint, hint_row, " select   ", theme.on_card(theme.fg_dim).cell);
     hint = w.writeText(surface, hint, hint_row, "enter", theme.on_card(theme.fg_muted).bold().cell);
-    _ = w.writeText(surface, hint, hint_row, " connect", theme.on_card(theme.fg_dim).cell);
+    const primary_action_label = if (selected.connected) " use" else " connect";
+    hint = w.writeText(surface, hint, hint_row, primary_action_label, theme.on_card(theme.fg_dim).cell);
+    const can_disconnect = selected.connected and selected.entry.key == .oauth;
+    if (can_disconnect) {
+        hint = w.writeText(surface, hint, hint_row, "   d", theme.on_card(theme.fg_muted).bold().cell);
+        _ = w.writeText(surface, hint, hint_row, " disconnect", theme.on_card(theme.fg_dim).cell);
+    }
 
     return .{ .surface = surface, .origin = .{ .row = origin_row, .col = origin_col } };
 }
@@ -321,10 +362,11 @@ fn drawField(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: v
             row.entry.host
         else if (row.connected)
             "leave empty to keep the stored key"
-        else if (row.entry.key == .optional)
-            "optional"
-        else
-            "required";
+        else switch (row.entry.key) {
+            .optional => "optional",
+            .required => "required",
+            .oauth => unreachable,
+        };
         active.placeholder_style = theme.on_card(theme.fg_dim).cell;
         active.height = 1;
         const drawn = try active.draw(ctx.withConstraints(
@@ -403,6 +445,25 @@ test "connecting the hosted provider asks for a key and nothing else" {
     try testing.expectEqualStrings("ollama-cloud", action.connect.id);
     try testing.expectEqualStrings("https://ollama.com", action.connect.host);
     try testing.expectEqualStrings("sk-secret", action.connect.key.?);
+}
+
+test "selecting signed-out Codex starts sign-in without credential fields" {
+    var connect: Connect = .init(testing.allocator);
+    defer connect.deinit();
+    try connect.show(&.{
+        .{ .id = "codex", .host = "https://chatgpt.com/backend-api/codex", .connected = false, .active = true },
+    });
+    const connect_action = try connect.press(.{ .codepoint = vaxis.Key.enter });
+    try testing.expectEqualStrings("codex", connect_action.connect.id);
+    try testing.expect(connect_action.connect.key == null);
+}
+
+test "a connected Codex account can be disconnected" {
+    var connect: Connect = .init(testing.allocator);
+    defer connect.deinit();
+    try connect.show(&.{.{ .id = "codex", .host = "https://chatgpt.com/backend-api/codex", .connected = true, .active = true }});
+    const disconnect_action = try connect.press(.{ .codepoint = 'd', .text = "d" });
+    try testing.expectEqualStrings("codex", disconnect_action.disconnect);
 }
 
 test "connecting the local provider asks for a URL first, and a key second" {
