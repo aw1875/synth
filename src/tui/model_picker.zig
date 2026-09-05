@@ -111,7 +111,7 @@ pub fn show(
     self.entries = entries;
 
     self.current = current;
-    self.search.clear();
+    if (!self.open) self.search.clear();
     self.cursor = 0;
     self.scroll = 0;
     try self.filter();
@@ -386,6 +386,15 @@ test "typing filters on the model and the provider" {
     try picker.search.insertText("nope");
     try picker.filter();
     try std.testing.expect(picker.selected() == null);
+
+    // A catalog arriving after the picker opens must keep the user's query.
+    try picker.show(&.{
+        .{ .name = "unrelated", .provider = "Ollama" },
+        .{ .name = "nope-new-model", .provider = "Ollama" },
+    }, &.{}, "");
+    try std.testing.expectEqualStrings("nope", picker.search.text.items);
+    try std.testing.expectEqual(@as(usize, 1), picker.matches.items.len);
+    try std.testing.expectEqualStrings("nope-new-model", picker.selected().?.name);
 }
 
 test "the cursor steps over headings and stops at the ends" {

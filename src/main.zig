@@ -174,6 +174,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .label = active.entry.label,
         .model = active.model,
         .api_key = active.api_key,
+        .auth = &auth,
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
@@ -184,6 +185,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     }
 
     try backend.start();
+    try backend.warmModels(&db);
     timing.mark("provider probe");
 
     const provider = backend.provider();

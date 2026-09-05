@@ -7,6 +7,7 @@ const pkg = @import("pkg");
 
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const Models = @import("models.zig");
 const retry = @import("retry.zig");
 const window = @import("window.zig");
 
@@ -21,6 +22,7 @@ retries: retry.Policy = .{},
 host: []const u8,
 /// Model tag, e.g. `qwen3`. Borrowed; also used as the provider's display name.
 model: []const u8,
+models: ?*Models = null,
 /// What this backend is called in the UI: the catalog provider's label, since
 /// the same client talks to the local server and the hosted one. Borrowed until
 /// a reconnect, which copies its own.
@@ -96,20 +98,8 @@ rejection: ?[]u8 = null,
 /// is nothing to probe - a client built only to list what a server offers skips
 /// the round trip.
 pub fn start(self: *OllamaProvider) !void {
-    var headers: []const std.http.Header = &.{};
-    if (self.api_key) |key| {
-        self.auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
-        self.auth_header[0] = .{ .name = "Authorization", .value = self.auth_value };
-        headers = self.auth_header[0..1];
-    }
-
-    self.client = Ollama.init(self.io, self.allocator, .{
-        .host = self.host,
-        .headers = headers,
-        .on_request = self.observer(),
-    });
-    self.started = true;
-    if (self.model.len > 0) self.probe();
+    if (!self.started) try self.startWithoutProbe();
+    self.probe();
 }
 
 /// Start a second client on the same server, taking what `other` already
@@ -133,17 +123,26 @@ fn probe(self: *OllamaProvider) void {
     self.think = self.want_think;
     self.supports_tools = true;
     self.supports_vision = true;
+    if (self.model.len == 0) return;
 
-    var response = self.client.show(.{ .model = self.model }) catch return;
-    defer response.deinit();
-    const body = response.body() catch return;
-
-    self.context_limit = contextLength(body.model_info);
-
-    const capabilities = body.capabilities orelse return;
-    self.think = self.want_think and has(capabilities, "thinking");
-    self.supports_tools = has(capabilities, "tools");
-    self.supports_vision = has(capabilities, "vision");
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const entries = self.catalogModels(arena) catch return;
+    for (entries) |entry| {
+        if (!sameModel(entry.id, self.model)) continue;
+        var source: ModelMetadata = .{ .provider = self, .model = entry.id };
+        const details = if (self.models) |models| details: {
+            const protocol = std.fmt.allocPrint(arena, "ollama/show/{s}", .{entry.id}) catch return;
+            break :details models.getOrFetchCatalog(protocol, std.mem.trimEnd(u8, self.host, "/"), self.api_key orelse "", &source) catch &.{};
+        } else source.fetchModels(arena) catch &.{};
+        const metadata = Models.findModel(details, entry.id) orelse entry;
+        self.context_limit = metadata.context_limit;
+        self.think = self.want_think and (metadata.thinking orelse true);
+        self.supports_tools = metadata.tools orelse true;
+        self.supports_vision = metadata.vision orelse true;
+        return;
+    }
 }
 
 fn has(capabilities: []const []const u8, name: []const u8) bool {
@@ -167,7 +166,7 @@ fn contextLength(model_info: ?std.json.Value) u32 {
     while (it.next()) |entry| {
         if (!std.mem.endsWith(u8, entry.key_ptr.*, ".context_length")) continue;
         return switch (entry.value_ptr.*) {
-            .integer => |i| @intCast(@max(i, 0)),
+            .integer => |i| std.math.cast(u32, i) orelse 0,
             else => 0,
         };
     }
@@ -177,26 +176,54 @@ fn contextLength(model_info: ?std.json.Value) u32 {
 /// Model names the server has pulled, newest listing order. Caller owns the
 /// result and each name.
 pub fn listModels(self: *OllamaProvider, allocator: std.mem.Allocator) ![][]const u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    return Models.copyVisibleModelNames(allocator, try self.catalogModels(arena_state.allocator()));
+}
+
+fn catalogModels(self: *OllamaProvider, arena: std.mem.Allocator) ![]const Models.Info {
+    if (self.models) |models| {
+        return models.getOrFetchCatalog("ollama", std.mem.trimEnd(u8, self.host, "/"), self.api_key orelse "", self);
+    }
+    return self.fetchModels(arena);
+}
+
+pub fn fetchModels(self: *OllamaProvider, arena: std.mem.Allocator) ![]const Models.Info {
     if (!self.started) try self.startWithoutProbe();
 
     var response = try self.client.list();
     defer response.deinit();
 
     const body = try response.body();
-    const names = try allocator.alloc([]const u8, body.models.len);
-    var filled: usize = 0;
-    errdefer {
-        for (names[0..filled]) |name| allocator.free(name);
-        allocator.free(names);
-    }
-
-    for (body.models, names) |model, *out| {
+    const entries = try arena.alloc(Models.Info, body.models.len);
+    for (body.models, entries) |model, *out| {
         const name = if (model.model.len > 0) model.model else model.name;
-        out.* = try allocator.dupe(u8, name);
-        filled += 1;
+        if (name.len == 0) return error.UnexpectedResponse;
+        out.* = .{ .id = try arena.dupe(u8, name) };
     }
-    return names;
+    return entries;
 }
+
+/// Detail requests have their own cache and deadline; listing never probes
+/// unselected models or loses its names when /show is slow.
+const ModelMetadata = struct {
+    provider: *OllamaProvider,
+    model: []const u8,
+
+    pub fn fetchModels(self: *ModelMetadata, arena: std.mem.Allocator) ![]const Models.Info {
+        var response = try self.provider.client.show(.{ .model = self.model });
+        defer response.deinit();
+        const body = try response.body();
+        const entries = try arena.alloc(Models.Info, 1);
+        entries[0] = .{ .id = try arena.dupe(u8, self.model), .context_limit = contextLength(body.model_info) };
+        if (body.capabilities) |capabilities| {
+            entries[0].thinking = has(capabilities, "thinking");
+            entries[0].tools = has(capabilities, "tools");
+            entries[0].vision = has(capabilities, "vision");
+        }
+        return entries;
+    }
+};
 
 /// Build the client without asking the server about the configured model. The
 /// listing does not need a context limit, and probing a model that is not
@@ -274,13 +301,13 @@ pub fn provider(self: *OllamaProvider) Provider {
         .name = self.label,
         .model = self.model,
         .context_limit = self.effectiveLimit(),
-        .vision = self.supports_vision,
+        .supports_vision = self.supports_vision,
         .userdata = self,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
         .describe_error = describeErrorErased,
-        .refresh = currentErased,
+        .describe_current = currentErased,
         .reconnect = reconnectErased,
         .abort = abortErased,
     };
@@ -377,7 +404,7 @@ pub fn current(self: *OllamaProvider) Provider.Current {
         .model = self.model,
         .name = self.label,
         .context_limit = self.effectiveLimit(),
-        .vision = self.supports_vision,
+        .supports_vision = self.supports_vision,
     };
 }
 
@@ -529,14 +556,6 @@ pub fn describeError(
     );
 }
 
-/// How many times a rejected request is retried with half the history, and the
-/// floor that stops at. Two halvings take a full window down to a quarter,
-/// which is either enough or a sign the problem was never the size.
-const max_shrink_attempts: u8 = 2;
-const min_budget: usize = 2 * 1024;
-
-/// Whether a complaint is about the size of the request, which is the one kind
-/// the harness can do something about without being told.
 /// Whether a refused request is worth sending again, waiting if so.
 ///
 /// The ollama package hands back an error rather than a status, so the
@@ -553,14 +572,14 @@ fn waitAndRetry(
     if (!retry.transientText(why)) return false;
 
     if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
+        if (s.isStopped(s.userdata)) return false;
     }
 
     const wait = retry.waitMs(self.retries, attempt, null);
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
+        if (s.isStopped(s.userdata)) return false;
     }
     return true;
 }
@@ -672,8 +691,8 @@ fn respond(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const system = turn.system;
-    var budget = self.contextBudget() -| (system.len / 4);
+    const system = turn.system_prompt;
+    const budget = window.requestBudget(self.effectiveLimit(), turn);
 
     var tools_parsed: ?std.json.Parsed(std.json.Value) = null;
     defer if (tools_parsed) |*parsed| parsed.deinit();
@@ -691,7 +710,6 @@ fn respond(
     self.armSocket();
 
     var messages: []Ollama.Message = undefined;
-    var attempt: u8 = 0;
     var sends: usize = 1;
     var stream = while (true) {
         messages = try self.buildMessages(convo, arena, system, turn.instruction, budget);
@@ -707,12 +725,6 @@ fn respond(
         break self.client.chat(request) catch |err| {
             self.captureRejection(request);
             const why = self.rejection orelse "";
-
-            if (attempt < max_shrink_attempts and budget > min_budget and isOverflow(why)) {
-                attempt += 1;
-                budget = @max(budget / 2, min_budget);
-                continue;
-            }
 
             if (self.waitAndRetry(sends, why, sink)) {
                 sends += 1;
@@ -740,7 +752,7 @@ fn respond(
 
     while (try stream.next()) |chunk| {
         if (sink) |s| {
-            if (s.stopped(s.userdata)) break;
+            if (s.isStopped(s.userdata)) break;
             if (chunk.message.thinking) |thinking| s.onThinking(s.userdata, thinking);
             if (chunk.message.content.len > 0) s.onText(s.userdata, chunk.message.content);
 
@@ -896,16 +908,15 @@ fn buildMessages(
     instruction: []const u8,
     budget: usize,
 ) ![]Ollama.Message {
-    const kept = try window.messages(convo, allocator, budget, self.supports_vision);
+    const kept = try window.completeMessages(convo, allocator, budget, self.supports_vision);
 
     const extra: usize = if (instruction.len > 0) 1 else 0;
     const messages = try allocator.alloc(Ollama.Message, kept.len + 1 + extra);
     errdefer allocator.free(messages);
 
-    const dropped = convo.messages.items.len - kept.len;
     messages[0] = .{
         .role = .system,
-        .content = try window.systemText(allocator, system, kept, dropped),
+        .content = try window.systemText(allocator, system, kept, 0),
     };
     if (instruction.len > 0) {
         messages[messages.len - 1] = .{ .role = .user, .content = instruction };
@@ -954,6 +965,9 @@ pub fn requestedContext(self: *const OllamaProvider) ?u32 {
 /// falling back to what the model says it could have.
 pub fn effectiveLimit(self: *const OllamaProvider) u32 {
     if (self.runtime_limit > 0) return self.runtime_limit;
+    if (self.num_ctx) |requested| {
+        if (requested > 0) return if (self.context_limit > 0) @min(requested, self.context_limit) else requested;
+    }
     return self.context_limit;
 }
 
@@ -990,8 +1004,99 @@ fn runnerContextLength(allocator: std.mem.Allocator, raw: []const u8, model: []c
     return 0;
 }
 
-fn contextBudget(self: *OllamaProvider) usize {
-    return window.budgetFor(self.effectiveLimit());
+test "Ollama lists without probing and keeps the list when selected model metadata times out" {
+    const testing = std.testing;
+    const PreviousMetadata = struct {
+        pub fn fetchModels(_: *@This(), arena: std.mem.Allocator) ![]const Models.Info {
+            return arena.dupe(Models.Info, &.{.{ .id = "chosen:latest", .context_limit = 64000 }});
+        }
+    };
+    const Endpoint = struct {
+        server: std.Io.net.Server,
+
+        fn serve(self: *@This(), stall_metadata: bool) !void {
+            for (0..2) |index| {
+                const stream = try self.server.accept(testing.io);
+                defer stream.close(testing.io);
+                var read_buffer: [4096]u8 = undefined;
+                var write_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(testing.io, &read_buffer);
+                var writer = stream.writer(testing.io, &write_buffer);
+                var http = std.http.Server.init(&reader.interface, &writer.interface);
+                var request = try http.receiveHead();
+                if (index == 0) {
+                    try testing.expectEqualStrings("/api/tags", request.head.target);
+                    try request.respond(
+                        \\{"models":[{"name":"unselected"},{"name":"chosen:latest"}]}
+                    , .{ .keep_alive = false });
+                } else {
+                    try testing.expectEqualStrings("/api/show", request.head.target);
+                    var body_buffer: [4096]u8 = undefined;
+                    const body_reader = try request.readerExpectContinue(&body_buffer);
+                    const body = try body_reader.allocRemaining(testing.allocator, .limited(4096));
+                    defer testing.allocator.free(body);
+                    const parsed = try std.json.parseFromSlice(struct { model: []const u8 }, testing.allocator, body, .{ .ignore_unknown_fields = true });
+                    defer parsed.deinit();
+                    try testing.expectEqualStrings("chosen:latest", parsed.value.model);
+                    if (stall_metadata) {
+                        _ = try reader.interface.discardRemaining();
+                    } else {
+                        try request.respond(
+                            \\{"model_info":{"test.context_length":123000},"capabilities":["tools"]}
+                        , .{ .keep_alive = false });
+                    }
+                }
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |stall_metadata| {
+        const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var endpoint: Endpoint = .{ .server = try address.listen(testing.io, .{ .mode = .stream }) };
+        defer endpoint.server.deinit(testing.io);
+        var server_task = try testing.io.concurrent(Endpoint.serve, .{ &endpoint, stall_metadata });
+        defer server_task.cancel(testing.io) catch {};
+        const host = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}", .{endpoint.server.socket.address.getPort()});
+        defer testing.allocator.free(host);
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const path_length = try tmp.dir.realPath(testing.io, &path_buffer);
+        const state_path = try std.fs.path.join(testing.allocator, &.{ path_buffer[0..path_length], "auth.json" });
+        defer testing.allocator.free(state_path);
+        {
+            // Last launch's /show metadata survives a failed refresh.
+            var previous = try Models.init(testing.allocator, testing.io, state_path);
+            defer previous.deinit();
+            var source: PreviousMetadata = .{};
+            _ = try previous.getOrFetchCatalog("ollama/show/chosen:latest", host, "", &source);
+        }
+        var models = try Models.init(testing.allocator, testing.io, state_path);
+        defer models.deinit();
+        models.fetch_timeout = .fromMilliseconds(200);
+        var provider_value: OllamaProvider = .{ .allocator = testing.allocator, .io = testing.io, .host = host, .model = "", .models = &models };
+        defer provider_value.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+
+        const before = try provider_value.listModels(scratch.allocator());
+        try testing.expectEqualDeep(@as([]const []const u8, &.{ "unselected", "chosen:latest" }), before);
+        try provider_value.setModel("chosen");
+        try server_task.await(testing.io);
+        const expected_limit: u32 = if (stall_metadata) 64000 else 123000;
+        try testing.expectEqual(expected_limit, provider_value.current().context_limit);
+        if (!stall_metadata) {
+            try testing.expect(!provider_value.current().supports_vision);
+            try testing.expect(!provider_value.think);
+            try testing.expect(provider_value.supports_tools);
+        }
+
+        // With the server no longer serving, both listing and re-probing must
+        // reuse their independent snapshots (including the failed /show).
+        const after = try provider_value.listModels(scratch.allocator());
+        try testing.expectEqualDeep(before, after);
+        try provider_value.start();
+        try testing.expectEqual(expected_limit, provider_value.current().context_limit);
+    }
 }
 
 test "the window asked for is the model's own unless configured otherwise" {
@@ -1201,5 +1306,7 @@ test "the window planned against is the runner's, not the metadata's" {
     backend.runtime_limit = 4096;
     try testing.expectEqual(@as(u32, 4096), backend.effectiveLimit());
     try testing.expectEqual(@as(u32, 4096), backend.current().context_limit);
-    try testing.expect(backend.contextBudget() < 4096);
+    backend.runtime_limit = 0;
+    backend.num_ctx = 8192;
+    try testing.expectEqual(@as(u32, 8192), backend.current().context_limit);
 }

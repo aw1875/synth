@@ -10,6 +10,7 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const Models = @import("models.zig");
 const retry = @import("retry.zig");
 const window = @import("window.zig");
 
@@ -26,6 +27,7 @@ retries: retry.Policy = .{},
 host: []const u8,
 /// Model id, e.g. `gpt-4o-mini`. Borrowed.
 model: []const u8,
+models: ?*Models = null,
 /// What this backend is called in the UI: the catalog provider's label, since
 /// one client serves OpenAI and every server imitating it.
 label: []const u8 = "OpenAI",
@@ -34,7 +36,7 @@ api_key: ?[]const u8 = null,
 /// When set, every request and reply is appended here as JSON.
 debug_log: ?[]const u8 = null,
 /// Context window in tokens, from the model listing where the server reports
-/// one and from `known_windows` otherwise. Zero when neither knows, which
+/// one and from models.dev otherwise. Zero when neither knows, which
 /// leaves the transcript on `window.budget`'s fixed ceiling.
 context_limit: u32 = 0,
 /// Whether to send tool definitions. Off for a model that has answered that it
@@ -89,8 +91,8 @@ const transfer_buffer_bytes: usize = 512 * 1024;
 /// initialization because the request borrows `auth_value`, which means this
 /// must run once the struct is at its final address.
 pub fn start(self: *OpenAIProvider) !void {
-    try self.startWithoutProbe();
-    if (self.model.len > 0) self.probe();
+    if (!self.started) try self.startWithoutProbe();
+    self.probe();
 }
 
 /// Build the client without asking the server about the configured model. What
@@ -117,19 +119,45 @@ pub fn startLike(self: *OpenAIProvider, other: *const OpenAIProvider) !void {
     self.send_stream_options = other.send_stream_options;
 }
 
-/// Read the context window for the current model. Failures leave the table's
-/// guess in place: a server that will not answer `/v1/models` is a problem the
-/// first request reports better than startup can.
+/// Read the current model from the shared launch snapshot, not another GET.
 fn probe(self: *OpenAIProvider) void {
-    self.context_limit = knownWindow(self.model);
-
+    self.context_limit = 0;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = self.get(arena, "/models") catch return;
-    const reported = listedWindow(arena, body, self.model);
-    if (reported > 0) self.context_limit = reported;
+    const entries = self.catalogModels(arena) catch return;
+    self.applyMetadata(arena, entries);
+}
+
+/// Apply a completed background lookup without touching the HTTP client.
+/// The owner calls this only between turns.
+pub fn refreshMetadata(self: *OpenAIProvider) void {
+    const models = self.models orelse return;
+    var scratch: std.heap.ArenaAllocator = .init(self.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const api_root = self.endpoint(arena, "") catch return;
+    const entries = models.cachedCatalog("openai", api_root, self.api_key orelse "") orelse return;
+    self.applyMetadata(arena, entries);
+}
+
+fn applyMetadata(self: *OpenAIProvider, arena: std.mem.Allocator, entries: []const Models.Info) void {
+    var metadata = Models.findModel(entries, self.model) orelse Models.Info{ .id = self.model };
+    if (metadata.context_limit == 0) {
+        if (self.models) |models| {
+            const api_root = self.endpoint(arena, "") catch return;
+            const fallback = models.referenceMetadataFor(arena, api_root, self.model) catch null;
+            if (fallback) |info| {
+                metadata.context_limit = info.context_limit;
+                metadata.vision = metadata.vision orelse info.vision;
+                metadata.tools = metadata.tools orelse info.tools;
+            }
+        }
+    }
+    self.context_limit = metadata.context_limit;
+    self.supports_vision = metadata.vision orelse true;
+    self.supports_tools = metadata.tools orelse true;
 }
 
 pub fn deinit(self: *OpenAIProvider) void {
@@ -147,13 +175,13 @@ pub fn provider(self: *OpenAIProvider) Provider {
         .name = self.label,
         .model = self.model,
         .context_limit = self.context_limit,
-        .vision = self.supports_vision,
+        .supports_vision = self.supports_vision,
         .userdata = self,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
         .describe_error = describeErrorErased,
-        .refresh = currentErased,
+        .describe_current = currentErased,
         .reconnect = reconnectErased,
         .abort = abortErased,
     };
@@ -216,7 +244,7 @@ pub fn current(self: *OpenAIProvider) Provider.Current {
         .model = self.model,
         .name = self.label,
         .context_limit = self.context_limit,
-        .vision = self.supports_vision,
+        .supports_vision = self.supports_vision,
     };
 }
 
@@ -326,37 +354,36 @@ pub fn ensureModel(self: *OpenAIProvider) !void {
 
 /// Model ids the server offers, sorted. Caller owns the result and each name.
 pub fn listModels(self: *OpenAIProvider, allocator: std.mem.Allocator) ![][]const u8 {
-    if (!self.started) try self.startWithoutProbe();
-
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const body = try self.get(arena, "/models");
-
-    const Listing = struct {
-        data: []const struct { id: []const u8 = "" } = &.{},
-    };
-    const parsed = std.json.parseFromSlice(Listing, arena, body, .{
-        .ignore_unknown_fields = true,
-    }) catch return error.UnexpectedResponse;
-
-    const names = try allocator.alloc([]const u8, parsed.value.data.len);
-    var filled: usize = 0;
-    errdefer {
-        for (names[0..filled]) |name| allocator.free(name);
-        allocator.free(names);
-    }
-
-    for (parsed.value.data) |entry| {
-        if (entry.id.len == 0) continue;
-        names[filled] = try allocator.dupe(u8, entry.id);
-        filled += 1;
-    }
-
-    const listed = names[0..filled];
+    const listed = try Models.copyVisibleModelNames(allocator, try self.catalogModels(arena_state.allocator()));
     std.mem.sort([]const u8, listed, {}, lessThan);
     return listed;
+}
+
+fn catalogModels(self: *OpenAIProvider, arena: std.mem.Allocator) ![]const Models.Info {
+    if (self.models) |models| {
+        const api_root = try self.endpoint(arena, "");
+        return models.getOrFetchCatalog("openai", api_root, self.api_key orelse "", self);
+    }
+    return self.fetchModels(arena);
+}
+
+/// Optional enrichment runs on a discovery worker, never in the picker/probe.
+pub fn warmReferenceMetadata(self: *OpenAIProvider, refresh: bool) !void {
+    const models = self.models orelse return;
+    var scratch: std.heap.ArenaAllocator = .init(self.allocator);
+    defer scratch.deinit();
+    const entries = try self.catalogModels(scratch.allocator());
+    for (entries) |entry| {
+        const needs_reference = entry.context_limit == 0;
+        if (needs_reference) return models.loadReferenceCatalog(refresh);
+    }
+}
+
+pub fn fetchModels(self: *OpenAIProvider, arena: std.mem.Allocator) ![]const Models.Info {
+    if (!self.started) try self.startWithoutProbe();
+    return parseModels(arena, try self.get(arena, "/models"));
 }
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
@@ -540,14 +567,14 @@ fn waitAndRetry(
     if (retry.tooLong(self.retries, retry_after_ms)) return false;
 
     if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
+        if (s.isStopped(s.userdata)) return false;
     }
 
     const wait = retry.waitMs(self.retries, attempt, retry_after_ms);
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
-        if (s.stopped(s.userdata)) return false;
+        if (s.isStopped(s.userdata)) return false;
     }
     return true;
 }
@@ -606,7 +633,7 @@ const Collector = struct {
         defer scratch.deinit();
 
         while (true) {
-            if (self.stopped()) return;
+            if (self.isStopped()) return;
 
             const raw = reader.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => return error.ResponseTooLong,
@@ -699,9 +726,9 @@ const Collector = struct {
         if (self.sink) |s| s.onThinkingDone(s.userdata);
     }
 
-    fn stopped(self: *Collector) bool {
+    fn isStopped(self: *Collector) bool {
         const s = self.sink orelse return false;
-        return s.stopped(s.userdata);
+        return s.isStopped(s.userdata);
     }
 
     /// Hand everything collected to the caller, which owns it from here.
@@ -825,13 +852,12 @@ fn writeMessages(
     convo: *Conversation,
     turn: Provider.Turn,
 ) !void {
-    const budget = window.budgetFor(self.context_limit) -| (turn.system.len / 4);
-    const kept = try window.messages(convo, arena, budget, self.supports_vision);
-    const dropped = convo.messages.items.len - kept.len;
+    const budget = window.requestBudget(self.context_limit, turn);
+    const kept = try window.completeMessages(convo, arena, budget, self.supports_vision);
 
     try w.writeAll("{\"role\":\"system\",\"content\":");
     try std.json.Stringify.encodeJsonString(
-        try window.systemText(arena, turn.system, kept, dropped),
+        try window.systemText(arena, turn.system_prompt, kept, 0),
         .{},
         w,
     );
@@ -945,7 +971,7 @@ fn writeParts(w: *std.Io.Writer, text: []const u8, images: []const []const u8) !
 /// The media type of a base64 image, read from what the encoding of its magic
 /// bytes always begins with. A data URL has to name one, and guessing wrong
 /// makes a model refuse to look.
-fn imageMime(base64: []const u8) []const u8 {
+pub fn imageMime(base64: []const u8) []const u8 {
     if (std.mem.startsWith(u8, base64, "iVBORw0KGgo")) return "image/png";
     if (std.mem.startsWith(u8, base64, "/9j/")) return "image/jpeg";
     if (std.mem.startsWith(u8, base64, "R0lGOD")) return "image/gif";
@@ -955,7 +981,7 @@ fn imageMime(base64: []const u8) []const u8 {
 
 /// The text a message is sent as: its own, plus inlined `@mention` files, plus
 /// a note standing in for images this model cannot be shown.
-fn messageContent(
+pub fn messageContent(
     arena: std.mem.Allocator,
     msg: Conversation.Message,
     supports_vision: bool,
@@ -1159,60 +1185,35 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// The context window a listing reports for `model`. Not part of the OpenAI
-/// API, but every self-hosted server has a field for it, and each picked a
-/// different name.
-fn listedWindow(arena: std.mem.Allocator, body: []const u8, model: []const u8) u32 {
+/// Preserve metadata for every model, including fields used by compatible
+/// servers. Missing limits remain unknown; model names are not specifications.
+fn parseModels(arena: std.mem.Allocator, body: []const u8) ![]const Models.Info {
     const Listing = struct {
         data: []const struct {
-            id: []const u8 = "",
+            id: []const u8,
             context_length: u32 = 0,
             max_model_len: u32 = 0,
             max_context_length: u32 = 0,
             context_window: u32 = 0,
-        } = &.{},
+        },
     };
 
     const parsed = std.json.parseFromSliceLeaky(Listing, arena, body, .{
         .ignore_unknown_fields = true,
-    }) catch return 0;
+        .allocate = .alloc_always,
+    }) catch return error.UnexpectedResponse;
 
-    for (parsed.data) |entry| {
-        if (!std.mem.eql(u8, entry.id, model)) continue;
-        return @max(
-            @max(entry.context_length, entry.max_model_len),
-            @max(entry.max_context_length, entry.context_window),
-        );
+    const entries = try arena.alloc(Models.Info, parsed.data.len);
+    for (parsed.data, entries) |entry, *out| {
+        if (entry.id.len == 0) return error.UnexpectedResponse;
+        var limit: u32 = 0;
+        for ([_]u32{ entry.context_length, entry.max_model_len, entry.max_context_length, entry.context_window }) |reported| {
+            const tighter_limit = reported > 0 and (limit == 0 or reported < limit);
+            if (tighter_limit) limit = reported;
+        }
+        out.* = .{ .id = entry.id, .context_limit = limit };
     }
-    return 0;
-}
-
-/// Context windows for models that will never report one, matched on the
-/// longest prefix so a dated id like `gpt-4o-2024-08-06` lands on its family.
-/// Only a starting figure: a listing that reports a window overrides it, and an
-/// unrecognised model falls back to the fixed budget.
-const known_windows: []const struct { prefix: []const u8, tokens: u32 } = &.{
-    .{ .prefix = "gpt-3.5", .tokens = 16_385 },
-    .{ .prefix = "gpt-4-turbo", .tokens = 128_000 },
-    .{ .prefix = "gpt-4o", .tokens = 128_000 },
-    .{ .prefix = "gpt-4.1", .tokens = 1_047_576 },
-    .{ .prefix = "gpt-4", .tokens = 8_192 },
-    .{ .prefix = "gpt-5", .tokens = 400_000 },
-    .{ .prefix = "o1", .tokens = 200_000 },
-    .{ .prefix = "o3", .tokens = 200_000 },
-    .{ .prefix = "o4", .tokens = 200_000 },
-};
-
-fn knownWindow(model: []const u8) u32 {
-    var best: u32 = 0;
-    var longest: usize = 0;
-    for (known_windows) |entry| {
-        if (!std.mem.startsWith(u8, model, entry.prefix)) continue;
-        if (entry.prefix.len < longest) continue;
-        longest = entry.prefix.len;
-        best = entry.tokens;
-    }
-    return best;
+    return entries;
 }
 
 const testing = std.testing;
@@ -1261,7 +1262,7 @@ test "a request carries the transcript in the shape the API expects" {
     };
 
     const body = try backend.buildRequest(arena, &convo, .{
-        .system = "you are a harness",
+        .system_prompt = "you are a harness",
         .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"list\"}}]",
     });
 
@@ -1313,7 +1314,7 @@ test "an instruction rides along without joining the transcript" {
     };
 
     const body = try backend.buildRequest(arena, &convo, .{
-        .system = "brief",
+        .system_prompt = "brief",
         .instruction = "summarise the session",
     });
 
@@ -1346,7 +1347,7 @@ test "an image is sent as a data URL, and a blind model gets a note instead" {
     };
 
     {
-        const body = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
+        const body = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
         var parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
@@ -1360,7 +1361,7 @@ test "an image is sent as a data URL, and a blind model gets a note instead" {
     }
 
     backend.supports_vision = false;
-    const body = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
+    const body = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
     defer parsed.deinit();
 
@@ -1470,30 +1471,26 @@ test "advice follows the complaint" {
     try testing.expectEqualStrings("", advice("upstream connect error"));
 }
 
-test "a context window is taken from the listing, then the table" {
+test "model listings preserve reported limits without guessing from names" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const listing =
         \\{"data":[
-        \\{"id":"qwen2.5-coder","max_model_len":32768},
+        \\{"id":"qwen2.5-coder","max_model_len":32768,"max_context_length":128000},
         \\{"id":"anthropic/claude","context_length":200000},
         \\{"id":"gpt-4o","object":"model"}
         \\]}
     ;
 
-    try testing.expectEqual(@as(u32, 32_768), listedWindow(arena, listing, "qwen2.5-coder"));
-    try testing.expectEqual(@as(u32, 200_000), listedWindow(arena, listing, "anthropic/claude"));
-    try testing.expectEqual(@as(u32, 0), listedWindow(arena, listing, "gpt-4o"));
-    try testing.expectEqual(@as(u32, 0), listedWindow(arena, listing, "absent"));
-    try testing.expectEqual(@as(u32, 0), listedWindow(arena, "<html>502</html>", "gpt-4o"));
-
-    try testing.expectEqual(@as(u32, 128_000), knownWindow("gpt-4o-2024-08-06"));
-    try testing.expectEqual(@as(u32, 128_000), knownWindow("gpt-4-turbo-preview"));
-    try testing.expectEqual(@as(u32, 8_192), knownWindow("gpt-4"));
-    try testing.expectEqual(@as(u32, 200_000), knownWindow("o3-mini"));
-    try testing.expectEqual(@as(u32, 0), knownWindow("qwen2.5-coder"));
+    const entries = try parseModels(arena, listing);
+    try testing.expectEqual(@as(u32, 32_768), Models.findModel(entries, "qwen2.5-coder").?.context_limit);
+    try testing.expectEqual(@as(u32, 200_000), Models.findModel(entries, "anthropic/claude").?.context_limit);
+    try testing.expectEqual(@as(u32, 0), Models.findModel(entries, "gpt-4o").?.context_limit);
+    try testing.expect(Models.findModel(entries, "absent") == null);
+    try testing.expectError(error.UnexpectedResponse, parseModels(arena, "<html>502</html>"));
+    try testing.expectError(error.UnexpectedResponse, parseModels(arena, "{}"));
 }
 
 test "the model chosen by default is one that answers a chat request" {
@@ -1522,14 +1519,14 @@ test "a server that rejects `stream_options` gets the same request without it" {
         .model = "local-model",
     };
 
-    const asking = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
+    const asking = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
     try testing.expect(std.mem.indexOf(u8, asking, "stream_options") != null);
 
     try testing.expect(backend.retryWithout("400: unknown field \"stream_options\""));
     try testing.expect(!backend.retryWithout("400: unknown field \"stream_options\""));
     try testing.expect(!backend.retryWithout("429: rate limit reached"));
 
-    const quiet = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
+    const quiet = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
     try testing.expect(std.mem.indexOf(u8, quiet, "stream_options") == null);
     try testing.expect(std.mem.indexOf(u8, quiet, "\"stream\":true") != null);
 }
@@ -1537,7 +1534,7 @@ test "a server that rejects `stream_options` gets the same request without it" {
 /// A sink that reports the turn as given up on, for the retry tests.
 fn stoppedSink() Provider.Sink {
     const Always = struct {
-        fn stopped(_: *anyopaque) bool {
+        fn isStopped(_: *anyopaque) bool {
             return true;
         }
         fn onThinking(_: *anyopaque, _: []const u8) void {}
@@ -1548,7 +1545,7 @@ fn stoppedSink() Provider.Sink {
     };
     return .{
         .userdata = &nothing.slot,
-        .stopped = Always.stopped,
+        .isStopped = Always.isStopped,
         .onThinking = Always.onThinking,
         .onText = Always.onText,
     };
