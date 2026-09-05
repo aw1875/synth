@@ -7,6 +7,36 @@
 const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
+const Provider = @import("provider.zig");
+
+pub fn requestBudget(limit: u32, turn: Provider.Turn) usize {
+    const summarising_known_window = turn.is_compacting and limit > 0;
+    const available = if (summarising_known_window) @as(usize, limit) * 9 / 10 else budgetFor(limit);
+    const instruction_tokens = (turn.system_prompt.len + turn.tools_json.len + turn.instruction.len) / 4;
+    return available -| instruction_tokens;
+}
+
+pub fn contextTokens(convo: *const Conversation, with_images: bool) usize {
+    var tokens: usize = 0;
+    for (convo.messages.items[summaryFloor(convo.messages.items)..]) |msg| {
+        if (msg.role != .summary) tokens += estimateTokens(msg, with_images);
+    }
+    return tokens;
+}
+
+/// Keep the entire active context, or refuse the request rather than truncate it.
+pub fn completeMessages(convo: *Conversation, allocator: std.mem.Allocator, budget: usize, with_images: bool) ![]Conversation.Message {
+    const kept = try messages(convo, allocator, budget, with_images);
+    errdefer allocator.free(kept);
+    const active_count = convo.messages.items.len - summaryFloor(convo.messages.items);
+    if (kept.len != active_count) return error.ContextTooLarge;
+    var tokens: usize = 0;
+    for (kept) |msg| {
+        if (msg.role != .summary) tokens += estimateTokens(msg, with_images);
+    }
+    if (tokens > budget) return error.ContextTooLarge;
+    return kept;
+}
 
 /// The token budget for the transcript, derived from the model's context
 /// window. When the window is unknown, fall back to a fixed ceiling so a long
@@ -22,9 +52,11 @@ pub fn budgetFor(limit: u32) usize {
 /// Exactness does not matter, only that the request stops growing.
 pub fn estimateTokens(msg: Conversation.Message, with_images: bool) usize {
     var bytes: usize = msg.text.len;
+    // Provider state repeats canonical content and may contain encrypted bytes,
+    // not text tokens. The loop also checks provider-reported context usage.
     for (msg.tool_calls) |call| {
         bytes += call.name.len + call.arguments.len;
-        if (call.result) |result| bytes += result.len;
+        // Results are sent in their own .tool message, not from the UI cache.
     }
     for (msg.attachments) |attachment| {
         bytes += attachment.path.len + attachment.content.len;
@@ -159,7 +191,7 @@ fn callFor(all: []const Conversation.Message, id: []const u8, before: usize) ?Co
 
 /// Index of the newest compaction summary, which is as far back as the window
 /// ever needs to reach.
-fn summaryFloor(all: []const Conversation.Message) usize {
+pub fn summaryFloor(all: []const Conversation.Message) usize {
     var i = all.len;
     while (i > 0) {
         i -= 1;
@@ -454,4 +486,71 @@ test "a summary is never sent to the model, and never costs budget" {
 
     try testing.expectEqual(@as(usize, 3), kept.len);
     try testing.expectEqual(Conversation.Role.summary, kept[2].role);
+}
+
+test "a complete request refuses overflow and keeps the latest checkpoint" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "original task " ** 100);
+    try convo.add(.assistant, "progress " ** 100);
+    try std.testing.expectError(error.ContextTooLarge, completeMessages(&convo, std.testing.allocator, 100, true));
+    try convo.add(.system, "Summary of the task and progress.");
+    try convo.add(.user, "continue");
+    const kept = try completeMessages(&convo, std.testing.allocator, 100, true);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("Summary of the task and progress.", kept[0].text);
+    try std.testing.expectEqualStrings("continue", kept[1].text);
+}
+
+test "opaque replay state and expanded UI results do not crowd out request text" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    _ = try convo.addUser("inspect this", &.{}, &.{});
+    var calls = [_]Conversation.ToolCall{.{ .id = "1", .name = "read", .arguments = "{}", .result = "expanded output" ** 4096, .status = .ok }};
+    _ = try convo.append(.{
+        .role = .assistant,
+        .text = "checking",
+        .provider_state = "encrypted" ** 4096,
+        .tool_calls = &calls,
+    });
+    _ = try convo.addToolResult("read", "1", "short result sent to the model");
+    const kept = try completeMessages(&convo, testing.allocator, 100, false);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 3), kept.len);
+    try testing.expectEqualStrings("inspect this", kept[0].text);
+    try testing.expectEqualStrings("short result sent to the model", kept[2].text);
+}
+
+test "even the newest message must fit the budget" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    try convo.add(.user, "old");
+    try convo.add(.assistant, "n" ** 100);
+
+    try std.testing.expectError(error.ContextTooLarge, completeMessages(&convo, std.testing.allocator, 1, true));
+}
+
+test "complete requests keep tool exchanges together or refuse overflow" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    try convo.add(.user, "a" ** 100);
+    var calls = [_]Conversation.ToolCall{.{ .id = "1", .name = "list", .arguments = "{}" }};
+    _ = try convo.append(.{
+        .role = .assistant,
+        .text = "b" ** 100,
+        .tool_calls = &calls,
+    });
+    _ = try convo.append(.{ .role = .tool, .text = "c" ** 100, .tool_call_id = "1" });
+    try convo.add(.user, "d" ** 100);
+
+    try std.testing.expectError(error.ContextTooLarge, completeMessages(&convo, std.testing.allocator, 60, true));
+    const kept = try completeMessages(&convo, std.testing.allocator, 200, true);
+    defer std.testing.allocator.free(kept);
+
+    try std.testing.expectEqual(@as(usize, 4), kept.len);
+    try std.testing.expectEqualStrings(kept[1].tool_calls[0].id, kept[2].tool_call_id.?);
 }

@@ -130,6 +130,8 @@ pub const Message = struct {
     /// Base64-encoded images pasted with this message. User messages only, and
     /// memory-only: nothing persists them yet.
     images: [][]const u8 = &.{},
+    /// Exact provider wire items needed to continue this conversation.
+    provider_state: ?[]const u8 = null,
 
     /// Whether every tool call on this message has finished. An unsettled
     /// message is still being written to, so it must stay in memory.
@@ -162,6 +164,7 @@ pub const Message = struct {
         allocator.free(self.attachments);
         for (self.images) |image| allocator.free(image);
         allocator.free(self.images);
+        if (self.provider_state) |state| allocator.free(state);
     }
 };
 
@@ -176,6 +179,10 @@ dropped: u64 = 0,
 /// Cap on in-memory messages. When an append would exceed it, the oldest are
 /// dropped. Zero means unbounded (tests, `synth run`).
 max_messages: usize = 0,
+/// Agent conversations must retain unsummarised context regardless of the cap.
+preserve_context: bool = false,
+/// Set by a provider after private replay data expires; consumed by the loop.
+reset_provider_state: bool = false,
 
 pub fn init(allocator: std.mem.Allocator) Conversation {
     return .{ .allocator = allocator };
@@ -203,6 +210,7 @@ pub fn clear(self: *Conversation) void {
     self.messages.clearRetainingCapacity();
     self.next_seq = 0;
     self.dropped = 0;
+    self.reset_provider_state = false;
 }
 
 /// Append a plain text message.
@@ -269,6 +277,7 @@ pub fn append(self: *Conversation, msg: Message) !*Message {
     errdefer owned.deinit(self.allocator);
 
     if (msg.thinking) |thinking| owned.thinking = try self.allocator.dupe(u8, thinking);
+    if (msg.provider_state) |state| owned.provider_state = try self.allocator.dupe(u8, state);
     if (msg.tool_name) |name| owned.tool_name = try self.allocator.dupe(u8, name);
     if (msg.tool_call_id) |id| owned.tool_call_id = try self.allocator.dupe(u8, id);
 
@@ -337,7 +346,17 @@ pub fn append(self: *Conversation, msg: Message) !*Message {
 /// knows there is history to page in.
 fn trim(self: *Conversation) void {
     if (self.max_messages == 0) return;
+    var checkpoint: ?u64 = null;
+    if (self.preserve_context) {
+        for (self.messages.items) |msg| {
+            if (msg.role == .system) checkpoint = msg.seq;
+        }
+    }
     while (self.messages.items.len > self.max_messages) {
+        if (self.preserve_context) {
+            const checkpoint_seq = checkpoint orelse return;
+            if (self.messages.items[0].seq >= checkpoint_seq) return;
+        }
         if (!self.messages.items[0].isSettled()) return;
         var removed = self.messages.orderedRemove(0);
         removed.deinit(self.allocator);
@@ -488,6 +507,22 @@ test "seq is monotonic and survives trimming" {
     try std.testing.expectEqual(@as(u64, 1), convo.messages.items[0].seq);
     try std.testing.expectEqual(@as(u64, 2), convo.messages.items[1].seq);
     try std.testing.expectEqual(@as(u64, 1), convo.firstSeq().?);
+}
+
+test "live context exceeds the display cap until a checkpoint covers it" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+    convo.max_messages = 2;
+    convo.preserve_context = true;
+    try convo.add(.user, "original task");
+    try convo.add(.assistant, "progress");
+    try convo.add(.user, "follow-up");
+    try std.testing.expectEqualStrings("original task", convo.messages.items[0].text);
+    try convo.add(.system, "Task and progress preserved here.");
+    try convo.add(.assistant, "continuing");
+    try convo.add(.user, "another follow-up");
+    try std.testing.expectEqualStrings("Task and progress preserved here.", convo.messages.items[0].text);
+    try std.testing.expectEqual(@as(usize, 3), convo.messages.items.len);
 }
 
 test "prepend pages older messages back in" {

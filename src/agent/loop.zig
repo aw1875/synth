@@ -22,6 +22,7 @@ const tool = @import("../tools/tool.zig");
 const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const Request = @import("request.zig");
+const window = @import("../provider/window.zig");
 const safety = @import("safety.zig");
 const Thought = @import("thought.zig");
 const ToolRun = @import("tool_run.zig");
@@ -238,15 +239,16 @@ prompt_cache: Context.Cache = .{},
 last_error: ?anyerror = null,
 /// Running totals for the session, for the sidebar.
 usage: Usage = .{},
-/// Fraction of the model's context window past which a finished turn triggers
-/// compaction on its own. Zero disables it.
+/// Fraction of the request budget that triggers compaction before the next
+/// model call, including calls within a tool turn. Zero disables it.
 auto_compact_at: f64 = 0.85,
 /// Set while the outstanding request is a summarisation rather than a turn.
 compacting: bool = false,
+resume_after_compaction: bool = false,
 
 pub const Usage = struct {
-    /// Prompt size of the most recent call. The whole conversation is resent
-    /// every turn, so this is how full the context currently is.
+    /// Latest reported input plus output, including opaque reasoning tokens.
+    /// A conservative size for the history replayed on the next call.
     context_tokens: u32 = 0,
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
@@ -279,6 +281,7 @@ pub fn init(
     reads: *tool.ReadLog,
     project_root: []const u8,
 ) Loop {
+    conversation.preserve_context = true;
     return .{
         .allocator = allocator,
         .io = io,
@@ -332,6 +335,8 @@ pub fn setModel(self: *Loop, model: []const u8) !void {
     if (self.session_model_owned) |previous| self.allocator.free(previous);
     self.session_model_owned = owned;
     self.session_model = owned;
+    // A provider/model selection invalidates the previous tokenizer's count.
+    self.usage.context_tokens = 0;
 
     const db = self.db orelse return;
     const session_id = self.session_id orelse return;
@@ -344,8 +349,8 @@ pub fn title(self: *const Loop) []const u8 {
 }
 
 /// Adopt an existing session: its id, its name, and the tail of its transcript.
-/// `limit` messages are loaded; anything older stays in the database and pages
-/// in when the transcript is scrolled to the top.
+/// Load at least `limit` messages, and always the whole unsummarised context.
+/// Older, summarised history stays in the database and pages in on scroll.
 pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     const db = self.db orelse return error.NoDatabase;
 
@@ -353,7 +358,8 @@ pub fn resumeSession(self: *Loop, session_id: i64, limit: usize) !void {
     // Seqs restart per session, so old entries point at another session's rows.
     self.message_ids.clearRetainingCapacity();
 
-    const loaded = try db.loadMessages(self.allocator, session_id, std.math.maxInt(i64), limit);
+    const context_count = try db.contextMessageCount(session_id);
+    const loaded = try db.loadMessages(self.allocator, session_id, std.math.maxInt(i64), @max(limit, context_count));
     defer self.allocator.free(loaded);
 
     std.mem.reverse(Conversation.Message, loaded);
@@ -418,7 +424,7 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
-    self.provider.vision = now.vision;
+    self.provider.supports_vision = now.supports_vision;
     try self.setModel(now.model);
 }
 
@@ -444,10 +450,12 @@ pub fn useAgent(self: *Loop, id: []const u8) !void {
 /// than in the backend is what keeps a provider from having to know what an
 /// agent is.
 fn turn(self: *Loop, instruction: []const u8) Provider.Turn {
+    const last = self.conversation.last();
+    const continuing_summary = instruction.len == 0 and last != null and last.?.role == .system;
     return .{
-        .system = self.systemPrompt(),
+        .system_prompt = self.systemPrompt(),
         .tools_json = self.tools_json orelse "",
-        .instruction = instruction,
+        .instruction = if (continuing_summary) "Continue the user's task from the conversation summary." else instruction,
     };
 }
 
@@ -564,11 +572,11 @@ pub fn isBusy(self: *const Loop) bool {
 /// Safe only between turns: the backend writes some of this from the worker
 /// thread.
 pub fn syncProvider(self: *Loop) void {
-    const now = self.provider.current();
+    const now = self.provider.currentTarget();
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
-    self.provider.vision = now.vision;
+    self.provider.supports_vision = now.supports_vision;
 }
 
 /// What the loop is doing, for the UI's status row.
@@ -671,36 +679,76 @@ pub fn compact(self: *Loop) !void {
     if (self.isBusy()) return;
     if (self.conversation.messages.items.len == 0) return;
 
-    self.compacting = true;
+    try self.startCompaction(false);
+}
+
+fn startCompaction(self: *Loop, resume_turn: bool) !void {
+    const request_turn: Provider.Turn = .{
+        .system_prompt = self.systemPrompt(),
+        .instruction = compaction_prompt,
+        .is_compacting = true,
+    };
+    if (!try self.contextFits(request_turn)) return self.stop("Stopped: history is too large to compact safely with this model. Nothing was discarded. Switch to a model with a larger context window, or use /clear to start a new session.");
     self.request = try Request.start(
         self.allocator,
         self.io,
         self.provider,
         self.conversation,
-        self.turn(compaction_prompt),
+        request_turn,
     );
+    self.compacting = true;
+    self.resume_after_compaction = resume_turn;
     self.state = .compacting;
 }
 
-/// Whether the context is full enough that the next turn should be compacted
-/// first. False when the provider does not report a window.
-pub fn shouldCompact(self: *const Loop) bool {
+/// Check the same budget the serializers enforce, even for an unknown model.
+pub fn shouldCompact(self: *Loop) bool {
     if (self.auto_compact_at <= 0) return false;
-    const fraction = self.usage.contextFraction(self.provider.context_limit) orelse return false;
-    return fraction >= self.auto_compact_at;
+    const request_turn = self.turn("");
+    const budget = window.requestBudget(self.provider.context_limit, request_turn);
+    const estimated = window.contextTokens(self.conversation, self.provider.supports_vision);
+    const prompt_overhead = (request_turn.system_prompt.len + request_turn.tools_json.len) / 4;
+    const reported = self.usage.context_tokens -| prompt_overhead;
+    const used = @max(estimated, reported);
+    const token_threshold = @as(f64, @floatFromInt(budget)) * self.auto_compact_at;
+    const tokens_are_full = used > 0 and @as(f64, @floatFromInt(used)) >= token_threshold;
+    const active_count = self.conversation.messages.items.len - window.summaryFloor(self.conversation.messages.items);
+    const message_limit = self.conversation.max_messages;
+    const messages_are_full = message_limit > 0 and active_count >= message_limit * 4 / 5;
+    return tokens_are_full or messages_are_full;
+}
+
+const context_full_notice = "Stopped: context is full. History was preserved. Use /compact or switch to a model with a larger context window before continuing.";
+
+fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
+    const budget = window.requestBudget(self.provider.context_limit, request_turn);
+    const kept = window.completeMessages(self.conversation, self.allocator, budget, self.provider.supports_vision) catch |err| switch (err) {
+        error.ContextTooLarge => return false,
+        else => return err,
+    };
+    self.allocator.free(kept);
+    return true;
 }
 
 /// Turn a finished summarisation into the system message that replaces the
 /// history it summarises.
 fn finishCompaction(self: *Loop, summary: []const u8) !void {
+    const resume_turn = self.resume_after_compaction;
     self.compacting = false;
+    self.resume_after_compaction = false;
     self.state = .idle;
-    if (summary.len == 0) return;
+    if (summary.len == 0) return self.stop("Stopped: compaction returned no summary. History was preserved; try /compact again.");
+    const failed_to_shrink = resume_turn and summary.len / 4 >= window.contextTokens(self.conversation, self.provider.supports_vision);
+    if (failed_to_shrink) return self.stop("Stopped: compaction did not reduce the context. History was preserved; try /compact or a larger model.");
 
     _ = try self.conversation.append(.{ .role = .system, .text = summary });
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     self.usage.context_tokens = 0;
+    if (resume_turn) {
+        if (self.shouldCompact()) return self.stop(context_full_notice);
+        try self.ask();
+    }
 }
 
 /// Start a turn. Attachments come from `@path` mentions in the prompt, plus
@@ -880,12 +928,13 @@ pub fn loadToolResult(self: *Loop, msg: *Conversation.Message, call_index: usize
 
 fn ask(self: *Loop) !void {
     try self.applySteering();
+    if (self.overBudget()) |reason| return self.stop(reason);
+    if (self.shouldCompact()) return self.startCompaction(true);
+    if (!try self.contextFits(self.turn(""))) return self.stop(context_full_notice);
     self.steps += 1;
     if (self.steps > self.agent.steps) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
-    if (self.overBudget()) |reason| return self.stop(reason);
-
     self.request = try Request.start(
         self.allocator,
         self.io,
@@ -1048,12 +1097,14 @@ fn pollCancelled(self: *Loop) !bool {
 
     if (self.tools) |tools| {
         tools.join();
-        tools.destroy();
         self.tools = null;
+        defer tools.destroy();
+        try self.adoptSettled(tools);
+        try self.persistReads();
     }
     self.clearNotes();
 
-    try self.abandonPending();
+    try self.abandonPending("cancelled");
     if (self.pending_submit) |*pending| pending.deinit(self.allocator);
     self.pending_submit = null;
 
@@ -1072,17 +1123,18 @@ fn pollCancelled(self: *Loop) !bool {
 
 /// Mark every call the cancelled turn left unfinished, so the transcript says
 /// what happened to it rather than leaving a row spinning forever.
-fn abandonPending(self: *Loop) !void {
+fn abandonPending(self: *Loop, reason: []const u8) !void {
     const index = self.pendingIndex() orelse return;
     for (self.conversation.messages.items[index].tool_calls, 0..) |*call, i| {
         if (call.status != .pending and call.status != .running) continue;
         call.status = .rejected;
         if (call.result == null) {
-            call.result = try self.allocator.dupe(u8, "cancelled");
-            call.result_bytes = "cancelled".len;
+            call.result = try self.allocator.dupe(u8, reason);
+            call.result_bytes = reason.len;
         }
         try self.persistToolCall(index, i);
     }
+    try self.appendToolResults();
 }
 
 /// Advance the loop. Called from the UI's tick; returns true if anything
@@ -1107,6 +1159,16 @@ fn pollRequest(self: *Loop) !bool {
 
     self.syncProvider();
 
+    const should_discard_persisted_provider_state = self.conversation.reset_provider_state;
+    if (should_discard_persisted_provider_state) {
+        if (self.db) |db| {
+            if (self.session_id) |session_id| {
+                try db.deleteProviderStateForSession(session_id);
+            }
+        }
+        self.conversation.reset_provider_state = false;
+    }
+
     const thinking: ?[]const u8 = if (request.thoughts.isEmpty())
         null
     else
@@ -1117,7 +1179,7 @@ fn pollRequest(self: *Loop) !bool {
     if (request.failed) |err| {
         self.last_error = err;
 
-        const detail = self.provider.explain(err, self.allocator) catch
+        const detail = self.provider.explainError(err, self.allocator) catch
             try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
         defer self.allocator.free(detail);
 
@@ -1136,7 +1198,7 @@ fn pollRequest(self: *Loop) !bool {
         self.turn_tokens += reply.usage.prompt_tokens + reply.usage.completion_tokens;
         self.usage.eval_duration_ns += reply.usage.eval_duration_ns;
         if (reply.usage.prompt_tokens > 0) {
-            self.usage.context_tokens = reply.usage.prompt_tokens;
+            self.usage.context_tokens = reply.usage.prompt_tokens +| reply.usage.completion_tokens;
         }
     }
 
@@ -1161,6 +1223,7 @@ fn pollRequest(self: *Loop) !bool {
         .thinking = thinking,
         .thinking_ms = thinking_ms,
         .tool_calls = reply.tool_calls,
+        .provider_state = reply.provider_state,
     });
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
@@ -1169,13 +1232,13 @@ fn pollRequest(self: *Loop) !bool {
         return true;
     }
 
+    self.pending_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
+    self.pending_index = 0;
     if (try self.repeating(reply.tool_calls)) {
         try self.stop("Stopped: the same tool call came back three times running.");
         return true;
     }
 
-    self.pending_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
-    self.pending_index = 0;
     try self.autoApprove();
     return true;
 }
@@ -1192,9 +1255,12 @@ pub fn lastTurn(self: *Loop, allocator: std.mem.Allocator) !recap.Recap {
 fn finish(self: *Loop, outcome: Outcome) void {
     self.state = .idle;
     self.finished += 1;
+    self.pending_seq = null;
+    self.pending_index = 0;
     self.repeats = 0;
     self.compacting = false;
     self.outcome = outcome;
+    self.resume_after_compaction = false;
 
     self.timed_out = false;
 
@@ -1224,6 +1290,7 @@ fn recordSummary(self: *Loop, outcome: Outcome) !void {
 /// the model sees it too and a later turn is not left guessing.
 fn stop(self: *Loop, reason: []const u8) !void {
     std.debug.assert(std.mem.startsWith(u8, reason, halt_prefix));
+    try self.abandonPending(reason);
     _ = try self.conversation.addAssistant(reason, null, null);
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.finish(.halted);
@@ -1729,6 +1796,10 @@ fn persistMessage(self: *Loop, index: usize) !void {
         }
     }
 
+    if (msg.provider_state) |provider_state| {
+        try db.appendBlob(message_id, 0, "provider_state", provider_state);
+    }
+
     for (msg.attachments, 0..) |attachment, i| {
         try db.appendAttachment(message_id, @intCast(i), attachment.path, attachment.content);
     }
@@ -2015,6 +2086,12 @@ fn pollTools(self: *Loop) !bool {
 /// Append one `.tool` message per settled call, then ask the model again with
 /// the results in hand.
 fn finishToolMessages(self: *Loop) !void {
+    try self.appendToolResults();
+    try self.ask();
+}
+
+/// Keep the wire history complete even when a turn ends without another request.
+fn appendToolResults(self: *Loop) !void {
     const message_index = self.pendingIndex() orelse return;
 
     const calls = self.conversation.messages.items[message_index].tool_calls;
@@ -2045,7 +2122,6 @@ fn finishToolMessages(self: *Loop) !void {
 
     self.pending_seq = null;
     self.pending_index = 0;
-    try self.ask();
 }
 
 /// A provider that asks for `list` on its first turn and answers on its
@@ -2066,6 +2142,7 @@ const FakeProvider = struct {
     loop_forever: bool = false,
     /// Reported prompt tokens, for the tests that care what a turn spends.
     prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
     /// Spend `latency` in a busy loop rather than a sleep, so the worker is
     /// deaf to both the stop flag and the signal. Stands in for a provider
     /// blocked inside a socket read, which is the only case where cancelling
@@ -2092,7 +2169,7 @@ const FakeProvider = struct {
             try std.Io.sleep(self.io, self.latency, .real);
         }
         if (sink) |s| {
-            if (s.stopped(s.userdata)) return .{};
+            if (s.isStopped(s.userdata)) return .{};
             s.onThinking(s.userdata, "thinking about it\n");
         }
 
@@ -2100,7 +2177,7 @@ const FakeProvider = struct {
         if (asked.instruction.len > 0) {
             return .{
                 .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{asked.instruction}),
-                .usage = .{ .prompt_tokens = self.prompt_tokens },
+                .usage = .{ .prompt_tokens = self.prompt_tokens, .completion_tokens = self.completion_tokens },
             };
         }
 
@@ -2120,14 +2197,14 @@ const FakeProvider = struct {
             return .{
                 .text = try allocator.dupe(u8, "Let me look at the project."),
                 .tool_calls = calls,
-                .usage = .{ .prompt_tokens = self.prompt_tokens },
+                .usage = .{ .prompt_tokens = self.prompt_tokens, .completion_tokens = self.completion_tokens },
             };
         }
 
         const question = if (convo.last()) |msg| msg.text else "";
         return .{
             .text = try std.fmt.allocPrint(allocator, "answered: {s}", .{question}),
-            .usage = .{ .prompt_tokens = self.prompt_tokens },
+            .usage = .{ .prompt_tokens = self.prompt_tokens, .completion_tokens = self.completion_tokens },
         };
     }
 };
@@ -2340,6 +2417,25 @@ test "allow always covers the rest of a same-message batch" {
     }
 }
 
+test "reported reasoning usage triggers compaction and model selection invalidates it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    fixture.fake.prompt_tokens = 500;
+    fixture.fake.completion_tokens = 30000;
+    var loop = fixture.loop();
+    defer loop.deinit();
+    fixture.registry.tools.getPtr("list").?.read_only = false;
+    try loop.submit("go", .{});
+    try loop.settle();
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expect(loop.shouldCompact());
+    try loop.cancel();
+    try loop.settle();
+    try loop.setModel("another-provider-model");
+    try testing.expect(!loop.shouldCompact());
+    try testing.expectEqual(@as(u64, 30000), loop.usage.output_tokens);
+}
+
 test "usage derives rate and context fraction" {
     const usage: Usage = .{
         .context_tokens = 8_192,
@@ -2498,30 +2594,49 @@ test "cancel returns while the worker is still running" {
     try testing.expect(!fixture.convo.hasPendingToolCalls());
 }
 
-test "a cancelled tool run leaves no call still spinning" {
-    const fixture = try Fixture.init();
-    defer fixture.deinit();
+fn expectAnsweredToolCalls(convo: *Conversation) !void {
+    for (convo.messages.items, 0..) |message, index| {
+        for (message.tool_calls) |call| {
+            try testing.expect(call.status.isSettled());
+            var outputs: usize = 0;
+            for (convo.messages.items[index + 1 ..]) |result| {
+                if (result.role != .tool) break;
+                if (std.mem.eql(u8, result.tool_call_id orelse "", call.id)) outputs += 1;
+            }
+            try testing.expectEqual(@as(usize, 1), outputs);
+        }
+    }
+}
 
-    fixture.registry.tools.getPtr("list").?.read_only = false;
+test "cancelling at approval or during execution leaves complete tool exchanges" {
+    for ([_]bool{ false, true }) |start_tools| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
 
-    var loop = fixture.loop();
-    defer loop.deinit();
+        fixture.registry.tools.getPtr("list").?.read_only = false;
 
-    try loop.submit("go", .{});
-    try loop.settle();
-    try testing.expectEqual(State.awaiting_approval, loop.state);
+        var loop = fixture.loop();
+        defer loop.deinit();
 
-    try loop.decide(.once);
-    try loop.cancel();
-    try loop.settle();
+        try loop.submit("go", .{});
+        try loop.settle();
+        try testing.expectEqual(State.awaiting_approval, loop.state);
 
-    try testing.expectEqual(State.idle, loop.state);
-    try testing.expect(loop.tools == null);
-    try testing.expect(!fixture.convo.hasPendingToolCalls());
+        if (start_tools) try loop.decide(.once);
+        try loop.cancel();
+        try loop.settle();
 
-    // Every call the turn left behind says what became of it.
-    for (fixture.convo.messages.items) |message| {
-        for (message.tool_calls) |call| try testing.expect(call.status.isSettled());
+        try testing.expectEqual(State.idle, loop.state);
+        try testing.expect(loop.tools == null);
+        try testing.expect(loop.pendingCall() == null);
+        try testing.expect(!fixture.convo.hasPendingToolCalls());
+
+        try expectAnsweredToolCalls(&fixture.convo);
+        fixture.registry.tools.getPtr("list").?.read_only = true;
+        try loop.submit("continue", .{});
+        try loop.settle();
+        try testing.expectEqual(Outcome.done, loop.outcome);
+        try expectAnsweredToolCalls(&fixture.convo);
     }
 }
 
@@ -2809,6 +2924,12 @@ test "the same call three times running stops the turn" {
 
     // Three model calls, not two hundred: the ceiling never came into it.
     try testing.expect(loop.steps <= max_repeats + 1);
+    try expectAnsweredToolCalls(&fixture.convo);
+    fixture.fake.loop_forever = false;
+    try loop.submit("continue", .{});
+    try settle(&loop);
+    try testing.expectEqual(Outcome.done, loop.outcome);
+    try expectAnsweredToolCalls(&fixture.convo);
 }
 
 test "different calls are work, not a loop" {
@@ -2915,7 +3036,7 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
 
     try loop.useAgent("plan");
     const planning = loop.turn("");
-    try testing.expectEqualStrings("base instructions", planning.system);
+    try testing.expectEqualStrings("base instructions", planning.system_prompt);
     try testing.expect(std.mem.indexOf(u8, planning.tools_json, "\"read\"") != null);
     try testing.expect(std.mem.indexOf(u8, planning.tools_json, "\"write\"") == null);
     try testing.expectEqualStrings("", planning.instruction);
@@ -2926,30 +3047,114 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
     loop.project = &project;
 
     const with_project = loop.turn("summarise");
-    try testing.expect(std.mem.startsWith(u8, with_project.system, "base instructions"));
-    try testing.expect(std.mem.indexOf(u8, with_project.system, "plan mode") != null);
-    try testing.expect(std.mem.indexOf(u8, with_project.system, "<environment>") != null);
+    try testing.expect(std.mem.startsWith(u8, with_project.system_prompt, "base instructions"));
+    try testing.expect(std.mem.indexOf(u8, with_project.system_prompt, "plan mode") != null);
+    try testing.expect(std.mem.indexOf(u8, with_project.system_prompt, "<environment>") != null);
     try testing.expectEqualStrings("summarise", with_project.instruction);
 }
 
-test "auto-compaction waits for the context to actually fill" {
+test "a tool turn compacts with its task intact and continues without another user message" {
+    const Script = struct {
+        calls: usize = 0,
+        fail_compaction: bool = false,
+        fn respond(ptr: *anyopaque, convo: *Conversation, asked: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                try testing.expect(!asked.is_compacting);
+                const calls = try allocator.alloc(Conversation.ToolCall, 1);
+                calls[0] = .{ .id = try allocator.dupe(u8, "list-1"), .name = try allocator.dupe(u8, "list"), .arguments = try allocator.dupe(u8, "{\"path\":\".\"}") };
+                return .{ .text = try allocator.dupe(u8, "checking files"), .tool_calls = calls, .usage = .{ .prompt_tokens = 30000 } };
+            }
+            if (self.calls == 2) {
+                try testing.expect(asked.is_compacting);
+                try testing.expectEqualStrings("", asked.tools_json);
+                try testing.expectEqualStrings("Implement catalog caching. Keep the original task throughout the tool run.", convo.messages.items[0].text);
+                try testing.expectEqual(Conversation.Role.tool, convo.last().?.role);
+                if (self.fail_compaction) return error.SummaryUnavailable;
+                return .{ .text = try allocator.dupe(u8, "Task: implement catalog caching. Files inspected; continue implementation.") };
+            }
+            try testing.expect(!asked.is_compacting);
+            const kept = try window.completeMessages(convo, allocator, 1000, true);
+            defer allocator.free(kept);
+            try testing.expectEqual(@as(usize, 1), kept.len);
+            try testing.expectEqualStrings("Task: implement catalog caching. Files inspected; continue implementation.", kept[0].text);
+            try testing.expect(asked.instruction.len > 0);
+            return .{ .text = try allocator.dupe(u8, "implemented") };
+        }
+    };
+    for ([_]u32{ 40000, 0 }) |limit| {
+        for ([_]bool{ false, true }) |fail_compaction| {
+            const fixture = try Fixture.init();
+            defer fixture.deinit();
+            var script: Script = .{ .fail_compaction = fail_compaction };
+            var loop = fixture.loop();
+            defer loop.deinit();
+            loop.system_prompt = "system";
+            loop.provider = .{ .name = "script", .userdata = &script, .respond = Script.respond, .context_limit = limit };
+            try loop.submit("Implement catalog caching. Keep the original task throughout the tool run.", .{});
+            try settle(&loop);
+            try testing.expectEqual(State.idle, loop.state);
+            try testing.expectEqual(@as(usize, 1), loop.finished);
+            if (fail_compaction) {
+                try testing.expectEqual(@as(usize, 2), script.calls);
+                try testing.expectEqual(Outcome.failed, loop.outcome.?);
+                try testing.expectEqual(Conversation.Role.user, fixture.convo.messages.items[0].role);
+            } else {
+                try testing.expectEqual(@as(usize, 3), script.calls);
+                try testing.expectEqualStrings("implemented", lastAssistant(&fixture.convo).?.text);
+                try testing.expectEqual(Outcome.done, loop.outcome.?);
+            }
+        }
+    }
+}
+
+test "a full context stops without sending a truncated request when auto-compaction is disabled" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
-
     var loop = fixture.loop();
     defer loop.deinit();
-
-    try testing.expect(!loop.shouldCompact());
-
-    loop.provider.context_limit = 1000;
-    loop.usage.context_tokens = 500;
-    try testing.expect(!loop.shouldCompact());
-
-    loop.usage.context_tokens = 900;
-    try testing.expect(loop.shouldCompact());
-
+    loop.system_prompt = "";
+    loop.provider.context_limit = 100;
     loop.auto_compact_at = 0;
-    try testing.expect(!loop.shouldCompact());
+    try loop.submit("preserve this task " ** 40, .{});
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Outcome.halted, loop.outcome.?);
+    try testing.expectEqual(@as(u32, 0), loop.usage.calls);
+    try testing.expectEqualStrings("preserve this task " ** 40, fixture.convo.messages.items[0].text);
+
+    try loop.compact();
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(u32, 0), loop.usage.calls);
+    try testing.expectEqualStrings("preserve this task " ** 40, fixture.convo.messages.items[0].text);
+    const notice = lastAssistant(&fixture.convo).?.text;
+    try testing.expect(std.mem.indexOf(u8, notice, "too large to compact") != null);
+    try testing.expect(std.mem.indexOf(u8, notice, "/clear") != null);
+    try testing.expect(std.mem.indexOf(u8, notice, "Use /compact") == null);
+}
+
+test "resuming loads the task beyond the display page, or its latest checkpoint" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const path = try std.fs.path.join(testing.allocator, &.{ fixture.root, "context.db" });
+    defer testing.allocator.free(path);
+    var db = try Database.init(testing.allocator, testing.io, path);
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    const session = try db.createSession(loop.project_id.?, fixture.root, "model");
+    _ = try db.appendMessage(session, 0, "user", "original task", null, 0);
+    _ = try db.appendMessage(session, 1, "assistant", "progress", null, 0);
+    _ = try db.appendMessage(session, 2, "user", "continue", null, 0);
+    try loop.resumeSession(session, 1);
+    try testing.expectEqualStrings("original task", fixture.convo.messages.items[0].text);
+    _ = try db.appendMessage(session, 3, "system", "task and progress checkpoint", null, 0);
+    _ = try db.appendMessage(session, 4, "user", "next step", null, 0);
+    try loop.resumeSession(session, 1);
+    try testing.expectEqual(@as(usize, 2), fixture.convo.messages.items.len);
+    try testing.expectEqualStrings("task and progress checkpoint", fixture.convo.messages.items[0].text);
+    try testing.expectEqualStrings("next step", fixture.convo.last().?.text);
 }
 
 test "switching models is recorded on the session row" {
@@ -3010,7 +3215,7 @@ const SwitchableProvider = struct {
         self.model = self.buffer[0..name.len];
         @memcpy(self.buffer[0..name.len], name);
         self.switches += 1;
-        return .{ .model = self.model, .context_limit = 4096, .vision = false };
+        return .{ .model = self.model, .context_limit = 4096, .supports_vision = false };
     }
 };
 
@@ -3043,7 +3248,7 @@ test "a resumed session runs under the model it was last used with" {
     try testing.expectEqualStrings("minimax-m3", loop.provider.model);
     try testing.expectEqualStrings("minimax-m3", loop.session_model);
     try testing.expectEqual(@as(u32, 4096), loop.provider.context_limit);
-    try testing.expect(!loop.provider.vision);
+    try testing.expect(!loop.provider.supports_vision);
 }
 
 test "resume leaves the provider alone when there is nothing to restore" {
