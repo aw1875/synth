@@ -64,12 +64,12 @@ pub fn provider(self: *CodexProvider) Provider {
         .name = "Codex Subscription",
         .model = self.model,
         .context_limit = self.context_limit,
-        .supports_vision = self.supports_vision,
+        .vision = self.supports_vision,
         .userdata = self,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
-        .describe_current = currentErased,
+        .refresh = currentErased,
         .describe_error = describeErrorErased,
     };
 }
@@ -90,7 +90,7 @@ pub fn current(self: *CodexProvider) Provider.Current {
         .model = self.model,
         .name = "Codex Subscription",
         .context_limit = self.context_limit,
-        .supports_vision = self.supports_vision,
+        .vision = self.supports_vision,
     };
 }
 
@@ -344,13 +344,13 @@ fn sessionIdForConversation(self: *CodexProvider, conversation: *Conversation) [
     }
     self.last_conversation = conversation;
     self.last_message_count = message_count;
-    return &self.session_id;
+    return &self.session_id.?;
 }
 
 fn buildResponseRequestBody(self: *CodexProvider, arena: std.mem.Allocator, conversation: *Conversation, turn: Provider.Turn) ![]u8 {
     const message_budget = window.requestBudget(self.context_limit, turn);
     const messages = try window.completeMessages(conversation, arena, message_budget, self.supports_vision);
-    const instructions = try window.systemText(arena, turn.system_prompt, messages, 0);
+    const instructions = try window.systemText(arena, turn.system, messages, 0);
     var request_body: std.Io.Writer.Allocating = .init(arena);
     const writer = &request_body.writer;
     try writer.writeAll("{\"model\":");
@@ -767,7 +767,7 @@ fn waitBeforeRetry(self: *CodexProvider, status: std.http.Status, attempt: usize
 
 fn requestWasCanceled(sink: ?Provider.Sink) bool {
     const response_sink = sink orelse return false;
-    return response_sink.isStopped(response_sink.userdata);
+    return response_sink.stopped(response_sink.userdata);
 }
 
 fn rememberHttpError(self: *CodexProvider, status: std.http.Status, response_body: []const u8) void {
@@ -907,7 +907,7 @@ test "Codex replays server items before the matching tool output" {
     var registry = try @import("../tools/registry.zig").init(std.testing.allocator);
     defer registry.deinit();
     const tools_json = try registry.schemaJson(arena_state.allocator(), &.{"read"});
-    const request_body = try codex.buildResponseRequestBody(arena_state.allocator(), &conversation, .{ .system_prompt = "brief", .tools_json = tools_json });
+    const request_body = try codex.buildResponseRequestBody(arena_state.allocator(), &conversation, .{ .system = "brief", .tools_json = tools_json });
     const parsed_request = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), request_body, .{});
     const definitions = parsed_request.object.get("tools").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), definitions.len);
@@ -971,7 +971,7 @@ test "Codex keeps tool history after a model switch, import, or reasoning reset"
         var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
         defer scratch.deinit();
         const arena = scratch.allocator();
-        const body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system_prompt = "brief" });
+        const body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system = "brief" });
         const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
         const items = parsed.object.get("input").?.array.items;
         try testing.expectEqual(@as(usize, 6), items.len);

@@ -424,7 +424,7 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
-    self.provider.supports_vision = now.supports_vision;
+    self.provider.vision = now.vision;
     try self.setModel(now.model);
 }
 
@@ -453,7 +453,7 @@ fn turn(self: *Loop, instruction: []const u8) Provider.Turn {
     const last = self.conversation.last();
     const continuing_summary = instruction.len == 0 and last != null and last.?.role == .system;
     return .{
-        .system_prompt = self.systemPrompt(),
+        .system = self.systemPrompt(),
         .tools_json = self.tools_json orelse "",
         .instruction = if (continuing_summary) "Continue the user's task from the conversation summary." else instruction,
     };
@@ -572,11 +572,11 @@ pub fn isBusy(self: *const Loop) bool {
 /// Safe only between turns: the backend writes some of this from the worker
 /// thread.
 pub fn syncProvider(self: *Loop) void {
-    const now = self.provider.currentTarget();
+    const now = self.provider.current();
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
-    self.provider.supports_vision = now.supports_vision;
+    self.provider.vision = now.vision;
 }
 
 /// What the loop is doing, for the UI's status row.
@@ -684,9 +684,9 @@ pub fn compact(self: *Loop) !void {
 
 fn startCompaction(self: *Loop, resume_turn: bool) !void {
     const request_turn: Provider.Turn = .{
-        .system_prompt = self.systemPrompt(),
+        .system = self.systemPrompt(),
         .instruction = compaction_prompt,
-        .is_compacting = true,
+        .compacting = true,
     };
     if (!try self.contextFits(request_turn)) return self.stop("Stopped: history is too large to compact safely with this model. Nothing was discarded. Switch to a model with a larger context window, or use /clear to start a new session.");
     self.request = try Request.start(
@@ -706,8 +706,8 @@ pub fn shouldCompact(self: *Loop) bool {
     if (self.auto_compact_at <= 0) return false;
     const request_turn = self.turn("");
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
-    const estimated = window.contextTokens(self.conversation, self.provider.supports_vision);
-    const prompt_overhead = (request_turn.system_prompt.len + request_turn.tools_json.len) / 4;
+    const estimated = window.contextTokens(self.conversation, self.provider.vision);
+    const prompt_overhead = (request_turn.system.len + request_turn.tools_json.len) / 4;
     const reported = self.usage.context_tokens -| prompt_overhead;
     const used = @max(estimated, reported);
     const token_threshold = @as(f64, @floatFromInt(budget)) * self.auto_compact_at;
@@ -722,7 +722,7 @@ const context_full_notice = "Stopped: context is full. History was preserved. Us
 
 fn contextFits(self: *Loop, request_turn: Provider.Turn) !bool {
     const budget = window.requestBudget(self.provider.context_limit, request_turn);
-    const kept = window.completeMessages(self.conversation, self.allocator, budget, self.provider.supports_vision) catch |err| switch (err) {
+    const kept = window.completeMessages(self.conversation, self.allocator, budget, self.provider.vision) catch |err| switch (err) {
         error.ContextTooLarge => return false,
         else => return err,
     };
@@ -738,7 +738,7 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     self.resume_after_compaction = false;
     self.state = .idle;
     if (summary.len == 0) return self.stop("Stopped: compaction returned no summary. History was preserved; try /compact again.");
-    const failed_to_shrink = resume_turn and summary.len / 4 >= window.contextTokens(self.conversation, self.provider.supports_vision);
+    const failed_to_shrink = resume_turn and summary.len / 4 >= window.contextTokens(self.conversation, self.provider.vision);
     if (failed_to_shrink) return self.stop("Stopped: compaction did not reduce the context. History was preserved; try /compact or a larger model.");
 
     _ = try self.conversation.append(.{ .role = .system, .text = summary });
@@ -1179,7 +1179,7 @@ fn pollRequest(self: *Loop) !bool {
     if (request.failed) |err| {
         self.last_error = err;
 
-        const detail = self.provider.explainError(err, self.allocator) catch
+        const detail = self.provider.explain(err, self.allocator) catch
             try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
         defer self.allocator.free(detail);
 
@@ -2169,7 +2169,7 @@ const FakeProvider = struct {
             try std.Io.sleep(self.io, self.latency, .real);
         }
         if (sink) |s| {
-            if (s.isStopped(s.userdata)) return .{};
+            if (s.stopped(s.userdata)) return .{};
             s.onThinking(s.userdata, "thinking about it\n");
         }
 
@@ -3036,7 +3036,7 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
 
     try loop.useAgent("plan");
     const planning = loop.turn("");
-    try testing.expectEqualStrings("base instructions", planning.system_prompt);
+    try testing.expectEqualStrings("base instructions", planning.system);
     try testing.expect(std.mem.indexOf(u8, planning.tools_json, "\"read\"") != null);
     try testing.expect(std.mem.indexOf(u8, planning.tools_json, "\"write\"") == null);
     try testing.expectEqualStrings("", planning.instruction);
@@ -3047,9 +3047,9 @@ test "a turn carries the agent's prompt and tools, not the provider's" {
     loop.project = &project;
 
     const with_project = loop.turn("summarise");
-    try testing.expect(std.mem.startsWith(u8, with_project.system_prompt, "base instructions"));
-    try testing.expect(std.mem.indexOf(u8, with_project.system_prompt, "plan mode") != null);
-    try testing.expect(std.mem.indexOf(u8, with_project.system_prompt, "<environment>") != null);
+    try testing.expect(std.mem.startsWith(u8, with_project.system, "base instructions"));
+    try testing.expect(std.mem.indexOf(u8, with_project.system, "plan mode") != null);
+    try testing.expect(std.mem.indexOf(u8, with_project.system, "<environment>") != null);
     try testing.expectEqualStrings("summarise", with_project.instruction);
 }
 
@@ -3061,20 +3061,20 @@ test "a tool turn compacts with its task intact and continues without another us
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             if (self.calls == 1) {
-                try testing.expect(!asked.is_compacting);
+                try testing.expect(!asked.compacting);
                 const calls = try allocator.alloc(Conversation.ToolCall, 1);
                 calls[0] = .{ .id = try allocator.dupe(u8, "list-1"), .name = try allocator.dupe(u8, "list"), .arguments = try allocator.dupe(u8, "{\"path\":\".\"}") };
                 return .{ .text = try allocator.dupe(u8, "checking files"), .tool_calls = calls, .usage = .{ .prompt_tokens = 30000 } };
             }
             if (self.calls == 2) {
-                try testing.expect(asked.is_compacting);
+                try testing.expect(asked.compacting);
                 try testing.expectEqualStrings("", asked.tools_json);
                 try testing.expectEqualStrings("Implement catalog caching. Keep the original task throughout the tool run.", convo.messages.items[0].text);
                 try testing.expectEqual(Conversation.Role.tool, convo.last().?.role);
                 if (self.fail_compaction) return error.SummaryUnavailable;
                 return .{ .text = try allocator.dupe(u8, "Task: implement catalog caching. Files inspected; continue implementation.") };
             }
-            try testing.expect(!asked.is_compacting);
+            try testing.expect(!asked.compacting);
             const kept = try window.completeMessages(convo, allocator, 1000, true);
             defer allocator.free(kept);
             try testing.expectEqual(@as(usize, 1), kept.len);
@@ -3215,7 +3215,7 @@ const SwitchableProvider = struct {
         self.model = self.buffer[0..name.len];
         @memcpy(self.buffer[0..name.len], name);
         self.switches += 1;
-        return .{ .model = self.model, .context_limit = 4096, .supports_vision = false };
+        return .{ .model = self.model, .context_limit = 4096, .vision = false };
     }
 };
 
@@ -3248,7 +3248,7 @@ test "a resumed session runs under the model it was last used with" {
     try testing.expectEqualStrings("minimax-m3", loop.provider.model);
     try testing.expectEqualStrings("minimax-m3", loop.session_model);
     try testing.expectEqual(@as(u32, 4096), loop.provider.context_limit);
-    try testing.expect(!loop.provider.supports_vision);
+    try testing.expect(!loop.provider.vision);
 }
 
 test "resume leaves the provider alone when there is nothing to restore" {

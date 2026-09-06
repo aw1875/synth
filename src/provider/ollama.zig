@@ -301,13 +301,13 @@ pub fn provider(self: *OllamaProvider) Provider {
         .name = self.label,
         .model = self.model,
         .context_limit = self.effectiveLimit(),
-        .supports_vision = self.supports_vision,
+        .vision = self.supports_vision,
         .userdata = self,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
         .describe_error = describeErrorErased,
-        .describe_current = currentErased,
+        .refresh = currentErased,
         .reconnect = reconnectErased,
         .abort = abortErased,
     };
@@ -404,7 +404,7 @@ pub fn current(self: *OllamaProvider) Provider.Current {
         .model = self.model,
         .name = self.label,
         .context_limit = self.effectiveLimit(),
-        .supports_vision = self.supports_vision,
+        .vision = self.supports_vision,
     };
 }
 
@@ -572,14 +572,14 @@ fn waitAndRetry(
     if (!retry.transientText(why)) return false;
 
     if (sink) |s| {
-        if (s.isStopped(s.userdata)) return false;
+        if (s.stopped(s.userdata)) return false;
     }
 
     const wait = retry.waitMs(self.retries, attempt, null);
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
-        if (s.isStopped(s.userdata)) return false;
+        if (s.stopped(s.userdata)) return false;
     }
     return true;
 }
@@ -691,7 +691,7 @@ fn respond(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const system = turn.system_prompt;
+    const system = turn.system;
     const budget = window.requestBudget(self.effectiveLimit(), turn);
 
     var tools_parsed: ?std.json.Parsed(std.json.Value) = null;
@@ -752,7 +752,7 @@ fn respond(
 
     while (try stream.next()) |chunk| {
         if (sink) |s| {
-            if (s.isStopped(s.userdata)) break;
+            if (s.stopped(s.userdata)) break;
             if (chunk.message.thinking) |thinking| s.onThinking(s.userdata, thinking);
             if (chunk.message.content.len > 0) s.onText(s.userdata, chunk.message.content);
 
@@ -1085,7 +1085,7 @@ test "Ollama lists without probing and keeps the list when selected model metada
         const expected_limit: u32 = if (stall_metadata) 64000 else 123000;
         try testing.expectEqual(expected_limit, provider_value.current().context_limit);
         if (!stall_metadata) {
-            try testing.expect(!provider_value.current().supports_vision);
+            try testing.expect(!provider_value.current().vision);
             try testing.expect(!provider_value.think);
             try testing.expect(provider_value.supports_tools);
         }

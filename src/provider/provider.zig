@@ -57,6 +57,8 @@ pub const Turn = struct {
     /// A one-off instruction, sent as the last user message and not part of the
     /// transcript. Compaction is what this is for.
     instruction: []const u8 = "",
+    /// Reserve less output space while summarizing, but never discard history.
+    compacting: bool = false,
 };
 
 /// Where a backend should point, and what to call it there. The label is the
@@ -99,6 +101,7 @@ pub fn current(self: Provider) Current {
 /// What went wrong, in the backend's own words where it has any. Caller owns
 /// the result.
 pub fn explain(self: Provider, err: anyerror, allocator: std.mem.Allocator) ![]const u8 {
+    if (err == error.ContextTooLarge) return allocator.dupe(u8, "Context is full. History was preserved. Use /compact or a model with a larger context window.");
     const describe = self.describe_error orelse
         return std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
     return describe(self.userdata, err, allocator) catch
@@ -133,12 +136,15 @@ pub const Reply = struct {
     /// Tool calls the model wants run. Owned by the caller, which frees each
     /// call with `Conversation.ToolCall.deinit`.
     tool_calls: []Conversation.ToolCall = &.{},
+    /// Provider-private wire items needed to continue this conversation.
+    provider_state: ?[]const u8 = null,
     usage: Usage = .{},
 
     pub fn deinit(self: *Reply, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         for (self.tool_calls) |*call| call.deinit(allocator);
         allocator.free(self.tool_calls);
+        if (self.provider_state) |state| allocator.free(state);
     }
 };
 

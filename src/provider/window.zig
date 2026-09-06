@@ -10,9 +10,9 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 
 pub fn requestBudget(limit: u32, turn: Provider.Turn) usize {
-    const summarising_known_window = turn.is_compacting and limit > 0;
+    const summarising_known_window = turn.compacting and limit > 0;
     const available = if (summarising_known_window) @as(usize, limit) * 9 / 10 else budgetFor(limit);
-    const instruction_tokens = (turn.system_prompt.len + turn.tools_json.len + turn.instruction.len) / 4;
+    const instruction_tokens = (turn.system.len + turn.tools_json.len + turn.instruction.len) / 4;
     return available -| instruction_tokens;
 }
 

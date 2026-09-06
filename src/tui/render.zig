@@ -924,7 +924,7 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
 
     const armed = self.quit_confirm.armed(self.io);
     const carries_image = self.held.imageCount() > 0 or mention.mentionsImage(self.input.text.items);
-    const blind = !self.provider.supports_vision and carries_image;
+    const blind = !self.provider.vision and carries_image;
     const hint = if (armed)
         "ctrl+c again to quit"
     else if (blind)

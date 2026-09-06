@@ -390,7 +390,7 @@ pub fn note(self: *Model, comptime fmt: []const u8, args: anytype) !void {
 /// Open the model switcher, asking each provider what it offers.
 pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (!try canSwitchProvider(self, ctx)) return;
-    if (!self.provider.hasModelChoice()) return;
+    if (!self.provider.switchable()) return;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
@@ -441,7 +441,7 @@ pub fn listModels(
     active_id: []const u8,
 ) ![]const []const u8 {
     const is_active_provider = std.mem.eql(u8, entry.id, active_id);
-    if (is_active_provider) return self.provider.listModelNames(arena) catch &.{};
+    if (is_active_provider) return self.provider.models(arena) catch &.{};
 
     var host = entry.host;
     if (entry.host_editable) {
@@ -483,7 +483,7 @@ pub fn syncProvider(self: *Model) void {
     self.provider.model = self.loop.provider.model;
     self.provider.name = self.loop.provider.name;
     self.provider.context_limit = self.loop.provider.context_limit;
-    self.provider.supports_vision = self.loop.provider.supports_vision;
+    self.provider.vision = self.loop.provider.vision;
 }
 
 /// Switch to a model, connecting its provider first when it belongs to another
@@ -520,10 +520,10 @@ pub fn switchModel(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !voi
 
     self.provider.model = current.model;
     self.provider.context_limit = current.context_limit;
-    self.provider.supports_vision = current.supports_vision;
+    self.provider.vision = current.vision;
     self.loop.provider.model = current.model;
     self.loop.provider.context_limit = current.context_limit;
-    self.loop.provider.supports_vision = current.supports_vision;
+    self.loop.provider.vision = current.vision;
     try self.loop.setModel(current.model);
 }
 
@@ -654,7 +654,7 @@ test "provider and model actions leave a running turn and its credentials alone"
         fn setModel(ptr: *anyopaque, _: []const u8) !Provider.Current {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.changes += 1;
-            return .{ .model = "next", .context_limit = 123000, .supports_vision = true };
+            return .{ .model = "next", .context_limit = 123000, .vision = true };
         }
         fn listModels(ptr: *anyopaque, allocator: std.mem.Allocator) ![][]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -773,7 +773,7 @@ test "startup selection is displayed and saved before the first request for ever
         try testing.expectEqualStrings("available-model", model.provider.model);
         try testing.expectEqualStrings("available-model", model.loop.provider.model);
         try testing.expectEqual(@as(u32, 123000), model.provider.context_limit);
-        try testing.expect(!model.provider.supports_vision);
+        try testing.expect(!model.provider.vision);
         try testing.expectEqual(@as(u64, 0), model.loop.usage.calls);
         try model.loop.rename("Before the first prompt");
         const saved_model = try db.sessionModel(model.loop.session_id.?, testing.allocator);

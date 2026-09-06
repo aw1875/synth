@@ -542,7 +542,7 @@ test "optional metadata stays off the interactive path and updates the selected 
     try testing.expectEqualStrings("second", backend.model());
     try testing.expectEqual(@as(u32, 456000), backend.current().context_limit);
     // Endpoint capabilities take precedence over the reference database.
-    try testing.expect(!backend.current().supports_vision);
+    try testing.expect(!backend.current().vision);
     const child = try backend.spawn(testing.allocator);
     defer child.deinit();
     try testing.expectEqual(@as(u32, 456000), child.provider().context_limit);
@@ -591,7 +591,7 @@ test "every backend switches and spawns from the shared catalog without rediscov
         const provider_value = backend.provider();
         const switched = try provider_value.set_model.?(provider_value.userdata, "second");
         try testing.expectEqual(@as(u32, 456000), switched.context_limit);
-        try testing.expect(!switched.supports_vision);
+        try testing.expect(!switched.vision);
         const child = try backend.spawn(testing.allocator);
         defer child.deinit();
         try testing.expectEqual(@as(u32, 456000), child.provider().context_limit);

@@ -175,13 +175,13 @@ pub fn provider(self: *OpenAIProvider) Provider {
         .name = self.label,
         .model = self.model,
         .context_limit = self.context_limit,
-        .supports_vision = self.supports_vision,
+        .vision = self.supports_vision,
         .userdata = self,
         .respond = respond,
         .list_models = listModelsErased,
         .set_model = setModelErased,
         .describe_error = describeErrorErased,
-        .describe_current = currentErased,
+        .refresh = currentErased,
         .reconnect = reconnectErased,
         .abort = abortErased,
     };
@@ -244,7 +244,7 @@ pub fn current(self: *OpenAIProvider) Provider.Current {
         .model = self.model,
         .name = self.label,
         .context_limit = self.context_limit,
-        .supports_vision = self.supports_vision,
+        .vision = self.supports_vision,
     };
 }
 
@@ -567,14 +567,14 @@ fn waitAndRetry(
     if (retry.tooLong(self.retries, retry_after_ms)) return false;
 
     if (sink) |s| {
-        if (s.isStopped(s.userdata)) return false;
+        if (s.stopped(s.userdata)) return false;
     }
 
     const wait = retry.waitMs(self.retries, attempt, retry_after_ms);
     std.Io.sleep(self.io, .fromMilliseconds(@intCast(wait)), .awake) catch return false;
 
     if (sink) |s| {
-        if (s.isStopped(s.userdata)) return false;
+        if (s.stopped(s.userdata)) return false;
     }
     return true;
 }
@@ -633,7 +633,7 @@ const Collector = struct {
         defer scratch.deinit();
 
         while (true) {
-            if (self.isStopped()) return;
+            if (self.stopped()) return;
 
             const raw = reader.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => return error.ResponseTooLong,
@@ -726,9 +726,9 @@ const Collector = struct {
         if (self.sink) |s| s.onThinkingDone(s.userdata);
     }
 
-    fn isStopped(self: *Collector) bool {
+    fn stopped(self: *Collector) bool {
         const s = self.sink orelse return false;
-        return s.isStopped(s.userdata);
+        return s.stopped(s.userdata);
     }
 
     /// Hand everything collected to the caller, which owns it from here.
@@ -857,7 +857,7 @@ fn writeMessages(
 
     try w.writeAll("{\"role\":\"system\",\"content\":");
     try std.json.Stringify.encodeJsonString(
-        try window.systemText(arena, turn.system_prompt, kept, 0),
+        try window.systemText(arena, turn.system, kept, 0),
         .{},
         w,
     );
@@ -1262,7 +1262,7 @@ test "a request carries the transcript in the shape the API expects" {
     };
 
     const body = try backend.buildRequest(arena, &convo, .{
-        .system_prompt = "you are a harness",
+        .system = "you are a harness",
         .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"list\"}}]",
     });
 
@@ -1314,7 +1314,7 @@ test "an instruction rides along without joining the transcript" {
     };
 
     const body = try backend.buildRequest(arena, &convo, .{
-        .system_prompt = "brief",
+        .system = "brief",
         .instruction = "summarise the session",
     });
 
@@ -1347,7 +1347,7 @@ test "an image is sent as a data URL, and a blind model gets a note instead" {
     };
 
     {
-        const body = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
+        const body = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
         var parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
@@ -1361,7 +1361,7 @@ test "an image is sent as a data URL, and a blind model gets a note instead" {
     }
 
     backend.supports_vision = false;
-    const body = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
+    const body = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
     defer parsed.deinit();
 
@@ -1519,14 +1519,14 @@ test "a server that rejects `stream_options` gets the same request without it" {
         .model = "local-model",
     };
 
-    const asking = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
+    const asking = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
     try testing.expect(std.mem.indexOf(u8, asking, "stream_options") != null);
 
     try testing.expect(backend.retryWithout("400: unknown field \"stream_options\""));
     try testing.expect(!backend.retryWithout("400: unknown field \"stream_options\""));
     try testing.expect(!backend.retryWithout("429: rate limit reached"));
 
-    const quiet = try backend.buildRequest(arena, &convo, .{ .system_prompt = "brief" });
+    const quiet = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
     try testing.expect(std.mem.indexOf(u8, quiet, "stream_options") == null);
     try testing.expect(std.mem.indexOf(u8, quiet, "\"stream\":true") != null);
 }
@@ -1534,7 +1534,7 @@ test "a server that rejects `stream_options` gets the same request without it" {
 /// A sink that reports the turn as given up on, for the retry tests.
 fn stoppedSink() Provider.Sink {
     const Always = struct {
-        fn isStopped(_: *anyopaque) bool {
+        fn stopped(_: *anyopaque) bool {
             return true;
         }
         fn onThinking(_: *anyopaque, _: []const u8) void {}
@@ -1545,7 +1545,7 @@ fn stoppedSink() Provider.Sink {
     };
     return .{
         .userdata = &nothing.slot,
-        .isStopped = Always.isStopped,
+        .stopped = Always.stopped,
         .onThinking = Always.onThinking,
         .onText = Always.onText,
     };
