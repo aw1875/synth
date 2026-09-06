@@ -662,6 +662,22 @@ const ResponseStream = struct {
         const is_reasoning_summary = std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta");
         const is_reasoning_delta = std.mem.eql(u8, event_type, "response.reasoning_text.delta");
         const is_reasoning_event = is_reasoning_summary or is_reasoning_delta;
+        // A declined request is still the model answering, and it arrives on no
+        // other event, so it is read as the reply rather than as a failure.
+        const is_refusal_delta = std.mem.eql(u8, event_type, "response.refusal.delta");
+        if (is_refusal_delta) {
+            const refusal_delta = stringValue(event_fields.get("delta") orelse return) orelse return;
+            self.received_text_delta = true;
+            return self.appendText(refusal_delta);
+        }
+        const starts_summary_part = std.mem.eql(u8, event_type, "response.reasoning_summary_part.added");
+        if (starts_summary_part) {
+            // The first part opens the summary rather than breaking it.
+            if (self.sent_summary_text) {
+                if (self.sink) |sink| sink.onThinking(sink.userdata, "\n\n");
+            }
+            return;
+        }
         if (is_reasoning_event) {
             const reasoning_delta = stringValue(event_fields.get("delta") orelse return) orelse return;
             if (self.sink) |sink| sink.onThinking(sink.userdata, reasoning_delta);
@@ -800,6 +816,14 @@ fn responseFailureMessage(event_fields: std.json.ObjectMap, fallback: []const u8
         .object => |value| value,
         else => return fallback,
     };
+    // A truncated response carries its reason here rather than in an error.
+    if (response_fields.get("incomplete_details")) |incomplete_details| {
+        if (incomplete_details == .object) {
+            if (incomplete_details.object.get("reason")) |reason| {
+                if (stringValue(reason)) |truncation_reason| return truncationMessage(truncation_reason);
+            }
+        }
+    }
     const error_message = error_fields.get("message") orelse return fallback;
     return stringValue(error_message) orelse fallback;
 }
@@ -808,6 +832,14 @@ fn stringValue(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |text| text,
         else => null,
+/// The reason is an open string, so an unknown one is reported rather than
+/// flattened into a guess.
+fn truncationMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "content_filter")) return "the response was stopped by a content filter.";
+    if (std.mem.eql(u8, reason, "max_output_tokens")) return "the reply hit the model's output limit and was cut off.";
+    return reason;
+}
+
     };
 }
 
@@ -906,7 +938,7 @@ fn clearLastError(self: *CodexProvider) void {
 pub fn describeError(self: *CodexProvider, err: anyerror, allocator: std.mem.Allocator) ![]const u8 {
     return switch (err) {
         error.NotSignedIn => allocator.dupe(u8, "not signed in. Open interactive synth and choose Codex Subscription in /providers."),
-        error.ReasoningOnly => allocator.dupe(u8, "Codex spent reasoning tokens but returned no answer. The synth instructions may not be supported by this model."),
+        error.ReasoningOnly => allocator.dupe(u8, "the model finished its turn without replying. Send the message again to continue."),
         error.TokenRefreshFailed => allocator.dupe(u8, "the Codex sign-in expired. Choose Codex Subscription in /providers to sign in again."),
         error.ModelNotAvailable => allocator.dupe(u8, "this model is not in your Codex catalog. Choose an available model with /models."),
         error.NoModelsAvailable => allocator.dupe(u8, "Codex reported no available models. Reconnect with /providers."),
@@ -1176,5 +1208,13 @@ test "a spent allowance reads as a sentence, not as the wire body" {
         describeUsageLimit(arena, spent, weekly_is_spent).?,
     );
 
-    // An unrecognised window length must not be guessed at.
-    const odd_window: RateLimits = .{ .primary = .{ .used_percent = 100, .window_minutes = 42 } };
+test "a truncated response says why it stopped" {
+    var reader = std.Io.Reader.fixed(
+        \\data: {"type":"response.incomplete","response":{"status":"incomplete","error":null,"incomplete_details":{"reason":"content_filter"}}}
+        \\
+    );
+    var stream = ResponseStream.init(std.testing.allocator, null, "model");
+    defer stream.deinit();
+    try std.testing.expectError(error.ResponseIncomplete, stream.readEvents(std.testing.allocator, &reader));
+    try std.testing.expectEqualStrings("the response was stopped by a content filter.", stream.server_error.items);
+}
