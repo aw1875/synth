@@ -274,18 +274,17 @@ fn respond(
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
         const retry_after_ms = retry.retryAfterMs(findHeaderValue(response.head, "retry-after"));
-        const quota_used_percent = copyQuotaUsedPercent(arena, response.head);
+        const rate_limits = RateLimits.read(arena, response.head);
         const transfer_buffer = try arena.alloc(u8, transfer_buffer_bytes);
         const response_reader = response.reader(transfer_buffer);
         const request_succeeded = response.head.status.class() == .success;
 
         if (!request_succeeded) {
             const response_body = response_reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
-            if (describeUsageLimit(arena, response_body)) |spent_allowance| {
+            if (describeUsageLimit(arena, response_body, rate_limits)) |spent_allowance| {
                 self.rememberResponseError(spent_allowance);
             } else {
-                const error_detail = errorDetailForResponse(arena, quota_used_percent, response_body);
-                self.rememberHttpError(response.head.status, error_detail);
+                self.rememberHttpError(response.head.status, response_body);
             }
 
             const should_refresh_token = response.head.status == .unauthorized and !token_was_refreshed;
@@ -330,18 +329,80 @@ fn respond(
     }
 }
 
-/// Header strings die the moment a body reader takes over the connection
-/// buffer, so the quota is copied out while it is still readable.
-fn copyQuotaUsedPercent(arena: std.mem.Allocator, response_head: std.http.Client.Response.Head) ?[]const u8 {
-    const is_rate_limited = response_head.status == .too_many_requests;
-    if (!is_rate_limited) return null;
-    const quota_used = findHeaderValue(response_head, "x-codex-primary-used-percent") orelse return null;
-    return arena.dupe(u8, quota_used) catch null;
+/// One metered window. The backend meters two at once: a short rolling window
+/// and a long one, and either can be the one that rejected the request.
+const RateLimitWindow = struct {
+    used_percent: f64,
+    window_minutes: ?i64 = null,
+
+    /// The window's own length is the only thing that says what to call it, so
+    /// a client that guesses "weekly" is wrong most of the time.
+    fn label(self: RateLimitWindow, is_secondary: bool) []const u8 {
+        const minutes = self.window_minutes orelse return if (is_secondary) "secondary usage" else "usage";
+        const known_windows = [_]struct { minutes: i64, name: []const u8 }{
+            .{ .minutes = 5 * 60, .name = "5h" },
+            .{ .minutes = 24 * 60, .name = "daily" },
+            .{ .minutes = 7 * 24 * 60, .name = "weekly" },
+            .{ .minutes = 30 * 24 * 60, .name = "monthly" },
+            .{ .minutes = 365 * 24 * 60, .name = "annual" },
+        };
+        for (known_windows) |known| {
+            if (isApproximateWindow(minutes, known.minutes)) return known.name;
+        }
+        return if (is_secondary) "secondary usage" else "usage";
+    }
+};
+
+fn isApproximateWindow(minutes: i64, expected_minutes: i64) bool {
+    const measured = @max(minutes, 0);
+    const lower_bound = @divTrunc(expected_minutes * 95, 100);
+    const upper_bound = @divTrunc(expected_minutes * 105, 100);
+    return measured >= lower_bound and measured <= upper_bound;
+}
+
+/// What the backend says about the caller's allowance. Header strings die the
+/// moment a body reader takes over the connection buffer, so this is read while
+/// they are still valid.
+const RateLimits = struct {
+    primary: ?RateLimitWindow = null,
+    secondary: ?RateLimitWindow = null,
+    /// Owned by the caller's arena; null when the header is absent.
+    reached_type: ?[]const u8 = null,
+
+    fn read(arena: std.mem.Allocator, response_head: std.http.Client.Response.Head) RateLimits {
+        const reached_type = findHeaderValue(response_head, "x-codex-rate-limit-reached-type");
+        return .{
+            .primary = readWindow(response_head, "x-codex-primary-used-percent", "x-codex-primary-window-minutes"),
+            .secondary = readWindow(response_head, "x-codex-secondary-used-percent", "x-codex-secondary-window-minutes"),
+            .reached_type = if (reached_type) |value| (arena.dupe(u8, value) catch null) else null,
+        };
+    }
+
+    /// The window that rejected the turn is the fuller of the two.
+    fn spentWindow(self: RateLimits) ?struct { window: RateLimitWindow, is_secondary: bool } {
+        const primary = self.primary orelse {
+            const secondary = self.secondary orelse return null;
+            return .{ .window = secondary, .is_secondary = true };
+        };
+        const secondary = self.secondary orelse return .{ .window = primary, .is_secondary = false };
+        const secondary_is_fuller = secondary.used_percent > primary.used_percent;
+        if (secondary_is_fuller) return .{ .window = secondary, .is_secondary = true };
+        return .{ .window = primary, .is_secondary = false };
+    }
+};
+
+fn readWindow(response_head: std.http.Client.Response.Head, percent_header: []const u8, minutes_header: []const u8) ?RateLimitWindow {
+    const percent_text = findHeaderValue(response_head, percent_header) orelse return null;
+    const used_percent = std.fmt.parseFloat(f64, percent_text) catch return null;
+    if (!std.math.isFinite(used_percent)) return null;
+    const minutes_text = findHeaderValue(response_head, minutes_header);
+    const window_minutes = if (minutes_text) |text| std.fmt.parseInt(i64, text, 10) catch null else null;
+    return .{ .used_percent = used_percent, .window_minutes = window_minutes };
 }
 
 /// A spent allowance arrives as a JSON envelope carrying everything a person
 /// needs, so the envelope itself never has to reach the transcript.
-fn describeUsageLimit(arena: std.mem.Allocator, response_body: []const u8) ?[]const u8 {
+fn describeUsageLimit(arena: std.mem.Allocator, response_body: []const u8, limits: RateLimits) ?[]const u8 {
     const Envelope = struct {
         @"error": struct {
             type: []const u8 = "",
@@ -352,16 +413,31 @@ fn describeUsageLimit(arena: std.mem.Allocator, response_body: []const u8) ?[]co
     const allowance_is_spent = std.mem.eql(u8, envelope.@"error".type, "usage_limit_reached");
     if (!allowance_is_spent) return null;
 
+    if (workspaceLimitMessage(limits.reached_type)) |message| return arena.dupe(u8, message) catch null;
+
+    const spent = limits.spentWindow();
+    const limit_label = if (spent) |spent_window| spent_window.window.label(spent_window.is_secondary) else "usage";
     const resets_in_seconds = envelope.@"error".resets_in_seconds orelse
-        return arena.dupe(u8, "your Codex usage limit has been reached.") catch null;
+        return std.fmt.allocPrint(arena, "your Codex {s} limit is used up.", .{limit_label}) catch null;
     var duration_buffer: [humanize.duration_bytes]u8 = undefined;
     const resets_in = humanize.duration(&duration_buffer, resets_in_seconds * std.time.ms_per_s);
-    return std.fmt.allocPrint(arena, "your Codex usage limit has been reached. It resets in {s}.", .{resets_in}) catch null;
+    return std.fmt.allocPrint(arena, "your Codex {s} limit is used up. It resets in {s}.", .{ limit_label, resets_in }) catch null;
 }
 
-fn errorDetailForResponse(arena: std.mem.Allocator, quota_used_percent: ?[]const u8, response_body: []const u8) []const u8 {
-    const quota_used = quota_used_percent orelse return response_body;
-    return std.fmt.allocPrint(arena, "weekly quota {s}% used. {s}", .{ quota_used, response_body }) catch response_body;
+/// A workspace rejection is not the caller's own allowance, and the action it
+/// calls for is somebody else's, so it never reads as "your limit".
+fn workspaceLimitMessage(reached_type: ?[]const u8) ?[]const u8 {
+    const reached = reached_type orelse return null;
+    const workspace_limits = [_]struct { reached_type: []const u8, message: []const u8 }{
+        .{ .reached_type = "workspace_owner_credits_depleted", .message = "your workspace is out of credits. Add credits to continue." },
+        .{ .reached_type = "workspace_member_credits_depleted", .message = "your workspace is out of credits. Ask the workspace owner to refill it." },
+        .{ .reached_type = "workspace_owner_usage_limit_reached", .message = "you hit the spend cap set on your workspace. Raise it to continue." },
+        .{ .reached_type = "workspace_member_usage_limit_reached", .message = "you hit the spend cap set by your workspace owner. Ask an owner to raise it." },
+    };
+    for (workspace_limits) |limit| {
+        if (std.mem.eql(u8, reached, limit.reached_type)) return limit.message;
+    }
+    return null;
 }
 
 fn sessionIdForConversation(self: *CodexProvider, conversation: *Conversation) []const u8 {
@@ -1058,15 +1134,25 @@ test "a spent allowance reads as a sentence, not as the wire body" {
         \\{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro_lite","resets_at":1788749039,"eligible_promo":null,"resets_in_seconds":37086}}
     ;
     try std.testing.expectEqualStrings(
-        "your Codex usage limit has been reached. It resets in 10h 18m.",
-        describeUsageLimit(arena, spent).?,
+        "your Codex usage limit is used up. It resets in 10h 18m.",
+        describeUsageLimit(arena, spent, odd_window).?,
+    );
+
+    // A workspace rejection is somebody else's to act on.
+    const workspace: RateLimits = .{
+        .primary = .{ .used_percent = 100, .window_minutes = 300 },
+        .reached_type = "workspace_member_usage_limit_reached",
+    };
+    try std.testing.expectEqualStrings(
+        "you hit the spend cap set by your workspace owner. Ask an owner to raise it.",
+        describeUsageLimit(arena, spent, workspace).?,
     );
 
     // Without a reset time the sentence still stands on its own.
     const undated = "{\"error\":{\"type\":\"usage_limit_reached\"}}";
     try std.testing.expectEqualStrings(
-        "your Codex usage limit has been reached.",
-        describeUsageLimit(arena, undated).?,
+        "your Codex 5h limit is used up.",
+        describeUsageLimit(arena, undated, five_hour_window).?,
     );
 
     // Anything else keeps the existing rejection path.
@@ -1074,3 +1160,21 @@ test "a spent allowance reads as a sentence, not as the wire body" {
     try std.testing.expect(describeUsageLimit(arena, "upstream timeout") == null);
     try std.testing.expect(describeUsageLimit(arena, "") == null);
 }
+    const five_hour_window: RateLimits = .{ .primary = .{ .used_percent = 100, .window_minutes = 300 } };
+    try std.testing.expectEqualStrings(
+        "your Codex 5h limit is used up. It resets in 10h 18m.",
+        describeUsageLimit(arena, spent, five_hour_window).?,
+    );
+
+    // The fuller window is the one that rejected the turn, and names itself.
+    const weekly_is_spent: RateLimits = .{
+        .primary = .{ .used_percent = 40, .window_minutes = 300 },
+        .secondary = .{ .used_percent = 100, .window_minutes = 10080 },
+    };
+    try std.testing.expectEqualStrings(
+        "your Codex weekly limit is used up. It resets in 10h 18m.",
+        describeUsageLimit(arena, spent, weekly_is_spent).?,
+    );
+
+    // An unrecognised window length must not be guessed at.
+    const odd_window: RateLimits = .{ .primary = .{ .used_percent = 100, .window_minutes = 42 } };
