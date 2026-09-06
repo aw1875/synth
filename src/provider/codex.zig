@@ -26,11 +26,10 @@ supports_vision: bool = true,
 owned_model: ?[]u8 = null,
 debug_log: ?[]const u8 = null,
 retries: retry.Policy = .{},
-client: std.http.Client = undefined,
-started: bool = false,
+/// Null until the first request; the optional is what says "not started yet".
+client: ?std.http.Client = null,
 last_error: ?[]u8 = null,
-session_id: [32]u8 = undefined,
-has_session_id: bool = false,
+session_id: ?[32]u8 = null,
 last_conversation: ?*Conversation = null,
 last_message_count: u64 = 0,
 
@@ -41,22 +40,22 @@ const max_state_bytes: usize = 512 * 1024;
 const transfer_buffer_bytes: usize = 512 * 1024;
 
 pub fn start(self: *CodexProvider) !void {
-    if (self.started) return;
+    if (self.client != null) return;
     self.client = .{ .allocator = self.allocator, .io = self.io };
-    self.started = true;
+    // The catalog decides the model, and it is reachable again on every later
+    // call; a backend that is down at launch must not stop the app opening.
     self.ensureModel() catch {};
 }
 
 pub fn startLike(self: *CodexProvider, other: *const CodexProvider) !void {
     self.client = .{ .allocator = self.allocator, .io = self.io };
-    self.started = true;
     self.context_limit = other.context_limit;
     self.supports_vision = other.supports_vision;
 }
 
 pub fn deinit(self: *CodexProvider) void {
     self.clearLastError();
-    if (self.started) self.client.deinit();
+    if (self.client) |*client| client.deinit();
     if (self.owned_model) |model| self.allocator.free(model);
 }
 
@@ -106,7 +105,7 @@ fn describeErrorErased(ptr: *anyopaque, err: anyerror, allocator: std.mem.Alloca
 }
 
 pub fn reconnect(self: *CodexProvider, _: Provider.Connection) !void {
-    if (!self.started) try self.start();
+    if (self.client == null) try self.start();
 }
 
 pub fn ensureModel(self: *CodexProvider) !void {
@@ -153,12 +152,12 @@ fn catalogModels(self: *CodexProvider, arena: std.mem.Allocator) ![]const Models
 }
 
 pub fn fetchModels(self: *CodexProvider, arena: std.mem.Allocator) ![]const Models.Info {
-    if (!self.started) {
+    if (self.client == null) {
         const is_signed_in = self.auth.key(auth_flow.provider_id) != null;
         if (!is_signed_in) return error.NotSignedIn;
         self.client = .{ .allocator = self.allocator, .io = self.io };
-        self.started = true;
     }
+    const client = if (self.client) |*started_client| started_client else return error.NotSignedIn;
     const tokens = try auth_flow.ensureFreshTokens(arena, self.io, self.auth);
     const request_url = try std.fmt.allocPrint(arena, "{s}/models?client_version={s}", .{ auth_flow.backend_url, codex_client_version });
     const uri = std.Uri.parse(request_url) catch return error.InvalidHost;
@@ -170,7 +169,7 @@ pub fn fetchModels(self: *CodexProvider, arena: std.mem.Allocator) ![]const Mode
     const account_headers = [_]std.http.Header{
         .{ .name = "ChatGPT-Account-ID", .value = tokens.account_id },
     };
-    var request = try self.client.request(.GET, uri, .{
+    var request = try client.request(.GET, uri, .{
         .redirect_behavior = .not_allowed,
         .keep_alive = false,
         .headers = .{
@@ -226,7 +225,8 @@ fn respond(
     sink: ?Provider.Sink,
 ) !Provider.Reply {
     const self: *CodexProvider = @ptrCast(@alignCast(ptr));
-    if (!self.started) try self.start();
+    if (self.client == null) try self.start();
+    const client = if (self.client) |*started_client| started_client else return error.NotSignedIn;
     self.clearLastError();
     const needs_model_metadata = self.model.len == 0 or self.context_limit == 0;
     if (needs_model_metadata) try self.ensureModel();
@@ -256,7 +256,7 @@ fn respond(
         const account_headers = [_]std.http.Header{
             .{ .name = "ChatGPT-Account-ID", .value = tokens.account_id },
         };
-        var request = try self.client.request(.POST, uri, .{
+        var request = try client.request(.POST, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
             .headers = .{
@@ -368,12 +368,11 @@ fn sessionIdForConversation(self: *CodexProvider, conversation: *Conversation) [
     const message_count = conversation.totalCount();
     const conversation_changed = self.last_conversation != conversation;
     const conversation_was_cleared = message_count < self.last_message_count;
-    const needs_new_session_id = !self.has_session_id or conversation_changed or conversation_was_cleared;
+    const needs_new_session_id = self.session_id == null or conversation_changed or conversation_was_cleared;
     if (needs_new_session_id) {
         var random_bytes: [16]u8 = undefined;
         self.io.random(&random_bytes);
         self.session_id = std.fmt.bytesToHex(random_bytes, .lower);
-        self.has_session_id = true;
     }
     self.last_conversation = conversation;
     self.last_message_count = message_count;

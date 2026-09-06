@@ -33,8 +33,10 @@ pub const Login = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     auth: *Auth,
-    arena: std.heap.ArenaAllocator = undefined,
-    login_future: std.Io.Future(void) = undefined,
+    /// Both are null exactly when no login is in flight; the optionals are
+    /// what say so, so no separate flag can drift out of step with them.
+    arena: ?std.heap.ArenaAllocator = null,
+    login_future: ?std.Io.Future(void) = null,
     cancel_future: ?std.Io.Future(void) = null,
     active: bool = false,
     login_finished: std.atomic.Value(bool) = .init(false),
@@ -51,11 +53,12 @@ pub const Login = struct {
     }
 
     pub fn start(self: *Login) !void {
-        if (self.active) return;
+        if (self.login_future != null) return;
         self.arena = .init(self.allocator);
-        errdefer self.arena.deinit();
-        self.active = true;
-        errdefer self.active = false;
+        errdefer {
+            if (self.arena) |*arena| arena.deinit();
+            self.arena = null;
+        }
         self.login_finished.store(false, .release);
         self.cancellation_finished.store(false, .release);
         self.code_received.store(false, .release);
@@ -65,7 +68,7 @@ pub const Login = struct {
     }
 
     pub fn connecting(self: *const Login) bool {
-        return self.active;
+        return self.login_future != null;
     }
 
     pub fn shouldAnnounceCode(self: *Login) bool {
@@ -78,13 +81,13 @@ pub const Login = struct {
     }
 
     pub fn activeCode(self: *const Login) ?[]const u8 {
-        const code_is_visible = self.active and self.code_received.load(.acquire);
+        const code_is_visible = self.connecting() and self.code_received.load(.acquire);
         if (!code_is_visible) return null;
         return self.user_code;
     }
 
     pub fn takeResult(self: *Login) ?Result {
-        if (!self.active) return null;
+        if (!self.connecting()) return null;
         if (self.cancel_future) |*cancel_future| {
             const cancellation_is_done = self.cancellation_finished.load(.acquire);
             if (!cancellation_is_done) return null;
@@ -94,7 +97,9 @@ pub const Login = struct {
         const cancellation_is_done = self.cancellation_finished.load(.acquire);
         const login_is_done = self.login_finished.load(.acquire);
         if (!login_is_done) return null;
-        if (!cancellation_is_done) self.login_future.await(self.io);
+        if (!cancellation_is_done) {
+            if (self.login_future) |*login_future| login_future.await(self.io);
+        }
         // Cancellation can lose the race to a completed token exchange.
         const result: Result = if (self.login_error) |login_error| switch (login_error) {
             error.Canceled => .canceled,
@@ -104,15 +109,16 @@ pub const Login = struct {
     }
 
     fn finalizeResult(self: *Login, result: Result) Result {
-        self.active = false;
-        self.arena.deinit();
+        self.login_future = null;
+        if (self.arena) |*arena| arena.deinit();
+        self.arena = null;
         return result;
     }
 
     /// Begin canceling off the caller's thread; `takeResult` reaps it from a tick.
     pub fn cancel(self: *Login) void {
         const cancellation_already_started = self.cancel_future != null or self.cancellation_finished.load(.acquire);
-        const can_start_cancellation = self.active and !cancellation_already_started;
+        const can_start_cancellation = self.connecting() and !cancellation_already_started;
         if (!can_start_cancellation) return;
         self.cancellation_finished.store(false, .release);
         if (self.io.concurrent(cancelLogin, .{self})) |cancel_future| {
@@ -123,12 +129,12 @@ pub const Login = struct {
     }
 
     fn cancelLogin(self: *Login) void {
-        self.login_future.cancel(self.io);
+        if (self.login_future) |*login_future| login_future.cancel(self.io);
         self.cancellation_finished.store(true, .release);
     }
 
     pub fn deinit(self: *Login) void {
-        if (!self.active) return;
+        if (!self.connecting()) return;
         self.cancel();
         if (self.cancel_future) |*cancel_future| cancel_future.await(self.io);
         self.cancel_future = null;
@@ -161,7 +167,7 @@ fn runDeviceLogin(login: *Login) !void {
     const user_code = jsonStringField(device_code_fields, "user_code") orelse jsonStringField(device_code_fields, "usercode") orelse return error.InvalidDeviceCode;
     const polling_interval_text = jsonStringField(device_code_fields, "interval") orelse "5";
     const polling_interval_seconds = std.math.clamp(std.fmt.parseInt(u64, polling_interval_text, 10) catch 5, 1, 30);
-    const login_arena = login.arena.allocator();
+    const login_arena = login.arena.?.allocator();
     const owned_device_auth_id = try login_arena.dupe(u8, device_auth_id);
     login.user_code = try login_arena.dupe(u8, user_code);
     login.code_received.store(true, .release);
@@ -198,7 +204,7 @@ fn exchangeAuthorizationCode(login: *Login, authorization_code: []const u8, code
 
     var client: std.http.Client = .{ .allocator = login.allocator, .io = login.io };
     defer client.deinit();
-    const login_arena = login.arena.allocator();
+    const login_arena = login.arena.?.allocator();
     const token_response = try postBody(&client, login_arena, token_endpoint, form_body.written(), "application/x-www-form-urlencoded");
     const token_exchange_succeeded = token_response.status.class() == .success;
     if (!token_exchange_succeeded) return error.TokenExchangeFailed;
@@ -427,7 +433,6 @@ test "login cancellation reports the worker outcome even when completion wins th
         var login = Login.init(testing.allocator, testing.io, &auth);
         login.arena = .init(testing.allocator);
         login.login_future = try testing.io.concurrent(Worker.run, .{ &login, attempt });
-        login.active = true;
         defer login.deinit();
         // The UI has not polled the completed result yet when Escape arrives.
         if (attempt != .pending) {
