@@ -392,10 +392,15 @@ const RateLimits = struct {
 };
 
 fn readWindow(response_head: std.http.Client.Response.Head, percent_header: []const u8, minutes_header: []const u8) ?RateLimitWindow {
-    const percent_text = findHeaderValue(response_head, percent_header) orelse return null;
-    const used_percent = std.fmt.parseFloat(f64, percent_text) catch return null;
+    return parseWindow(findHeaderValue(response_head, percent_header), findHeaderValue(response_head, minutes_header));
+}
+
+/// The percent is what says a window exists at all; an unreadable length only
+/// costs the window its name.
+fn parseWindow(percent_text: ?[]const u8, minutes_text: ?[]const u8) ?RateLimitWindow {
+    const percent = percent_text orelse return null;
+    const used_percent = std.fmt.parseFloat(f64, percent) catch return null;
     if (!std.math.isFinite(used_percent)) return null;
-    const minutes_text = findHeaderValue(response_head, minutes_header);
     const window_minutes = if (minutes_text) |text| std.fmt.parseInt(i64, text, 10) catch null else null;
     return .{ .used_percent = used_percent, .window_minutes = window_minutes };
 }
@@ -1293,4 +1298,30 @@ test "a truncated response says why it stopped" {
     defer stream.deinit();
     try std.testing.expectError(error.ResponseIncomplete, stream.readEvents(std.testing.allocator, &reader));
     try std.testing.expectEqualStrings("the response was stopped by a content filter.", stream.server_error.items);
+}
+
+test "a window is read from the header values the backend really sends" {
+    // Values lifted from codex's own fixtures for these headers.
+    const twelve_and_a_half = parseWindow("12.5", "10").?;
+    try std.testing.expectEqual(@as(f64, 12.5), twelve_and_a_half.used_percent);
+    try std.testing.expectEqual(@as(i64, 10), twelve_and_a_half.window_minutes.?);
+    try std.testing.expectEqualStrings("usage", twelve_and_a_half.label(false));
+
+    const spent = parseWindow("100.0", "10080").?;
+    try std.testing.expectEqual(@as(f64, 100), spent.used_percent);
+    try std.testing.expectEqualStrings("weekly", spent.label(false));
+
+    // No percent means no window, whatever else the response carries.
+    try std.testing.expect(parseWindow(null, "300") == null);
+    try std.testing.expect(parseWindow("", "300") == null);
+    try std.testing.expect(parseWindow("not-a-number", "300") == null);
+    try std.testing.expect(parseWindow("nan", "300") == null);
+    try std.testing.expect(parseWindow("inf", "300") == null);
+
+    // An unreadable or absent length leaves a usable window with no name.
+    const unnamed = parseWindow("40.0", null).?;
+    try std.testing.expectEqual(@as(f64, 40), unnamed.used_percent);
+    try std.testing.expect(unnamed.window_minutes == null);
+    try std.testing.expectEqualStrings("secondary usage", unnamed.label(true));
+    try std.testing.expect(parseWindow("40.0", "later").?.window_minutes == null);
 }
