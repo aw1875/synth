@@ -611,6 +611,9 @@ const ResponseStream = struct {
     response_completed: bool = false,
     received_text_delta: bool = false,
     thinking_finished: bool = false,
+    /// A summary arrives in parts. Nothing separates them on the wire, so the
+    /// first part of the next one has to carry the break itself.
+    sent_summary_text: bool = false,
 
     fn init(allocator: std.mem.Allocator, sink: ?Provider.Sink, model: []const u8) ResponseStream {
         return .{ .allocator = allocator, .sink = sink, .model = model, .preserved_items = .init(allocator) };
@@ -659,9 +662,6 @@ const ResponseStream = struct {
             self.received_text_delta = true;
             return self.appendText(text_delta);
         }
-        const is_reasoning_summary = std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta");
-        const is_reasoning_delta = std.mem.eql(u8, event_type, "response.reasoning_text.delta");
-        const is_reasoning_event = is_reasoning_summary or is_reasoning_delta;
         // A declined request is still the model answering, and it arrives on no
         // other event, so it is read as the reply rather than as a failure.
         const is_refusal_delta = std.mem.eql(u8, event_type, "response.refusal.delta");
@@ -678,8 +678,12 @@ const ResponseStream = struct {
             }
             return;
         }
+        const is_reasoning_summary = std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta");
+        const is_reasoning_delta = std.mem.eql(u8, event_type, "response.reasoning_text.delta");
+        const is_reasoning_event = is_reasoning_summary or is_reasoning_delta;
         if (is_reasoning_event) {
             const reasoning_delta = stringValue(event_fields.get("delta") orelse return) orelse return;
+            if (is_reasoning_summary) self.sent_summary_text = true;
             if (self.sink) |sink| sink.onThinking(sink.userdata, reasoning_delta);
             return;
         }
@@ -812,10 +816,6 @@ fn responseFailureMessage(event_fields: std.json.ObjectMap, fallback: []const u8
         .object => |value| value,
         else => return fallback,
     };
-    const error_fields = switch (response_fields.get("error") orelse return fallback) {
-        .object => |value| value,
-        else => return fallback,
-    };
     // A truncated response carries its reason here rather than in an error.
     if (response_fields.get("incomplete_details")) |incomplete_details| {
         if (incomplete_details == .object) {
@@ -824,14 +824,14 @@ fn responseFailureMessage(event_fields: std.json.ObjectMap, fallback: []const u8
             }
         }
     }
+    const error_fields = switch (response_fields.get("error") orelse return fallback) {
+        .object => |value| value,
+        else => return fallback,
+    };
     const error_message = error_fields.get("message") orelse return fallback;
     return stringValue(error_message) orelse fallback;
 }
 
-fn stringValue(value: std.json.Value) ?[]const u8 {
-    return switch (value) {
-        .string => |text| text,
-        else => null,
 /// The reason is an open string, so an unknown one is reported rather than
 /// flattened into a guess.
 fn truncationMessage(reason: []const u8) []const u8 {
@@ -840,6 +840,10 @@ fn truncationMessage(reason: []const u8) []const u8 {
     return reason;
 }
 
+fn stringValue(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
     };
 }
 
@@ -1165,6 +1169,24 @@ test "a spent allowance reads as a sentence, not as the wire body" {
     const spent =
         \\{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro_lite","resets_at":1788749039,"eligible_promo":null,"resets_in_seconds":37086}}
     ;
+    const five_hour_window: RateLimits = .{ .primary = .{ .used_percent = 100, .window_minutes = 300 } };
+    try std.testing.expectEqualStrings(
+        "your Codex 5h limit is used up. It resets in 10h 18m.",
+        describeUsageLimit(arena, spent, five_hour_window).?,
+    );
+
+    // The fuller window is the one that rejected the turn, and names itself.
+    const weekly_is_spent: RateLimits = .{
+        .primary = .{ .used_percent = 40, .window_minutes = 300 },
+        .secondary = .{ .used_percent = 100, .window_minutes = 10080 },
+    };
+    try std.testing.expectEqualStrings(
+        "your Codex weekly limit is used up. It resets in 10h 18m.",
+        describeUsageLimit(arena, spent, weekly_is_spent).?,
+    );
+
+    // An unrecognised window length must not be guessed at.
+    const odd_window: RateLimits = .{ .primary = .{ .used_percent = 100, .window_minutes = 42 } };
     try std.testing.expectEqualStrings(
         "your Codex usage limit is used up. It resets in 10h 18m.",
         describeUsageLimit(arena, spent, odd_window).?,
@@ -1188,25 +1210,79 @@ test "a spent allowance reads as a sentence, not as the wire body" {
     );
 
     // Anything else keeps the existing rejection path.
-    try std.testing.expect(describeUsageLimit(arena, "{\"error\":{\"type\":\"invalid_request_error\"}}") == null);
-    try std.testing.expect(describeUsageLimit(arena, "upstream timeout") == null);
-    try std.testing.expect(describeUsageLimit(arena, "") == null);
+    const nothing_known: RateLimits = .{};
+    try std.testing.expect(describeUsageLimit(arena, "{\"error\":{\"type\":\"invalid_request_error\"}}", nothing_known) == null);
+    try std.testing.expect(describeUsageLimit(arena, "upstream timeout", nothing_known) == null);
+    try std.testing.expect(describeUsageLimit(arena, "", nothing_known) == null);
 }
-    const five_hour_window: RateLimits = .{ .primary = .{ .used_percent = 100, .window_minutes = 300 } };
-    try std.testing.expectEqualStrings(
-        "your Codex 5h limit is used up. It resets in 10h 18m.",
-        describeUsageLimit(arena, spent, five_hour_window).?,
-    );
 
-    // The fuller window is the one that rejected the turn, and names itself.
-    const weekly_is_spent: RateLimits = .{
-        .primary = .{ .used_percent = 40, .window_minutes = 300 },
-        .secondary = .{ .used_percent = 100, .window_minutes = 10080 },
-    };
-    try std.testing.expectEqualStrings(
-        "your Codex weekly limit is used up. It resets in 10h 18m.",
-        describeUsageLimit(arena, spent, weekly_is_spent).?,
+test "a metered window names itself from its own length" {
+    // Codex's own tolerance is plus or minus five percent of the nominal window.
+    const five_hours: RateLimitWindow = .{ .used_percent = 0, .window_minutes = 300 };
+    const nearly_five_hours: RateLimitWindow = .{ .used_percent = 0, .window_minutes = 290 };
+    const weekly: RateLimitWindow = .{ .used_percent = 0, .window_minutes = 10080 };
+    const unknown_length: RateLimitWindow = .{ .used_percent = 0, .window_minutes = 60 };
+    const unreported: RateLimitWindow = .{ .used_percent = 0 };
+
+    try std.testing.expectEqualStrings("5h", five_hours.label(false));
+    try std.testing.expectEqualStrings("5h", nearly_five_hours.label(false));
+    try std.testing.expectEqualStrings("weekly", weekly.label(false));
+    try std.testing.expectEqualStrings("usage", unknown_length.label(false));
+    try std.testing.expectEqualStrings("secondary usage", unreported.label(true));
+}
+
+test "a declined request reads as the model's answer, not as a failure" {
+    var reader = std.Io.Reader.fixed(
+        \\data: {"type":"response.refusal.delta","delta":"I can't help with that."}
+        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":9,"output_tokens":5}}}
+        \\
     );
+    var stream = ResponseStream.init(std.testing.allocator, null, "model");
+    defer stream.deinit();
+    try stream.readEvents(std.testing.allocator, &reader);
+    var reply = try stream.intoReply();
+    defer reply.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("I can't help with that.", reply.text);
+}
+
+test "a summary that arrives in parts keeps the parts apart" {
+    const Collected = struct {
+        thinking: std.ArrayList(u8) = .empty,
+        fn onThinking(ptr: *anyopaque, bytes: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.thinking.appendSlice(std.testing.allocator, bytes) catch unreachable;
+        }
+        fn onText(_: *anyopaque, _: []const u8) void {}
+        fn isRunning(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var collected: Collected = .{};
+    defer collected.thinking.deinit(std.testing.allocator);
+    const sink: Provider.Sink = .{
+        .userdata = &collected,
+        .onThinking = Collected.onThinking,
+        .onText = Collected.onText,
+        .stopped = Collected.isRunning,
+    };
+
+    // The first part opens the summary; only the second one breaks it.
+    var reader = std.Io.Reader.fixed(
+        \\data: {"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":0}
+        \\data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"Read the config"}
+        \\data: {"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":1}
+        \\data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":1,"delta":"Patch it"}
+        \\data: {"type":"response.output_text.delta","delta":"done"}
+        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}
+        \\
+    );
+    var stream = ResponseStream.init(std.testing.allocator, sink, "model");
+    defer stream.deinit();
+    try stream.readEvents(std.testing.allocator, &reader);
+    var reply = try stream.intoReply();
+    defer reply.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Read the config\n\nPatch it", collected.thinking.items);
+}
 
 test "a truncated response says why it stopped" {
     var reader = std.Io.Reader.fixed(
