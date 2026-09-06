@@ -19,6 +19,9 @@ const CodexProvider = @This();
 allocator: std.mem.Allocator,
 io: std.Io,
 auth: *Auth,
+/// The backend is not user configurable; this exists so tests can serve the
+/// wire contract from a loopback listener.
+host: []const u8 = auth_flow.backend_url,
 model: []const u8 = "",
 models: ?*Models = null,
 context_limit: u32 = 0,
@@ -146,7 +149,7 @@ pub fn listModels(self: *CodexProvider, allocator: std.mem.Allocator) ![][]const
 fn catalogModels(self: *CodexProvider, arena: std.mem.Allocator) ![]const Models.Info {
     if (self.models) |models| {
         const tokens = try auth_flow.loadTokens(arena, self.auth);
-        return models.getOrFetchCatalog("codex", auth_flow.backend_url, tokens.account_id, self);
+        return models.getOrFetchCatalog("codex", self.host, tokens.account_id, self);
     }
     return self.fetchModels(arena);
 }
@@ -159,7 +162,7 @@ pub fn fetchModels(self: *CodexProvider, arena: std.mem.Allocator) ![]const Mode
     }
     const client = if (self.client) |*started_client| started_client else return error.NotSignedIn;
     const tokens = try auth_flow.ensureFreshTokens(arena, self.io, self.auth);
-    const request_url = try std.fmt.allocPrint(arena, "{s}/models?client_version={s}", .{ auth_flow.backend_url, codex_client_version });
+    const request_url = try std.fmt.allocPrint(arena, "{s}/models?client_version={s}", .{ self.host, codex_client_version });
     const uri = std.Uri.parse(request_url) catch return error.InvalidHost;
     const authorization_header = try std.fmt.allocPrint(arena, "Bearer {s}", .{tokens.access_token});
     const extra_headers = [_]std.http.Header{
@@ -241,7 +244,7 @@ fn respond(
 
         const tokens = try auth_flow.ensureFreshTokens(arena, self.io, self.auth);
         const request_body = try self.buildResponseRequestBody(arena, conversation, turn);
-        const request_url = try std.fmt.allocPrint(arena, "{s}/responses", .{auth_flow.backend_url});
+        const request_url = try std.fmt.allocPrint(arena, "{s}/responses", .{self.host});
         const uri = std.Uri.parse(request_url) catch return error.InvalidHost;
         const authorization_header = try std.fmt.allocPrint(arena, "Bearer {s}", .{tokens.access_token});
         const session_id = self.sessionIdForConversation(conversation);
@@ -1324,4 +1327,85 @@ test "a window is read from the header values the backend really sends" {
     try std.testing.expect(unnamed.window_minutes == null);
     try std.testing.expectEqualStrings("secondary usage", unnamed.label(true));
     try std.testing.expect(parseWindow("40.0", "later").?.window_minutes == null);
+}
+
+test "a rejected turn is read off the wire, headers and all" {
+    const testing = std.testing;
+    // The header names, and the rule that they must be read before the body
+    // reader invalidates them, are only exercised over a real connection.
+    const Endpoint = struct {
+        server: std.Io.net.Server,
+
+        fn serve(self: *@This()) !void {
+            const stream = try self.server.accept(testing.io);
+            defer stream.close(testing.io);
+            var read_buffer: [4096]u8 = undefined;
+            var write_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(testing.io, &read_buffer);
+            var writer = stream.writer(testing.io, &write_buffer);
+            var http = std.http.Server.init(&reader.interface, &writer.interface);
+            var request = try http.receiveHead();
+            try testing.expectEqualStrings("/responses", request.head.target);
+            try request.respond(
+                \\{"error":{"type":"usage_limit_reached","message":"limit reached","resets_in_seconds":37086}}
+            , .{
+                .status = .too_many_requests,
+                .keep_alive = false,
+                .extra_headers = &.{
+                    .{ .name = "x-codex-primary-used-percent", .value = "40.0" },
+                    .{ .name = "x-codex-primary-window-minutes", .value = "300" },
+                    .{ .name = "x-codex-secondary-used-percent", .value = "100.0" },
+                    .{ .name = "x-codex-secondary-window-minutes", .value = "10080" },
+                },
+            });
+        }
+    };
+
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var endpoint: Endpoint = .{ .server = try address.listen(testing.io, .{ .mode = .stream }) };
+    defer endpoint.server.deinit(testing.io);
+    var server_task = try testing.io.concurrent(Endpoint.serve, .{&endpoint});
+    defer server_task.cancel(testing.io) catch {};
+
+    const host = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}", .{endpoint.server.socket.address.getPort()});
+    defer testing.allocator.free(host);
+
+    var auth = Auth.init(testing.allocator, testing.io);
+    defer auth.deinit();
+    try auth.set(auth_flow.provider_id, "{\"access_token\":\"t\",\"refresh_token\":\"r\",\"account_id\":\"a\"}");
+
+    var codex: CodexProvider = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .auth = &auth,
+        .host = host,
+        .model = "gpt-test",
+        .context_limit = 128000,
+        .retries = .{ .attempts = 1 },
+    };
+    // Not `start`: resolving the model would spend the listener on a catalog
+    // request, and this is about the response path.
+    codex.client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer codex.deinit();
+
+    var conversation = Conversation.init(testing.allocator);
+    defer conversation.deinit();
+    _ = try conversation.append(.{ .role = .user, .text = "hello" });
+
+    const provider_value = codex.provider();
+    try testing.expectError(error.HttpError, provider_value.respond(
+        provider_value.userdata,
+        &conversation,
+        .{ .system = "brief" },
+        testing.allocator,
+        null,
+    ));
+
+    // The weekly window is the spent one, and it must name itself as weekly.
+    const detail = try codex.describeError(error.HttpError, testing.allocator);
+    defer testing.allocator.free(detail);
+    try testing.expectEqualStrings(
+        "Codex rejected the request: your Codex weekly limit is used up. It resets in 10h 18m.",
+        detail,
+    );
 }
