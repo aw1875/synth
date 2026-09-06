@@ -10,6 +10,7 @@ const Models = @import("models.zig");
 const OpenAI = @import("openai.zig");
 const Provider = @import("provider.zig");
 const auth_flow = @import("codex_auth.zig");
+const humanize = @import("../core/humanize.zig");
 const retry = @import("retry.zig");
 const window = @import("window.zig");
 
@@ -273,14 +274,19 @@ fn respond(
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
         const retry_after_ms = retry.retryAfterMs(findHeaderValue(response.head, "retry-after"));
+        const quota_used_percent = copyQuotaUsedPercent(arena, response.head);
         const transfer_buffer = try arena.alloc(u8, transfer_buffer_bytes);
         const response_reader = response.reader(transfer_buffer);
         const request_succeeded = response.head.status.class() == .success;
 
         if (!request_succeeded) {
             const response_body = response_reader.allocRemaining(arena, .limited(max_body_bytes)) catch "";
-            const error_detail = errorDetailForResponse(arena, response.head, response_body);
-            self.rememberHttpError(response.head.status, error_detail);
+            if (describeUsageLimit(arena, response_body)) |spent_allowance| {
+                self.rememberResponseError(spent_allowance);
+            } else {
+                const error_detail = errorDetailForResponse(arena, quota_used_percent, response_body);
+                self.rememberHttpError(response.head.status, error_detail);
+            }
 
             const should_refresh_token = response.head.status == .unauthorized and !token_was_refreshed;
             if (should_refresh_token) {
@@ -324,10 +330,37 @@ fn respond(
     }
 }
 
-fn errorDetailForResponse(arena: std.mem.Allocator, response_head: std.http.Client.Response.Head, response_body: []const u8) []const u8 {
+/// Header strings die the moment a body reader takes over the connection
+/// buffer, so the quota is copied out while it is still readable.
+fn copyQuotaUsedPercent(arena: std.mem.Allocator, response_head: std.http.Client.Response.Head) ?[]const u8 {
     const is_rate_limited = response_head.status == .too_many_requests;
-    if (!is_rate_limited) return response_body;
-    const quota_used = findHeaderValue(response_head, "x-codex-primary-used-percent") orelse return response_body;
+    if (!is_rate_limited) return null;
+    const quota_used = findHeaderValue(response_head, "x-codex-primary-used-percent") orelse return null;
+    return arena.dupe(u8, quota_used) catch null;
+}
+
+/// A spent allowance arrives as a JSON envelope carrying everything a person
+/// needs, so the envelope itself never has to reach the transcript.
+fn describeUsageLimit(arena: std.mem.Allocator, response_body: []const u8) ?[]const u8 {
+    const Envelope = struct {
+        @"error": struct {
+            type: []const u8 = "",
+            resets_in_seconds: ?u64 = null,
+        } = .{},
+    };
+    const envelope = std.json.parseFromSliceLeaky(Envelope, arena, response_body, .{ .ignore_unknown_fields = true }) catch return null;
+    const allowance_is_spent = std.mem.eql(u8, envelope.@"error".type, "usage_limit_reached");
+    if (!allowance_is_spent) return null;
+
+    const resets_in_seconds = envelope.@"error".resets_in_seconds orelse
+        return arena.dupe(u8, "your Codex usage limit has been reached.") catch null;
+    var duration_buffer: [humanize.duration_bytes]u8 = undefined;
+    const resets_in = humanize.duration(&duration_buffer, resets_in_seconds * std.time.ms_per_s);
+    return std.fmt.allocPrint(arena, "your Codex usage limit has been reached. It resets in {s}.", .{resets_in}) catch null;
+}
+
+fn errorDetailForResponse(arena: std.mem.Allocator, quota_used_percent: ?[]const u8, response_body: []const u8) []const u8 {
+    const quota_used = quota_used_percent orelse return response_body;
     return std.fmt.allocPrint(arena, "weekly quota {s}% used. {s}", .{ quota_used, response_body }) catch response_body;
 }
 
@@ -1015,4 +1048,30 @@ test "starting Codex does not require prior sign-in" {
     var codex: CodexProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .auth = &auth };
     defer codex.deinit();
     try codex.start();
+
+test "a spent allowance reads as a sentence, not as the wire body" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spent =
+        \\{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro_lite","resets_at":1788749039,"eligible_promo":null,"resets_in_seconds":37086}}
+    ;
+    try std.testing.expectEqualStrings(
+        "your Codex usage limit has been reached. It resets in 10h 18m.",
+        describeUsageLimit(arena, spent).?,
+    );
+
+    // Without a reset time the sentence still stands on its own.
+    const undated = "{\"error\":{\"type\":\"usage_limit_reached\"}}";
+    try std.testing.expectEqualStrings(
+        "your Codex usage limit has been reached.",
+        describeUsageLimit(arena, undated).?,
+    );
+
+    // Anything else keeps the existing rejection path.
+    try std.testing.expect(describeUsageLimit(arena, "{\"error\":{\"type\":\"invalid_request_error\"}}") == null);
+    try std.testing.expect(describeUsageLimit(arena, "upstream timeout") == null);
+    try std.testing.expect(describeUsageLimit(arena, "") == null);
+}
 }
