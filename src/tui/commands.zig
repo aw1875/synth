@@ -120,7 +120,9 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (std.mem.startsWith(u8, line, "/model")) {
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
-            switchModel(self, ctx, name) catch {};
+            switchModel(self, ctx, name) catch |err| {
+                try note(self, "Could not switch to {s}: {s}", .{ name, @errorName(err) });
+            };
         } else {
             try showModels(self, ctx);
         }
@@ -309,7 +311,9 @@ pub fn connectProvider(self: *Model, ctx: *vxfw.EventContext, connection: Connec
     const accepts_api_key = !uses_browser_sign_in;
     if (accepts_api_key) {
         if (connection.key) |api_key| {
-            auth.set(entry.id, api_key) catch {};
+            auth.set(entry.id, api_key) catch |err| {
+                try note(self, "Could not store the key: {s}", .{@errorName(err)});
+            };
             auth.save(self.io, auth.path) catch |err| {
                 try note(self, "Could not write {s}: {s}", .{ auth.path, @errorName(err) });
             };
