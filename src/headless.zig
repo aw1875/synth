@@ -111,6 +111,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     defer backend.deinit();
 
     try backend.start();
+    // Both only enrich what is printed below. A one-shot run still reports the
+    // provider and root without a model name or a context limit.
     backend.ensureModel() catch {};
     backend.warmReferenceMetadata(false) catch {};
     const provider = backend.provider();

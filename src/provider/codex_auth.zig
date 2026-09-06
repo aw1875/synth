@@ -38,7 +38,6 @@ pub const Login = struct {
     arena: ?std.heap.ArenaAllocator = null,
     login_future: ?std.Io.Future(void) = null,
     cancel_future: ?std.Io.Future(void) = null,
-    active: bool = false,
     login_finished: std.atomic.Value(bool) = .init(false),
     cancellation_finished: std.atomic.Value(bool) = .init(false),
     code_received: std.atomic.Value(bool) = .init(false),
@@ -171,6 +170,8 @@ fn runDeviceLogin(login: *Login) !void {
     const owned_device_auth_id = try login_arena.dupe(u8, device_auth_id);
     login.user_code = try login_arena.dupe(u8, user_code);
     login.code_received.store(true, .release);
+    // The UI shows the code and the URL either way, so a machine with no
+    // browser - an SSH session, a container - can still finish the sign-in.
     mcp.Browser.defaultOpen(login.io, device_login_url) catch {};
 
     var elapsed_seconds: u64 = 0;

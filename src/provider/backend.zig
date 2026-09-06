@@ -207,6 +207,8 @@ pub fn modelsWarming(self: *Backend) bool {
 pub fn pollModels(self: *Backend) bool {
     const finished = self.warmup_started and self.models_pending.load(.acquire) == 0;
     if (!finished) return false;
+    // Every job has already reported; this only reaps the group. A job that
+    // failed left its own error in the catalog for the next caller to see.
     self.model_warmup.await(self.options.io) catch {};
     self.warmup_started = false;
     switch (self.client) {

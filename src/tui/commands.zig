@@ -339,6 +339,8 @@ pub fn connectProvider(self: *Model, ctx: *vxfw.EventContext, connection: Connec
         db.setActiveProvider(entry.id) catch |err| {
             try note(self, "Could not remember the provider: {s}", .{@errorName(err)});
         };
+        // Warming is an optimisation; a failure only means the picker fetches
+        // on demand instead.
         backend.warmModels(db) catch {};
     }
     if (backend.modelsWarming()) try self.scheduleTick(ctx);

@@ -324,7 +324,7 @@ fn respond(
                 request_body,
                 reply.text,
                 reply.tool_calls.len,
-            }) catch {};
+            }) catch {}; // Diagnostics must never cost the user a completed turn.
         }
         return reply;
     }
@@ -1047,6 +1047,7 @@ test "starting Codex does not require prior sign-in" {
     var codex: CodexProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .auth = &auth };
     defer codex.deinit();
     try codex.start();
+}
 
 test "a spent allowance reads as a sentence, not as the wire body" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -1072,5 +1073,4 @@ test "a spent allowance reads as a sentence, not as the wire body" {
     try std.testing.expect(describeUsageLimit(arena, "{\"error\":{\"type\":\"invalid_request_error\"}}") == null);
     try std.testing.expect(describeUsageLimit(arena, "upstream timeout") == null);
     try std.testing.expect(describeUsageLimit(arena, "") == null);
-}
 }
