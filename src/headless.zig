@@ -193,7 +193,15 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     }
     _ = try report(out, &convo, printed);
 
-    try out.print("\n{s}{d} messages, {d} model calls{s}\n", .{ dim, convo.messages.items.len, loop.steps, reset });
+    try out.print("\n{s}{d} messages, {d} model calls, {d} in ({d} cached), {d} out{s}\n", .{
+        dim,
+        convo.messages.items.len,
+        loop.steps,
+        loop.usage.input_tokens,
+        loop.usage.cached_input_tokens,
+        loop.usage.output_tokens,
+        reset,
+    });
     try out.flush();
 }
 

@@ -1008,6 +1008,11 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16)
         try compact(ctx.arena, usage.input_tokens),
         try compact(ctx.arena, usage.output_tokens),
     }));
+    if (usage.cached_input_tokens > 0) {
+        try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{s} cached", .{
+            try compact(ctx.arena, usage.cached_input_tokens),
+        }));
+    }
     try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{d} model calls", .{usage.calls}));
     if (usage.tokensPerSecond()) |rate| {
         try session_lines.append(ctx.arena, try std.fmt.allocPrint(ctx.arena, "{d:.0} tok/s", .{rate}));

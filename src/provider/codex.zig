@@ -826,6 +826,15 @@ const ResponseStream = struct {
         const output_tokens = usage_fields.get("output_tokens") orelse std.json.Value{ .integer = 0 };
         self.usage.prompt_tokens = unsignedIntegerValue(input_tokens);
         self.usage.completion_tokens = unsignedIntegerValue(output_tokens);
+        // What the prompt cache actually saved, which is the only way to see
+        // whether the cache key and the prefix are doing their job.
+        if (usage_fields.get("input_tokens_details")) |details| {
+            if (details == .object) {
+                if (details.object.get("cached_tokens")) |cached| {
+                    self.usage.cached_prompt_tokens = unsignedIntegerValue(cached);
+                }
+            }
+        }
     }
 
     fn intoReply(self: *ResponseStream) !Provider.Reply {
@@ -1600,4 +1609,34 @@ test "a call the turn never answered is closed rather than left open" {
         }
         try testing.expect(found);
     }
+}
+
+test "the cache saving is read back off a completed response" {
+    // Shape taken from a real Codex response.
+    var reader = std.Io.Reader.fixed(
+        \\data: {"type":"response.output_text.delta","delta":"hi"}
+        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":3038,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":2560},"output_tokens":6,"total_tokens":3044}}}
+        \\
+    );
+    var stream = ResponseStream.init(std.testing.allocator, null, "model");
+    defer stream.deinit();
+    try stream.readEvents(std.testing.allocator, &reader);
+    var reply = try stream.intoReply();
+    defer reply.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 3038), reply.usage.prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 2560), reply.usage.cached_prompt_tokens);
+    try std.testing.expectEqual(@as(u32, 6), reply.usage.completion_tokens);
+
+    // A provider that reports no details simply saves nothing.
+    var bare = std.Io.Reader.fixed(
+        \\data: {"type":"response.output_text.delta","delta":"hi"}
+        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":2}}}
+        \\
+    );
+    var plain = ResponseStream.init(std.testing.allocator, null, "model");
+    defer plain.deinit();
+    try plain.readEvents(std.testing.allocator, &bare);
+    var plain_reply = try plain.intoReply();
+    defer plain_reply.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), plain_reply.usage.cached_prompt_tokens);
 }

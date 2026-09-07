@@ -124,6 +124,9 @@ pub const Usage = struct {
     /// Tokens in the request. Doubles as "how full is the context", since the
     /// whole conversation is resent each turn.
     prompt_tokens: u32 = 0,
+    /// The part of `prompt_tokens` the provider served from its own cache.
+    /// Zero from a provider that does not report it.
+    cached_prompt_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     /// Time spent generating, for a tokens-per-second figure.
     eval_duration_ns: u64 = 0,

@@ -254,6 +254,7 @@ pub const Usage = struct {
     /// A conservative size for the history replayed on the next call.
     context_tokens: u32 = 0,
     input_tokens: u64 = 0,
+    cached_input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     eval_duration_ns: u64 = 0,
     /// Model calls, which exceeds user turns whenever tools are involved.
@@ -1193,6 +1194,7 @@ fn pollRequest(self: *Loop) !bool {
     if (request.reply) |reply| {
         self.usage.calls += 1;
         self.usage.input_tokens += reply.usage.prompt_tokens;
+        self.usage.cached_input_tokens += reply.usage.cached_prompt_tokens;
         self.usage.output_tokens += reply.usage.completion_tokens;
         self.turn_tokens += reply.usage.prompt_tokens + reply.usage.completion_tokens;
         self.usage.eval_duration_ns += reply.usage.eval_duration_ns;
