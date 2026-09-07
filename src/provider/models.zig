@@ -42,22 +42,6 @@ pub fn deinit(self: *Models) void {
     self.allocator.free(self.cache_directory);
 }
 
-/// An explicit reconnect can retry an unavailable endpoint. Successful
-/// snapshots still last the whole launch, including switches in the picker.
-pub fn forgetFailedCatalogs(self: *Models) void {
-    self.catalogs_mutex.lockUncancelable(self.io);
-    defer self.catalogs_mutex.unlock(self.io);
-    var catalog_entries = self.catalogs.iterator();
-    while (catalog_entries.next()) |catalog_entry| {
-        _ = catalog_entry.value_ptr.* catch |catalog_error| {
-            const discovery_is_running = catalog_error == error.CatalogLoading;
-            if (discovery_is_running) continue;
-            _ = self.catalogs.remove(catalog_entry.key_ptr.*);
-            catalog_entries = self.catalogs.iterator();
-        };
-    }
-}
-
 /// fetcher.fetchModels returns normalized metadata allocated in the supplied
 /// arena. Snapshots stay alive until shutdown, even across provider switches.
 pub fn getOrFetchCatalog(self: *Models, catalog_namespace: []const u8, endpoint: []const u8, account_identity: []const u8, source: anytype) ![]const Info {
@@ -75,10 +59,11 @@ fn loadCatalog(self: *Models, catalog_namespace: []const u8, endpoint: []const u
         try self.catalogs.put(self.allocator, catalog_key, error.CatalogLoading);
     }
     return self.fetchOrRestoreCatalog(catalog_key, source, refresh_from_source) catch |catalog_error| {
+        // A failure is not an answer. Forgetting it lets the next caller try
+        // again, so one unreachable moment does not cost the whole launch.
         self.catalogs_mutex.lockUncancelable(self.io);
         defer self.catalogs_mutex.unlock(self.io);
-        const catalog_result = self.catalogs.getPtr(catalog_key).?;
-        catalog_result.* = catalog_error;
+        _ = self.catalogs.remove(catalog_key);
         return catalog_error;
     };
 }
@@ -392,13 +377,14 @@ test "catalog refreshes once per launch, survives failure, and isolates endpoint
         try testing.expectError(error.Unavailable, cache.getOrFetchCatalog("codex", "host", "other-account", &source));
         try testing.expectError(error.Unavailable, cache.getOrFetchCatalog("codex", "other-host", "account", &source));
         try testing.expectError(error.Unavailable, cache.getOrFetchCatalog("openai", "host", "account", &source));
+        // A failure is forgotten, so the next caller tries again rather than
+        // inheriting a dead endpoint for the rest of the launch.
         const calls_before_retry = source.calls;
         try testing.expectError(error.Unavailable, cache.getOrFetchCatalog("openai", "host", "account", &source));
-        try testing.expectEqual(calls_before_retry, source.calls);
-        source.fail = false;
-        cache.forgetFailedCatalogs();
-        _ = try cache.getOrFetchCatalog("openai", "host", "account", &source);
         try testing.expectEqual(calls_before_retry + 1, source.calls);
+        source.fail = false;
+        _ = try cache.getOrFetchCatalog("openai", "host", "account", &source);
+        try testing.expectEqual(calls_before_retry + 2, source.calls);
     }
     source.fail = false;
     source.stalled = true;
@@ -449,7 +435,6 @@ test "catalog retries release downloads and retain only owned metadata" {
     var source: Source = .{};
     for (0..10) |_| {
         try testing.expectError(error.Unavailable, cache.getOrFetchCatalog("test", "host", "", &source));
-        cache.forgetFailedCatalogs();
     }
     source.fail = false;
     const entries = try cache.getOrFetchCatalog("test", "host", "", &source);
@@ -505,7 +490,6 @@ test "slow catalogs do not block ready endpoints and are stopped at the deadline
     var pending = try testing.io.concurrent(Source.discover, .{ &cache, &source });
     defer _ = pending.cancel(testing.io) catch {};
     try source.started.wait(testing.io);
-    cache.forgetFailedCatalogs(); // Must not evict an in-flight request.
     try testing.expectError(error.CatalogLoading, cache.getOrFetchCatalog("test", "slow", "", &source));
     const entries = try cache.getOrFetchCatalog("test", "ready", "", &ready);
     try testing.expectEqualStrings("ready", entries[0].id);

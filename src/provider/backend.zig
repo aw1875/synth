@@ -345,7 +345,6 @@ pub fn connect(
     // A selection must not see an unfinished warmup as an unavailable catalog.
     self.model_warmup.cancel(self.options.io);
     self.warmup_started = false;
-    self.options.models.?.forgetFailedCatalogs();
     const connection: Provider.Connection = .{
         .label = entry.label,
         .host = host,
