@@ -48,7 +48,15 @@ pub const std_options = std.Options{
 };
 
 pub fn main(init: std.process.Init) !void {
-    const command = try cli.parse(init, init.arena.allocator());
+    // A bad flag is the person's typo, not a crash. The parser has already said
+    // what it did not understand, so add the way out and stop there.
+    const command = cli.parse(init, init.arena.allocator()) catch |parse_error| switch (parse_error) {
+        error.OutOfMemory => return parse_error,
+        else => {
+            try writeLine(init.io, "\nTry `" ++ pkg.name ++ " --help` for usage.\n");
+            std.process.exit(2);
+        },
+    };
     switch (command) {
         .help => |topic| try writeLine(init.io, cli.usageFor(topic)),
         .version => try writeLine(init.io, pkg.name ++ " " ++ pkg.version ++ "\n"),

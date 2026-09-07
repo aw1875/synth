@@ -287,7 +287,13 @@ fn parseRun(
     if (res.args.help != 0) return .{ .help = .run };
 
     const words = res.positionals[0];
-    if (words.len == 0) return error.MissingPrompt;
+    if (words.len == 0) {
+        var buffer: [128]u8 = undefined;
+        var out = std.Io.File.stderr().writer(init.io, &buffer);
+        try out.interface.writeAll("run needs a message. Try: synth run \"what changed here?\"\n");
+        try out.interface.flush();
+        return error.MissingPrompt;
+    }
 
     return .{
         .run = .{
