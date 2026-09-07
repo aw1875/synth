@@ -111,11 +111,34 @@ pub fn show(
     self.entries = entries;
 
     self.current = current;
-    if (!self.open) self.search.clear();
-    self.cursor = 0;
-    self.scroll = 0;
+    // Reopening starts fresh; refreshing an open list must not move the
+    // highlight out from under whoever is arrowing through it.
+    const held = if (self.open) self.selected() else null;
+    const held_name = if (held) |entry| entry.name else null;
+    if (!self.open) {
+        self.search.clear();
+        self.cursor = 0;
+        self.scroll = 0;
+    }
     try self.filter();
+    if (held_name) |name| self.restoreCursor(name);
     self.open = true;
+}
+
+/// Put the highlight back on the entry it was on, or as close as the new list
+/// allows. The name is what a person is tracking, not the row number.
+fn restoreCursor(self: *Picker, name: []const u8) void {
+    for (self.rows.items, 0..) |row, row_index| {
+        switch (row) {
+            .heading => continue,
+            .entry => |entry_index| {
+                if (!std.mem.eql(u8, self.entries[entry_index].name, name)) continue;
+                self.cursor = row_index;
+                return;
+            },
+        }
+    }
+    if (self.cursor >= self.rows.items.len) self.cursor = 0;
 }
 
 fn isRecent(name: []const u8, recent: []const []const u8) bool {
@@ -497,4 +520,39 @@ test "the box is drawn without overflowing its own arithmetic" {
 
     try std.testing.expect(try picker.draw(ctx, widget, .{ .width = 20, .height = 40 }) == null);
     try std.testing.expect(try picker.draw(ctx, widget, .{ .width = 100, .height = 4 }) == null);
+}
+
+test "a list that grows while it is open keeps the highlight where it was" {
+    const testing = std.testing;
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+
+    const first = [_]Entry{
+        .{ .name = "alpha", .provider = "P", .provider_id = "p" },
+        .{ .name = "beta", .provider = "P", .provider_id = "p" },
+    };
+    try picker.show(&first, &.{}, "alpha");
+    picker.move(1);
+    // The picker owns its entry strings and frees them on the next show.
+    const held = try testing.allocator.dupe(u8, picker.selected().?.name);
+    defer testing.allocator.free(held);
+
+    // Another provider's models land while the picker is open.
+    const grown = [_]Entry{
+        .{ .name = "alpha", .provider = "P", .provider_id = "p" },
+        .{ .name = "beta", .provider = "P", .provider_id = "p" },
+        .{ .name = "gamma", .provider = "Q", .provider_id = "q" },
+        .{ .name = "delta", .provider = "Q", .provider_id = "q" },
+    };
+    try picker.show(&grown, &.{}, "alpha");
+    try testing.expectEqualStrings(held, picker.selected().?.name);
+
+    // Arrowing still works afterwards.
+    picker.move(1);
+    try testing.expect(!std.mem.eql(u8, held, picker.selected().?.name));
+
+    // Reopening starts from the top again.
+    picker.close();
+    try picker.show(&grown, &.{}, "alpha");
+    try testing.expectEqualStrings("alpha", picker.selected().?.name);
 }
