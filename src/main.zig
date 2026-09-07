@@ -195,9 +195,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     }
 
     try backend.start();
-    // Discovery runs now so the picker is ready the moment it is opened; a
-    // list that fills in while someone is arrowing through it is worse than a
-    // list that waits.
+    // Prepare local picker choices and discover updates in the background.
     try backend.warmModels(&db);
     timing.mark("provider probe");
 

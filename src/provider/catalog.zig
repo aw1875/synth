@@ -155,7 +155,11 @@ pub fn resolve(
     };
 
     const uses_codex_managed_model = entry.kind == .codex;
-    const configured_model = if (uses_codex_managed_model) "" else config.model_override;
+    var configured_model = if (uses_codex_managed_model) "" else config.model_override;
+    if (configured_model.len == 0) {
+        const model_key = try std.fmt.allocPrint(arena, "model:{s}", .{entry.id});
+        configured_model = try db.setting(arena, model_key);
+    }
 
     return .{ .entry = entry, .host = host, .model = configured_model, .api_key = key };
 }

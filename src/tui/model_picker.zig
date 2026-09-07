@@ -43,6 +43,7 @@ const Row = union(enum) {
 
 allocator: std.mem.Allocator,
 open: bool = false,
+loading: bool = false,
 /// Owned: names and provider labels are duped when the picker is shown, since
 /// the provider's own list is freed straight after.
 entries: []Entry = &.{},
@@ -70,13 +71,17 @@ pub fn deinit(self: *Picker) void {
 }
 
 fn release(self: *Picker) void {
-    for (self.entries) |entry| {
+    self.freeEntries(self.entries);
+    self.entries = &.{};
+}
+
+fn freeEntries(self: *Picker, entries: []Entry) void {
+    for (entries) |entry| {
         self.allocator.free(entry.name);
         self.allocator.free(entry.provider);
         self.allocator.free(entry.provider_id);
     }
-    self.allocator.free(self.entries);
-    self.entries = &.{};
+    self.allocator.free(entries);
 }
 
 /// Show the list. `models` and `recent` are borrowed for the length of the
@@ -87,18 +92,19 @@ pub fn show(
     recent: []const []const u8,
     current: []const u8,
 ) !void {
-    self.release();
-
+    const held = if (self.open) self.selected() else null;
+    const previous_entries = self.entries;
     const entries = try self.allocator.alloc(Entry, models.len);
     var filled: usize = 0;
-    errdefer {
+    var installed = false;
+    errdefer if (!installed) {
         for (entries[0..filled]) |entry| {
             self.allocator.free(entry.name);
             self.allocator.free(entry.provider);
             self.allocator.free(entry.provider_id);
         }
         self.allocator.free(entries);
-    }
+    };
     for (models, entries) |src, *dst| {
         dst.* = .{
             .name = try self.allocator.dupe(u8, src.name),
@@ -109,31 +115,33 @@ pub fn show(
         filled += 1;
     }
     self.entries = entries;
+    installed = true;
+    defer self.freeEntries(previous_entries);
 
     self.current = current;
     // Reopening starts fresh; refreshing an open list must not move the
     // highlight out from under whoever is arrowing through it.
-    const held = if (self.open) self.selected() else null;
-    const held_name = if (held) |entry| entry.name else null;
     if (!self.open) {
         self.search.clear();
         self.cursor = 0;
         self.scroll = 0;
     }
     try self.filter();
-    if (held_name) |name| self.restoreCursor(name);
+    if (held) |entry| self.restoreCursor(entry);
     self.open = true;
 }
 
 /// Put the highlight back on the entry it was on, or as close as the new list
 /// allows. The name is what a person is tracking, not the row number.
-fn restoreCursor(self: *Picker, name: []const u8) void {
+fn restoreCursor(self: *Picker, held: Entry) void {
     for (self.rows.items, 0..) |row, row_index| {
         switch (row) {
             .heading => continue,
             .entry => |entry_index| {
-                if (!std.mem.eql(u8, self.entries[entry_index].name, name)) continue;
+                if (!std.mem.eql(u8, self.entries[entry_index].name, held.name) or
+                    !std.mem.eql(u8, self.entries[entry_index].provider_id, held.provider_id)) continue;
                 self.cursor = row_index;
+                if (self.cursor >= self.scroll + max_rows) self.scroll = self.cursor - max_rows + 1;
                 return;
             },
         }
@@ -304,7 +312,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
     const first_row: u16 = field_row + 2;
     if (self.rows.items.len == 0) {
-        _ = w.writeText(surface, pad, first_row, "no models", theme.on_card(theme.fg_dim).cell);
+        _ = w.writeText(surface, pad, first_row, if (self.loading) "Loading models…" else "no models", theme.on_card(theme.fg_dim).cell);
     }
 
     for (self.rows.items[self.scroll..][0..visible], 0..) |row, i| {
@@ -555,4 +563,23 @@ test "a list that grows while it is open keeps the highlight where it was" {
     picker.close();
     try picker.show(&grown, &.{}, "alpha");
     try testing.expectEqualStrings("alpha", picker.selected().?.name);
+}
+
+test "refresh preserves the highlighted provider and model across reordered and shrinking lists" {
+    const testing = std.testing;
+    var picker = Picker.init(testing.allocator);
+    defer picker.deinit();
+    const first: Entry = .{ .name = "same", .provider = "One", .provider_id = "one" };
+    const second: Entry = .{ .name = "same", .provider = "Two", .provider_id = "two" };
+    try picker.show(&.{ first, second }, &.{}, "");
+    picker.move(1);
+    try testing.expectEqualStrings("two", picker.selected().?.provider_id);
+    try picker.search.insertText("same");
+    try picker.show(&.{ second, first }, &.{}, "");
+    try testing.expectEqualStrings("same", picker.search.text.items);
+    try testing.expectEqualStrings("two", picker.selected().?.provider_id);
+    try picker.show(&.{second}, &.{}, "");
+    try testing.expectEqualStrings("two", picker.selected().?.provider_id);
+    try picker.show(&.{}, &.{}, "");
+    try testing.expect(picker.selected() == null);
 }

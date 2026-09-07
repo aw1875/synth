@@ -15,3 +15,4 @@ zig-pkg
 # Configs, except the schema
 *.json
 !*.schema.json
+!src/provider/models.dev.json

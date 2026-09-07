@@ -163,6 +163,17 @@ server the other's settings.
 
 Model context limits and capabilities come from each provider's own endpoint.
 Where one does not say, synth fills the gaps from [models.dev](https://models.dev).
+The model picker reads known models immediately: live discovery results, then
+saved endpoint catalogs, then matching entries from models.dev. A full models.dev
+snapshot is bundled in the binary for first-run use; saved reference data takes
+precedence. Provider discovery and reference updates run in the background.
+Local/custom servers without a saved list show their configured model or a loading
+state until discovery finishes. Codex choices come from its account-specific
+catalog, not the public OpenAI catalog.
+
+The bundled snapshot is `src/provider/models.dev.json`. To update it, download `https://models.dev/api.json`
+to that file and run `zig build test`. Builds embed the checked-in snapshot and
+require no catalog download.
 Point `SYNTH_MODELS_URL` at a mirror, `SYNTH_MODELS_PATH` at a local copy, or set
 `SYNTH_DISABLE_MODELS_FETCH=1` to skip that lookup entirely.
 

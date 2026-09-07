@@ -1,5 +1,6 @@
 //! One catalog snapshot per endpoint/account per launch. Shared by the picker,
-//! live backend and subagents; disk is a last-good fallback, never the authority.
+//! live backend and subagents. The picker can read disk/bundled fallbacks
+//! without starting discovery or treating them as a live endpoint response.
 const std = @import("std");
 const Config = @import("../core/config.zig");
 const Models = @This();
@@ -18,6 +19,8 @@ io: std.Io,
 cache_directory: []const u8,
 catalogs: std.AutoHashMapUnmanaged([32]u8, anyerror![]const Info) = .empty,
 catalogs_mutex: std.Io.Mutex = .init,
+reference_arena: ?std.heap.ArenaAllocator = null,
+reference_snapshot: ?[]const Info = null,
 fetch_timeout: std.Io.Duration = .fromSeconds(5),
 /// Where the reference metadata comes from. Redirectable to a mirror or a
 /// local file, and switchable off entirely for a machine that should not be
@@ -39,6 +42,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, state_file_path: []const u
 }
 
 pub fn deinit(self: *Models) void {
+    if (self.reference_arena) |*arena| arena.deinit();
     var catalog_results = self.catalogs.valueIterator();
     while (catalog_results.next()) |catalog_result| {
         const catalog = catalog_result.* catch continue;
@@ -52,10 +56,6 @@ pub fn deinit(self: *Models) void {
 /// fetcher.fetchModels returns normalized metadata allocated in the supplied
 /// arena. Snapshots stay alive until shutdown, even across provider switches.
 pub fn getOrFetchCatalog(self: *Models, catalog_namespace: []const u8, endpoint: []const u8, account_identity: []const u8, source: anytype) ![]const Info {
-    return self.loadCatalog(catalog_namespace, endpoint, account_identity, source, true);
-}
-
-fn loadCatalog(self: *Models, catalog_namespace: []const u8, endpoint: []const u8, account_identity: []const u8, source: anytype, refresh_from_source: bool) ![]const Info {
     const catalog_key = catalogCacheKey(catalog_namespace, endpoint, account_identity);
     {
         self.catalogs_mutex.lockUncancelable(self.io);
@@ -65,7 +65,7 @@ fn loadCatalog(self: *Models, catalog_namespace: []const u8, endpoint: []const u
         // Other callers can use ready catalogs without waiting on this network call.
         try self.catalogs.put(self.allocator, catalog_key, error.CatalogLoading);
     }
-    return self.fetchOrRestoreCatalog(catalog_key, source, refresh_from_source) catch |catalog_error| {
+    return self.fetchOrRestoreCatalog(catalog_key, source) catch |catalog_error| {
         // A failure is not an answer. Forgetting it lets the next caller try
         // again, so one unreachable moment does not cost the whole launch.
         self.catalogs_mutex.lockUncancelable(self.io);
@@ -84,6 +84,60 @@ pub fn cachedCatalog(self: *Models, catalog_namespace: []const u8, endpoint: []c
     return catalog_result catch null;
 }
 
+/// Local-only picker lookup. A saved empty list is still an authoritative list.
+/// Disk entries belong to scratch; live snapshots belong to Models.
+pub fn knownCatalog(self: *Models, scratch: std.mem.Allocator, namespace: []const u8, endpoint: []const u8, identity: []const u8) !?[]const Info {
+    if (self.cachedCatalog(namespace, endpoint, identity)) |ready| return ready;
+    const filename = std.fmt.bytesToHex(catalogCacheKey(namespace, endpoint, identity), .lower);
+    const path = try std.fmt.allocPrint(scratch, "{s}/{s}.json", .{ self.cache_directory, filename });
+    return self.readCatalogFromDisk(scratch, path);
+}
+
+/// Load reference data locally, once. Never substitute the public bundle for
+/// an explicitly configured mirror/file or expose it when lookup is disabled.
+pub fn knownReferenceCatalog(self: *Models) !?[]const Info {
+    if (!self.reference_enabled) return null;
+    if (self.cachedCatalog("models.dev", self.reference_url, "")) |ready| return ready;
+    self.catalogs_mutex.lockUncancelable(self.io);
+    defer self.catalogs_mutex.unlock(self.io);
+    if (self.reference_snapshot) |snapshot| return snapshot;
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    const filename = std.fmt.bytesToHex(catalogCacheKey("models.dev", self.reference_url, ""), .lower);
+    const path = try std.fmt.allocPrint(scratch, "{s}/{s}.json", .{ self.cache_directory, filename });
+    const snapshot = try self.readCatalogFromDisk(scratch, path) orelse blk: {
+        const contents = if (std.mem.eql(u8, self.reference_url, default_reference_url))
+            @embedFile("models.dev.json")
+        else if (!std.mem.startsWith(u8, self.reference_url, "http"))
+            try std.Io.Dir.cwd().readFileAlloc(self.io, self.reference_url, scratch, .limited(16 * 1024 * 1024))
+        else {
+            arena.deinit();
+            return null;
+        };
+        break :blk try Reference.parseCatalogResponse(scratch, contents);
+    };
+    self.reference_arena = arena;
+    self.reference_snapshot = snapshot;
+    return snapshot;
+}
+
+pub fn referenceModelNames(self: *Models, scratch: std.mem.Allocator, api_root: []const u8) ![][]const u8 {
+    // Public directory entries can name local HTTP gateways. Those defaults
+    // are not evidence of what is installed on this machine.
+    if (std.mem.eql(u8, self.reference_url, default_reference_url) and !std.mem.startsWith(u8, api_root, "https://"))
+        return scratch.alloc([]const u8, 0);
+    const entries = try self.knownReferenceCatalog() orelse return scratch.alloc([]const u8, 0);
+    const prefix = try std.fmt.allocPrint(scratch, "{s}/", .{std.mem.trimEnd(u8, api_root, "/")});
+    var names: std.ArrayList([]const u8) = .empty;
+    for (entries) |entry| {
+        if (entry.visible and std.mem.startsWith(u8, entry.id, prefix)) {
+            try names.append(scratch, try scratch.dupe(u8, entry.id[prefix.len..]));
+        }
+    }
+    return names.toOwnedSlice(scratch);
+}
+
 fn catalogCacheKey(catalog_namespace: []const u8, endpoint: []const u8, account_identity: []const u8) [32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     for ([_][]const u8{ catalog_namespace, endpoint, account_identity }) |identity_part| {
@@ -93,17 +147,12 @@ fn catalogCacheKey(catalog_namespace: []const u8, endpoint: []const u8, account_
     return hasher.finalResult();
 }
 
-fn fetchOrRestoreCatalog(self: *Models, catalog_key: [32]u8, source: anytype, refresh_from_source: bool) ![]const Info {
+fn fetchOrRestoreCatalog(self: *Models, catalog_key: [32]u8, source: anytype) ![]const Info {
     var scratch_arena: std.heap.ArenaAllocator = .init(self.allocator);
     defer scratch_arena.deinit();
     const scratch = scratch_arena.allocator();
     const cache_filename = std.fmt.bytesToHex(catalog_key, .lower);
     const cache_path = try std.fmt.allocPrint(scratch, "{s}/{s}.json", .{ self.cache_directory, cache_filename });
-    const should_read_disk_first = !refresh_from_source;
-    if (should_read_disk_first) {
-        const disk_catalog = try self.readCatalogFromDisk(scratch, cache_path);
-        if (disk_catalog) |catalog| return self.storeOwnedCatalog(catalog_key, catalog);
-    }
     const fetched_catalog = self.fetchCatalogBeforeTimeout(source, scratch) catch |fetch_error| {
         const fetch_was_canceled = fetch_error == error.Canceled;
         if (fetch_was_canceled) return fetch_error;
@@ -208,7 +257,7 @@ pub fn containsString(candidates: []const []const u8, expected: []const u8) bool
 /// Like OpenCode, use models.dev only to fill metadata an endpoint omits.
 /// Matching includes the API root: a custom server's "gpt-5" is not OpenAI's.
 pub fn referenceMetadataFor(self: *Models, scratch: std.mem.Allocator, api_root: []const u8, model_id: []const u8) !?Info {
-    const reference_catalog = self.cachedCatalog("models.dev", self.reference_url, "") orelse return null;
+    const reference_catalog = try self.knownReferenceCatalog() orelse return null;
     const normalized_api_root = std.mem.trimEnd(u8, api_root, "/");
     const qualified_model_id = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ normalized_api_root, model_id });
     return findModel(reference_catalog, qualified_model_id);
@@ -217,8 +266,9 @@ pub fn referenceMetadataFor(self: *Models, scratch: std.mem.Allocator, api_root:
 /// Interactive boots refresh in the background; one-shot runs prefer disk.
 pub fn loadReferenceCatalog(self: *Models, refresh_from_source: bool) !void {
     if (!self.reference_enabled) return;
+    if (!refresh_from_source and (try self.knownReferenceCatalog()) != null) return;
     var reference_source: Reference = .{ .io = self.io, .url = self.reference_url };
-    _ = try self.loadCatalog("models.dev", self.reference_url, "", &reference_source, refresh_from_source);
+    _ = try self.getOrFetchCatalog("models.dev", self.reference_url, "", &reference_source);
 }
 
 const Reference = struct {
@@ -256,7 +306,8 @@ const Reference = struct {
         const ModelMetadata = struct {
             limit: struct { context: u32, input: ?u32 = null },
             tool_call: ?bool = null,
-            modalities: ?struct { input: []const []const u8 } = null,
+            modalities: ?struct { input: []const []const u8, output: []const []const u8 = &.{"text"} } = null,
+            status: ?[]const u8 = null,
         };
         const ProviderCatalog = struct { api: ?[]const u8 = null, models: std.json.ArrayHashMap(ModelMetadata) };
         const response_catalog = try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(ProviderCatalog), scratch, response_body, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
@@ -278,6 +329,8 @@ const Reference = struct {
                     .context_limit = @min(max_input_tokens, metadata.limit.context),
                     .tools = metadata.tool_call,
                     .vision = supports_vision,
+                    .visible = !std.mem.eql(u8, metadata.status orelse "", "deprecated") and
+                        (if (metadata.modalities) |modalities| containsString(modalities.output, "text") else true),
                 });
             }
         }
@@ -335,11 +388,20 @@ test "reference metadata uses disk for one-shot runs and refreshes for interacti
     const state_path = try std.fs.path.join(testing.allocator, &.{ root, "auth.json" });
     defer testing.allocator.free(state_path);
     var source: Source = .{};
-    // First boot fetches on a cache miss; subsequent headless boots stay local.
-    for ([_]bool{ false, false, true }) |refresh| {
+    {
+        var previous = try Models.init(testing.allocator, testing.io, state_path);
+        defer previous.deinit();
+        _ = try previous.getOrFetchCatalog("models.dev", previous.reference_url, "", &source);
+    }
+    // Headless boots read the saved reference; interactive discovery refreshes it.
+    for ([_]bool{ false, true }) |refresh| {
         var cache = try Models.init(testing.allocator, testing.io, state_path);
         defer cache.deinit();
-        _ = try cache.loadCatalog("models.dev", "https://models.dev/api.json", "", &source, refresh);
+        if (refresh) {
+            _ = try cache.getOrFetchCatalog("models.dev", cache.reference_url, "", &source);
+        } else {
+            try cache.loadReferenceCatalog(false);
+        }
         var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
         defer scratch.deinit();
         const model = (try cache.referenceMetadataFor(scratch.allocator(), "https://api.example/v1", "model")).?;
@@ -552,4 +614,102 @@ test "the reference source can be pinned to a file or switched off" {
         defer scratch.deinit();
         try testing.expect((try cache.referenceMetadataFor(scratch.allocator(), "https://api.openai.com/v1", "pinned-model")) == null);
     }
+}
+
+test "first-run reference choices use the bundle without fetching or crossing endpoints" {
+    const testing = std.testing;
+    var models = try Models.init(testing.allocator, testing.io, "");
+    defer models.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    try models.loadReferenceCatalog(false);
+    const names = try models.referenceModelNames(scratch, "https://api.openai.com/v1");
+    try testing.expect(names.len > 0);
+    try testing.expect(models.cachedCatalog("models.dev", models.reference_url, "") == null);
+    try testing.expectEqual(@as(usize, 0), (try models.referenceModelNames(scratch, "http://localhost:8080/v1")).len);
+    try testing.expectEqual(@as(usize, 0), (try models.referenceModelNames(scratch, "https://api.openai.com/v1-other")).len);
+    models.reference_enabled = false;
+    try testing.expectEqual(@as(usize, 0), (try models.referenceModelNames(scratch, "https://api.openai.com/v1")).len);
+}
+
+test "picker reads saved catalogs during discovery and retains them after failure" {
+    const testing = std.testing;
+    const Source = struct {
+        started: std.Io.Event = .unset,
+        released: std.Io.Event = .unset,
+        fail: bool = false,
+        pub fn fetchModels(self: *@This(), _: std.mem.Allocator) ![]const Info {
+            if (self.fail) {
+                self.started.set(testing.io);
+                try self.released.wait(testing.io);
+                return error.Unavailable;
+            }
+            return &.{.{ .id = "saved-model" }};
+        }
+        fn discover(self: *@This(), models: *Models) ![]const Info {
+            return models.getOrFetchCatalog("test", "endpoint", "account", self);
+        }
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const state = try std.fs.path.join(scratch, &.{ root, "auth.json" });
+    var source: Source = .{};
+    {
+        var previous = try Models.init(testing.allocator, testing.io, state);
+        defer previous.deinit();
+        _ = try source.discover(&previous);
+    }
+    var models = try Models.init(testing.allocator, testing.io, state);
+    defer models.deinit();
+    try testing.expectEqualStrings("saved-model", (try models.knownCatalog(scratch, "test", "endpoint", "account")).?[0].id);
+    try testing.expect((try models.knownCatalog(scratch, "test", "endpoint", "other-account")) == null);
+    try testing.expect((try models.knownCatalog(scratch, "test", "other-endpoint", "account")) == null);
+    source.fail = true;
+    var pending = try testing.io.concurrent(Source.discover, .{ &source, &models });
+    defer _ = pending.cancel(testing.io) catch {};
+    try source.started.wait(testing.io);
+    try testing.expectEqualStrings("saved-model", (try models.knownCatalog(scratch, "test", "endpoint", "account")).?[0].id);
+    source.released.set(testing.io);
+    _ = try pending.await(testing.io);
+    try testing.expectEqualStrings("saved-model", (try models.knownCatalog(scratch, "test", "endpoint", "account")).?[0].id);
+}
+
+test "saved reference catalog beats the bundle and live refresh replaces the saved choices" {
+    const testing = std.testing;
+    const Source = struct {
+        id: []const u8,
+        pub fn fetchModels(self: *@This(), scratch: std.mem.Allocator) ![]const Info {
+            return scratch.dupe(Info, &.{.{ .id = self.id }});
+        }
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const state = try std.fs.path.join(scratch, &.{ root, "auth.json" });
+    var source: Source = .{ .id = "https://api.openai.com/v1/saved" };
+    {
+        var previous = try Models.init(testing.allocator, testing.io, state);
+        defer previous.deinit();
+        _ = try previous.getOrFetchCatalog("models.dev", default_reference_url, "", &source);
+    }
+    var models = try Models.init(testing.allocator, testing.io, state);
+    defer models.deinit();
+    const saved = try models.referenceModelNames(scratch, "https://api.openai.com/v1");
+    try testing.expectEqual(@as(usize, 1), saved.len);
+    try testing.expectEqualStrings("saved", saved[0]);
+    source.id = "https://api.openai.com/v1/refreshed";
+    _ = try models.getOrFetchCatalog("models.dev", default_reference_url, "", &source);
+    const refreshed = try models.referenceModelNames(scratch, "https://api.openai.com/v1");
+    try testing.expectEqual(@as(usize, 1), refreshed.len);
+    try testing.expectEqualStrings("refreshed", refreshed[0]);
 }

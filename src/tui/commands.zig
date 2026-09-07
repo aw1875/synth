@@ -394,7 +394,7 @@ pub fn note(self: *Model, comptime fmt: []const u8, args: anytype) !void {
     self.scroll = 0;
 }
 
-/// Open the model switcher, asking each provider what it offers.
+/// Open the model switcher from local catalogs while discovery runs separately.
 pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (!try canSwitchProvider(self, ctx)) return;
     if (!self.provider.switchable()) return;
@@ -426,6 +426,7 @@ pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
         }
     }
 
+    self.models.loading = if (self.backend) |backend| backend.modelsWarming() else false;
     try self.models.show(entries.items, recent, self.provider.model);
 }
 
@@ -435,12 +436,8 @@ pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
     return entry.ready(auth);
 }
 
-/// The models one provider offers.
-///
-/// The one in use answers through the live backend; the rest get a client of
-/// their own, built from the host the database remembers and the key
-/// `auth.json` holds. Nothing is reconnected to list a model - that only
-/// happens when one is picked.
+/// Local picker choices, using the active connection's settings or the
+/// remembered host and credentials for another provider. No client is started.
 pub fn listModels(
     self: *Model,
     arena: std.mem.Allocator,
@@ -448,7 +445,10 @@ pub fn listModels(
     active_id: []const u8,
 ) ![]const []const u8 {
     const is_active_provider = std.mem.eql(u8, entry.id, active_id);
-    if (is_active_provider) return self.provider.models(arena) catch &.{};
+    if (is_active_provider) {
+        if (self.backend) |backend| return backend.knownModels(arena);
+        return self.provider.models(arena) catch &.{};
+    }
 
     var host = entry.host;
     if (entry.host_editable) {
@@ -471,13 +471,16 @@ pub fn listModels(
         .models = if (self.backend) |backend| backend.options.models else null,
     });
     defer backend.deinit();
-    backend.start() catch return &.{};
-
-    return backend.listModels(arena) catch &.{};
+    return backend.knownModels(arena) catch &.{};
 }
 
 /// The provider in use, by catalog id. Caller owns the result.
 pub fn activeProviderId(self: *Model, arena: std.mem.Allocator) ![]const u8 {
+    if (self.backend) |backend| {
+        for (catalog.all) |entry| {
+            if (std.mem.eql(u8, backend.current().name, entry.label)) return entry.id;
+        }
+    }
     const db = self.loop.database() orelse return catalog.default_id;
     const remembered_provider_id = try db.activeProvider(arena);
     return catalog.findOrDefault(remembered_provider_id).id;
@@ -532,6 +535,13 @@ pub fn switchModel(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !voi
     self.loop.provider.context_limit = current.context_limit;
     self.loop.provider.vision = current.vision;
     try self.loop.setModel(current.model);
+    if (self.loop.database()) |db| {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const id = try activeProviderId(self, arena.allocator());
+        const key = try std.fmt.allocPrint(arena.allocator(), "model:{s}", .{id});
+        try db.setSetting(key, current.model);
+    }
 }
 
 fn canSwitchProvider(self: *Model, ctx: *vxfw.EventContext) !bool {
@@ -714,7 +724,7 @@ test "provider and model actions leave a running turn and its credentials alone"
     try testing.expectEqualStrings("next", model.provider.model);
 }
 
-test "startup selection is displayed and saved before the first request for every backend" {
+test "startup selection and explicit model choices survive reopening for every backend" {
     const testing = std.testing;
     const Auth = @import("../core/auth.zig");
     const Database = @import("../core/database.zig");
@@ -723,6 +733,7 @@ test "startup selection is displayed and saved before the first request for ever
         pub fn fetchModels(_: *@This(), arena: std.mem.Allocator) ![]const Models.Info {
             return arena.dupe(Models.Info, &.{
                 .{ .id = "available-model", .context_limit = 123000, .vision = false },
+                .{ .id = "chosen-model", .context_limit = 64000, .vision = true },
             });
         }
     };
@@ -736,25 +747,36 @@ test "startup selection is displayed and saved before the first request for ever
     // Keep the optional metadata fallback offline as well.
     _ = try models.getOrFetchCatalog("models.dev", "https://models.dev/api.json", "", &source);
 
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+    const db_path = try std.fs.path.join(testing.allocator, &.{ root, "models.db" });
+    defer testing.allocator.free(db_path);
+
     for ([_]catalog.Kind{ .ollama, .openai, .codex }) |kind| {
+        const entry = catalog.find(if (kind == .openai) "openai" else @tagName(kind)).?;
         const host = if (kind == .codex) codex_auth.backend_url else "http://127.0.0.1:1/v1";
         const identity = if (kind == .codex) "test-account" else "";
         // The codex catalog is keyed by the client version it was fetched under.
         const namespace = if (kind == .codex) CodexProvider.codex_catalog_namespace else @tagName(kind);
         _ = try models.getOrFetchCatalog(namespace, host, identity, &source);
-        if (kind == .ollama) _ = try models.getOrFetchCatalog("ollama/show/available-model", host, identity, &source);
+        if (kind == .ollama) {
+            _ = try models.getOrFetchCatalog("ollama/show/available-model", host, identity, &source);
+            _ = try models.getOrFetchCatalog("ollama/show/chosen-model", host, identity, &source);
+        }
         var backend = Backend.init(kind, .{
             .allocator = testing.allocator,
             .io = testing.io,
             .host = host,
-            .label = "test",
+            .label = entry.label,
             .auth = &auth,
             .models = &models,
         });
         defer backend.deinit();
         try backend.start();
 
-        var db = try Database.init(testing.allocator, testing.io, ":memory:");
+        var db = try Database.init(testing.allocator, testing.io, db_path);
         defer db.deinit();
         var model: Model = .{
             .allocator = testing.allocator,
@@ -788,6 +810,32 @@ test "startup selection is displayed and saved before the first request for ever
         const saved_model = try db.sessionModel(model.loop.session_id.?, testing.allocator);
         defer testing.allocator.free(saved_model);
         try testing.expectEqualStrings("available-model", saved_model);
+
+        // Selection before any prompt must outlive both the UI and database connection.
+        try switchModel(&model, &ctx, "chosen-model");
+        db.deinit();
+        db = try Database.init(testing.allocator, testing.io, db_path);
+        var config: @import("../core/config.zig") = .{ .arena = .init(testing.allocator), .provider_override = entry.id };
+        defer config.deinit();
+        const active = try catalog.resolve(config.arena.allocator(), &db, &config, &auth);
+        try testing.expectEqualStrings("chosen-model", active.model);
+        var restarted = Backend.init(kind, .{
+            .allocator = testing.allocator,
+            .io = testing.io,
+            .host = host,
+            .label = entry.label,
+            .model = active.model,
+            .auth = &auth,
+            .models = &models,
+        });
+        defer restarted.deinit();
+        try restarted.start();
+        try restarted.ensureModel();
+        try testing.expectEqualStrings("chosen-model", restarted.model());
+
+        config.model_override = "explicit-override";
+        const overridden = try catalog.resolve(config.arena.allocator(), &db, &config, &auth);
+        try testing.expectEqualStrings(if (kind == .codex) "chosen-model" else "explicit-override", overridden.model);
     }
 }
 

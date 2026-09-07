@@ -369,15 +369,15 @@ fn catalogModels(self: *OpenAIProvider, arena: std.mem.Allocator) ![]const Model
     return self.fetchModels(arena);
 }
 
-/// Optional enrichment runs on a discovery worker, never in the picker/probe.
-pub fn warmReferenceMetadata(self: *OpenAIProvider, refresh: bool) !void {
+/// Headless enrichment prefers local reference data.
+pub fn warmReferenceMetadata(self: *OpenAIProvider) !void {
     const models = self.models orelse return;
     var scratch: std.heap.ArenaAllocator = .init(self.allocator);
     defer scratch.deinit();
     const entries = try self.catalogModels(scratch.allocator());
     for (entries) |entry| {
         const needs_reference = entry.context_limit == 0;
-        if (needs_reference) return models.loadReferenceCatalog(refresh);
+        if (needs_reference) return models.loadReferenceCatalog(false);
     }
 }
 
@@ -410,7 +410,7 @@ fn isChatModel(id: []const u8) bool {
 /// The endpoint URL for a path under the API root. Trailing slashes and a
 /// missing `/v1` are both common in a hand-typed host, and neither should be
 /// the reason a request 404s.
-fn endpoint(self: *const OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+pub fn endpoint(self: *const OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     const base = std.mem.trimEnd(u8, self.host, "/");
     if (std.mem.endsWith(u8, base, "/v1")) {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });

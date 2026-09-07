@@ -145,6 +145,13 @@ pub fn warmModels(self: *Backend, db: *@import("../core/database.zig")) !void {
     if (self.warmup_started) return;
     try self.prepareModels();
     const auth = self.options.auth orelse return;
+    _ = self.options.models.?.knownReferenceCatalog() catch null;
+    if (self.options.models.?.reference_enabled) {
+        _ = self.models_pending.fetchAdd(1, .monotonic);
+        errdefer _ = self.models_pending.fetchSub(1, .release);
+        try self.model_warmup.concurrent(self.options.io, warmReferenceCatalog, .{self});
+        self.warmup_started = true;
+    }
     for (catalog.all) |entry| {
         if (!entry.ready(auth)) continue;
         // The active endpoint may have an environment override.
@@ -187,17 +194,21 @@ fn warmModelCatalog(self: *Backend, child: *Spawned) std.Io.Cancelable!void {
         error.Canceled => return error.Canceled,
         else => return,
     };
-    child.backend.warmReferenceMetadata(true) catch |err| switch (err) {
+}
+
+fn warmReferenceCatalog(self: *Backend) std.Io.Cancelable!void {
+    defer _ = self.models_pending.fetchSub(1, .release);
+    self.options.models.?.loadReferenceCatalog(true) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
         else => {},
     };
 }
 
 /// Headless startup can wait here; interactive callers use the discovery group.
-pub fn warmReferenceMetadata(self: *Backend, refresh: bool) !void {
+pub fn warmReferenceMetadata(self: *Backend) !void {
     switch (self.client) {
         .openai => |*client| {
-            try client.warmReferenceMetadata(refresh);
+            try client.warmReferenceMetadata();
             client.refreshMetadata();
         },
         else => {},
@@ -307,6 +318,49 @@ pub fn listModels(self: *Backend, allocator: std.mem.Allocator) ![][]const u8 {
     return switch (self.client) {
         inline else => |*client| client.listModels(allocator),
     };
+}
+
+/// Picker choices only: never start a client, refresh tokens, or contact a server.
+/// The caller supplies an arena for the list and its strings.
+pub fn knownModels(self: *Backend, arena: std.mem.Allocator) ![]const []const u8 {
+    try self.prepareModels();
+    const models = self.options.models.?;
+    var namespace: []const u8 = undefined;
+    var endpoint: []const u8 = undefined;
+    var identity: []const u8 = undefined;
+    var reference_root: ?[]const u8 = null;
+    switch (self.client) {
+        .openai => |*client| {
+            namespace = "openai";
+            endpoint = try client.endpoint(arena, "");
+            identity = client.api_key orelse "";
+            reference_root = endpoint;
+        },
+        .ollama => |*client| {
+            namespace = "ollama";
+            endpoint = std.mem.trimEnd(u8, client.host, "/");
+            identity = client.api_key orelse "";
+            reference_root = try std.fmt.allocPrint(arena, "{s}/v1", .{endpoint});
+        },
+        .codex => |*client| {
+            namespace = CodexProvider.codex_catalog_namespace;
+            endpoint = client.host;
+            const tokens = codex_auth.loadTokens(arena, client.auth) catch return &.{};
+            identity = tokens.account_id;
+        },
+    }
+    if (try models.knownCatalog(arena, namespace, endpoint, identity)) |entries| {
+        return Models.copyVisibleModelNames(arena, entries);
+    }
+    if (reference_root) |root| {
+        const names = try models.referenceModelNames(arena, root);
+        if (names.len > 0) return names;
+    }
+    const selected = self.model();
+    if (selected.len == 0) return &.{};
+    const names = try arena.alloc([]const u8, 1);
+    names[0] = try arena.dupe(u8, selected);
+    return names;
 }
 
 /// Settle on a model the server will actually answer for, where the client has
@@ -448,6 +502,7 @@ test "background discovery deadlines and shutdown close stalled HTTP connections
             var models = try Models.init(testing.allocator, testing.io, "");
             defer models.deinit();
             models.fetch_timeout = .fromMilliseconds(200);
+            models.reference_enabled = false;
             {
                 // Mark the other optional provider active so only this endpoint warms.
                 const active = catalog.find(if (kind == .ollama) "openai-compat" else "ollama").?;
@@ -694,4 +749,44 @@ test "an ollama tag matches loosely, an openai id exactly" {
     try testing.expect(local.sameModel("qwen3:latest", "qwen3"));
     try testing.expect(!hosted.sameModel("gpt-4o-2024-08-06", "gpt-4o"));
     try testing.expect(hosted.sameModel("gpt-4o", "gpt-4o"));
+}
+
+test "picker uses bundled hosted choices without starting clients and respects discovered empty lists" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var models = try Models.init(testing.allocator, testing.io, "");
+    defer models.deinit();
+    var backend = Backend.init(.openai, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "https://api.openai.com",
+        .label = "OpenAI",
+        .models = &models,
+    });
+    defer backend.deinit();
+    try testing.expect((try backend.knownModels(arena.allocator())).len > 0);
+    try testing.expect(!backend.client.openai.started);
+    const Empty = struct {
+        pub fn fetchModels(_: *@This(), _: std.mem.Allocator) ![]const Models.Info {
+            return &.{};
+        }
+    };
+    var empty: Empty = .{};
+    _ = try models.getOrFetchCatalog("openai", "https://api.openai.com/v1", "", &empty);
+    try testing.expectEqual(@as(usize, 0), (try backend.knownModels(arena.allocator())).len);
+    try testing.expect(!backend.client.openai.started);
+
+    var local = Backend.init(.ollama, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "http://127.0.0.1:1",
+        .label = "Ollama",
+        .model = "configured-local-model",
+        .models = &models,
+    });
+    defer local.deinit();
+    const names = try local.knownModels(arena.allocator());
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("configured-local-model", names[0]);
 }
