@@ -33,7 +33,6 @@ retries: retry.Policy = .{},
 client: ?std.http.Client = null,
 last_error: ?[]u8 = null,
 session_id: ?[32]u8 = null,
-last_conversation: ?*Conversation = null,
 last_message_count: u64 = 0,
 
 // Version Synth reports to the private Codex backend for compatibility checks.
@@ -251,10 +250,8 @@ fn respond(
         const extra_headers = [_]std.http.Header{
             .{ .name = "Accept", .value = "text/event-stream" },
             .{ .name = "Originator", .value = pkg.name },
-            .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
-            .{ .name = "session_id", .value = session_id },
+            .{ .name = "session-id", .value = session_id },
             .{ .name = "version", .value = codex_client_version },
-            .{ .name = "prompt_cache_key", .value = session_id },
         };
         const account_headers = [_]std.http.Header{
             .{ .name = "ChatGPT-Account-ID", .value = tokens.account_id },
@@ -448,17 +445,19 @@ fn workspaceLimitMessage(reached_type: ?[]const u8) ?[]const u8 {
     return null;
 }
 
+/// The key the backend caches a prompt prefix under, so it has to outlive
+/// everything that keeps the prefix intact: model switches, subagents, and the
+/// UI swapping which conversation it holds. Only starting the history over
+/// earns a new one.
 fn sessionIdForConversation(self: *CodexProvider, conversation: *Conversation) []const u8 {
     const message_count = conversation.totalCount();
-    const conversation_changed = self.last_conversation != conversation;
-    const conversation_was_cleared = message_count < self.last_message_count;
-    const needs_new_session_id = self.session_id == null or conversation_changed or conversation_was_cleared;
+    const history_restarted = message_count < self.last_message_count;
+    const needs_new_session_id = self.session_id == null or history_restarted;
     if (needs_new_session_id) {
         var random_bytes: [16]u8 = undefined;
         self.io.random(&random_bytes);
         self.session_id = std.fmt.bytesToHex(random_bytes, .lower);
     }
-    self.last_conversation = conversation;
     self.last_message_count = message_count;
     return &self.session_id.?;
 }
@@ -492,7 +491,12 @@ fn buildResponseRequestBody(self: *CodexProvider, arena: std.mem.Allocator, conv
         try writer.writeAll(",\"tools\":");
         try writeToolDefinitions(arena, writer, turn.tools_json);
     }
-    try writer.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"summary\":\"auto\"},\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"]}");
+    try writer.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"summary\":\"auto\"},\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"]");
+    // The backend reads the cache key from the body. Sent only as a header it
+    // is ignored, and every turn is billed as an uncached prompt.
+    try writer.writeAll(",\"prompt_cache_key\":");
+    try writeJsonString(writer, self.sessionIdForConversation(conversation));
+    try writer.writeByte('}');
     return request_body.toOwnedSlice();
 }
 
@@ -1409,4 +1413,38 @@ test "a rejected turn is read off the wire, headers and all" {
         "Codex rejected the request: your Codex weekly limit is used up. It resets in 10h 18m.",
         detail,
     );
+}
+
+test "the prompt cache key rides in the body and survives a model switch" {
+    const testing = std.testing;
+    var auth = Auth.init(testing.allocator, testing.io);
+    defer auth.deinit();
+    var codex: CodexProvider = .{ .allocator = testing.allocator, .io = testing.io, .auth = &auth, .model = "current", .context_limit = 100000 };
+
+    var conversation = Conversation.init(testing.allocator);
+    defer conversation.deinit();
+    _ = try conversation.append(.{ .role = .user, .text = "first" });
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first_body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system = "brief" });
+    const first = try std.json.parseFromSliceLeaky(std.json.Value, arena, first_body, .{});
+    const first_key = first.object.get("prompt_cache_key").?.string;
+    try testing.expect(first_key.len > 0);
+
+    // A model switch must not invalidate the cached prefix.
+    codex.model = "other";
+    _ = try conversation.append(.{ .role = .user, .text = "second" });
+    const second_body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system = "brief" });
+    const second = try std.json.parseFromSliceLeaky(std.json.Value, arena, second_body, .{});
+    try testing.expectEqualStrings(first_key, second.object.get("prompt_cache_key").?.string);
+
+    // Starting the history over does earn a new key.
+    conversation.clear();
+    _ = try conversation.append(.{ .role = .user, .text = "fresh" });
+    const third_body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system = "brief" });
+    const third = try std.json.parseFromSliceLeaky(std.json.Value, arena, third_body, .{});
+    try testing.expect(!std.mem.eql(u8, first_key, third.object.get("prompt_cache_key").?.string));
 }
