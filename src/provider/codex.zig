@@ -992,8 +992,20 @@ fn findHeaderValue(response_head: std.http.Client.Response.Head, name: []const u
     return null;
 }
 
+/// Whether a rejection is about the reasoning we replayed.
+///
+/// Kept deliberately loose. The backend words this several ways and has changed
+/// them before; a match that is too exact fails silently, and every later turn
+/// then rebuilds the same rejected request, wedging the session for good. The
+/// cost of being wrong the other way is one retry without reasoning.
 fn reportsStaleReasoningItem(response_body: []const u8) bool {
-    return std.mem.indexOf(u8, response_body, "rs_") != null;
+    const names_a_reasoning_item = std.mem.indexOf(u8, response_body, "rs_") != null;
+    if (!names_a_reasoning_item) return false;
+    const complaints = [_][]const u8{ "reasoning", "not found", "expired", "required" };
+    for (complaints) |complaint| {
+        if (std.mem.indexOf(u8, response_body, complaint) != null) return true;
+    }
+    return false;
 }
 
 fn discardProviderState(conversation: *Conversation) void {
@@ -1728,4 +1740,29 @@ test "a cancel breaks the socket a silent stream is parked on" {
 
     codex.forgetSocket();
     try testing.expectEqual(no_socket, codex.live_socket);
+}
+
+test "a stale reasoning rejection is recognised however it is worded" {
+    // The wordings the backend is known to use.
+    try std.testing.expect(reportsStaleReasoningItem(
+        \\{"error":{"message":"Item 'fc_1' of type 'function_call' was provided without its required 'reasoning' item: 'rs_1'."}}
+    ));
+    try std.testing.expect(reportsStaleReasoningItem(
+        \\{"error":{"message":"Item with id 'rs_1' not found"}}
+    ));
+    try std.testing.expect(reportsStaleReasoningItem(
+        \\{"error":{"message":"Referenced reasoning item 'rs_1' was not found or has expired"}}
+    ));
+    try std.testing.expect(reportsStaleReasoningItem(
+        \\{"error":{"message":"Item 'rs_1' of type 'reasoning' was provided without its required following item"}}
+    ));
+
+    // A rejection that merely echoes an id is not about the reasoning.
+    try std.testing.expect(!reportsStaleReasoningItem(
+        \\{"error":{"message":"Unsupported parameter 'foo' near item rs_1"}}
+    ));
+    try std.testing.expect(!reportsStaleReasoningItem(
+        \\{"error":{"message":"System messages are not allowed"}}
+    ));
+    try std.testing.expect(!reportsStaleReasoningItem(""));
 }
