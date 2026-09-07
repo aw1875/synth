@@ -530,7 +530,7 @@ fn writeConversationMessage(
         .assistant => {
             can_replay_tool_results.* = false;
             if (message.provider_state) |provider_state| {
-                const state_has_tool_calls = try self.writePreservedResponseItems(arena, writer, provider_state, is_first_input);
+                const state_has_tool_calls = try writePreservedResponseItems(arena, writer, provider_state, is_first_input);
                 if (state_has_tool_calls) |has_tool_calls| {
                     can_replay_tool_results.* = has_tool_calls;
                     return;
@@ -567,16 +567,16 @@ fn writeConversationMessage(
     }
 }
 
-fn writePreservedResponseItems(self: *CodexProvider, arena: std.mem.Allocator, writer: *std.Io.Writer, provider_state: []const u8, is_first_input: *bool) !?bool {
+fn writePreservedResponseItems(arena: std.mem.Allocator, writer: *std.Io.Writer, provider_state: []const u8, is_first_input: *bool) !?bool {
     const saved_state = std.json.parseFromSliceLeaky(struct {
         provider: []const u8 = "",
-        model: []const u8 = "",
         items: []const std.json.Value = &.{},
     }, arena, provider_state, .{ .ignore_unknown_fields = true }) catch return null;
+    // Reasoning belongs to the thread, not to the model that produced it, so a
+    // model switch keeps it. Only another provider's state is unusable.
     const belongs_to_codex = std.mem.eql(u8, saved_state.provider, "codex");
-    const matches_model = std.mem.eql(u8, saved_state.model, self.model);
     const has_items = saved_state.items.len > 0;
-    const can_replay_state = belongs_to_codex and matches_model and has_items;
+    const can_replay_state = belongs_to_codex and has_items;
     if (!can_replay_state) return null;
 
     var contains_tool_call = false;
@@ -1106,7 +1106,6 @@ test "Codex keeps tool history after a model switch, import, or reasoning reset"
     const histories = [_]struct { state: ?[]const u8, reset: bool = false }{
         .{ .state = null },
         .{ .state = "{\"provider\":\"other\",\"model\":\"current\",\"items\":[{\"type\":\"reasoning\"}]}" },
-        .{ .state = "{\"provider\":\"codex\",\"model\":\"previous\",\"items\":[{\"type\":\"reasoning\"}]}" },
         .{ .state = "{\"provider\":\"codex\",\"model\":\"current\",\"items\":[{\"type\":\"reasoning\"}]}", .reset = true },
     };
     var auth = Auth.init(testing.allocator, testing.io);
@@ -1487,4 +1486,38 @@ test "the cached prefix holds steady across turns and a model switch" {
     const first_input = second.object.get("input").?.array.items[0].object;
     try testing.expectEqualStrings("user", first_input.get("role").?.string);
     try testing.expectEqualStrings("first", first_input.get("content").?.array.items[0].object.get("text").?.string);
+}
+
+test "reasoning recorded under one model is replayed under the next" {
+    const testing = std.testing;
+    var auth = Auth.init(testing.allocator, testing.io);
+    defer auth.deinit();
+    var codex: CodexProvider = .{ .allocator = testing.allocator, .io = testing.io, .auth = &auth, .model = "current" };
+
+    // What a real turn stores: the reasoning and the call it belongs to.
+    const recorded_under_previous_model =
+        \\{"provider":"codex","model":"previous","items":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"},{"type":"function_call","call_id":"read-1","name":"read","arguments":"{}"}]}
+    ;
+    var calls = [_]Conversation.ToolCall{.{ .id = "read-1", .name = "read", .arguments = "{}" }};
+
+    var conversation = Conversation.init(testing.allocator);
+    defer conversation.deinit();
+    _ = try conversation.append(.{ .role = .assistant, .text = "checking", .tool_calls = &calls, .provider_state = recorded_under_previous_model });
+    _ = try conversation.addToolResult("read", "read-1", "contents");
+    try conversation.add(.user, "and?");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system = "brief" });
+    const items = (try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{})).object.get("input").?.array.items;
+
+    // Verbatim, in order, and the tool result still lands behind its call.
+    const expected_types = [_][]const u8{ "reasoning", "function_call", "function_call_output", "message" };
+    try testing.expectEqual(expected_types.len, items.len);
+    for (items, expected_types) |item, expected| {
+        try testing.expectEqualStrings(expected, item.object.get("type").?.string);
+    }
+    try testing.expectEqualStrings("rs_1", items[0].object.get("id").?.string);
+    try testing.expectEqualStrings("opaque", items[0].object.get("encrypted_content").?.string);
 }
