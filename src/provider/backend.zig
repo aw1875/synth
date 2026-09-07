@@ -39,6 +39,9 @@ pub const Options = struct {
     /// advertised maximum; zero leaves the choice to the server.
     num_ctx: ?u32 = null,
     debug_log: ?[]const u8 = null,
+    /// Where model metadata is read from, and whether to read it at all.
+    models_url: ?[]const u8 = null,
+    models_enabled: bool = true,
 };
 
 options: Options,
@@ -126,6 +129,8 @@ fn prepareModels(self: *Backend) !void {
         errdefer self.options.allocator.destroy(models);
         const state_path = if (self.options.auth) |auth| auth.path else "";
         models.* = try .init(self.options.allocator, self.options.io, state_path);
+        if (self.options.models_url) |url| models.reference_url = url;
+        models.reference_enabled = self.options.models_enabled;
         self.options.models = models;
         self.owns_models = true;
     }

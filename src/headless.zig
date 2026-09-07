@@ -107,6 +107,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
+        .models_url = config.models_url,
+        .models_enabled = config.models_enabled,
     });
     defer backend.deinit();
 

@@ -186,6 +186,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
+        .models_url = config.models_url,
+        .models_enabled = config.models_enabled,
     });
     defer {
         backend.deinit();

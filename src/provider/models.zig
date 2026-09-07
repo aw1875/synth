@@ -19,6 +19,13 @@ cache_directory: []const u8,
 catalogs: std.AutoHashMapUnmanaged([32]u8, anyerror![]const Info) = .empty,
 catalogs_mutex: std.Io.Mutex = .init,
 fetch_timeout: std.Io.Duration = .fromSeconds(5),
+/// Where the reference metadata comes from. Redirectable to a mirror or a
+/// local file, and switchable off entirely for a machine that should not be
+/// reaching a third party at all.
+reference_url: []const u8 = default_reference_url,
+reference_enabled: bool = true,
+
+pub const default_reference_url = "https://models.dev/api.json";
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, state_file_path: []const u8) !Models {
     var self: Models = .{ .allocator = allocator, .io = io, .cache_directory = "" };
@@ -201,7 +208,7 @@ pub fn containsString(candidates: []const []const u8, expected: []const u8) bool
 /// Like OpenCode, use models.dev only to fill metadata an endpoint omits.
 /// Matching includes the API root: a custom server's "gpt-5" is not OpenAI's.
 pub fn referenceMetadataFor(self: *Models, scratch: std.mem.Allocator, api_root: []const u8, model_id: []const u8) !?Info {
-    const reference_catalog = self.cachedCatalog("models.dev", "https://models.dev/api.json", "") orelse return null;
+    const reference_catalog = self.cachedCatalog("models.dev", self.reference_url, "") orelse return null;
     const normalized_api_root = std.mem.trimEnd(u8, api_root, "/");
     const qualified_model_id = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ normalized_api_root, model_id });
     return findModel(reference_catalog, qualified_model_id);
@@ -209,17 +216,26 @@ pub fn referenceMetadataFor(self: *Models, scratch: std.mem.Allocator, api_root:
 
 /// Interactive boots refresh in the background; one-shot runs prefer disk.
 pub fn loadReferenceCatalog(self: *Models, refresh_from_source: bool) !void {
-    var reference_source: Reference = .{ .io = self.io };
-    _ = try self.loadCatalog("models.dev", "https://models.dev/api.json", "", &reference_source, refresh_from_source);
+    if (!self.reference_enabled) return;
+    var reference_source: Reference = .{ .io = self.io, .url = self.reference_url };
+    _ = try self.loadCatalog("models.dev", self.reference_url, "", &reference_source, refresh_from_source);
 }
 
 const Reference = struct {
     io: std.Io,
+    url: []const u8 = default_reference_url,
 
     pub fn fetchModels(self: *Reference, scratch: std.mem.Allocator) ![]const Info {
+        // A path rather than a URL is read straight off disk, so a pinned
+        // catalog needs no network at all.
+        const is_local_file = !std.mem.startsWith(u8, self.url, "http");
+        if (is_local_file) {
+            const contents = try std.Io.Dir.cwd().readFileAlloc(self.io, self.url, scratch, .limited(16 * 1024 * 1024));
+            return parseCatalogResponse(scratch, contents);
+        }
         var http_client: std.http.Client = .{ .allocator = scratch, .io = self.io };
         defer http_client.deinit();
-        const uri = try std.Uri.parse("https://models.dev/api.json");
+        const uri = try std.Uri.parse(self.url);
         var request = try http_client.request(.GET, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
@@ -496,4 +512,44 @@ test "slow catalogs do not block ready endpoints and are stopped at the deadline
     try testing.expect(!source.stopped.load(.acquire));
     try testing.expectError(error.CatalogTimeout, pending.await(testing.io));
     try testing.expect(source.stopped.load(.acquire));
+}
+
+test "the reference source can be pinned to a file or switched off" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buffer[0..try tmp.dir.realPath(testing.io, &path_buffer)];
+    const pinned = try std.fs.path.join(testing.allocator, &.{ root, "catalog.json" });
+    defer testing.allocator.free(pinned);
+    try tmp.dir.writeFile(testing.io, .{
+        .sub_path = "catalog.json",
+        .data =
+        \\{"openai":{"models":{"pinned-model":{"limit":{"context":4096},"tool_call":true}}}}
+        ,
+    });
+
+    // A local path is read straight off disk, with no network at all.
+    {
+        var cache = try Models.init(testing.allocator, testing.io, "");
+        defer cache.deinit();
+        cache.reference_url = pinned;
+        try cache.loadReferenceCatalog(true);
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const model = (try cache.referenceMetadataFor(scratch.allocator(), "https://api.openai.com/v1", "pinned-model")).?;
+        try testing.expectEqual(@as(u32, 4096), model.context_limit);
+    }
+
+    // Switched off, nothing is read and nothing is known.
+    {
+        var cache = try Models.init(testing.allocator, testing.io, "");
+        defer cache.deinit();
+        cache.reference_url = pinned;
+        cache.reference_enabled = false;
+        try cache.loadReferenceCatalog(true);
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        try testing.expect((try cache.referenceMetadataFor(scratch.allocator(), "https://api.openai.com/v1", "pinned-model")) == null);
+    }
 }

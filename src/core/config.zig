@@ -86,6 +86,10 @@ openai_api_key: ?[]const u8 = null,
 /// Without one the tool reads DuckDuckGo's HTML results page instead, which
 /// needs no key but is throttled after a handful of searches.
 search_api_key: ?[]const u8 = null,
+/// Where model metadata is read from, or null for the built-in source. A path
+/// is read off disk; an empty value turns the lookup off entirely.
+models_url: ?[]const u8 = null,
+models_enabled: bool = true,
 /// Window to ask ollama to load a model with, sent as `num_ctx`. Null asks for
 /// the model's advertised maximum; zero leaves the choice to the server, which
 /// is what `OLLAMA_CONTEXT_LENGTH` or its own default decides. A window larger
@@ -302,6 +306,11 @@ fn applyEnv(self: *Config, env: *std.process.Environ.Map) !void {
     if (env.get("SYNTH_DEBUG_LOG")) |value| self.debug_log = value;
     if (env.get("BRAVE_API_KEY")) |value| self.search_api_key = value;
     if (env.get("SYNTH_SEARCH_API_KEY")) |value| self.search_api_key = value;
+    if (env.get("SYNTH_MODELS_URL")) |value| self.models_url = value;
+    if (env.get("SYNTH_MODELS_PATH")) |value| self.models_url = value;
+    if (env.get("SYNTH_DISABLE_MODELS_FETCH")) |value| {
+        self.models_enabled = std.mem.eql(u8, value, "0") or std.mem.eql(u8, value, "false");
+    }
     if (env.get("OLLAMA_THINK")) |value| {
         self.think = !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
     }
