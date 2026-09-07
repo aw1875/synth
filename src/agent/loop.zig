@@ -245,6 +245,9 @@ auto_compact_at: f64 = 0.85,
 /// Set while the outstanding request is a summarisation rather than a turn.
 compacting: bool = false,
 resume_after_compaction: bool = false,
+/// Whether this turn already bought itself room by compacting. One recovery is
+/// a full context; a second in the same turn means it will never fit.
+recovered_from_overflow: bool = false,
 
 pub const Usage = struct {
     /// Latest reported input plus output, including opaque reasoning tokens.
@@ -738,10 +741,7 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     self.usage.context_tokens = 0;
-    if (resume_turn) {
-        if (self.shouldCompact()) return self.stop(context_full_notice);
-        try self.ask();
-    }
+    if (resume_turn) try self.ask();
 }
 
 /// Start a turn. Attachments come from `@path` mentions in the prompt, plus
@@ -790,6 +790,7 @@ fn finishSubmit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     _ = try self.conversation.addUser(prompt, attachments, images);
     try self.persistMessage(self.conversation.messages.items.len - 1);
     self.steps = 0;
+    self.recovered_from_overflow = false;
     self.repeats = 0;
     self.outcome = null;
     self.turn_start_seq = self.conversation.messages.items[self.conversation.messages.items.len - 1].seq;
@@ -923,7 +924,12 @@ fn ask(self: *Loop) !void {
     try self.applySteering();
     if (self.overBudget()) |reason| return self.stop(reason);
     if (self.shouldCompact()) return self.startCompaction(true);
-    if (!try self.contextFits(self.turn(""))) return self.stop(context_full_notice);
+    if (!try self.contextFits(self.turn(""))) {
+        const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
+        if (!may_recover) return self.stop(context_full_notice);
+        self.recovered_from_overflow = true;
+        return self.startCompaction(true);
+    }
     self.steps += 1;
     if (self.steps > self.agent.steps) {
         return self.stop("Stopped: too many tool calls in one turn.");
@@ -3912,4 +3918,37 @@ test "a blanket allowance still stops at the project boundary" {
 
     call.arguments = "{\"path\":\"/tmp/hooks.zig\"}";
     try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "a turn that will not fit compacts and carries on instead of stopping" {
+    const Script = struct {
+        calls: usize = 0,
+        fn respond(ptr: *anyopaque, _: *Conversation, asked: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (asked.compacting) return .{ .text = try allocator.dupe(u8, "Summary of the work so far.") };
+            return .{ .text = try allocator.dupe(u8, "carried on") };
+        }
+    };
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var script: Script = .{};
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.system_prompt = "";
+    loop.provider = .{ .name = "script", .userdata = &script, .respond = Script.respond, .context_limit = 4000 };
+
+    // Fill the window past what a turn can carry, then ask for one more.
+    for (0..8) |_| {
+        _ = try fixture.convo.append(.{ .role = .user, .text = "prior work " ** 60 });
+        _ = try fixture.convo.append(.{ .role = .assistant, .text = "acknowledged " ** 60 });
+    }
+    try loop.submit("and now the next thing", .{});
+    try settle(&loop);
+
+    // It compacted and then answered, rather than handing back a dead end.
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Outcome.done, loop.outcome.?);
+    try testing.expectEqualStrings("carried on", lastAssistant(&fixture.convo).?.text);
+    try testing.expect(script.calls >= 2);
 }
