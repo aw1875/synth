@@ -193,7 +193,6 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     }
 
     try backend.start();
-    try backend.warmModels(&db);
     timing.mark("provider probe");
 
     const provider = backend.provider();

@@ -399,6 +399,14 @@ pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (!try canSwitchProvider(self, ctx)) return;
     if (!self.provider.switchable()) return;
 
+    // Other providers are discovered when the picker is opened, not at launch.
+    // Nobody is contacted until the person asks to see what is on offer, and
+    // the list fills in as each answers.
+    if (self.backend) |backend| {
+        if (self.loop.database()) |db| backend.warmModels(db) catch {};
+        if (backend.modelsWarming()) try self.scheduleTick(ctx);
+    }
+
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
