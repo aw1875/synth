@@ -156,9 +156,15 @@ that is what the sidebar plans against.
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
 `SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
 `OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
-`SYNTH_SEARCH_API_KEY`. `VISUAL` and `EDITOR` decide what `ctrl+e` opens. Which host-and-key pair applies depends on the protocol
+`SYNTH_SEARCH_API_KEY`, `SYNTH_MODELS_URL`, `SYNTH_MODELS_PATH`,
+`SYNTH_DISABLE_MODELS_FETCH`. `VISUAL` and `EDITOR` decide what `ctrl+e` opens. Which host-and-key pair applies depends on the protocol
 the chosen provider speaks, so having both sets exported does not hand one
 server the other's settings.
+
+Model context limits and capabilities come from each provider's own endpoint.
+Where one does not say, synth fills the gaps from [models.dev](https://models.dev).
+Point `SYNTH_MODELS_URL` at a mirror, `SYNTH_MODELS_PATH` at a local copy, or set
+`SYNTH_DISABLE_MODELS_FETCH=1` to skip that lookup entirely.
 
 `web_search` needs no key: without one it reads DuckDuckGo's HTML results page.
 That works, but DuckDuckGo throttles it after a handful of searches and answers
