@@ -377,6 +377,14 @@ fn respond(
         response_stream.readEvents(arena, response_reader) catch |response_error| {
             const server_reported_error = response_stream.server_error.items.len > 0;
             if (server_reported_error) self.rememberResponseError(response_stream.server_error.items);
+            // A stream that died before saying anything can simply be asked
+            // again. One that already spoke cannot, because the caller has
+            // shown what arrived and a second copy would follow it.
+            const stream_broke_in_transit = !server_reported_error and !response_stream.delivered_anything;
+            if (stream_broke_in_transit and self.waitBeforeRetry(.internal_server_error, attempt, null, sink)) {
+                attempt += 1;
+                continue;
+            }
             return response_error;
         };
         const reply = try response_stream.intoReply();
@@ -713,6 +721,9 @@ const ResponseStream = struct {
     server_error: std.ArrayList(u8) = .empty,
     response_completed: bool = false,
     received_text_delta: bool = false,
+    /// Whether anything has reached the caller yet. A re-send after that would
+    /// repeat what the reader already showed, so only a silent stream retries.
+    delivered_anything: bool = false,
     thinking_finished: bool = false,
     /// A summary arrives in parts. Nothing separates them on the wire, so the
     /// first part of the next one has to carry the break itself.
@@ -763,6 +774,7 @@ const ResponseStream = struct {
         if (is_text_delta) {
             const text_delta = stringValue(event_fields.get("delta") orelse return) orelse return;
             self.received_text_delta = true;
+            self.delivered_anything = true;
             return self.appendText(text_delta);
         }
         // A declined request is still the model answering, and it arrives on no
@@ -787,6 +799,7 @@ const ResponseStream = struct {
         if (is_reasoning_event) {
             const reasoning_delta = stringValue(event_fields.get("delta") orelse return) orelse return;
             if (is_reasoning_summary) self.sent_summary_text = true;
+            self.delivered_anything = true;
             if (self.sink) |sink| sink.onThinking(sink.userdata, reasoning_delta);
             return;
         }
@@ -1765,4 +1778,28 @@ test "a stale reasoning rejection is recognised however it is worded" {
         \\{"error":{"message":"System messages are not allowed"}}
     ));
     try std.testing.expect(!reportsStaleReasoningItem(""));
+}
+
+test "only a stream that said nothing is safe to ask again" {
+    const testing = std.testing;
+    // Nothing reached the caller: re-sending repeats nothing.
+    var silent = std.Io.Reader.fixed("data: {\"type\":\"response.created\"}\n");
+    var quiet = ResponseStream.init(testing.allocator, null, "model");
+    defer quiet.deinit();
+    try quiet.readEvents(testing.allocator, &silent);
+    try testing.expect(!quiet.delivered_anything);
+
+    // Text already shown: a second attempt would print it twice.
+    var spoke = std.Io.Reader.fixed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"half an answer\"}\n");
+    var loud = ResponseStream.init(testing.allocator, null, "model");
+    defer loud.deinit();
+    try loud.readEvents(testing.allocator, &spoke);
+    try testing.expect(loud.delivered_anything);
+
+    // Thinking counts too: the reader has already rendered it.
+    var thought = std.Io.Reader.fixed("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"weighing it\"}\n");
+    var thinking = ResponseStream.init(testing.allocator, null, "model");
+    defer thinking.deinit();
+    try thinking.readEvents(testing.allocator, &thought);
+    try testing.expect(thinking.delivered_anything);
 }
