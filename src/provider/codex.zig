@@ -951,7 +951,8 @@ pub fn describeError(self: *CodexProvider, err: anyerror, allocator: std.mem.All
     return switch (err) {
         error.NotSignedIn => allocator.dupe(u8, "not signed in. Open interactive synth and choose Codex Subscription in /providers."),
         error.ReasoningOnly => allocator.dupe(u8, "the model finished its turn without replying. Send the message again to continue."),
-        error.TokenRefreshFailed => allocator.dupe(u8, "the Codex sign-in expired. Choose Codex Subscription in /providers to sign in again."),
+        error.SignedOut => allocator.dupe(u8, "the Codex sign-in expired. Choose Codex Subscription in /providers to sign in again."),
+        error.TokenRefreshFailed => allocator.dupe(u8, "could not refresh the Codex sign-in just now. Your credentials are intact; try again."),
         error.ModelNotAvailable => allocator.dupe(u8, "this model is not in your Codex catalog. Choose an available model with /models."),
         error.NoModelsAvailable => allocator.dupe(u8, "Codex reported no available models. Reconnect with /providers."),
         error.HttpError, error.ResponseFailed, error.ResponseIncomplete => self.describeRejectedRequest(err, allocator),

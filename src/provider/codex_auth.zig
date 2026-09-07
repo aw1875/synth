@@ -257,11 +257,17 @@ pub fn refreshTokens(allocator: std.mem.Allocator, io: std.Io, auth: *Auth, prev
     const refresh_response = try postJson(&client, allocator, token_endpoint, request_body.written());
     const refresh_succeeded = refresh_response.status.class() == .success;
     if (!refresh_succeeded) {
-        const credentials_were_rejected = refresh_response.status == .bad_request or refresh_response.status == .unauthorized;
-        if (credentials_were_rejected) {
+        // Only a grant the issuer has actually rejected is worth signing out
+        // for. Every other refusal is the server's problem, not the
+        // credential's, and discarding a good refresh token over one costs a
+        // full sign-in to recover.
+        const grant_was_rejected = refresh_response.status == .unauthorized or
+            (refresh_response.status == .bad_request and std.mem.indexOf(u8, refresh_response.body, "invalid_grant") != null);
+        if (grant_was_rejected) {
             _ = persisted_auth.remove(provider_id);
             try persisted_auth.save(io, persisted_auth.path);
             _ = auth.remove(provider_id);
+            return error.SignedOut;
         }
         return error.TokenRefreshFailed;
     }
