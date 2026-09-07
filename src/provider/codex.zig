@@ -478,7 +478,7 @@ fn buildResponseRequestBody(self: *CodexProvider, arena: std.mem.Allocator, conv
     for (messages) |message| {
         const is_instruction_message = message.role == .system or message.role == .summary;
         if (is_instruction_message) continue;
-        try self.writeConversationMessage(arena, writer, message, &is_first_input, &can_replay_tool_results);
+        try self.writeConversationMessage(arena, writer, message, messages, &is_first_input, &can_replay_tool_results);
     }
     const has_turn_instruction = turn.instruction.len > 0;
     if (has_turn_instruction) {
@@ -505,6 +505,7 @@ fn writeConversationMessage(
     arena: std.mem.Allocator,
     writer: *std.Io.Writer,
     message: Conversation.Message,
+    all_messages: []const Conversation.Message,
     is_first_input: *bool,
     can_replay_tool_results: *bool,
 ) !void {
@@ -533,6 +534,7 @@ fn writeConversationMessage(
                 const state_has_tool_calls = try writePreservedResponseItems(arena, writer, provider_state, is_first_input);
                 if (state_has_tool_calls) |has_tool_calls| {
                     can_replay_tool_results.* = has_tool_calls;
+                    try writeAbandonedCallOutputs(writer, message, all_messages, is_first_input);
                     return;
                 }
             }
@@ -553,6 +555,7 @@ fn writeConversationMessage(
                 }, .{}, writer);
             }
             can_replay_tool_results.* = message.tool_calls.len > 0;
+            try writeAbandonedCallOutputs(writer, message, all_messages, is_first_input);
         },
         .tool => {
             if (!can_replay_tool_results.*) return;
@@ -565,6 +568,32 @@ fn writeConversationMessage(
             try writer.writeByte('}');
         },
     }
+}
+
+/// A call the turn never answered. The backend rejects a call with no output,
+/// so an interrupted turn has to say so rather than leave the pair open.
+fn writeAbandonedCallOutputs(
+    writer: *std.Io.Writer,
+    message: Conversation.Message,
+    all_messages: []const Conversation.Message,
+    is_first_input: *bool,
+) !void {
+    for (message.tool_calls) |call| {
+        if (toolResultExists(all_messages, call.id)) continue;
+        try writeSeparator(writer, is_first_input);
+        try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
+        try writeJsonString(writer, call.id);
+        try writer.writeAll(",\"output\":\"aborted\"}");
+    }
+}
+
+fn toolResultExists(all_messages: []const Conversation.Message, call_id: []const u8) bool {
+    for (all_messages) |message| {
+        if (message.role != .tool) continue;
+        const result_call_id = message.tool_call_id orelse continue;
+        if (std.mem.eql(u8, result_call_id, call_id)) return true;
+    }
+    return false;
 }
 
 fn writePreservedResponseItems(arena: std.mem.Allocator, writer: *std.Io.Writer, provider_state: []const u8, is_first_input: *bool) !?bool {
@@ -1520,4 +1549,56 @@ test "reasoning recorded under one model is replayed under the next" {
     }
     try testing.expectEqualStrings("rs_1", items[0].object.get("id").?.string);
     try testing.expectEqualStrings("opaque", items[0].object.get("encrypted_content").?.string);
+}
+
+test "a call the turn never answered is closed rather than left open" {
+    const testing = std.testing;
+    var auth = Auth.init(testing.allocator, testing.io);
+    defer auth.deinit();
+    var codex: CodexProvider = .{ .allocator = testing.allocator, .io = testing.io, .auth = &auth, .model = "current" };
+
+    // Two calls, one interrupted before its result was recorded.
+    var calls = [_]Conversation.ToolCall{
+        .{ .id = "read-1", .name = "read", .arguments = "{}" },
+        .{ .id = "read-2", .name = "read", .arguments = "{}" },
+    };
+    var conversation = Conversation.init(testing.allocator);
+    defer conversation.deinit();
+    _ = try conversation.append(.{ .role = .assistant, .text = "checking", .tool_calls = &calls });
+    _ = try conversation.addToolResult("read", "read-1", "contents");
+    try conversation.add(.user, "carry on");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const body = try codex.buildResponseRequestBody(arena, &conversation, .{ .system = "brief" });
+    const items = (try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{})).object.get("input").?.array.items;
+
+    // Every call is answered, and all calls precede all outputs.
+    var last_call_index: usize = 0;
+    var first_output_index: usize = items.len;
+    var answered_calls: usize = 0;
+    for (items, 0..) |item, index| {
+        const item_type = item.object.get("type").?.string;
+        if (std.mem.eql(u8, item_type, "function_call")) last_call_index = index;
+        if (std.mem.eql(u8, item_type, "function_call_output")) {
+            if (index < first_output_index) first_output_index = index;
+            answered_calls += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), answered_calls);
+    try testing.expect(last_call_index < first_output_index);
+
+    for (calls) |call| {
+        const expected_output = if (std.mem.eql(u8, call.id, "read-1")) "contents" else "aborted";
+        var found = false;
+        for (items) |item| {
+            const item_type = item.object.get("type").?.string;
+            if (!std.mem.eql(u8, item_type, "function_call_output")) continue;
+            if (!std.mem.eql(u8, item.object.get("call_id").?.string, call.id)) continue;
+            try testing.expectEqualStrings(expected_output, item.object.get("output").?.string);
+            found = true;
+        }
+        try testing.expect(found);
+    }
 }
