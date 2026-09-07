@@ -38,7 +38,6 @@ last_message_count: u64 = 0,
 // Version Synth reports to the private Codex backend for compatibility checks.
 const codex_client_version = "0.153.0";
 const max_body_bytes: usize = 4 * 1024 * 1024;
-const max_state_bytes: usize = 512 * 1024;
 const transfer_buffer_bytes: usize = 512 * 1024;
 
 pub fn start(self: *CodexProvider) !void {
@@ -755,9 +754,6 @@ const ResponseStream = struct {
         const has_preserved_items = self.preserved_items.written().len > 0;
         if (has_preserved_items) try self.preserved_items.writer.writeByte(',');
         try std.json.Stringify.value(item, .{}, &self.preserved_items.writer);
-        const provider_state_is_too_large = self.preserved_items.written().len > max_state_bytes;
-        if (provider_state_is_too_large) return error.ResponseTooLong;
-
         const item_fields = switch (item) {
             .object => |value| value,
             else => return,
@@ -938,7 +934,10 @@ fn discardProviderState(conversation: *Conversation) void {
 
 fn waitBeforeRetry(self: *CodexProvider, status: std.http.Status, attempt: usize, retry_after_ms: ?u64, sink: ?Provider.Sink) bool {
     const attempts_exhausted = attempt >= self.retries.attempts;
-    const status_is_transient = retry.transient(status);
+    // A 429 here is a spent allowance, not momentary congestion. Waiting eight
+    // seconds cannot fix it, and retrying only delays telling the user.
+    const allowance_is_spent = status == .too_many_requests;
+    const status_is_transient = retry.transient(status) and !allowance_is_spent;
     const server_delay_is_too_long = retry.tooLong(self.retries, retry_after_ms);
     const request_can_retry = !attempts_exhausted and status_is_transient and !server_delay_is_too_long;
     const request_was_canceled = requestWasCanceled(sink);

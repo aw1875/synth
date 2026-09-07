@@ -711,11 +711,7 @@ pub fn shouldCompact(self: *Loop) bool {
     const reported = self.usage.context_tokens -| prompt_overhead;
     const used = @max(estimated, reported);
     const token_threshold = @as(f64, @floatFromInt(budget)) * self.auto_compact_at;
-    const tokens_are_full = used > 0 and @as(f64, @floatFromInt(used)) >= token_threshold;
-    const active_count = self.conversation.messages.items.len - window.summaryFloor(self.conversation.messages.items);
-    const message_limit = self.conversation.max_messages;
-    const messages_are_full = message_limit > 0 and active_count >= message_limit * 4 / 5;
-    return tokens_are_full or messages_are_full;
+    return used > 0 and @as(f64, @floatFromInt(used)) >= token_threshold;
 }
 
 const context_full_notice = "Stopped: context is full. History was preserved. Use /compact or switch to a model with a larger context window before continuing.";
@@ -738,9 +734,6 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     self.resume_after_compaction = false;
     self.state = .idle;
     if (summary.len == 0) return self.stop("Stopped: compaction returned no summary. History was preserved; try /compact again.");
-    const failed_to_shrink = resume_turn and summary.len / 4 >= window.contextTokens(self.conversation, self.provider.vision);
-    if (failed_to_shrink) return self.stop("Stopped: compaction did not reduce the context. History was preserved; try /compact or a larger model.");
-
     _ = try self.conversation.append(.{ .role = .system, .text = summary });
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
