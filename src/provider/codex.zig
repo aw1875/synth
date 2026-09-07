@@ -744,23 +744,45 @@ const ResponseStream = struct {
     fn readEvents(self: *ResponseStream, arena: std.mem.Allocator, reader: *std.Io.Reader) !void {
         var scratch: std.heap.ArenaAllocator = .init(arena);
         defer scratch.deinit();
+        var scratch_line: std.heap.ArenaAllocator = .init(arena);
+        defer scratch_line.deinit();
         while (true) {
+            _ = scratch_line.reset(.retain_capacity);
             if (requestWasCanceled(self.sink)) return error.Canceled;
-            const raw_line = reader.takeDelimiter('\n') catch |read_error| switch (read_error) {
-                error.StreamTooLong => return error.ResponseTooLong,
-                else => |other_error| return other_error,
-            } orelse break;
+            // A single event can be larger than any buffer worth reserving:
+            // one encrypted reasoning item is unbounded. Grow to the line
+            // rather than refuse it.
+            var event_line: std.Io.Writer.Allocating = .init(scratch_line.allocator());
+            defer event_line.deinit();
+            const stream_ended = blk: {
+                _ = reader.streamDelimiter(&event_line.writer, '\n') catch |read_error| switch (read_error) {
+                    error.EndOfStream => break :blk true,
+                    error.WriteFailed => return error.OutOfMemory,
+                    else => |other_error| return other_error,
+                };
+                reader.toss(1); // the delimiter itself
+                break :blk false;
+            };
+            const raw_line = event_line.written();
+            if (stream_ended and raw_line.len == 0) break;
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             const is_data_event = std.mem.startsWith(u8, line, "data:");
-            if (!is_data_event) continue;
+            if (!is_data_event) {
+                if (stream_ended) break;
+                continue;
+            }
             const event_json = std.mem.trimStart(u8, line[5..], " ");
             const event_is_empty = event_json.len == 0;
             const stream_is_done = std.mem.eql(u8, event_json, "[DONE]");
             const should_ignore_event = event_is_empty or stream_is_done;
-            if (should_ignore_event) continue;
+            if (should_ignore_event) {
+                if (stream_ended) break;
+                continue;
+            }
             _ = scratch.reset(.retain_capacity);
             const event = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), event_json, .{}) catch continue;
             try self.applyEvent(event);
+            if (stream_ended) break;
         }
     }
 
@@ -1802,4 +1824,27 @@ test "only a stream that said nothing is safe to ask again" {
     defer thinking.deinit();
     try thinking.readEvents(testing.allocator, &thought);
     try testing.expect(thinking.delivered_anything);
+}
+
+test "an event larger than any fixed buffer is still read" {
+    const testing = std.testing;
+    // Bigger than the 512KiB line cap this used to refuse.
+    const filler = try testing.allocator.alloc(u8, 700 * 1024);
+    defer testing.allocator.free(filler);
+    @memset(filler, 'x');
+    const stream_text = try std.fmt.allocPrint(
+        testing.allocator,
+        "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"reasoning\",\"id\":\"rs_big\",\"encrypted_content\":\"{s}\"}}}}\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"done\"}}\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n",
+        .{filler},
+    );
+    defer testing.allocator.free(stream_text);
+
+    var reader = std.Io.Reader.fixed(stream_text);
+    var stream = ResponseStream.init(testing.allocator, null, "model");
+    defer stream.deinit();
+    try stream.readEvents(testing.allocator, &reader);
+    var reply = try stream.intoReply();
+    defer reply.deinit(testing.allocator);
+    try testing.expectEqualStrings("done", reply.text);
+    try testing.expect(std.mem.indexOf(u8, reply.provider_state.?, "rs_big") != null);
 }
