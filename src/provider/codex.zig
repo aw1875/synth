@@ -41,8 +41,14 @@ live_socket: std.posix.fd_t = no_socket,
 socket_lock: std.Io.Mutex = .init,
 aborted: bool = false,
 
-// Version Synth reports to the private Codex backend for compatibility checks.
+// The backend gates its model list on the client version, and synth's own
+// version returns an empty catalog, so this reports a Codex release instead.
+// Raising it can change which models come back, which is why the catalog is
+// keyed by it below.
 const codex_client_version = "0.153.0";
+/// Cache identity for the catalog. The version belongs in the key: a list
+/// fetched under one is not an answer for another.
+pub const codex_catalog_namespace = "codex/" ++ codex_client_version;
 /// No request in flight.
 const no_socket: std.posix.fd_t = -1;
 const max_body_bytes: usize = 4 * 1024 * 1024;
@@ -199,7 +205,7 @@ pub fn listModels(self: *CodexProvider, allocator: std.mem.Allocator) ![][]const
 fn catalogModels(self: *CodexProvider, arena: std.mem.Allocator) ![]const Models.Info {
     if (self.models) |models| {
         const tokens = try auth_flow.loadTokens(arena, self.auth);
-        return models.getOrFetchCatalog("codex", self.host, tokens.account_id, self);
+        return models.getOrFetchCatalog(codex_catalog_namespace, self.host, tokens.account_id, self);
     }
     return self.fetchModels(arena);
 }

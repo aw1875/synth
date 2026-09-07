@@ -568,7 +568,9 @@ test "every backend switches and spawns from the shared catalog without rediscov
     for ([_]catalog.Kind{ .ollama, .openai, .codex }) |kind| {
         const host = if (kind == .codex) codex_auth.backend_url else "http://127.0.0.1:1/v1";
         const identity = if (kind == .codex) "test-account" else "";
-        _ = try models.getOrFetchCatalog(@tagName(kind), host, identity, &source);
+        // The codex catalog is keyed by the client version it was fetched under.
+        const namespace = if (kind == .codex) CodexProvider.codex_catalog_namespace else @tagName(kind);
+        _ = try models.getOrFetchCatalog(namespace, host, identity, &source);
         if (kind == .ollama) {
             _ = try models.getOrFetchCatalog("ollama/show/first", host, identity, &source);
             _ = try models.getOrFetchCatalog("ollama/show/second", host, identity, &source);

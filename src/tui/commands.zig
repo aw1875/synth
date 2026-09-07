@@ -14,6 +14,7 @@ const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const skill_tool = @import("../tools/skill.zig");
 const catalog = @import("../provider/catalog.zig");
+const CodexProvider = @import("../provider/codex.zig");
 const codex_auth = @import("../provider/codex_auth.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
@@ -738,7 +739,9 @@ test "startup selection is displayed and saved before the first request for ever
     for ([_]catalog.Kind{ .ollama, .openai, .codex }) |kind| {
         const host = if (kind == .codex) codex_auth.backend_url else "http://127.0.0.1:1/v1";
         const identity = if (kind == .codex) "test-account" else "";
-        _ = try models.getOrFetchCatalog(@tagName(kind), host, identity, &source);
+        // The codex catalog is keyed by the client version it was fetched under.
+        const namespace = if (kind == .codex) CodexProvider.codex_catalog_namespace else @tagName(kind);
+        _ = try models.getOrFetchCatalog(namespace, host, identity, &source);
         if (kind == .ollama) _ = try models.getOrFetchCatalog("ollama/show/available-model", host, identity, &source);
         var backend = Backend.init(kind, .{
             .allocator = testing.allocator,
