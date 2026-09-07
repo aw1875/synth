@@ -1448,3 +1448,43 @@ test "the prompt cache key rides in the body and survives a model switch" {
     const third = try std.json.parseFromSliceLeaky(std.json.Value, arena, third_body, .{});
     try testing.expect(!std.mem.eql(u8, first_key, third.object.get("prompt_cache_key").?.string));
 }
+
+test "the cached prefix holds steady across turns and a model switch" {
+    const testing = std.testing;
+    var auth = Auth.init(testing.allocator, testing.io);
+    defer auth.deinit();
+    var codex: CodexProvider = .{ .allocator = testing.allocator, .io = testing.io, .auth = &auth, .model = "current", .context_limit = 100000 };
+
+    var conversation = Conversation.init(testing.allocator);
+    defer conversation.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Caching keys off the prompt prefix, so `instructions` has to be byte
+    // identical turn over turn or every request pays full price.
+    const turn: Provider.Turn = .{ .system = "you are synth" };
+    _ = try conversation.append(.{ .role = .user, .text = "first" });
+    const first = try std.json.parseFromSliceLeaky(std.json.Value, arena, try codex.buildResponseRequestBody(arena, &conversation, turn), .{});
+    const first_instructions = first.object.get("instructions").?.string;
+
+    _ = try conversation.append(.{ .role = .assistant, .text = "answered" });
+    _ = try conversation.append(.{ .role = .user, .text = "second" });
+    const second = try std.json.parseFromSliceLeaky(std.json.Value, arena, try codex.buildResponseRequestBody(arena, &conversation, turn), .{});
+    try testing.expectEqualStrings(first_instructions, second.object.get("instructions").?.string);
+
+    // A model switch keeps the prefix and the key, so the cache survives it.
+    codex.model = "other";
+    const switched = try std.json.parseFromSliceLeaky(std.json.Value, arena, try codex.buildResponseRequestBody(arena, &conversation, turn), .{});
+    try testing.expectEqualStrings(first_instructions, switched.object.get("instructions").?.string);
+    try testing.expectEqualStrings(
+        first.object.get("prompt_cache_key").?.string,
+        switched.object.get("prompt_cache_key").?.string,
+    );
+
+    // The first user message stays first, so the prefix after `instructions`
+    // is stable too.
+    const first_input = second.object.get("input").?.array.items[0].object;
+    try testing.expectEqualStrings("user", first_input.get("role").?.string);
+    try testing.expectEqualStrings("first", first_input.get("content").?.array.items[0].object.get("text").?.string);
+}
