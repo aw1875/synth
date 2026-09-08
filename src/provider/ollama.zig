@@ -532,9 +532,6 @@ pub fn describeError(
 /// How many times a rejected request is retried with half the history, and the
 /// floor that stops at. Two halvings take a full window down to a quarter,
 /// which is either enough or a sign the problem was never the size.
-const max_shrink_attempts: u8 = 2;
-const min_budget: usize = 2 * 1024;
-
 /// Whether a complaint is about the size of the request, which is the one kind
 /// the harness can do something about without being told.
 /// Whether a refused request is worth sending again, waiting if so.
@@ -673,7 +670,7 @@ fn respond(
     const arena = arena_state.allocator();
 
     const system = turn.system;
-    var budget = self.contextBudget() -| (system.len / 4);
+    const budget = window.requestBudget(self.effectiveLimit(), turn);
 
     var tools_parsed: ?std.json.Parsed(std.json.Value) = null;
     defer if (tools_parsed) |*parsed| parsed.deinit();
@@ -691,7 +688,6 @@ fn respond(
     self.armSocket();
 
     var messages: []Ollama.Message = undefined;
-    var attempt: u8 = 0;
     var sends: usize = 1;
     var stream = while (true) {
         messages = try self.buildMessages(convo, arena, system, turn.instruction, budget);
@@ -707,12 +703,6 @@ fn respond(
         break self.client.chat(request) catch |err| {
             self.captureRejection(request);
             const why = self.rejection orelse "";
-
-            if (attempt < max_shrink_attempts and budget > min_budget and isOverflow(why)) {
-                attempt += 1;
-                budget = @max(budget / 2, min_budget);
-                continue;
-            }
 
             if (self.waitAndRetry(sends, why, sink)) {
                 sends += 1;
@@ -896,16 +886,15 @@ fn buildMessages(
     instruction: []const u8,
     budget: usize,
 ) ![]Ollama.Message {
-    const kept = try window.messages(convo, allocator, budget, self.supports_vision);
+    const kept = try window.completeMessages(convo, allocator, budget, self.supports_vision);
 
     const extra: usize = if (instruction.len > 0) 1 else 0;
     const messages = try allocator.alloc(Ollama.Message, kept.len + 1 + extra);
     errdefer allocator.free(messages);
 
-    const dropped = convo.messages.items.len - kept.len;
     messages[0] = .{
         .role = .system,
-        .content = try window.systemText(allocator, system, kept, dropped),
+        .content = try window.systemText(allocator, system, kept),
     };
     if (instruction.len > 0) {
         messages[messages.len - 1] = .{ .role = .user, .content = instruction };
@@ -988,10 +977,6 @@ fn runnerContextLength(allocator: std.mem.Allocator, raw: []const u8, model: []c
         }
     }
     return 0;
-}
-
-fn contextBudget(self: *OllamaProvider) usize {
-    return window.budgetFor(self.effectiveLimit());
 }
 
 test "the window asked for is the model's own unless configured otherwise" {
@@ -1201,5 +1186,6 @@ test "the window planned against is the runner's, not the metadata's" {
     backend.runtime_limit = 4096;
     try testing.expectEqual(@as(u32, 4096), backend.effectiveLimit());
     try testing.expectEqual(@as(u32, 4096), backend.current().context_limit);
-    try testing.expect(backend.contextBudget() < 4096);
+    const turn: Provider.Turn = .{ .system = "", .tools_json = "" };
+    try testing.expect(window.requestBudget(backend.effectiveLimit(), turn) < 4096);
 }

@@ -57,6 +57,7 @@ pub fn start(
             .system = try allocator.dupe(u8, turn.system),
             .tools_json = try allocator.dupe(u8, turn.tools_json),
             .instruction = try allocator.dupe(u8, turn.instruction),
+            .compacting = turn.compacting,
         },
         .thoughts = .init(allocator, io),
         .content = .init(allocator, io),
