@@ -324,6 +324,7 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !void {
             try note(self, "Could not remember the provider: {s}", .{@errorName(err)});
         };
     }
+    self.provider_id = entry.id;
 
     try note(self, "Connected {s} at {s}, running {s}.", .{ entry.label, result.host, provider.model });
 }
@@ -474,8 +475,7 @@ fn rememberModelChoice(self: *Model, model: []const u8) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const provider_id = try db.activeProvider(arena);
-    const key = try std.fmt.allocPrint(arena, "model:{s}", .{provider_id});
+    const key = try std.fmt.allocPrint(arena, "model:{s}", .{self.provider_id});
     try db.setSetting(key, model);
 }
 

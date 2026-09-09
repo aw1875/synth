@@ -287,6 +287,40 @@ test "a remembered model reopens the session, and the config still overrides it"
     try testing.expectEqualStrings("gpt-oss", overridden.model);
 }
 
+test "a fresh database reads the model back under the id it defaults to" {
+    const testing = std.testing;
+
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    var auth: Auth = .init(testing.allocator);
+    defer auth.deinit();
+
+    // Nothing has ever connected, so there is no provider row to normalize from.
+    // Whatever id the resolver settles on is the one a stored model must be
+    // keyed under, and it is the id the TUI starts holding.
+    const fresh = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings(default_id, fresh.entry.id);
+
+    const key = try std.fmt.allocPrint(arena_state.allocator(), "model:{s}", .{default_id});
+    try fixture.db.setSetting(key, "llama3");
+
+    const remembered = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings("llama3", remembered.model);
+
+    // A pinned provider moves the key with it, so a pick made under the pin is
+    // read back under the pin rather than under the database's own row.
+    config.provider_override = "ollama-cloud";
+    const pinned = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings("ollama-cloud", pinned.entry.id);
+    try testing.expectEqualStrings("", pinned.model);
+}
+
 test "the environment beats the database, and a stored key beats the config" {
     const testing = std.testing;
 

@@ -201,6 +201,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .environ = init.environ_map,
         .auth = &auth,
         .backend = &backend,
+        .provider_id = active.entry.id,
     };
     try tui_app.wire(model);
 
