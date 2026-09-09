@@ -141,7 +141,13 @@ pub fn resolve(
         break :blk from_env.key;
     };
 
-    return .{ .entry = entry, .host = host, .model = config.model_override, .api_key = key };
+    var configured_model = config.model_override;
+    if (configured_model.len == 0) {
+        const model_key = try std.fmt.allocPrint(arena, "model:{s}", .{entry.id});
+        configured_model = try db.setting(arena, model_key);
+    }
+
+    return .{ .entry = entry, .host = host, .model = configured_model, .api_key = key };
 }
 
 test "every provider is findable by the id it stores itself under" {
@@ -248,6 +254,37 @@ test "what the database remembers is what a new run connects to" {
     const hosted = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
     try testing.expectEqualStrings("https://ollama.com", hosted.host);
     try testing.expect(hosted.api_key == null);
+}
+
+test "a remembered model reopens the session, and the config still overrides it" {
+    const testing = std.testing;
+
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    var auth: Auth = .init(testing.allocator);
+    defer auth.deinit();
+
+    try fixture.db.setActiveProvider("ollama");
+    try fixture.db.setSetting("model:ollama", "qwen3");
+
+    const remembered = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings("qwen3", remembered.model);
+
+    // Each provider remembers its own choice, so switching shows nothing yet.
+    try fixture.db.setActiveProvider("openai");
+    const unseen = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings("", unseen.model);
+
+    try fixture.db.setActiveProvider("ollama");
+    config.model_override = "gpt-oss";
+    const overridden = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
+    try testing.expectEqualStrings("gpt-oss", overridden.model);
 }
 
 test "the environment beats the database, and a stored key beats the config" {
