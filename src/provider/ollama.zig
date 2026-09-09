@@ -529,9 +529,6 @@ pub fn describeError(
     );
 }
 
-/// How many times a rejected request is retried with half the history, and the
-/// floor that stops at. Two halvings take a full window down to a quarter,
-/// which is either enough or a sign the problem was never the size.
 /// Whether a complaint is about the size of the request, which is the one kind
 /// the harness can do something about without being told.
 /// Whether a refused request is worth sending again, waiting if so.
