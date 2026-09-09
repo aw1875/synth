@@ -901,6 +901,9 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     try self.seedHistory();
     self.input.clear();
     self.held.clear();
+    self.mentions.close();
+    self.selection.clear();
+    self.reads.clear(self.io);
     self.scroll = 0;
 }
 
@@ -917,6 +920,7 @@ pub fn clearSession(self: *Model) bool {
     self.held.clear();
     self.mentions.close();
     self.selection.clear();
+    self.reads.clear(self.io);
     self.scroll = 0;
     return true;
 }
@@ -1564,10 +1568,12 @@ test "a cleared session forgets the subagents the old one left" {
     try model.subagent_sessions.put(testing.allocator, key, child);
     try testing.expect(try model.openSubagent(key, 0, 0, "task"));
     try testing.expect(model.inSubagent());
+    try model.reads.record(testing.io, "/repo/old.txt", 1);
 
     try testing.expect(model.clearSession());
 
     try testing.expect(!model.inSubagent());
+    try testing.expect(model.reads.lastRead(testing.io, "/repo/old.txt") == null);
     try testing.expectEqual(&model.conversation, model.shown());
     try testing.expectEqual(@as(usize, 0), model.subagent_sessions.count());
     try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);

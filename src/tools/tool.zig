@@ -264,9 +264,20 @@ pub const ReadLog = struct {
     }
 
     pub fn deinit(self: *ReadLog) void {
+        self.clearUnlocked();
+        self.seen.deinit(self.allocator);
+    }
+
+    pub fn clear(self: *ReadLog, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.clearUnlocked();
+    }
+
+    fn clearUnlocked(self: *ReadLog) void {
         var it = self.seen.keyIterator();
         while (it.next()) |key| self.allocator.free(key.*);
-        self.seen.deinit(self.allocator);
+        self.seen.clearRetainingCapacity();
     }
 
     pub fn record(self: *ReadLog, io: std.Io, path: []const u8, mtime: i96) !void {
