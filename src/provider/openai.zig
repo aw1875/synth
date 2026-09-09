@@ -830,7 +830,7 @@ fn writeMessages(
 
     try w.writeAll("{\"role\":\"system\",\"content\":");
     try std.json.Stringify.encodeJsonString(
-        try window.systemText(arena, turn.system, kept),
+        try window.systemText(arena, turn.system, kept, 0),
         .{},
         w,
     );

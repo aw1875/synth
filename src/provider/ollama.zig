@@ -894,7 +894,7 @@ fn buildMessages(
 
     messages[0] = .{
         .role = .system,
-        .content = try window.systemText(allocator, system, kept),
+        .content = try window.systemText(allocator, system, kept, 0),
     };
     if (instruction.len > 0) {
         messages[messages.len - 1] = .{ .role = .user, .content = instruction };

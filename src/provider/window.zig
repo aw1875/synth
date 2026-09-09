@@ -301,12 +301,13 @@ pub fn systemText(
     allocator: std.mem.Allocator,
     system: []const u8,
     kept: []const Conversation.Message,
+    dropped: usize,
 ) ![]const u8 {
     var summaries: usize = 0;
     for (kept) |msg| {
         if (msg.role == .system) summaries += 1;
     }
-    if (summaries == 0) return system;
+    if (summaries == 0 and dropped == 0) return system;
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -316,6 +317,12 @@ pub fn systemText(
         if (msg.role != .system) continue;
         try out.writer.print("\n\n<summary>\n{s}\n</summary>", .{msg.text});
     }
+    if (dropped > 0) {
+        try out.writer.print(
+            "\n\n<note>{d} earlier message(s) in this session were dropped to fit the context window. Ask if you need something from them.</note>",
+            .{dropped},
+        );
+    }
     return out.toOwnedSlice();
 }
 
@@ -323,7 +330,7 @@ test "the brief is returned untouched when there is nothing to fold in" {
     const system = "brief";
     try std.testing.expectEqualStrings(
         system,
-        try systemText(std.testing.allocator, system, &.{}),
+        try systemText(std.testing.allocator, system, &.{}, 0),
     );
 }
 
@@ -336,10 +343,18 @@ test "a summary is folded into the brief rather than sent as its own message" {
         .{ .role = .user, .text = "and then" },
     };
 
-    const text = try systemText(arena_state.allocator(), "brief", kept);
+    const text = try systemText(arena_state.allocator(), "brief", kept, 0);
     try std.testing.expect(std.mem.startsWith(u8, text, "brief"));
     try std.testing.expect(std.mem.indexOf(u8, text, "<summary>\nwhat happened earlier\n</summary>") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "and then") == null);
+}
+
+test "the dropped-messages note still gets through" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const text = try systemText(arena_state.allocator(), "brief", &.{}, 3);
+    try std.testing.expect(std.mem.indexOf(u8, text, "3 earlier message(s)") != null);
 }
 
 /// A read of `path` and the result it came back with, as the transcript stores
