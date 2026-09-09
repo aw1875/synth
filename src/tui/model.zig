@@ -230,10 +230,6 @@ auth: ?*Auth = null,
 /// because connecting a provider of another protocol replaces the client, which
 /// the erased `Provider` has no way to do.
 backend: ?*Backend = null,
-/// The catalog id of the provider in use, normalized the way `catalog.resolve`
-/// normalizes it, so a remembered model is stored under the id the next launch
-/// will read it back from.
-provider_id: []const u8 = catalog.default_id,
 /// The `/` command picker, open while one is being typed.
 slash: Slash = undefined,
 /// Where the left button went down, so a drag can anchor there. The first

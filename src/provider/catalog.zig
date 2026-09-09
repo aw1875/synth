@@ -313,8 +313,9 @@ test "a fresh database reads the model back under the id it defaults to" {
     const remembered = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
     try testing.expectEqualStrings("llama3", remembered.model);
 
-    // A pinned provider moves the key with it, so a pick made under the pin is
-    // read back under the pin rather than under the database's own row.
+    // A pin changes which entry resolves, so it also changes which key the model
+    // is read back from. The TUI still stores a pick under the database's own
+    // provider, so a pick made under a pin is not read back. Known gap.
     config.provider_override = "ollama-cloud";
     const pinned = try resolve(arena_state.allocator(), &fixture.db, &config, &auth);
     try testing.expectEqualStrings("ollama-cloud", pinned.entry.id);
