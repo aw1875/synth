@@ -489,6 +489,7 @@ fn respond(
                 attempt += 1;
                 continue;
             }
+            if (Provider.mentionsOverflow(why)) return error.ContextTooLarge;
             return error.HttpError;
         }
 
@@ -825,13 +826,12 @@ fn writeMessages(
     convo: *Conversation,
     turn: Provider.Turn,
 ) !void {
-    const budget = window.budgetFor(self.context_limit) -| (turn.system.len / 4);
-    const kept = try window.messages(convo, arena, budget, self.supports_vision);
-    const dropped = convo.messages.items.len - kept.len;
+    const budget = window.requestBudget(self.context_limit, turn);
+    const kept = try window.completeMessages(convo, arena, budget, self.supports_vision);
 
     try w.writeAll("{\"role\":\"system\",\"content\":");
     try std.json.Stringify.encodeJsonString(
-        try window.systemText(arena, turn.system, kept, dropped),
+        try window.systemText(arena, turn.system, kept, 0),
         .{},
         w,
     );
