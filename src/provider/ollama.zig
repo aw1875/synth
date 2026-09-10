@@ -560,15 +560,7 @@ fn waitAndRetry(
 }
 
 fn isOverflow(why: []const u8) bool {
-    const needles: []const []const u8 = &.{
-        "context length",  "context window", "too long",     "too large",
-        "too many token",  "exceeds",        "input length", "token limit",
-        "maximum context",
-    };
-    for (needles) |needle| {
-        if (containsIgnoreCase(why, needle)) return true;
-    }
-    return false;
+    return Provider.mentionsOverflow(why);
 }
 
 /// What to do about a complaint the server made. Only three answers are ever
@@ -705,6 +697,7 @@ fn respond(
                 sends += 1;
                 continue;
             }
+            if (isOverflow(why)) return error.ContextTooLarge;
             return err;
         };
     };

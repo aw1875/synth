@@ -1168,6 +1168,18 @@ fn pollRequest(self: *Loop) !bool {
     if (request.failed) |err| {
         self.last_error = err;
 
+        // The estimate said this fit and the server disagreed. Compaction is the
+        // only answer that keeps the history, and it gets the same one attempt
+        // per submit a predicted overflow gets. A compaction request that is
+        // itself refused falls through and reports, rather than trying again.
+        const server_refused_the_size = err == error.ContextTooLarge and !self.compacting;
+        const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
+        if (server_refused_the_size and may_recover) {
+            self.recovered_from_overflow = true;
+            try self.startCompaction(true);
+            return true;
+        }
+
         const detail = self.provider.explain(err, self.allocator) catch
             try std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)});
         defer self.allocator.free(detail);
@@ -3903,6 +3915,65 @@ test "a blanket allowance still stops at the project boundary" {
 
     call.arguments = "{\"path\":\"/tmp/hooks.zig\"}";
     try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "a request the backend calls too large compacts and carries on" {
+    const Script = struct {
+        calls: usize = 0,
+        refusals: usize = 0,
+        fn respond(ptr: *anyopaque, _: *Conversation, asked: Provider.Turn, allocator: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (asked.compacting) return .{ .text = try allocator.dupe(u8, "Summary of the work so far.") };
+            // The local estimate let this through and the backend disagreed.
+            if (self.refusals == 0) {
+                self.refusals += 1;
+                return error.ContextTooLarge;
+            }
+            return .{ .text = try allocator.dupe(u8, "carried on") };
+        }
+    };
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var script: Script = .{};
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.system_prompt = "";
+    loop.provider = .{ .name = "script", .userdata = &script, .respond = Script.respond, .context_limit = 4000 };
+
+    try loop.submit("do the thing", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(@as(usize, 1), script.refusals);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Outcome.done, loop.outcome.?);
+    try testing.expectEqualStrings("carried on", lastAssistant(&fixture.convo).?.text);
+}
+
+test "a compaction the backend also refuses reports instead of trying again" {
+    const Script = struct {
+        calls: usize = 0,
+        fn respond(ptr: *anyopaque, _: *Conversation, _: Provider.Turn, _: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.ContextTooLarge;
+        }
+    };
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var script: Script = .{};
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.system_prompt = "";
+    loop.provider = .{ .name = "script", .userdata = &script, .respond = Script.respond, .context_limit = 4000 };
+
+    try loop.submit("do the thing", .{});
+    try settle(&loop);
+
+    // The turn, then one compaction attempt. Not a third.
+    try testing.expectEqual(@as(usize, 2), script.calls);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Outcome.failed, loop.outcome.?);
 }
 
 test "a turn that will not fit compacts and carries on instead of stopping" {

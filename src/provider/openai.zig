@@ -489,6 +489,7 @@ fn respond(
                 attempt += 1;
                 continue;
             }
+            if (Provider.mentionsOverflow(why)) return error.ContextTooLarge;
             return error.HttpError;
         }
 
