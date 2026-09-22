@@ -1168,10 +1168,6 @@ fn pollRequest(self: *Loop) !bool {
     if (request.failed) |err| {
         self.last_error = err;
 
-        // The estimate said this fit and the server disagreed. Compaction is the
-        // only answer that keeps the history, and it gets the same one attempt
-        // per submit a predicted overflow gets. A compaction request that is
-        // itself refused falls through and reports, rather than trying again.
         const server_refused_the_size = err == error.ContextTooLarge and !self.compacting;
         const may_recover = self.auto_compact_at > 0 and !self.recovered_from_overflow;
         if (server_refused_the_size and may_recover) {

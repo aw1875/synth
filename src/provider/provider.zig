@@ -98,14 +98,11 @@ pub fn current(self: Provider) Current {
     return refresh(self.userdata);
 }
 
-/// Whether a rejection is the server saying the request was too big. Backends
-/// classify their own wire errors, so the loop can react to an overflow it did
-/// not predict without knowing how any one server phrases it.
 pub fn mentionsOverflow(why: []const u8) bool {
     const needles: []const []const u8 = &.{
-        "context length",  "context window", "too long",     "too large",
-        "too many token",  "exceeds",        "input length", "token limit",
-        "maximum context",
+        "context length",  "context window",      "too long",     "too large",
+        "too many token",  "exceeds",             "input length", "token limit",
+        "maximum context", "must have less than",
     };
     for (needles) |needle| {
         if (containsIgnoreCase(why, needle)) return true;
@@ -190,3 +187,9 @@ pub const Sink = struct {
 };
 
 fn ignoreThinkingDone(_: *anyopaque) void {}
+
+test "a TGI length refusal reads as an overflow, a quota refusal does not" {
+    const testing = std.testing;
+    try testing.expect(mentionsOverflow("Input validation error: `inputs` must have less than 2048 tokens. Given: 4194"));
+    try testing.expect(!mentionsOverflow("You exceeded your current quota, please check your plan and billing details."));
+}
