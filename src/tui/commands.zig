@@ -470,13 +470,16 @@ pub fn switchModel(self: *Model, name: []const u8) !void {
 
 /// Remember the model per provider so the next launch reopens on it.
 fn rememberModelChoice(self: *Model, model: []const u8) !void {
+    if (model.len == 0) return;
     const db = self.loop.database() orelse return;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const provider_id = try activeProviderId(self, arena);
     const key = try std.fmt.allocPrint(arena, "model:{s}", .{provider_id});
-    try db.setSetting(key, model);
+    db.setSetting(key, model) catch |err| {
+        try note(self, "Could not remember the model: {s}", .{@errorName(err)});
+    };
 }
 
 /// Turn the highlighted MCP server on or off.
