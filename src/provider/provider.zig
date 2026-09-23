@@ -57,6 +57,8 @@ pub const Turn = struct {
     /// A one-off instruction, sent as the last user message and not part of the
     /// transcript. Compaction is what this is for.
     instruction: []const u8 = "",
+    /// Reserve less output space while summarizing, but never discard history.
+    compacting: bool = false,
 };
 
 /// Where a backend should point, and what to call it there. The label is the
@@ -96,9 +98,31 @@ pub fn current(self: Provider) Current {
     return refresh(self.userdata);
 }
 
+pub fn mentionsOverflow(why: []const u8) bool {
+    const needles: []const []const u8 = &.{
+        "context length",  "context window",      "too long",     "too large",
+        "too many token",  "exceeds",             "input length", "token limit",
+        "maximum context", "must have less than",
+    };
+    for (needles) |needle| {
+        if (containsIgnoreCase(why, needle)) return true;
+    }
+    return false;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
 /// What went wrong, in the backend's own words where it has any. Caller owns
 /// the result.
 pub fn explain(self: Provider, err: anyerror, allocator: std.mem.Allocator) ![]const u8 {
+    if (err == error.ContextTooLarge) return allocator.dupe(u8, "Context is full. History was preserved. Use /compact or a model with a larger context window.");
     const describe = self.describe_error orelse
         return std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
     return describe(self.userdata, err, allocator) catch
@@ -163,3 +187,9 @@ pub const Sink = struct {
 };
 
 fn ignoreThinkingDone(_: *anyopaque) void {}
+
+test "a TGI length refusal reads as an overflow, a quota refusal does not" {
+    const testing = std.testing;
+    try testing.expect(mentionsOverflow("Input validation error: `inputs` must have less than 2048 tokens. Given: 4194"));
+    try testing.expect(!mentionsOverflow("You exceeded your current quota, please check your plan and billing details."));
+}

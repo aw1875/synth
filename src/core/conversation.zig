@@ -176,6 +176,8 @@ dropped: u64 = 0,
 /// Cap on in-memory messages. When an append would exceed it, the oldest are
 /// dropped. Zero means unbounded (tests, `synth run`).
 max_messages: usize = 0,
+/// Agent conversations must retain unsummarised context regardless of the cap.
+preserve_context: bool = false,
 
 pub fn init(allocator: std.mem.Allocator) Conversation {
     return .{ .allocator = allocator };
@@ -337,7 +339,17 @@ pub fn append(self: *Conversation, msg: Message) !*Message {
 /// knows there is history to page in.
 fn trim(self: *Conversation) void {
     if (self.max_messages == 0) return;
+    var checkpoint: ?u64 = null;
+    if (self.preserve_context) {
+        for (self.messages.items) |msg| {
+            if (msg.role == .system) checkpoint = msg.seq;
+        }
+    }
     while (self.messages.items.len > self.max_messages) {
+        if (self.preserve_context) {
+            const checkpoint_seq = checkpoint orelse return;
+            if (self.messages.items[0].seq >= checkpoint_seq) return;
+        }
         if (!self.messages.items[0].isSettled()) return;
         var removed = self.messages.orderedRemove(0);
         removed.deinit(self.allocator);
@@ -488,6 +500,22 @@ test "seq is monotonic and survives trimming" {
     try std.testing.expectEqual(@as(u64, 1), convo.messages.items[0].seq);
     try std.testing.expectEqual(@as(u64, 2), convo.messages.items[1].seq);
     try std.testing.expectEqual(@as(u64, 1), convo.firstSeq().?);
+}
+
+test "live context exceeds the display cap until a checkpoint covers it" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+    convo.max_messages = 2;
+    convo.preserve_context = true;
+    try convo.add(.user, "original task");
+    try convo.add(.assistant, "progress");
+    try convo.add(.user, "follow-up");
+    try std.testing.expectEqualStrings("original task", convo.messages.items[0].text);
+    try convo.add(.system, "Task and progress preserved here.");
+    try convo.add(.assistant, "continuing");
+    try convo.add(.user, "another follow-up");
+    try std.testing.expectEqualStrings("Task and progress preserved here.", convo.messages.items[0].text);
+    try std.testing.expectEqual(@as(usize, 3), convo.messages.items.len);
 }
 
 test "prepend pages older messages back in" {

@@ -743,6 +743,16 @@ pub fn toolCallId(self: *Database, message_id: i64, seq: i64) !?i64 {
     return row.int(0);
 }
 
+/// Messages needed to continue, including the latest compaction checkpoint.
+pub fn contextMessageCount(self: *Database, session_id: i64) !usize {
+    const row = try self.conn.row(
+        \\SELECT COUNT(*) FROM message WHERE session_id = ? AND seq >= COALESCE(
+        \\  (SELECT MAX(seq) FROM message WHERE session_id = ? AND role = 'system'), 0)
+    , .{ session_id, session_id }) orelse return 0;
+    defer row.deinit();
+    return @intCast(row.int(0));
+}
+
 /// Load up to `limit` messages with `seq < before_seq`, in descending order
 /// (newest first), along with their tool calls and reasoning previews. The
 /// caller reverses them before prepending. Owned by the caller; free each
