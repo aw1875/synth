@@ -151,6 +151,9 @@ pub const Message = struct {
     /// Base64-encoded images pasted with this message. User messages only, and
     /// memory-only: nothing persists them yet.
     images: [][]const u8 = &.{},
+    /// What the provider asked to have replayed with this turn. Assistant
+    /// messages only; see `Provider.Reply.provider_state`.
+    provider_state: ?[]const u8 = null,
 
     /// Whether every tool call on this message has finished. An unsettled
     /// message is still being written to, so it must stay in memory.
@@ -183,6 +186,7 @@ pub const Message = struct {
         allocator.free(self.attachments);
         for (self.images) |image| allocator.free(image);
         allocator.free(self.images);
+        if (self.provider_state) |state| allocator.free(state);
     }
 };
 
@@ -292,6 +296,7 @@ pub fn append(self: *Conversation, msg: Message) !*Message {
     errdefer owned.deinit(self.allocator);
 
     if (msg.thinking) |thinking| owned.thinking = try self.allocator.dupe(u8, thinking);
+    if (msg.provider_state) |state| owned.provider_state = try self.allocator.dupe(u8, state);
     if (msg.tool_name) |name| owned.tool_name = try self.allocator.dupe(u8, name);
     if (msg.tool_call_id) |id| owned.tool_call_id = try self.allocator.dupe(u8, id);
 

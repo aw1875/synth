@@ -16,6 +16,9 @@ conn: zqlite.Conn,
 io: std.Io,
 
 /// Length of the random part of a session handle.
+/// The blob kind a provider's replay record is stored under.
+pub const provider_state_blob = "provider_state";
+
 const public_id_chars: usize = 8;
 /// Crockford-style base32: no letters that read as digits, so a handle can be
 /// copied off a terminal by eye.
@@ -810,6 +813,7 @@ pub fn loadMessages(
             }
         }
 
+        msg.provider_state = try self.loadBlob(allocator, id, 0, provider_state_blob);
         msg.tool_calls = try self.loadToolCalls(allocator, id);
         msg.attachments = try self.loadAttachments(allocator, id);
 
@@ -1022,7 +1026,7 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
     if (policy.shed_after_days > 0) {
         const cutoff = now_ms - dayMs(policy.shed_after_days);
         // An allowlist, aged by the parent: a child's own clock stops on landing.
-        const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result')" ++
+        const scope = "FROM blob WHERE kind IN ('reasoning', 'tool_result', '" ++ provider_state_blob ++ "')" ++
             " AND message_id IN (SELECT m.id FROM message m" ++
             " JOIN session s ON m.session_id = s.id" ++
             " LEFT JOIN session p ON s.parent_session_id = p.id" ++
@@ -2006,4 +2010,35 @@ test "a call's duration survives a round trip" {
         testing.allocator.free(again);
     }
     try testing.expectEqual(@as(?u64, 900), again[1].elapsed_ms);
+}
+
+test "a provider's replay record comes back whole on resume, and is shed with old payloads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fs.path.join(std.testing.allocator, &.{ buf[0..n], "test.db" });
+    defer std.testing.allocator.free(db_path);
+
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const project_id = try db.resolveProject("/repo", "git", "repo");
+    const session_id = try db.createSession(project_id, "/repo", "gpt-test");
+    const record = "{\"provider\":\"chatgpt\",\"items\":[" ++ ("{\"type\":\"reasoning\"}," ** 400) ++ "{}]}";
+
+    const m = try db.appendMessage(session_id, 0, "assistant", "done", null, 0);
+    try db.appendBlob(m, 0, provider_state_blob, record);
+
+    const loaded = try db.loadMessages(std.testing.allocator, session_id, 1, 10);
+    defer {
+        for (loaded) |*msg| msg.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+    try std.testing.expectEqualStrings(record, loaded[0].provider_state.?);
+
+    try db.conn.exec("UPDATE session SET updated_at = 0 WHERE id = ?", .{session_id});
+    _ = try db.prune(.{ .shed_after_days = 1 }, db.nowMs());
+    try std.testing.expectEqual(@as(i64, 0), try countOf(&db, "SELECT count(*) FROM blob WHERE kind = '" ++ provider_state_blob ++ "'"));
 }

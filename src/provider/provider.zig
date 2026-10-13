@@ -157,12 +157,16 @@ pub const Reply = struct {
     /// Tool calls the model wants run. Owned by the caller, which frees each
     /// call with `Conversation.ToolCall.deinit`.
     tool_calls: []Conversation.ToolCall = &.{},
+    /// The provider's own record of this turn, replayed verbatim on later
+    /// turns. Opaque to everything but the provider that wrote it.
+    provider_state: ?[]const u8 = null,
     usage: Usage = .{},
 
     pub fn deinit(self: *Reply, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         for (self.tool_calls) |*call| call.deinit(allocator);
         allocator.free(self.tool_calls);
+        if (self.provider_state) |state| allocator.free(state);
     }
 };
 
