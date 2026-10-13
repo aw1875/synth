@@ -26,13 +26,20 @@ pub fn defaultPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) 
 /// `$XDG_DATA_HOME/<name>/<name>.db`, or `~/.local/share/<name>/<name>.db`. A
 /// debug build keeps it in the working directory. Owned by the caller.
 pub fn defaultDatabasePath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
-    if (builtin.mode == .Debug) return allocator.dupe(u8, database_file);
+    return dataPath(allocator, env, database_file);
+}
+
+/// `$XDG_DATA_HOME/<name>/<file>`, or `~/.local/share/<name>/<file>`: where
+/// state the program writes lives. A debug build keeps it in the working
+/// directory. Owned by the caller.
+pub fn dataPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, file: []const u8) ![]u8 {
+    if (builtin.mode == .Debug) return allocator.dupe(u8, file);
     const base = env.get("XDG_DATA_HOME") orelse blk: {
         const home = env.get("HOME") orelse return error.NoHome;
         break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share" });
     };
     defer if (env.get("XDG_DATA_HOME") == null) allocator.free(base);
-    return std.fs.path.join(allocator, &.{ base, pkg.name, database_file });
+    return std.fs.path.join(allocator, &.{ base, pkg.name, file });
 }
 
 /// `$XDG_DATA_HOME/<name>/mcp-auth.json`, or `~/.local/share/<name>/...`. A
@@ -42,13 +49,7 @@ pub fn defaultDatabasePath(allocator: std.mem.Allocator, env: *std.process.Envir
 /// writes - OAuth tokens and client registrations - not anything a person
 /// edits.
 pub fn defaultMcpAuthPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
-    if (builtin.mode == .Debug) return allocator.dupe(u8, mcp_auth_file);
-    const base = env.get("XDG_DATA_HOME") orelse blk: {
-        const home = env.get("HOME") orelse return error.NoHome;
-        break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share" });
-    };
-    defer if (env.get("XDG_DATA_HOME") == null) allocator.free(base);
-    return std.fs.path.join(allocator, &.{ base, pkg.name, mcp_auth_file });
+    return dataPath(allocator, env, mcp_auth_file);
 }
 
 /// What the database is called, wherever it ends up living.

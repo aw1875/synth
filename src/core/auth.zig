@@ -1,9 +1,8 @@
 //! Credentials for the providers the harness can talk to.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
-const pkg = @import("pkg");
+const Config = @import("config.zig");
 
 const Auth = @This();
 
@@ -26,7 +25,7 @@ const max_file_bytes: std.Io.Limit = .limited(64 * 1024);
 /// Owner-only, since the whole point of this file is that it holds secrets.
 /// The Windows `Permissions` is a different enum with no mode to set, so it
 /// falls back to the default there.
-const owner_only: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
+pub const owner_only: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
     .fromMode(0o600)
 else
     .default_file;
@@ -42,13 +41,7 @@ path: []const u8 = "",
 /// the config. It is state the program writes, not something a person edits.
 /// Owned by the caller.
 pub fn defaultPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
-    if (builtin.mode == .Debug) return allocator.dupe(u8, "auth.json");
-    const base = env.get("XDG_DATA_HOME") orelse blk: {
-        const home = env.get("HOME") orelse return error.NoHome;
-        break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share" });
-    };
-    defer if (env.get("XDG_DATA_HOME") == null) allocator.free(base);
-    return std.fs.path.join(allocator, &.{ base, pkg.name, "auth.json" });
+    return Config.dataPath(allocator, env, "auth.json");
 }
 
 /// Resolve the path and read it. The one way in, matching `Config.open`.
@@ -140,7 +133,6 @@ pub fn remove(self: *Auth, provider_id: []const u8) bool {
 
 /// Write the store to `path`, atomically and owner-only.
 pub fn save(self: *const Auth, io: std.Io, path: []const u8) !void {
-    const Config = @import("config.zig");
     try Config.ensureDir(io, path);
 
     var temp_buffer: [std.fs.max_path_bytes]u8 = undefined;
