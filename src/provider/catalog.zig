@@ -45,7 +45,7 @@ pub const Entry = struct {
         return switch (self.key) {
             .optional => true,
             .required => (auth.key(self.id) orelse @as([]const u8, "")).len > 0,
-            .oauth => if (chatgpt) |store| store.signedIn() else false,
+            .oauth => if (chatgpt) |store| store.isUsable() else false,
         };
     }
 };
