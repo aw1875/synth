@@ -213,6 +213,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         },
         .tick => {
             self.tick_pending = false;
+            try commands.pollSignIn(self, ctx);
             commands.checkModel(self, ctx);
             try commands.applyMcp(self, ctx);
             if (self.mcp) |host| {
@@ -309,9 +310,13 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.connect.close(),
                     .connect => |result| {
-                        try commands.connectProvider(self, result);
-                        self.connect.close();
+                        if (try commands.connectProvider(self, result)) {
+                            self.connect.close();
+                        } else {
+                            try self.scheduleTick(ctx);
+                        }
                     },
+                    .cancel_sign_in => commands.cancelSignIn(self),
                 }
                 return ctx.consumeAndRedraw();
             }
