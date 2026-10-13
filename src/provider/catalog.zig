@@ -6,6 +6,7 @@ const std = @import("std");
 const Auth = @import("../core/auth.zig");
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
+const chatgpt_auth = @import("chatgpt_auth.zig");
 
 /// What a provider needs before it will answer.
 pub const Key = enum {
@@ -15,11 +16,13 @@ pub const Key = enum {
     /// Hosted. Without a key every request is a 401, so the UI says so before
     /// the first turn rather than after it.
     required,
+    /// A browser sign-in. Nothing is typed into synth.
+    oauth,
 };
 
 /// Which client answers for a provider: the wire protocol, not the vendor.
 /// `openai` covers every server imitating that API, which is most of them.
-pub const Kind = enum { ollama, openai };
+pub const Kind = enum { ollama, openai, chatgpt };
 
 pub const Entry = struct {
     /// Stable id: the key in `auth.json` and in the config. Never shown.
@@ -38,10 +41,11 @@ pub const Entry = struct {
     kind: Kind = .ollama,
 
     /// Whether this provider has what it needs to be used.
-    pub fn ready(self: Entry, auth: *const Auth) bool {
+    pub fn ready(self: Entry, auth: *const Auth, chatgpt: ?*chatgpt_auth.Store) bool {
         return switch (self.key) {
             .optional => true,
             .required => (auth.key(self.id) orelse @as([]const u8, "")).len > 0,
+            .oauth => if (chatgpt) |store| store.signedIn() else false,
         };
     }
 };
@@ -85,7 +89,18 @@ pub const all: []const Entry = &.{
         .key = .optional,
         .kind = .openai,
     },
+    .{
+        .id = chatgpt_id,
+        .label = "ChatGPT plan",
+        .summary = "sign in with your ChatGPT account",
+        .host = chatgpt_auth.resource,
+        .host_editable = false,
+        .key = .oauth,
+        .kind = .chatgpt,
+    },
 };
+
+pub const chatgpt_id = "chatgpt";
 
 /// The entry with this id, or null. An id from a config file written by a newer
 /// harness lands here, which is why callers fall back rather than fail.
@@ -125,6 +140,7 @@ pub fn resolve(
     const from_env: struct { host: []const u8, key: ?[]const u8 } = switch (entry.kind) {
         .ollama => .{ .host = config.host_override, .key = config.api_key },
         .openai => .{ .host = config.openai_host, .key = config.openai_api_key },
+        .chatgpt => .{ .host = "", .key = null },
     };
 
     var host = entry.host;
@@ -172,14 +188,14 @@ test "a hosted provider is not ready until it has a key" {
     const local = find("ollama").?;
     const cloud = find("ollama-cloud").?;
 
-    try testing.expect(local.ready(&auth));
-    try testing.expect(!cloud.ready(&auth));
+    try testing.expect(local.ready(&auth, null));
+    try testing.expect(!cloud.ready(&auth, null));
 
     try auth.set("ollama-cloud", "sk-secret");
-    try testing.expect(cloud.ready(&auth));
+    try testing.expect(cloud.ready(&auth, null));
 
     try auth.set("ollama-cloud", "");
-    try testing.expect(!cloud.ready(&auth));
+    try testing.expect(!cloud.ready(&auth, null));
 }
 
 /// Open a database in a temporary directory, for the resolution tests.
@@ -398,6 +414,21 @@ test "the environment pair that applies is the one the provider speaks" {
     try testing.expectEqualStrings("from-openai-env", hosted.api_key.?);
 }
 
+test "ChatGPT is ready only once signed in, and takes nothing from the environment" {
+    const testing = std.testing;
+    var auth: Auth = .init(testing.allocator);
+    defer auth.deinit();
+
+    const chatgpt = find(chatgpt_id).?;
+    try testing.expectEqual(Kind.chatgpt, chatgpt.kind);
+    try testing.expectEqual(Key.oauth, chatgpt.key);
+    try testing.expect(!chatgpt.host_editable);
+    try testing.expect(!chatgpt.ready(&auth, null));
+
+    try auth.set(chatgpt_id, "sk-not-how-this-signs-in");
+    try testing.expect(!chatgpt.ready(&auth, null));
+}
+
 test "an OpenAI-compatible server needs no key, and OpenAI itself does" {
     const testing = std.testing;
 
@@ -412,9 +443,9 @@ test "an OpenAI-compatible server needs no key, and OpenAI itself does" {
     try testing.expect(compatible.host_editable);
     try testing.expect(!hosted.host_editable);
 
-    try testing.expect(compatible.ready(&auth));
-    try testing.expect(!hosted.ready(&auth));
+    try testing.expect(compatible.ready(&auth, null));
+    try testing.expect(!hosted.ready(&auth, null));
 
     try auth.set("openai", "sk-secret");
-    try testing.expect(hosted.ready(&auth));
+    try testing.expect(hosted.ready(&auth, null));
 }
