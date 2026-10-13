@@ -52,6 +52,9 @@ pub const Outcome = union(enum) {
         /// a mix-up attack: a code minted by one server, redirected to a
         /// client that thinks it is talking to another.
         iss: ?[]const u8 = null,
+        /// The client a dynamic registration just issued, for an authorization
+        /// server that names it in the redirect rather than a separate call.
+        client_id: ?[]const u8 = null,
     };
 };
 
@@ -155,7 +158,12 @@ fn handle(rendezvous: *Rendezvous, request: *httpz.Request, response: *httpz.Res
     else
         null;
 
-    rendezvous.settle(.{ .code = .{ .code = owned, .iss = issuer } });
+    const client_id: ?[]const u8 = if (query.get("client_id")) |raw|
+        rendezvous.allocator.dupe(u8, raw) catch return badRequest(response, "out of memory")
+    else
+        null;
+
+    rendezvous.settle(.{ .code = .{ .code = owned, .iss = issuer, .client_id = client_id } });
 
     response.status = 200;
     response.content_type = .HTML;
