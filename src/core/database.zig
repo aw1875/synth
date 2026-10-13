@@ -466,11 +466,12 @@ pub fn appendToolCall(
     status: []const u8,
     result: ?[]const u8,
     result_bytes: i64,
+    elapsed_ms: ?i64,
 ) !i64 {
     try self.conn.exec(
-        \\INSERT INTO tool_call (message_id, seq, call_id, name, arguments, status, result, result_bytes)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    , .{ message_id, seq, call_id, name, arguments, status, result, result_bytes });
+        \\INSERT INTO tool_call (message_id, seq, call_id, name, arguments, status, result, result_bytes, elapsed_ms)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    , .{ message_id, seq, call_id, name, arguments, status, result, result_bytes, elapsed_ms });
     return self.conn.lastInsertedRowId();
 }
 
@@ -715,11 +716,12 @@ pub fn updateToolCall(
     status: []const u8,
     result: ?[]const u8,
     result_bytes: i64,
+    elapsed_ms: ?i64,
 ) !void {
     try self.conn.exec(
-        "UPDATE tool_call SET status = ?, result = ?, result_bytes = ? WHERE message_id = ? AND seq = ?",
-        .{ status, result, result_bytes, message_id, seq },
-    );
+        \\UPDATE tool_call SET status = ?, result = ?, result_bytes = ?, elapsed_ms = ?
+        \\WHERE message_id = ? AND seq = ?
+    , .{ status, result, result_bytes, elapsed_ms, message_id, seq });
 }
 
 /// The row a message was stored as. Asked by seq rather than remembered: a
@@ -921,9 +923,9 @@ fn loadBlob(self: *Database, allocator: std.mem.Allocator, message_id: i64, seq:
     return try allocator.dupe(u8, row.text(0));
 }
 
-fn loadToolCalls(self: *Database, allocator: std.mem.Allocator, message_id: i64) ![]Conversation.ToolCall {
+pub fn loadToolCalls(self: *Database, allocator: std.mem.Allocator, message_id: i64) ![]Conversation.ToolCall {
     var rows = try self.conn.rows(
-        \\SELECT seq, call_id, name, arguments, status, result, result_bytes
+        \\SELECT seq, call_id, name, arguments, status, result, result_bytes, elapsed_ms
         \\FROM tool_call WHERE message_id = ? ORDER BY seq
     , .{message_id});
     defer rows.deinit();
@@ -956,6 +958,7 @@ fn loadToolCalls(self: *Database, allocator: std.mem.Allocator, message_id: i64)
             .status = parseStatus(row.text(4)),
             .result = result,
             .result_bytes = result_bytes,
+            .elapsed_ms = if (row.nullableInt(7)) |ms| @intCast(@max(0, ms)) else null,
         });
     }
 
@@ -1145,7 +1148,7 @@ fn agedFixture(dir: *std.testing.TmpDir, ages: []const u32) !Database {
     for (ages) |days| {
         const session_id = try db.createSession(project_id, "/repo", "a-model");
         const message_id = try db.appendMessage(session_id, 0, "assistant", "a message", null, 0);
-        _ = try db.appendToolCall(message_id, 0, "call_0", "read", "{}", "ok", "short", 5);
+        _ = try db.appendToolCall(message_id, 0, "call_0", "read", "{}", "ok", "short", 5, null);
         try db.appendBlob(message_id, 1, "image", "a pasted screenshot");
         try db.appendBlob(message_id, 0, "tool_result", "the whole of a long result");
         try db.appendBlob(message_id, 0, "reasoning", "some thinking");
@@ -1373,7 +1376,7 @@ test "a subagent transcript stays out of every listing" {
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
     const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "done", null, 0);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "done", null, 0, null);
 
     const child = try db.createSubagentSession(
         fixture.project_id,
@@ -1414,7 +1417,7 @@ test "pruning leaves a live session's subagent transcript alone" {
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
     const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4, null);
     const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
     _ = try db.appendMessage(child, 0, "user", "find it", null, 0);
 
@@ -1438,7 +1441,7 @@ test "a subagent's blobs are shed with its parent, not before" {
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
     const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4, null);
     const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
     const child_message = try db.appendMessage(child, 0, "assistant", "found it", null, 8);
     try db.appendBlob(child_message, 0, "reasoning", "a long think");
@@ -1466,7 +1469,7 @@ test "deleting a session takes its subagent transcripts with it" {
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
     const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "done", null, 0);
+    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "done", null, 0, null);
     const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
     _ = try db.appendMessage(child, 0, "user", "find it", null, 0);
 
@@ -1587,7 +1590,7 @@ test "project, session, message and approval round-trip" {
 
     const msg_id = try db.appendMessage(session_id, 0, "user", "hello", null, 0);
     try db.appendBlob(msg_id, 0, "reasoning", "thinking hard");
-    _ = try db.appendToolCall(msg_id, 0, "call_1", "read", "{\"path\":\"x\"}", "ok", "contents", 8);
+    _ = try db.appendToolCall(msg_id, 0, "call_1", "read", "{\"path\":\"x\"}", "ok", "contents", 8, null);
 
     try db.recordRead(session_id, "/repo/x", 12345);
     try std.testing.expectEqual(@as(?i64, 12345), try db.lastRead(session_id, "/repo/x"));
@@ -1627,7 +1630,7 @@ test "loadMessages pages older messages back with tool calls and reasoning" {
     _ = try db.appendMessage(session_id, 0, "user", "hello", null, 0);
     const m1 = try db.appendMessage(session_id, 1, "assistant", "let me look", 42, 8);
     try db.appendBlob(m1, 0, "reasoning", "thinking");
-    _ = try db.appendToolCall(m1, 0, "call_1", "list", "{\"path\":\".\"}", "ok", "a\nb", 3);
+    _ = try db.appendToolCall(m1, 0, "call_1", "list", "{\"path\":\".\"}", "ok", "a\nb", 3, null);
     _ = try db.appendMessage(session_id, 2, "tool", "a\nb", null, 0);
 
     const loaded = try db.loadMessages(std.testing.allocator, session_id, 2, 10);
@@ -1669,7 +1672,7 @@ test "long reasoning and tool results load as previews then full bodies" {
 
     const m = try db.appendMessage(session_id, 0, "assistant", "done", 10, reasoning.len);
     try db.appendBlob(m, 0, "reasoning", reasoning);
-    _ = try db.appendToolCall(m, 0, "c", "bash", "{}", "ok", result, result.len);
+    _ = try db.appendToolCall(m, 0, "c", "bash", "{}", "ok", result, result.len, null);
     try db.appendBlob(m, 0, "tool_result", result);
 
     const loaded = try db.loadMessages(std.testing.allocator, session_id, 1, 10);
@@ -1753,7 +1756,7 @@ test "deleting a session takes its messages, blobs, attachments and tool calls w
 
     const message_id = try db.appendMessage(session_id, 0, "assistant", "hi", 12, 4);
     try db.appendBlob(message_id, 0, "reasoning", "a long thought");
-    _ = try db.appendToolCall(message_id, 0, "1", "bash", "{}", "ok", "output", 6);
+    _ = try db.appendToolCall(message_id, 0, "1", "bash", "{}", "ok", "output", 6, null);
     try db.appendAttachment(message_id, 0, "/p/.agents/skills/release/SKILL.md", "tag, then push");
     try db.recordRead(session_id, "/tmp/project/a.zig", 1234);
 
@@ -1972,4 +1975,35 @@ test "a session's steps outlive it being closed" {
     const gone = try db.loadTodos(std.testing.allocator, session_id);
     defer std.testing.allocator.free(gone);
     try std.testing.expectEqual(@as(usize, 0), gone.len);
+}
+
+test "a call's duration survives a round trip" {
+    const testing = std.testing;
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    const project = try db.resolveProject("/repo", "git", "repo");
+    const session = try db.createSession(project, "/repo", "model");
+    const message = try db.appendMessage(session, 0, "assistant", "", null, 0);
+    _ = try db.appendToolCall(message, 0, "c0", "read", "{}", "ok", "out", 3, 250);
+    _ = try db.appendToolCall(message, 1, "c1", "edit", "{}", "rejected", null, 0, null);
+
+    const calls = try db.loadToolCalls(testing.allocator, message);
+    defer {
+        for (calls) |*call| call.deinit(testing.allocator);
+        testing.allocator.free(calls);
+    }
+
+    try testing.expectEqual(@as(?u64, 250), calls[0].elapsed_ms);
+    try testing.expect(calls[1].elapsed_ms == null);
+
+    // And an update carries it too, for a call timed after it was first stored.
+    try db.updateToolCall(message, 1, "ok", "later", 5, 900);
+    const again = try db.loadToolCalls(testing.allocator, message);
+    defer {
+        for (again) |*call| call.deinit(testing.allocator);
+        testing.allocator.free(again);
+    }
+    try testing.expectEqual(@as(?u64, 900), again[1].elapsed_ms);
 }

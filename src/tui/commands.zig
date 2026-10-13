@@ -119,7 +119,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (std.mem.startsWith(u8, line, "/model")) {
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
-            switchModel(self, name) catch {};
+            _ = switchModel(self, name) catch "";
         } else {
             try showModels(self);
         }
@@ -291,10 +291,26 @@ pub fn showProviders(self: *Model) !void {
     try self.connect.show(&states);
 }
 
-/// Point the harness at a provider: store what was given, re-point the backend,
-/// and remember the choice.
+/// Point the harness at a provider and say so.
 pub fn connectProvider(self: *Model, result: Connect.Result) !void {
-    const auth = self.auth orelse return;
+    if (!try pointAt(self, result)) return;
+    try announceProvider(self, result, self.provider.model);
+}
+
+/// Say which provider is answering now, and with what.
+///
+/// The model is passed rather than read because the caller may not be finished:
+/// a connect made to reach one particular model is announced after that model
+/// is set, not while the backend is still on whatever it defaulted to.
+fn announceProvider(self: *Model, result: Connect.Result, model: []const u8) !void {
+    const entry = catalog.findOrDefault(result.id);
+    try note(self, "Connected {s} at {s}, running {s}.", .{ entry.label, result.host, model });
+}
+
+/// Point the harness at a provider: store what was given, re-point the backend,
+/// and remember the choice. Returns whether it got there.
+fn pointAt(self: *Model, result: Connect.Result) !bool {
+    const auth = self.auth orelse return false;
     const entry = catalog.findOrDefault(result.id);
 
     if (result.key) |key| {
@@ -304,14 +320,13 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !void {
         };
     }
 
-    const backend = self.backend orelse return;
+    const backend = self.backend orelse return false;
     const provider = backend.connect(entry, result.host, auth.key(entry.id)) catch |err| {
         try note(self, "Could not reach {s} at {s}: {s}", .{ entry.label, result.host, @errorName(err) });
-        return;
+        return false;
     };
 
-    // Wholesale, not field by field: a provider of another protocol is a
-    // different client behind a different vtable, and the old one is gone.
+    // Wholesale: another protocol is another client, and the old one is gone.
     self.provider = provider;
     self.loop.provider = provider;
     try self.loop.setModel(provider.model);
@@ -325,7 +340,7 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !void {
         };
     }
 
-    try note(self, "Connected {s} at {s}, running {s}.", .{ entry.label, result.host, provider.model });
+    return true;
 }
 
 /// Say something in the transcript, in the harness's own voice.
@@ -447,15 +462,26 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
                     if (remembered.len > 0) host = remembered;
                 }
             }
-            try connectProvider(self, .{ .id = provider.id, .host = host, .key = null });
+
+            const connection: Connect.Result = .{ .id = provider.id, .host = host, .key = null };
+
+            // A provider we never reached is still on the old model.
+            if (!try pointAt(self, connection)) return;
+
+            const running = try switchModel(self, entry.name);
+            try announceProvider(self, connection, running);
+            return;
         }
     }
 
-    try switchModel(self, entry.name);
+    _ = try switchModel(self, entry.name);
 }
 
-pub fn switchModel(self: *Model, name: []const u8) !void {
-    const set = self.provider.set_model orelse return;
+/// Point the provider at another of its models. Returns the model now in use,
+/// which is what a caller announcing the change has to wait for: until this
+/// returns, the backend is still on whatever it was.
+pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
+    const set = self.provider.set_model orelse return self.provider.model;
     const current = try set(self.provider.userdata, name);
 
     self.provider.model = current.model;
@@ -466,6 +492,7 @@ pub fn switchModel(self: *Model, name: []const u8) !void {
     self.loop.provider.vision = current.vision;
     try self.loop.setModel(current.model);
     try rememberModelChoice(self, current.model);
+    return self.provider.model;
 }
 
 /// Remember the model per provider so the next launch reopens on it.
@@ -577,4 +604,100 @@ pub fn reportMcpFailures(self: *Model, ctx: *vxfw.EventContext) !void {
     }
 
     try self.notification.show(ctx, .err, out.written());
+}
+
+const testing = std.testing;
+
+/// Stands in for a backend that can be pointed at another of its models.
+fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
+    return .{ .model = name };
+}
+
+/// A model in a test needs only enough to hold a provider and a transcript.
+fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []const u8) !Model {
+    var self: Model = .{
+        .allocator = allocator,
+        .io = testing.io,
+        .conversation = .init(allocator),
+        .provider = .{
+            .userdata = userdata,
+            .respond = undefined,
+            .name = "Ollama",
+            .model = model_name,
+            .set_model = fakeSetModel,
+        },
+        .input = .init(allocator),
+    };
+    try self.wire();
+    return self;
+}
+
+test "the provider is announced with the model that was actually picked" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "deepseek-v4-pro:0813");
+    defer model.deinit();
+
+    // What the connect settled on, which is not what the backend defaulted to.
+    model.provider.model = "glm-5.3-flash";
+    try announceProvider(&model, .{ .id = "ollama-cloud", .host = "https://ollama.com", .key = null }, model.provider.model);
+
+    const said = model.conversation.messages.items[0].text;
+    try testing.expect(std.mem.indexOf(u8, said, "glm-5.3-flash") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "deepseek-v4-pro:0813") == null);
+    try testing.expect(std.mem.indexOf(u8, said, "https://ollama.com") != null);
+}
+
+test "a model whose provider could not be reached is not set on the one in use" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+
+    // No backend to connect with, so the switch cannot go through.
+    try switchTo(&model, .{
+        .name = "glm-5.3-flash",
+        .provider = "Ollama Cloud",
+        .provider_id = "ollama-cloud",
+    });
+
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+}
+
+test "connecting to reach a model announces that model, not what the backend defaulted to" {
+    const Auth = @import("../core/auth.zig");
+
+    // Unreachable on purpose: the lookup that picks a default model is ignored.
+    var backend: Backend = .init(.ollama, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "http://127.0.0.1:1",
+        .label = "Ollama",
+    });
+    defer backend.deinit();
+
+    var auth: Auth = .{ .arena = .init(testing.allocator) };
+    defer auth.deinit();
+
+    var model: Model = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = backend.provider(),
+        .input = .init(testing.allocator),
+        .backend = &backend,
+        .auth = &auth,
+    };
+    try model.wire();
+    defer model.deinit();
+
+    try switchTo(&model, .{
+        .name = "glm-5.3-flash",
+        .provider = "Ollama Cloud",
+        .provider_id = "ollama-cloud",
+    });
+
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+
+    const said = model.conversation.messages.items[0].text;
+    try testing.expect(std.mem.indexOf(u8, said, "glm-5.3-flash") != null);
+    try testing.expect(std.mem.indexOf(u8, said, "Ollama Cloud") != null);
 }

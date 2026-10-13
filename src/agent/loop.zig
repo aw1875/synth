@@ -1329,7 +1329,7 @@ fn autoApprove(self: *Loop) !void {
             try self.refuse(message_index, i);
             continue;
         }
-        if (self.needsNoDecision(call)) call.status = .running;
+        if (self.needsNoDecision(call)) call.begin(tool.monotonicMilliseconds(self.io));
     }
 
     if (self.firstPending() != null) {
@@ -1370,7 +1370,7 @@ pub fn answer(self: *Loop, text: []const u8) !void {
         if (call.status != .running) continue;
         if (!std.mem.eql(u8, call.name, ask_user.name)) continue;
 
-        call.status = .ok;
+        call.settle(.ok, tool.monotonicMilliseconds(self.io));
         call.result = try self.allocator.dupe(u8, text);
         call.result_bytes = text.len;
         try self.persistToolCall(message_index, i);
@@ -1409,7 +1409,7 @@ fn applyTodos(self: *Loop, message_index: usize) !void {
         try self.persistTodos();
 
         const text = try todo_tool.summary(self.allocator, &self.todos);
-        call.status = .ok;
+        call.settle(.ok, tool.monotonicMilliseconds(self.io));
         if (call.result) |old| self.allocator.free(old);
         call.result = text;
         call.result_bytes = text.len;
@@ -1454,9 +1454,9 @@ pub fn decide(self: *Loop, decision: Decision) !void {
     const call_index = self.firstPending() orelse return;
 
     switch (decision) {
-        .once => call.status = .running,
+        .once => call.begin(tool.monotonicMilliseconds(self.io)),
         .always => {
-            call.status = .running;
+            call.begin(tool.monotonicMilliseconds(self.io));
             try self.allow(call);
         },
         .deny => {
@@ -1480,7 +1480,7 @@ fn autoApproveRemaining(self: *Loop, message_index: usize) !void {
     const calls = self.conversation.messages.items[message_index].tool_calls;
     for (calls) |*call| {
         if (call.status != .pending) continue;
-        if (self.needsNoDecision(call)) call.status = .running;
+        if (self.needsNoDecision(call)) call.begin(tool.monotonicMilliseconds(self.io));
     }
 }
 
@@ -1812,6 +1812,7 @@ fn persistMessage(self: *Loop, index: usize) !void {
             @tagName(call.status),
             call.result,
             @intCast(call.result_bytes),
+            if (call.elapsed_ms) |ms| @intCast(ms) else null,
         );
     }
 }
@@ -1876,6 +1877,7 @@ fn persistSubagent(
                 @tagName(call.status),
                 call.result,
                 @intCast(call.result_bytes),
+            if (call.elapsed_ms) |ms| @intCast(ms) else null,
             );
         }
     }
@@ -1901,6 +1903,7 @@ fn persistToolCall(self: *Loop, message_index: usize, call_index: usize) !void {
         @tagName(call.status),
         call.result,
         @intCast(call.result_bytes),
+        if (call.elapsed_ms) |ms| @intCast(ms) else null,
     );
     self.shrinkResult(call);
 }
@@ -2047,7 +2050,7 @@ fn adoptSettled(self: *Loop, tools: *ToolRun) !void {
         if (result.index >= calls.len) continue;
 
         const call = &calls[result.index];
-        call.status = if (result.is_error) .failed else .ok;
+        call.settle(if (result.is_error) .failed else .ok, tool.monotonicMilliseconds(self.io));
         call.result = try redact.scrub(self.allocator, result.content);
         call.result_bytes = result.content.len;
         try self.persistToolCall(message_index, result.index);
@@ -4003,4 +4006,42 @@ test "a turn that will not fit compacts and carries on instead of stopping" {
     try testing.expectEqual(Outcome.done, loop.outcome.?);
     try testing.expectEqualStrings("carried on", lastAssistant(&fixture.convo).?.text);
     try testing.expect(script.calls >= 2);
+}
+
+test "a call that runs comes out of the turn with a duration on it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    var timed: usize = 0;
+    for (fixture.convo.messages.items) |msg| {
+        for (msg.tool_calls) |call| {
+            if (call.status != .ok and call.status != .failed) continue;
+            timed += 1;
+            try testing.expect(call.elapsed_ms != null);
+            // The clock is stopped, so nothing is left counting.
+            try testing.expect(call.started_ms == null);
+        }
+    }
+    try testing.expect(timed > 0);
+
+    // And what the turn measured is what the session keeps.
+    const session = loop.session_id.?;
+    const message = (try db.messageId(session, 1)).?;
+    const stored = try db.loadToolCalls(testing.allocator, message);
+    defer {
+        for (stored) |*call| call.deinit(testing.allocator);
+        testing.allocator.free(stored);
+    }
+    try testing.expect(stored.len > 0);
+    try testing.expect(stored[0].elapsed_ms != null);
 }

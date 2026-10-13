@@ -143,6 +143,7 @@ pub fn toolCard(
     card.result = call.result;
     card.note = self.loop.toolNote(msg.seq, call_index);
     card.status = call.status;
+    card.elapsed_ms = call.elapsed_ms;
     card.open = if (self.hasSubagent(key, msg, call_index))
         .{ .userdata = self, .key = key, .seq = msg.seq, .index = call_index, .call = Model.openFromCard }
     else

@@ -31,6 +31,7 @@ pub const all = [_]Migration{
     .{ .version = 3, .sql = @embedFile("migrations/003_attachment.sql") },
     .{ .version = 4, .sql = @embedFile("migrations/004_todo.sql") },
     .{ .version = 5, .sql = @embedFile("migrations/005_subagent_session.sql") },
+    .{ .version = 6, .sql = @embedFile("migrations/006_tool_call_elapsed.sql") },
 };
 
 /// The version this build writes. Derived, so adding a migration is one edit.

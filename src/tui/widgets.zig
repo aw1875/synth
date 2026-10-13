@@ -15,6 +15,107 @@ pub fn fill(surface: vxfw.Surface, style: Cell.Style) void {
     @memset(surface.buffer, .{ .style = style });
 }
 
+/// What one level of nesting indents by: a rule and the space after it.
+///
+/// A reply hangs off a rule at the margin, and a call it made hangs off one
+/// this far in, which puts the call's rule where the reply's text is. That is
+/// what makes the transcript read as a call stack rather than a list of cards.
+pub const nest: u16 = 2;
+
+/// What marks the head of a rail or a group of rows.
+///
+/// A box-drawing corner rather than a bullet or an icon glyph: those are
+/// substitutes for something a terminal cannot draw, and this is a corner the
+/// terminal has. The rule it opens is the section it heads.
+pub const rail_head = "\u{256d}\u{2500}";
+
+/// Write a section heading, marked and set in the colour headings take.
+pub fn writeHeading(
+    surface: vxfw.Surface,
+    col: u16,
+    row: u16,
+    title: []const u8,
+    style: Cell.Style,
+    mark: Cell.Color,
+) u16 {
+    var at = writeText(surface, col, row, rail_head, .{ .fg = mark, .bg = style.bg });
+    at = writeText(surface, at + 1, row, title, style);
+    return at;
+}
+
+/// A card's edge: solid enough to be the block's own boundary.
+pub const block_rule = "\u{258c}";
+/// A spine: what a tool call or a reply hangs off, one step in from the margin.
+pub const solid_rule = "\u{2502}";
+/// The same spine, broken, for a block the reader is meant to skim past.
+pub const dashed_rule = "\u{2506}";
+/// What marks a turn the reader typed, the way a shell marks the line it was
+/// handed. It sits at the head of the turn rather than running down its side:
+/// what the reader wrote is where the transcript starts, not something the
+/// rows below hang off.
+pub const prompt_mark = "\u{203a}";
+/// A status light: what a call did, or which session is in front of you.
+pub const dot = "\u{25cf}";
+/// What joins two facts written on one line.
+pub const separator = " \u{00b7} ";
+
+/// A hairline box: where it sits, and how big its inside is.
+pub const Box = struct {
+    top: u16,
+    left: u16,
+    /// Rows inside the box. Its drawn height is two more than this.
+    rows: u16,
+    /// Drawn width, borders included.
+    width: u16,
+};
+
+/// Outline `area` in single-width box-drawing glyphs and paint its inside.
+///
+/// The glyphs are drawn on `ground` rather than on whatever is behind them: a
+/// rule is centred in its cell, so a border on one ground beside an inside on
+/// another shows a seam down the middle of every edge cell.
+pub fn box(surface: vxfw.Surface, area: Box, ground: Cell.Style, edge: Cell.Color) void {
+    const right = area.left + area.width -| 1;
+    if (right <= area.left) return;
+
+    const line = Cell.Style{ .fg = edge, .bg = ground.bg };
+    const bottom = area.top + area.rows + 1;
+
+    for (0..area.rows + 2) |i| {
+        const row = area.top + @as(u16, @intCast(i));
+        fillRow(surface, row, area.left, area.width, ground);
+
+        const corners: [2][]const u8, const span: []const u8 = if (row == area.top)
+            .{ .{ "\u{250c}", "\u{2510}" }, "\u{2500}" }
+        else if (row == bottom)
+            .{ .{ "\u{2514}", "\u{2518}" }, "\u{2500}" }
+        else
+            .{ .{ "\u{2502}", "\u{2502}" }, "" };
+
+        surface.writeCell(area.left, row, .{ .char = .{ .grapheme = corners[0], .width = 1 }, .style = line });
+        surface.writeCell(right, row, .{ .char = .{ .grapheme = corners[1], .width = 1 }, .style = line });
+        if (span.len == 0) continue;
+
+        var col = area.left + 1;
+        while (col < right) : (col += 1) {
+            surface.writeCell(col, row, .{ .char = .{ .grapheme = span, .width = 1 }, .style = line });
+        }
+    }
+}
+
+/// A horizontal hairline, the width of what it divides.
+pub fn rule(surface: vxfw.Surface, row: u16, col: u16, width: u16, style: Cell.Style) void {
+    if (row >= surface.size.height) return;
+    const end = @min(col + width, surface.size.width);
+    var x = col;
+    while (x < end) : (x += 1) {
+        surface.writeCell(x, row, .{
+            .char = .{ .grapheme = "\u{2500}", .width = 1 },
+            .style = style,
+        });
+    }
+}
+
 pub const PanelOptions = struct {
     /// Background/foreground of the panel itself.
     style: Cell.Style,
@@ -24,6 +125,12 @@ pub const PanelOptions = struct {
     bottom: u16 = 0,
     /// When set, draws a one-column vertical bar down the left edge.
     accent: ?Cell.Color = null,
+    /// The bar's glyph. A block reads as a card's edge, a rule as the spine a
+    /// nested block hangs off.
+    rule: []const u8 = block_rule,
+    /// Drawn on the first row instead of the rule, leaving the rows below it
+    /// bare. For a block marked at its head rather than down its whole side.
+    mark: ?[]const u8 = null,
     /// Defaults to the full available width.
     width: ?u16 = null,
     min_height: u16 = 0,
@@ -71,8 +178,9 @@ pub fn wrap(ctx: vxfw.DrawContext, child_surface: vxfw.Surface, opts: PanelOptio
 
     if (opts.accent) |color| {
         for (0..height) |row| {
+            const glyph = if (opts.mark) |mark| (if (row == 0) mark else " ") else opts.rule;
             surface.writeCell(0, @intCast(row), .{
-                .char = .{ .grapheme = "▌", .width = 1 },
+                .char = .{ .grapheme = glyph, .width = 1 },
                 .style = .{ .fg = color, .bg = opts.style.bg },
             });
         }

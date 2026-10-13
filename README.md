@@ -3,9 +3,6 @@
 A terminal coding agent, written in Zig. Runs on local or hosted models, with
 MCP servers and skills.
 
-The TUI's design is borrowed from [opencode](https://github.com/anomalyco/opencode) -
-the layout, the tool cards, the slash picker, the modals.
-
 > Early. It works and it is used daily, but there is no release yet and things
 > move.
 

@@ -172,6 +172,7 @@ pub const shortcuts: []const struct { keys: []const u8, description: []const u8 
     .{ .keys = "ctrl+p", .description = "switch provider" },
     .{ .keys = "ctrl+r", .description = "rename this session" },
     .{ .keys = "ctrl+t", .description = "collapse or expand the plan" },
+    .{ .keys = "ctrl+b", .description = "show or hide the rail" },
     .{ .keys = "ctrl+v", .description = "paste an image from the clipboard" },
     .{ .keys = "ctrl+c", .description = "clear the draft, interrupt a turn, then quit" },
     .{ .keys = "ctrl+z", .description = "suspend to the shell" },

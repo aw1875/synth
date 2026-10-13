@@ -42,6 +42,9 @@ pub const Palette = struct {
     success: u24,
     warning: u24,
     danger: u24,
+    /// Rules and box edges. Darker than the faintest text: a border is meant to
+    /// be found when looked for and ignored otherwise.
+    border: u24,
     /// Selected text: the ink and the ground swap, the way a terminal's own
     /// selection reads.
     selection_bg: u24,
@@ -49,6 +52,10 @@ pub const Palette = struct {
     /// tinted enough to read as added or removed at a glance.
     diff_added_bg: u24,
     diff_removed_bg: u24,
+    /// Diff row text. Separate from the row backgrounds so a theme can colour
+    /// the code itself rather than only the ground it sits on.
+    diff_added_fg: u24,
+    diff_removed_fg: u24,
 };
 
 /// The palette in use. These are `var` rather than `const` so a theme switch is
@@ -68,10 +75,13 @@ pub var success = rgb(0x9ece6a);
 pub var warning = rgb(0xe0af68);
 pub var danger = rgb(0xf7768e);
 
+pub var border = rgb(0x34363f);
 pub var selection_bg = rgb(0xa9b1c6);
 
 pub var diff_added_bg = rgb(0x1c2a1e);
 pub var diff_removed_bg = rgb(0x2e1c22);
+pub var diff_added_fg = rgb(0xe7e5dd);
+pub var diff_removed_fg = rgb(0xe7e5dd);
 
 /// Base style for the app background.
 pub var base: Style = .{ .cell = .{ .fg = rgb(0xc5cad4), .bg = rgb(0x14161a) } };
@@ -92,9 +102,12 @@ pub fn apply(palette: Palette) void {
     success = rgb(palette.success);
     warning = rgb(palette.warning);
     danger = rgb(palette.danger);
+    border = rgb(palette.border);
     selection_bg = rgb(palette.selection_bg);
     diff_added_bg = rgb(palette.diff_added_bg);
     diff_removed_bg = rgb(palette.diff_removed_bg);
+    diff_added_fg = rgb(palette.diff_added_fg);
+    diff_removed_fg = rgb(palette.diff_removed_fg);
 
     base = .{ .cell = .{ .fg = fg, .bg = bg } };
     card = .{ .cell = .{ .fg = fg, .bg = surface } };
@@ -103,6 +116,11 @@ pub fn apply(palette: Palette) void {
 /// A style on the app background.
 pub fn on_bg(color: Color) Style {
     return .{ .cell = .{ .fg = color, .bg = bg } };
+}
+
+/// A style on whichever ground the caller is painting.
+pub fn on(background: Color, color: Color) Style {
+    return .{ .cell = .{ .fg = color, .bg = background } };
 }
 
 /// A style on a raised surface.
@@ -169,3 +187,57 @@ pub const Style = struct {
         return Cell.Style.eql(a.cell, b.cell);
     }
 };
+
+/// `color` moved `amount`/255 of the way toward `target`.
+///
+/// A terminal cell has no alpha, so a translucent layer over the frame is not
+/// something the renderer can composite. Baking the blend into the colors is
+/// the same picture by another route. A cell painted in one of the terminal's
+/// own colors has no channels to mix, so it takes `target` whole.
+pub fn toward(color: Color, target: Color, amount: u8) Color {
+    const from = channels(color) orelse return target;
+    const to = channels(target) orelse return color;
+    return .{ .rgb = .{
+        mix(from[0], to[0], amount),
+        mix(from[1], to[1], amount),
+        mix(from[2], to[2], amount),
+    } };
+}
+
+fn channels(color: Color) ?[3]u8 {
+    return switch (color) {
+        .rgb => |value| value,
+        .default, .index => null,
+    };
+}
+
+fn mix(from: u8, to: u8, amount: u8) u8 {
+    const rest: u16 = 255 - @as(u16, amount);
+    return @intCast((@as(u16, from) * rest + @as(u16, to) * @as(u16, amount)) / 255);
+}
+
+const testing = @import("std").testing;
+
+test "a blend of nothing is the color itself, and of everything the target" {
+    const from = rgbOf(0xff0000);
+    const to = rgbOf(0x0000ff);
+
+    try testing.expectEqual(from, toward(from, to, 0));
+    try testing.expectEqual(to, toward(from, to, 255));
+}
+
+test "a half blend lands between the two" {
+    const mid = toward(rgbOf(0x000000), rgbOf(0xffffff), 128);
+    try testing.expectEqual(@as([3]u8, .{ 128, 128, 128 }), mid.rgb);
+}
+
+test "a terminal color has no channels to mix" {
+    const target = rgbOf(0x102030);
+
+    try testing.expectEqual(target, toward(.default, target, 64));
+    try testing.expectEqual(target, toward(.{ .index = 4 }, target, 64));
+
+    // The other way round there is nothing to move toward, so it stays put.
+    const kept = toward(rgbOf(0xabcdef), .default, 64);
+    try testing.expectEqual(@as([3]u8, .{ 0xab, 0xcd, 0xef }), kept.rgb);
+}

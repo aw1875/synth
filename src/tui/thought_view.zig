@@ -34,7 +34,7 @@ pub const View = struct {
     /// Index into `spinner_frames`, advanced by the model's tick handler.
     frame: u8 = 0,
     /// Column the header text starts at, to line up with assistant messages.
-    indent: u16 = 3,
+    indent: u16 = w.nest,
     /// Cap on visible thought rows; the newest are kept.
     max_body_rows: u16 = 12,
     /// Header text while the request is running. The loop swaps this to say
@@ -106,13 +106,14 @@ pub const View = struct {
             .height = height,
         });
         w.fill(surface, theme.base.cell);
+        drawRule(surface);
 
         try self.drawHeader(ctx.arena, surface, thoughts.len > 0);
 
         if (body) |b| {
             const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
             children[0] = .{
-                .origin = .{ .row = 1, .col = @intCast(self.indent + 2) },
+                .origin = .{ .row = 1, .col = @intCast(self.indent) },
                 .surface = b,
             };
             return .{
@@ -124,6 +125,17 @@ pub const View = struct {
         }
 
         return surface;
+    }
+
+    /// The spine this block hangs off, broken rather than solid: reasoning is
+    /// the part of a turn the reader is meant to be able to skim past.
+    fn drawRule(surface: vxfw.Surface) void {
+        for (0..surface.size.height) |row| {
+            surface.writeCell(0, @intCast(row), .{
+                .char = .{ .grapheme = w.dashed_rule, .width = 1 },
+                .style = theme.on_bg(theme.border).cell,
+            });
+        }
     }
 
     fn drawHeader(
@@ -178,7 +190,7 @@ pub const View = struct {
         width: u16,
         thoughts: []const u8,
     ) std.mem.Allocator.Error!?vxfw.Surface {
-        const body_width = width -| (self.indent + 4);
+        const body_width = width -| (self.indent + 2);
         if (body_width == 0) return null;
 
         // Not italic: tmux renders it as reverse video without `sitm`.
@@ -357,4 +369,36 @@ test "a long trace shows its newest rows, not its first" {
 
     try std.testing.expect(std.mem.indexOf(u8, text.items, "line-39") != null);
     try std.testing.expect(std.mem.indexOf(u8, text.items, "line-0\n") == null);
+}
+
+test "reasoning hangs off a broken rule" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const themes = @import("themes.zig");
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var view: View = .{ .text = "one\ntwo", .expanded = true, .elapsed_ms = 882 };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = 40, .height = 20 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const surface = try view.draw(ctx);
+    try std.testing.expect(surface.size.height > 1);
+
+    // Broken, not solid: a reply's spine is the solid one.
+    for (0..surface.size.height) |row| {
+        const cell = surface.buffer[row * surface.size.width];
+        try std.testing.expectEqualStrings(w.dashed_rule, cell.char.grapheme);
+        try std.testing.expectEqual(theme.border, cell.style.fg);
+    }
+
+    // Its header sits where a reply's text does, so the two line up.
+    try std.testing.expectEqualStrings("T", surface.buffer[w.nest].char.grapheme);
+    try std.testing.expectEqual(@as(i17, w.nest), surface.children[0].origin.col);
 }
