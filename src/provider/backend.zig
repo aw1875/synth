@@ -35,8 +35,7 @@ pub const Options = struct {
     /// advertised maximum; zero leaves the choice to the server.
     num_ctx: ?u32 = null,
     debug_log: ?[]const u8 = null,
-    /// Where a ChatGPT client gets its tokens. Borrowed for the life of the
-    /// backend; null where nothing opened the credential file.
+    /// Borrowed for the life of the backend.
     chatgpt: ?*chatgpt_auth.Store = null,
 };
 

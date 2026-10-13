@@ -59,6 +59,17 @@ const max_body_bytes: usize = 4 * 1024 * 1024;
 const max_rejection_bytes: usize = 2 * 1024;
 const transfer_buffer_bytes: usize = 64 * 1024;
 const aborted_call_output = "aborted";
+const models_url = auth.resource ++ "/models";
+const responses_url = auth.resource ++ "/responses";
+
+/// The Responses item and content types this provider writes or reads.
+const Item = struct {
+    const message = "message";
+    const function_call = "function_call";
+    const function_call_output = "function_call_output";
+    const input_text = "input_text";
+    const output_text = "output_text";
+};
 
 pub const Model = struct {
     slug: []const u8,
@@ -249,7 +260,7 @@ fn loadCatalog(self: *ChatGPTProvider) !void {
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try self.get(arena, "/models");
+    const body = try self.get(arena, models_url);
     self.catalog = try parseCatalog(arena, body);
     self.catalog_arena = arena_state;
     self.applyCatalogEntry();
@@ -289,12 +300,7 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn endpoint(self: *const ChatGPTProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimEnd(u8, self.host, "/"), path });
-}
-
-fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, path: []const u8) ![]u8 {
-    const url = try self.endpoint(arena, path);
+fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
     const store = self.store orelse return error.NotSignedIn;
@@ -354,8 +360,7 @@ fn respond(
         const token = try store.accessToken(arena);
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
         const body = try self.buildRequest(arena, convo, turn);
-        const url = try self.endpoint(arena, "/responses");
-        const uri = std.Uri.parse(url) catch return error.InvalidHost;
+        const uri = std.Uri.parse(responses_url) catch return error.InvalidHost;
 
         const extra_headers = [_]std.http.Header{.{ .name = "Accept", .value = "text/event-stream" }};
         var request = try self.client.request(.POST, uri, .{
@@ -387,7 +392,7 @@ fn respond(
             const refusal = Refusal.parse(arena, why);
 
             if (response.head.status == .unauthorized and !refreshed) {
-                store.forceRefresh() catch return error.SessionExpired;
+                try store.forceRefresh();
                 refreshed = true;
                 continue;
             }
@@ -418,7 +423,7 @@ fn respond(
             return failure.toError();
         }
 
-        const reply = try stream.intoReply(self.model);
+        const reply = try stream.intoReply();
         self.log(arena, body, reply) catch {};
         return reply;
     }
@@ -478,7 +483,7 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
         if (msg.role == .system or msg.role == .summary) continue;
         try input.message(arena, msg, kept);
     }
-    if (turn.instruction.len > 0) try input.text("user", "input_text", turn.instruction);
+    if (turn.instruction.len > 0) try input.text("user", Item.input_text, turn.instruction);
     try w.writeByte(']');
 
     if (turn.tools_json.len > 2) {
@@ -523,7 +528,7 @@ const InputWriter = struct {
                 if (!self.open_calls) return;
                 try self.separator();
                 try std.json.Stringify.value(.{
-                    .type = "function_call_output",
+                    .type = Item.function_call_output,
                     .call_id = msg.tool_call_id orelse "",
                     .output = content,
                 }, .{}, self.writer);
@@ -557,11 +562,11 @@ const InputWriter = struct {
         if (msg.provider_state) |state| {
             if (try self.recorded(arena, state)) |made_calls| return made_calls;
         }
-        if (content.len > 0) try self.text("assistant", "output_text", content);
+        if (content.len > 0) try self.text("assistant", Item.output_text, content);
         for (msg.tool_calls) |call| {
             try self.separator();
             try std.json.Stringify.value(.{
-                .type = "function_call",
+                .type = Item.function_call,
                 .call_id = call.id,
                 .name = call.name,
                 .arguments = if (call.arguments.len > 0) call.arguments else "{}",
@@ -578,7 +583,7 @@ const InputWriter = struct {
         var made_calls = false;
         for (record.items) |item| {
             if (itemType(item)) |kind| {
-                if (std.mem.eql(u8, kind, "function_call")) made_calls = true;
+                if (std.mem.eql(u8, kind, Item.function_call)) made_calls = true;
             }
             try self.separator();
             try std.json.Stringify.value(item, .{}, self.writer);
@@ -593,7 +598,7 @@ const InputWriter = struct {
             if (hasResult(all, call.id)) continue;
             try self.separator();
             try std.json.Stringify.value(.{
-                .type = "function_call_output",
+                .type = Item.function_call_output,
                 .call_id = call.id,
                 .output = aborted_call_output,
             }, .{}, self.writer);
@@ -715,6 +720,13 @@ const Refusal = struct {
         };
     }
 
+    /// The server's words, naming the offending field when it said which.
+    fn describe(self: Refusal, arena: std.mem.Allocator, fallback: []const u8) ![]const u8 {
+        const said = if (self.message.len > 0) self.message else fallback;
+        if (self.param.len == 0) return said;
+        return std.fmt.allocPrint(arena, "{s} (at {s})", .{ said, self.param });
+    }
+
     fn isTemporary(self: Refusal) bool {
         const code = self.code orelse return true;
         return code == .subscription_sharing_usage_unavailable or code == .subscription_sharing_user_unavailable;
@@ -750,7 +762,12 @@ const Failure = struct {
 
 fn rememberFailure(self: *ChatGPTProvider, failure: Failure) void {
     self.clearRejection();
-    const detail = if (failure.incomplete_reason.len > 0) failure.incomplete_reason else failure.refusal.message;
+    var scratch: std.heap.ArenaAllocator = .init(self.allocator);
+    defer scratch.deinit();
+    const detail = if (failure.incomplete_reason.len > 0)
+        failure.incomplete_reason
+    else
+        failure.refusal.describe(scratch.allocator(), "") catch return;
     if (detail.len == 0) return;
     self.rejection = self.allocator.dupe(u8, detail[0..@min(detail.len, max_rejection_bytes)]) catch null;
 }
@@ -763,7 +780,6 @@ const ResponseStream = struct {
     text: std.ArrayList(u8) = .empty,
     calls: std.ArrayList(Conversation.ToolCall) = .empty,
     items: std.Io.Writer.Allocating,
-    item_count: usize = 0,
     usage: Provider.Usage = .{},
     failure: ?Failure = null,
     /// Backs the strings in `failure`, which outlive the line they came from.
@@ -873,9 +889,8 @@ const ResponseStream = struct {
     }
 
     fn keepItem(self: *ResponseStream, item: std.json.Value) !void {
-        if (self.item_count > 0) try self.items.writer.writeByte(',');
+        if (self.items.written().len > 0) try self.items.writer.writeByte(',');
         try std.json.Stringify.value(item, .{}, &self.items.writer);
-        self.item_count += 1;
 
         const fields = switch (item) {
             .object => |object| object,
@@ -883,7 +898,7 @@ const ResponseStream = struct {
         };
         const kind = stringField(fields, "type") orelse return;
 
-        if (std.mem.eql(u8, kind, "function_call")) {
+        if (std.mem.eql(u8, kind, Item.function_call)) {
             self.closeThinking();
             self.delivered_anything = true;
             const call_id = stringField(fields, "call_id") orelse return;
@@ -901,7 +916,7 @@ const ResponseStream = struct {
         }
 
         // A message whose text never streamed as deltas still has it here.
-        const unstreamed_message = std.mem.eql(u8, kind, "message") and !self.streamed_text;
+        const unstreamed_message = std.mem.eql(u8, kind, Item.message) and !self.streamed_text;
         if (!unstreamed_message) return;
         const parts = switch (fields.get("content") orelse return) {
             .array => |array| array.items,
@@ -913,7 +928,7 @@ const ResponseStream = struct {
                 else => continue,
             };
             const part_type = stringField(part_fields, "type") orelse continue;
-            if (!std.mem.eql(u8, part_type, "output_text")) continue;
+            if (!std.mem.eql(u8, part_type, Item.output_text)) continue;
             try self.appendText(stringField(part_fields, "text") orelse continue);
         }
     }
@@ -946,14 +961,12 @@ const ResponseStream = struct {
     /// A completed response with neither text nor a call is the model
     /// spending the plan on nothing; that is an error worth seeing, not a
     /// blank turn.
-    fn intoReply(self: *ResponseStream, model: []const u8) !Provider.Reply {
+    fn intoReply(self: *ResponseStream) !Provider.Reply {
         if (self.text.items.len == 0 and self.calls.items.len == 0) return error.EmptyResponse;
 
         var record: std.Io.Writer.Allocating = .init(self.allocator);
         errdefer record.deinit();
-        try record.writer.writeAll("{\"provider\":\"" ++ provider_tag ++ "\",\"model\":");
-        try writeString(&record.writer, model);
-        try record.writer.writeAll(",\"items\":[");
+        try record.writer.writeAll("{\"provider\":\"" ++ provider_tag ++ "\",\"items\":[");
         try record.writer.writeAll(self.items.written());
         try record.writer.writeAll("]}");
 
@@ -993,7 +1006,8 @@ fn captureRejection(self: *ChatGPTProvider, status: std.http.Status, body: []con
     var scratch: std.heap.ArenaAllocator = .init(self.allocator);
     defer scratch.deinit();
     const refusal = Refusal.parse(scratch.allocator(), body);
-    const said = if (refusal.message.len > 0) refusal.message else std.mem.trim(u8, body, " \t\r\n");
+    const raw_body = std.mem.trim(u8, body, " \t\r\n");
+    const said = refusal.describe(scratch.allocator(), raw_body) catch raw_body;
     const kept = said[0..@min(said.len, max_rejection_bytes)];
     self.rejection = std.fmt.allocPrint(self.allocator, "{d} {s}{s}{s}", .{
         @intFromEnum(status),
@@ -1011,12 +1025,13 @@ fn clearRejection(self: *ChatGPTProvider) void {
 pub fn describeError(self: *ChatGPTProvider, err: anyerror, allocator: std.mem.Allocator) ![]const u8 {
     const said = self.rejection orelse "";
     return switch (err) {
-        error.Canceled => allocator.dupe(u8, "cancelled"),
-        error.NotSignedIn, error.SessionExpired => allocator.dupe(u8, "your ChatGPT sign-in has ended. Sign in again with ctrl+p."),
-        error.UsageLimitReached => allocator.dupe(u8, "usage limit reached for your ChatGPT plan or for synth's share of it. Manage usage: " ++ auth.usage_url),
+        error.Canceled => allocator.dupe(u8, "canceled"),
+        error.NotSignedIn, error.SessionExpired => allocator.dupe(u8, "your ChatGPT sign-in has ended. Sign in again from the providers dialog (ctrl+p)."),
+        error.RefreshUnavailable => allocator.dupe(u8, "ChatGPT's sign-in service did not answer. Your sign-in is kept; try again in a moment."),
+        error.UsageLimitReached => allocator.dupe(u8, "usage limit reached. The limit may be on your ChatGPT plan or on synth's share of it. Manage usage: " ++ auth.usage_url),
         error.UsageUnavailable => allocator.dupe(u8, "ChatGPT could not check your plan's usage right now. Try again in a moment."),
-        error.PlanNotEligible => allocator.dupe(u8, "this ChatGPT account or workspace cannot use its plan in other apps."),
-        error.NotAuthorizedForPlan => allocator.dupe(u8, "this sign-in is not allowed to use your ChatGPT plan. Sign in again with ctrl+p and allow plan usage."),
+        error.PlanNotEligible => allocator.dupe(u8, "this ChatGPT account or workspace cannot use its plan in other apps. An OpenAI API key works instead: ctrl+p, then OpenAI."),
+        error.NotAuthorizedForPlan => allocator.dupe(u8, "this sign-in is not allowed to use your ChatGPT plan. Run /logout, then sign in again and allow plan usage."),
         error.UnsupportedCapability => std.fmt.allocPrint(allocator, "your ChatGPT plan does not support part of this request{s}{s}.", .{
             if (said.len > 0) ": " else "",
             said,
@@ -1196,7 +1211,7 @@ test "a stream folds into text, calls, and a replay record" {
         \\data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}
         \\
     );
-    var reply = try stream.intoReply("gpt-test");
+    var reply = try stream.intoReply();
     defer reply.deinit(testing.allocator);
     try testing.expectEqualStrings("Hello", reply.text);
     try testing.expectEqual(@as(usize, 1), reply.tool_calls.len);
@@ -1223,7 +1238,7 @@ test "a completed response with nothing in it is an error, not a blank turn" {
         \\data: {"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":9}}}
         \\
     );
-    try testing.expectError(error.EmptyResponse, stream.intoReply("gpt-test"));
+    try testing.expectError(error.EmptyResponse, stream.intoReply());
 }
 
 test "a usage limit mid-stream reads as the limit, not a broken stream" {

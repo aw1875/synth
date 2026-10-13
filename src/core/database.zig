@@ -15,10 +15,10 @@ const Database = @This();
 conn: zqlite.Conn,
 io: std.Io,
 
-/// Length of the random part of a session handle.
 /// The blob kind a provider's replay record is stored under.
 pub const provider_state_blob = "provider_state";
 
+/// Length of the random part of a session handle.
 const public_id_chars: usize = 8;
 /// Crockford-style base32: no letters that read as digits, so a handle can be
 /// copied off a terminal by eye.
