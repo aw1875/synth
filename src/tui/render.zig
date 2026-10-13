@@ -38,9 +38,9 @@ pub fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) !vxfw.Surface {
 }
 
 pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
-    const max = ctx.max.size();
-
-    var root = try w.surfaceClamped(ctx.arena, self.widget(), max);
+    var root = try w.surfaceClamped(ctx.arena, self.widget(), ctx.max.size());
+    // Rows past the root's clamped height are not addressable by vaxis.
+    const max = root.size;
     w.fill(root, theme.base.cell);
     if (max.width == 0 or max.height == 0) return root;
 
@@ -1599,11 +1599,6 @@ fn chromeFixture(allocator: std.mem.Allocator, userdata: *u8, project: *Project)
     return model;
 }
 
-
-
-
-
-
 /// A project with a branch, for drawing chrome against.
 fn chromeProject(allocator: std.mem.Allocator, branch: ?[]const u8) !Project {
     return .{
@@ -1844,6 +1839,49 @@ test "the frame runs from the title rule down to the composer rule" {
         if (child.origin.col != @as(i17, @intCast(size.width - Model.sidebar_width))) continue;
         try testing.expectEqual(bottom.origin.row, child.origin.row + @as(i17, @intCast(child.surface.size.height)));
     }
+}
+
+test "a terminal too big to address still keeps the composer on screen" {
+    const testing = std.testing;
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    defer _ = themes.apply(themes.default_id);
+    _ = themes.apply("synth");
+
+    var project = try chromeProject(testing.allocator, null);
+    defer project.deinit(testing.allocator);
+
+    var userdata: u8 = 0;
+    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    defer model.deinit();
+
+    _ = try model.conversation.addUser("hello", &.{}, &.{});
+
+    const size: vxfw.Size = .{ .width = 400, .height = 300 };
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena,
+        .min = .{},
+        .max = .{ .width = size.width, .height = size.height },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+
+    const root = try draw(&model, ctx);
+    try testing.expectEqual(w.maxRows(size.width), root.size.height);
+
+    var composer: ?vxfw.SubSurface = null;
+    for (root.children) |child| {
+        if (child.origin.col == 0) composer = child;
+    }
+
+    const bottom = composer.?;
+    try testing.expect(bottom.surface.size.height > 0);
+    try testing.expectEqual(
+        @as(i17, root.size.height),
+        bottom.origin.row + @as(i17, @intCast(bottom.surface.size.height)),
+    );
 }
 
 test "the rail divides itself from the transcript with a border, not a ground" {
