@@ -143,8 +143,12 @@ pub fn handleKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) 
         .closed => .none,
         .choosing => self.chooseKey(key_press),
         .host, .key => self.editKey(ctx, key_press),
-        .signing_in => if (key_press.matches(vaxis.Key.escape, .{})) .cancel_sign_in else .none,
+        .signing_in => if (cancelsSignIn(key_press)) .cancel_sign_in else .none,
     };
+}
+
+fn cancelsSignIn(key_press: vaxis.Key) bool {
+    return key_press.matches(vaxis.Key.escape, .{}) or key_press.matches('c', .{ .ctrl = true });
 }
 
 /// Show the wait on a browser sign-in, with the page it is waiting on.

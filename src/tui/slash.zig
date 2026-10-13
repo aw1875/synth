@@ -46,6 +46,7 @@ pub const commands: []const Command = &.{
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
     .{ .name = "logout", .description = "sign out of ChatGPT" },
+    .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use" },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = "[name]" },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },

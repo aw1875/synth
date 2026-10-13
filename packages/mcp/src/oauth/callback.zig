@@ -116,8 +116,8 @@ const Server = httpz.Server(*Rendezvous);
 
 const ok_body =
     \\<html><body style="font-family:system-ui;padding:3rem">
-    \\<h2>Authorization complete</h2>
-    \\<p>You can close this tab and return to your terminal.</p>
+    \\<h2>Authorization received</h2>
+    \\<p>Return to your terminal to finish. You can close this tab.</p>
     \\</body></html>
 ;
 

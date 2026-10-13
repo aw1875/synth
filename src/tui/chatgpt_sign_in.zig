@@ -32,13 +32,9 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, store: *chatgpt_auth.Stor
 
 fn run(self: *SignInTask) void {
     defer self.done.store(true, .release);
-    _ = self.sign_in.finish(chatgpt_auth.sign_in_timeout_ns) catch |err| {
+    self.sign_in.finish() catch |err| {
         self.outcome = err;
     };
-}
-
-pub fn url(self: *const SignInTask) []const u8 {
-    return self.sign_in.url;
 }
 
 pub fn isFinished(self: *SignInTask) bool {
@@ -54,6 +50,19 @@ pub fn cancel(self: *SignInTask) void {
 /// Only call once `isFinished`, or after `cancel`.
 pub fn finish(self: *SignInTask) anyerror!void {
     self.future.await(self.io);
+    return self.release();
+}
+
+/// Stop at the worker's next cancelation point, network I/O included, and
+/// release everything. For quitting, where waiting out a token exchange
+/// would hold the terminal.
+pub fn abandon(self: *SignInTask) void {
+    self.sign_in.cancel();
+    self.future.cancel(self.io);
+    self.release() catch {};
+}
+
+fn release(self: *SignInTask) anyerror!void {
     const outcome = self.outcome;
     self.sign_in.destroy();
     self.allocator.destroy(self);
@@ -66,11 +75,12 @@ pub fn explain(err: anyerror) []const u8 {
         error.SignInCanceled => "Sign-in canceled.",
         error.SignInTimedOut => "Sign-in timed out waiting for the browser. Try again with ctrl+p.",
         error.AuthorizationDenied => "Sign-in was declined in the browser.",
-        error.PlanUsageNotGranted => "Signed in, but synth was not allowed to use your ChatGPT plan. Sign in again and allow plan usage.",
-        error.AccountMismatch => "That is a different ChatGPT account than the one synth was registered with. Sign out first with /logout.",
+        error.PlanUsageNotGranted => "Signed in, but synth was not allowed to use your ChatGPT plan. Pick ChatGPT plan again (ctrl+p) to allow it.",
+        error.AccountMismatch => "That is a different ChatGPT account than the one synth was signed in with. Run /logout to switch accounts, then sign in again.",
         error.ClientMismatch, error.RegistrationIncomplete => "OpenAI did not finish registering synth. Try signing in again.",
         error.InvalidIdToken => "OpenAI's sign-in response could not be verified, so it was not trusted.",
-        error.NoFreePort => "Could not open a local port for the sign-in callback.",
-        else => "Sign-in failed.",
+        error.NoFreePort => "Could not open a local port for the sign-in callback. Another sign-in may be open; close it and try again.",
+        error.Canceled => "Sign-in canceled.",
+        else => "Sign-in failed. Try again from the providers dialog (ctrl+p).",
     };
 }
