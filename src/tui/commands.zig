@@ -17,6 +17,10 @@ const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
 const Connect = @import("connect.zig");
+const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
+const SignInTask = @import("chatgpt_sign_in.zig");
+const SignOutTask = @import("chatgpt_sign_out.zig");
+const keys = @import("keys.zig");
 const Model = @import("model.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
@@ -108,6 +112,16 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
             "No skills found.";
         _ = try self.conversation.append(.{ .role = .assistant, .text = text });
         self.scroll = 0;
+        ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.eql(u8, line, "/logout")) {
+        try signOutOfChatGPT(self, ctx);
+        ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.eql(u8, line, "/usage")) {
+        try openUsage(self);
         ctx.redraw = true;
         return true;
     }
@@ -283,7 +297,7 @@ pub fn showProviders(self: *Model) !void {
         state.* = .{
             .id = entry.id,
             .host = if (entry.host_editable and remembered.len > 0) remembered else entry.host,
-            .connected = auth.key(entry.id) != null,
+            .connected = if (entry.key == .oauth) entry.ready(auth, self.chatgpt) else auth.key(entry.id) != null,
             .active = std.mem.eql(u8, entry.id, active_id),
         };
     }
@@ -291,10 +305,119 @@ pub fn showProviders(self: *Model) !void {
     try self.connect.show(&states);
 }
 
-/// Point the harness at a provider and say so.
-pub fn connectProvider(self: *Model, result: Connect.Result) !void {
+/// Point the harness at a provider and say so. Returns false while a browser
+/// sign-in it started is still waiting, so the dialog stays up for it.
+pub fn connectProvider(self: *Model, result: Connect.Result) !bool {
+    const auth = self.auth orelse return true;
+    const entry = catalog.findOrDefault(result.id);
+    const needs_sign_in = entry.key == .oauth and !entry.ready(auth, self.chatgpt);
+    if (needs_sign_in) return !try beginSignIn(self);
+
+    if (!try pointAt(self, result)) return true;
+    try announceProvider(self, result, self.provider.model);
+    return true;
+}
+
+/// Start a ChatGPT sign-in in the background. Returns whether one is running.
+fn beginSignIn(self: *Model) !bool {
+    if (self.chatgpt_sign_in) |running| {
+        try self.connect.showSignIn(running.sign_in.url);
+        return true;
+    }
+    const store = self.chatgpt orelse {
+        try note(self, "ChatGPT sign-in is unavailable: no credential file could be opened.", .{});
+        return false;
+    };
+
+    const task = SignInTask.start(self.allocator, self.io, store) catch |err| {
+        try note(self, "{s}", .{SignInTask.explain(err)});
+        return false;
+    };
+    self.chatgpt_sign_in = task;
+    const url = task.sign_in.url;
+    try self.connect.showSignIn(url);
+    try note(self, "Sign in to ChatGPT in your browser. If it did not open, visit:\n\n{s}\n\nOn a remote machine, forward the callback first: `ssh -L {d}:127.0.0.1:{d} <host>`.", .{
+        url,
+        chatgpt_auth.callback_port,
+        chatgpt_auth.callback_port,
+    });
+    keys.openUrl(self, url);
+    return true;
+}
+
+pub fn cancelSignIn(self: *Model) void {
+    if (self.chatgpt_sign_in) |task| task.cancel();
+}
+
+/// Called each tick: once the browser has come back, connect or say why not.
+pub fn pollSignIn(self: *Model, ctx: *vxfw.EventContext) !void {
+    const task = self.chatgpt_sign_in orelse return;
+    if (!task.isFinished()) return self.scheduleTick(ctx);
+
+    self.chatgpt_sign_in = null;
+    self.connect.close();
+    ctx.redraw = true;
+    task.finish() catch |err| {
+        try note(self, "{s}", .{SignInTask.explain(err)});
+        return;
+    };
+
+    const entry = catalog.find(catalog.chatgpt_id).?;
+    const result: Connect.Result = .{ .id = entry.id, .host = entry.host, .key = null };
     if (!try pointAt(self, result)) return;
     try announceProvider(self, result, self.provider.model);
+    try welcomeToPlanUsage(self);
+}
+
+/// Said once, the first time this installation signs in.
+fn welcomeToPlanUsage(self: *Model) !void {
+    const welcomed_key = "chatgpt:welcomed";
+    const db = self.loop.database() orelse return;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const welcomed = db.setting(arena_state.allocator(), welcomed_key) catch "";
+    if (welcomed.len > 0) return;
+    try note(self, "You're using your ChatGPT plan. Requests in synth count toward its usage. Manage usage with /usage or at {s}", .{chatgpt_auth.usage_url});
+    db.setSetting(welcomed_key, "1") catch {};
+}
+
+/// Revoking is a network round trip, so it runs off this thread and the tick
+/// loop reports how it went.
+fn signOutOfChatGPT(self: *Model, ctx: *vxfw.EventContext) !void {
+    const store = self.chatgpt orelse return;
+    if (self.chatgpt_sign_out != null) return;
+    if (!store.isSignedIn()) return note(self, "Not signed in to ChatGPT.", .{});
+    self.chatgpt_sign_out = SignOutTask.start(self.allocator, self.io, store) catch |err| {
+        return note(self, "Could not sign out of ChatGPT: {s}", .{@errorName(err)});
+    };
+    try self.scheduleTick(ctx);
+}
+
+pub fn pollSignOut(self: *Model, ctx: *vxfw.EventContext) !void {
+    const task = self.chatgpt_sign_out orelse return;
+    if (!task.isFinished()) return self.scheduleTick(ctx);
+
+    self.chatgpt_sign_out = null;
+    ctx.redraw = true;
+    const confirmed = task.finish() catch |err| {
+        return note(self, "Could not sign out of ChatGPT: {s}", .{@errorName(err)});
+    };
+    const said = if (confirmed)
+        "Signed out of ChatGPT."
+    else
+        "Signed out of ChatGPT here, but OpenAI did not confirm it. You can disconnect synth in ChatGPT settings.";
+    try note(self, "{s}", .{said});
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const active_id = try activeProviderId(self, arena_state.allocator());
+    if (std.mem.eql(u8, active_id, catalog.chatgpt_id)) try showProviders(self);
+}
+
+/// Open ChatGPT's usage page, where the plan's and synth's limits are set.
+fn openUsage(self: *Model) !void {
+    keys.openUrl(self, chatgpt_auth.usage_url);
+    try note(self, "Manage your ChatGPT plan usage at {s}", .{chatgpt_auth.usage_url});
 }
 
 /// Say which provider is answering now, and with what.
@@ -304,6 +427,7 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !void {
 /// is set, not while the backend is still on whatever it defaulted to.
 fn announceProvider(self: *Model, result: Connect.Result, model: []const u8) !void {
     const entry = catalog.findOrDefault(result.id);
+    if (entry.key == .oauth) return note(self, "Connected to your {s}, running {s}.", .{ entry.label, model });
     try note(self, "Connected {s} at {s}, running {s}.", .{ entry.label, result.host, model });
 }
 
@@ -388,7 +512,7 @@ pub fn showModels(self: *Model) !void {
 /// Whether a provider has what it needs to be asked what it offers.
 pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
     const auth = self.auth orelse return std.mem.eql(u8, entry.id, catalog.default_id);
-    return entry.ready(auth);
+    return entry.ready(auth, self.chatgpt);
 }
 
 /// The models one provider offers.
@@ -419,6 +543,7 @@ pub fn listModels(
         .host = host,
         .label = entry.label,
         .api_key = if (self.auth) |auth| auth.key(entry.id) else null,
+        .chatgpt = self.chatgpt,
     });
     defer backend.deinit();
     backend.start() catch return &.{};

@@ -1220,6 +1220,7 @@ fn pollRequest(self: *Loop) !bool {
         .thinking = thinking,
         .thinking_ms = thinking_ms,
         .tool_calls = reply.tool_calls,
+        .provider_state = reply.provider_state,
     });
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
@@ -1790,6 +1791,10 @@ fn persistMessage(self: *Loop, index: usize) !void {
             try db.appendBlob(message_id, 0, "reasoning", thinking);
             self.shrinkThinking(msg);
         }
+    }
+
+    if (msg.provider_state) |state| {
+        try db.appendBlob(message_id, 0, Database.provider_state_blob, state);
     }
 
     for (msg.attachments, 0..) |attachment, i| {

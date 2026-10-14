@@ -9,6 +9,7 @@ const Conversation = @import("core/conversation.zig");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 const Auth = @import("core/auth.zig");
+const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const agents = @import("agent/agent.zig");
 const subagent = @import("agent/subagent.zig");
 const mcp = @import("mcp");
@@ -98,6 +99,10 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
 
     var auth = try Auth.open(allocator, io, init.environ_map);
     defer auth.deinit();
+    const chatgpt_path = try chatgpt_auth.defaultPath(allocator, init.environ_map);
+    defer allocator.free(chatgpt_path);
+    const chatgpt = try chatgpt_auth.Store.open(allocator, io, chatgpt_path);
+    defer chatgpt.destroy();
     timing.mark("auth");
 
     var db = try Database.init(allocator, io, config.database_path);
@@ -177,6 +182,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
+        .chatgpt = chatgpt,
     });
     defer {
         backend.deinit();
@@ -200,6 +206,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .app = &app,
         .environ = init.environ_map,
         .auth = &auth,
+        .chatgpt = chatgpt,
         .backend = &backend,
     };
     try tui_app.wire(model);
@@ -259,7 +266,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try model.loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");
 
-    if (!active.entry.ready(&auth)) try tui_commands.showProviders(model);
+    if (!active.entry.ready(&auth, chatgpt)) try tui_commands.showProviders(model);
 
     if (try resumeTarget(&db, model.loop.project_id, options)) |session_id| {
         try model.loop.resumeSession(session_id, Model.resume_messages);

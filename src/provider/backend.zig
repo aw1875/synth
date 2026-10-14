@@ -8,6 +8,8 @@
 const std = @import("std");
 
 const catalog = @import("catalog.zig");
+const ChatGPTProvider = @import("chatgpt.zig");
+const chatgpt_auth = @import("chatgpt_auth.zig");
 const OllamaProvider = @import("ollama.zig");
 const OpenAIProvider = @import("openai.zig");
 const Provider = @import("provider.zig");
@@ -33,6 +35,8 @@ pub const Options = struct {
     /// advertised maximum; zero leaves the choice to the server.
     num_ctx: ?u32 = null,
     debug_log: ?[]const u8 = null,
+    /// Borrowed for the life of the backend.
+    chatgpt: ?*chatgpt_auth.Store = null,
 };
 
 options: Options,
@@ -41,6 +45,7 @@ client: Client,
 pub const Client = union(catalog.Kind) {
     ollama: OllamaProvider,
     openai: OpenAIProvider,
+    chatgpt: ChatGPTProvider,
 };
 
 pub fn init(kind: catalog.Kind, options: Options) Backend {
@@ -70,6 +75,16 @@ fn build(kind: catalog.Kind, options: Options) Client {
                 .label = options.label,
                 .model = options.model,
                 .api_key = options.api_key,
+                .debug_log = options.debug_log,
+            },
+        },
+        .chatgpt => .{
+            .chatgpt = .{
+                .allocator = options.allocator,
+                .io = options.io,
+                .store = options.chatgpt,
+                .label = options.label,
+                .model = options.model,
                 .debug_log = options.debug_log,
             },
         },
@@ -132,6 +147,7 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     switch (child.backend.client) {
         .ollama => |*client| try client.startLike(&self.client.ollama),
         .openai => |*client| try client.startLike(&self.client.openai),
+        .chatgpt => |*client| try client.startLike(&self.client.chatgpt),
     }
     return child;
 }
@@ -145,7 +161,9 @@ pub fn currentHost(self: *Backend) []const u8 {
 
 fn currentKey(self: *Backend) ?[]const u8 {
     return switch (self.client) {
-        inline else => |*client| client.api_key,
+        .ollama => |*client| client.api_key,
+        .openai => |*client| client.api_key,
+        .chatgpt => null,
     };
 }
 
@@ -189,7 +207,7 @@ pub fn describeError(self: *Backend, err: anyerror, allocator: std.mem.Allocator
 pub fn sameModel(self: *Backend, listed: []const u8, wanted: []const u8) bool {
     return switch (self.client) {
         .ollama => OllamaProvider.sameModel(listed, wanted),
-        .openai => std.mem.eql(u8, listed, wanted),
+        .openai, .chatgpt => std.mem.eql(u8, listed, wanted),
     };
 }
 
@@ -222,6 +240,7 @@ pub fn connect(
             .want_think = self.options.want_think,
             .num_ctx = self.options.num_ctx,
             .debug_log = self.options.debug_log,
+            .chatgpt = self.options.chatgpt,
         });
     }
 

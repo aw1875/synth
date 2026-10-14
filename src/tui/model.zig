@@ -18,6 +18,9 @@ const Project = @import("../core/project.zig");
 const mcp_tools = @import("../tools/mcp.zig");
 const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
+const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
+const SignInTask = @import("chatgpt_sign_in.zig");
+const SignOutTask = @import("chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
 const image = @import("../core/image.zig");
@@ -231,6 +234,12 @@ notification: Notification = undefined,
 /// Where credentials are stored, so connecting a provider can write one.
 /// Borrowed; it outlives the model.
 auth: ?*Auth = null,
+/// The ChatGPT sign-in, which lives in a file of its own. Borrowed.
+chatgpt: ?*chatgpt_auth.Store = null,
+/// A browser sign-in in progress, polled by the tick loop.
+chatgpt_sign_in: ?*SignInTask = null,
+/// A sign-out waiting on OpenAI to confirm the revocation.
+chatgpt_sign_out: ?*SignOutTask = null,
 /// The client behind `provider`. Borrowed; it outlives the model. Needed
 /// because connecting a provider of another protocol replaces the client, which
 /// the erased `Provider` has no way to do.
@@ -601,6 +610,14 @@ fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
 }
 
 pub fn deinit(self: *Model) void {
+    if (self.chatgpt_sign_in) |task| {
+        task.abandon();
+        self.chatgpt_sign_in = null;
+    }
+    if (self.chatgpt_sign_out) |task| {
+        task.abandon();
+        self.chatgpt_sign_out = null;
+    }
     self.closeSubagent();
     self.subagent_sessions.deinit(self.allocator);
     self.loop.deinit();

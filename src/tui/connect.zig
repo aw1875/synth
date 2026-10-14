@@ -34,7 +34,7 @@ pub const State = struct {
 };
 
 /// Which step is on screen.
-pub const Stage = enum { closed, choosing, host, key };
+pub const Stage = enum { closed, choosing, host, key, signing_in };
 
 /// A provider row: the catalog entry, plus what the caller knows about it.
 const Row = struct {
@@ -52,6 +52,8 @@ cursor: usize = 0,
 chosen: usize = 0,
 host: Input,
 key: Input,
+/// The page a browser sign-in is waiting on, while one is. Owned.
+sign_in_url: []const u8 = "",
 
 pub fn init(allocator: std.mem.Allocator) Connect {
     return .{
@@ -62,6 +64,7 @@ pub fn init(allocator: std.mem.Allocator) Connect {
 }
 
 pub fn deinit(self: *Connect) void {
+    self.forgetSignIn();
     self.release();
     self.rows.deinit(self.allocator);
     self.host.deinit();
@@ -109,6 +112,7 @@ fn find(states: []const State, id: []const u8) ?State {
 }
 
 pub fn close(self: *Connect) void {
+    self.forgetSignIn();
     self.stage = .closed;
     self.release();
     self.host.clear();
@@ -123,6 +127,8 @@ pub const Action = union(enum) {
     cancel,
     /// The user finished: connect this provider and store what came back.
     connect: Result,
+    /// The user gave up waiting on the browser.
+    cancel_sign_in,
 };
 
 pub const Result = struct {
@@ -137,7 +143,24 @@ pub fn handleKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) 
         .closed => .none,
         .choosing => self.chooseKey(key_press),
         .host, .key => self.editKey(ctx, key_press),
+        .signing_in => if (cancelsSignIn(key_press)) .cancel_sign_in else .none,
     };
+}
+
+fn cancelsSignIn(key_press: vaxis.Key) bool {
+    return key_press.matches(vaxis.Key.escape, .{}) or key_press.matches('c', .{ .ctrl = true });
+}
+
+/// Show the wait on a browser sign-in, with the page it is waiting on.
+pub fn showSignIn(self: *Connect, url: []const u8) !void {
+    self.forgetSignIn();
+    self.sign_in_url = try self.allocator.dupe(u8, url);
+    self.stage = .signing_in;
+}
+
+fn forgetSignIn(self: *Connect) void {
+    if (self.sign_in_url.len > 0) self.allocator.free(self.sign_in_url);
+    self.sign_in_url = "";
 }
 
 fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
@@ -153,6 +176,8 @@ fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
     }
     if (key_press.matches(vaxis.Key.enter, .{})) {
         self.chosen = self.cursor;
+        const row = self.rows.items[self.chosen];
+        if (row.entry.key == .oauth) return .{ .connect = .{ .id = row.entry.id, .host = row.entry.host, .key = null } };
         self.openFields() catch return .none;
         return .none;
     }
@@ -225,7 +250,7 @@ fn finish(self: *Connect) Action {
 /// paste lands in: the app routes one to whatever owns the keyboard.
 pub fn focus(self: *Connect) ?*Input {
     return switch (self.stage) {
-        .closed, .choosing => null,
+        .closed, .choosing, .signing_in => null,
         .host => &self.host,
         .key => &self.key,
     };
@@ -246,6 +271,7 @@ pub fn draw(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vx
         .closed => null,
         .choosing => self.drawList(ctx, parent, size),
         .host, .key => self.drawField(ctx, parent, size),
+        .signing_in => self.drawSignIn(ctx, parent, size),
     };
 }
 
@@ -282,6 +308,9 @@ fn drawList(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vx
 
         if (row.entry.key == .required and !row.connected) {
             _ = w.writeText(surface, x + 1, y, "needs a key", base.withFg(theme.warning).cell);
+        }
+        if (row.entry.key == .oauth and !row.connected) {
+            _ = w.writeText(surface, x + 1, y, "opens your browser", base.withFg(theme.fg_muted).cell);
         }
     }
 
@@ -356,6 +385,39 @@ fn drawField(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: v
         .origin = .{ .row = origin_row, .col = origin_col },
         .cursor = cursor,
     };
+}
+
+fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxfw.Size) !?Drawn {
+    const url_rows: u16 = 4;
+    const height: u16 = 8 + url_rows;
+    if (size.width < 32 or size.height < height) return null;
+
+    const width = @min(box_width, size.width -| 4);
+    const origin_row = (size.height -| height) / 2;
+    const origin_col = (size.width -| width) / 2;
+
+    const surface = try w.surfaceClamped(ctx.arena, parent, .{ .width = width, .height = height });
+    w.fill(surface, theme.card.cell);
+
+    _ = w.writeText(surface, pad, 1, "Sign in with ChatGPT", theme.on_card(theme.fg).bold().cell);
+    w.writeTextRight(surface, 1, pad, "esc", theme.on_card(theme.fg_dim).cell);
+    _ = w.writeText(surface, pad, 3, "Finish in your browser. If it did not open, visit:", theme.on_card(theme.fg_muted).cell);
+
+    const inner: usize = width -| (pad * 2);
+    var remaining = self.sign_in_url;
+    var line: u16 = 0;
+    while (remaining.len > 0 and line < url_rows and inner > 0) : (line += 1) {
+        const take = @min(remaining.len, inner);
+        _ = w.writeText(surface, pad, 5 + line, remaining[0..take], theme.on_card(theme.fg_dim).cell);
+        remaining = remaining[take..];
+    }
+
+    const hint_row = height - 2;
+    var x = w.writeText(surface, pad, hint_row, "waiting for the browser   ", theme.on_card(theme.fg_dim).cell);
+    x = w.writeText(surface, x, hint_row, "esc", theme.on_card(theme.fg_muted).bold().cell);
+    _ = w.writeText(surface, x, hint_row, " cancel", theme.on_card(theme.fg_dim).cell);
+
+    return .{ .surface = surface, .origin = .{ .row = origin_row, .col = origin_col } };
 }
 
 /// Drive the dialog with a key, the way the app does.
@@ -500,4 +562,29 @@ test "a provider that already has a key connects on one Enter" {
     const action = try connect.press(.{ .codepoint = vaxis.Key.enter });
     try testing.expectEqualStrings("ollama-cloud", action.connect.id);
     try testing.expect(action.connect.key == null);
+}
+
+test "a browser sign-in row connects on Enter, whatever was left in the key field" {
+    var connect: Connect = .init(testing.allocator);
+    defer connect.deinit();
+
+    try connect.show(&.{});
+    connect.cursor = connect.rows.items.len - 1;
+    try testing.expectEqual(catalog.Key.oauth, connect.rows.items[connect.cursor].entry.key);
+    try connect.key.insertText("sk-left-over");
+
+    const action = try connect.press(.{ .codepoint = vaxis.Key.enter });
+    try testing.expectEqualStrings(catalog.chatgpt_id, action.connect.id);
+    try testing.expect(action.connect.key == null);
+}
+
+test "escape while waiting on the browser cancels the sign-in" {
+    var connect: Connect = .init(testing.allocator);
+    defer connect.deinit();
+
+    try connect.showSignIn("https://auth.openai.com/api/accounts/authorize?x=1");
+    try testing.expectEqual(Stage.signing_in, connect.stage);
+    try testing.expect(connect.focus() == null);
+    try testing.expectEqual(Action.none, try connect.press(.{ .codepoint = vaxis.Key.enter }));
+    try testing.expectEqual(Action.cancel_sign_in, try connect.press(.{ .codepoint = vaxis.Key.escape }));
 }

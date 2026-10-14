@@ -132,8 +132,14 @@ pub fn trackSelection(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse)
 
 /// Hand a clicked link to the desktop's opener.
 pub fn openLink(self: *Model, point: Selection.Point) void {
-    if (builtin.is_test) return;
     const uri = self.selection.linkAt(point.row, point.col) orelse return;
+    openUrl(self, uri);
+}
+
+/// Hand a web address to the desktop's opener, in the background so a slow
+/// browser launch never holds up the screen.
+pub fn openUrl(self: *Model, uri: []const u8) void {
+    if (builtin.is_test) return;
     if (!std.mem.startsWith(u8, uri, "http://") and !std.mem.startsWith(u8, uri, "https://")) return;
 
     const opener = switch (builtin.os.tag) {
@@ -213,6 +219,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         },
         .tick => {
             self.tick_pending = false;
+            try commands.pollSignIn(self, ctx);
+            try commands.pollSignOut(self, ctx);
             commands.checkModel(self, ctx);
             try commands.applyMcp(self, ctx);
             if (self.mcp) |host| {
@@ -309,9 +317,13 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.connect.close(),
                     .connect => |result| {
-                        try commands.connectProvider(self, result);
-                        self.connect.close();
+                        if (try commands.connectProvider(self, result)) {
+                            self.connect.close();
+                        } else {
+                            try self.scheduleTick(ctx);
+                        }
                     },
+                    .cancel_sign_in => commands.cancelSignIn(self),
                 }
                 return ctx.consumeAndRedraw();
             }
