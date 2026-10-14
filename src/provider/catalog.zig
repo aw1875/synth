@@ -92,7 +92,7 @@ pub const all: []const Entry = &.{
     .{
         .id = chatgpt_id,
         .label = "ChatGPT plan",
-        .summary = "sign in with your ChatGPT account",
+        .summary = "your ChatGPT subscription",
         .host = chatgpt_auth.resource,
         .host_editable = false,
         .key = .oauth,

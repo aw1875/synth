@@ -310,7 +310,7 @@ fn drawList(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vx
             _ = w.writeText(surface, x + 1, y, "needs a key", base.withFg(theme.warning).cell);
         }
         if (row.entry.key == .oauth and !row.connected) {
-            _ = w.writeText(surface, x + 1, y, "opens your browser", base.withFg(theme.fg_muted).cell);
+            _ = w.writeText(surface, x + 1, y, "browser sign-in", base.withFg(theme.fg_muted).cell);
         }
     }
 
