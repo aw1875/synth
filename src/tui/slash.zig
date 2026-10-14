@@ -27,6 +27,8 @@ pub const Command = struct {
     /// Whether this came from a skill directory rather than the table below.
     /// What tells the dispatcher to load instructions instead of running a verb.
     is_skill: bool = false,
+    /// Only offered while signed in to ChatGPT.
+    needs_chatgpt: bool = false,
 };
 
 /// Ranked fuzzy matches kept when nothing matched by prefix. A ceiling on the
@@ -45,8 +47,8 @@ pub const commands: []const Command = &.{
     .{ .name = "model", .description = "switch the model this session runs on", .argument = "[name]" },
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
-    .{ .name = "logout", .description = "sign out of ChatGPT" },
-    .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use" },
+    .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true },
+    .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = "[name]" },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
@@ -60,6 +62,9 @@ pub const commands: []const Command = &.{
 /// The project's skills, offered after the built-in commands. Borrowed, and
 /// empty where nothing discovered any.
 skills: []const skill.Skill = &.{},
+/// Set by the owner before each `update`; hides the ChatGPT-only commands
+/// while there is no ChatGPT sign-in for them to act on.
+chatgpt_signed_in: bool = false,
 
 /// Indices into everything on offer, matching what has been typed, best first.
 matches: std.ArrayList(usize) = .empty,
@@ -129,7 +134,9 @@ fn filter(self: *Slash, query: []const u8) !void {
     self.matches.clearRetainingCapacity();
 
     for (0..self.total()) |i| {
-        if (std.ascii.startsWithIgnoreCase(self.at(i).name, query)) {
+        const command = self.at(i);
+        if (!self.isOffered(command)) continue;
+        if (std.ascii.startsWithIgnoreCase(command.name, query)) {
             try self.matches.append(self.allocator, i);
         }
     }
@@ -138,10 +145,15 @@ fn filter(self: *Slash, query: []const u8) !void {
     var top: fuzzy.Top(max_ranked) = .{};
     for (0..self.total()) |i| {
         const command = self.at(i);
+        if (!self.isOffered(command)) continue;
         if (std.ascii.startsWithIgnoreCase(command.name, query)) continue;
         top.consider(i, command.name, query, .{});
     }
     for (top.ranked()) |entry| try self.matches.append(self.allocator, entry.index);
+}
+
+fn isOffered(self: *const Slash, command: Command) bool {
+    return !command.needs_chatgpt or self.chatgpt_signed_in;
 }
 
 pub fn moveSelection(self: *Slash, delta: i32) void {
@@ -271,6 +283,7 @@ pub fn draw(self: *Slash, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
 test "the picker opens on a slash and closes once arguments start" {
     var slash: Slash = .init(std.testing.allocator);
     defer slash.deinit();
+    slash.chatgpt_signed_in = true;
 
     try slash.update("", 0);
     try std.testing.expect(!slash.isOpen());
@@ -288,6 +301,22 @@ test "the picker opens on a slash and closes once arguments start" {
 
     try slash.update("what is /compact", 16);
     try std.testing.expect(!slash.isOpen());
+}
+
+test "the ChatGPT commands are offered only while signed in to ChatGPT" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
+    try slash.update("/lo", 3);
+    try std.testing.expect(!slash.isOpen());
+    try slash.update("/us", 3);
+    try std.testing.expect(!slash.isOpen());
+
+    slash.chatgpt_signed_in = true;
+    try slash.update("/lo", 3);
+    try std.testing.expectEqualStrings("logout", slash.selectedCommand().?.name);
+    try slash.update("/us", 3);
+    try std.testing.expectEqualStrings("usage", slash.selectedCommand().?.name);
 }
 
 test "completion leaves room for an argument" {
@@ -327,6 +356,7 @@ test "a skill is offered like any other command, and says it is one" {
         .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
         .{ .id = "commit-style", .name = "commit-style", .description = "", .dir = "/p/commit", .body = "b" },
     };
+    slash.chatgpt_signed_in = true;
 
     try slash.update("/", 1);
     try std.testing.expectEqual(commands.len + 2, slash.matches.items.len);

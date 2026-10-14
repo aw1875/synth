@@ -528,6 +528,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             _ = try self.input.handleEvent(ctx, event);
             try self.refreshMentions();
             try self.awaitMentions(ctx);
+            self.slash.chatgpt_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
             try self.slash.update(self.input.text.items, self.input.cursor);
             if (ctx.consume_event) return;
         },
