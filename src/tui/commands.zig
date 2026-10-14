@@ -624,23 +624,24 @@ fn refreshEffort(self: *Model) void {
     self.loop.provider.effort = effort;
 }
 
-/// `/effort` alone says where the current model stands; with a level, sets it.
+/// `/effort` alone opens the picker; with a level, sets it.
 fn chooseEffort(self: *Model, level: []const u8) !void {
     const efforts = self.provider.effortsFor(self.provider.model);
     if (efforts.levels.len == 0) return note(self, "`{s}` has no effort setting.", .{self.provider.model});
+    if (level.len == 0) return self.effort_picker.show(self.provider.model, efforts.levels, self.provider.effort);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const offered = try std.mem.join(arena_state.allocator(), ", ", efforts.levels);
-
-    if (level.len == 0) {
-        return note(self, "`{s}` is running at {s} effort. Levels: {s}.", .{ self.provider.model, self.provider.effort, offered });
-    }
     const is_offered = for (efforts.levels) |candidate| {
         if (std.mem.eql(u8, candidate, level)) break true;
     } else false;
     if (!is_offered) return note(self, "`{s}` is not a level `{s}` offers. Levels: {s}.", .{ level, self.provider.model, offered });
 
+    try setEffort(self, level);
+}
+
+pub fn setEffort(self: *Model, level: []const u8) !void {
     try applyEffort(self, level);
     try note(self, "`{s}` now runs at {s} effort.", .{ self.provider.model, self.provider.effort });
 }

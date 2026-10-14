@@ -43,6 +43,7 @@ const SessionPicker = @import("session_picker.zig");
 const Slash = @import("slash.zig");
 const theme = @import("theme.zig");
 const ThemePicker = @import("theme_picker.zig");
+const EffortPicker = @import("effort_picker.zig");
 const McpPicker = @import("mcp_picker.zig");
 const agents = @import("../agent/agent.zig");
 const themes = @import("themes.zig");
@@ -228,6 +229,8 @@ models: ModelPicker = undefined,
 connect: Connect = undefined,
 /// The theme switcher. Closed unless `/theme` opened it.
 theme_picker: ThemePicker = undefined,
+/// The reasoning effort switcher. Closed unless `/effort` opened it.
+effort_picker: EffortPicker = undefined,
 mcp_picker: McpPicker = undefined,
 /// The toast in the top-right corner.
 notification: Notification = undefined,
@@ -633,6 +636,7 @@ pub fn deinit(self: *Model) void {
     self.models.deinit();
     self.connect.deinit();
     self.theme_picker.deinit();
+    self.effort_picker.deinit();
     self.mcp_picker.deinit();
     self.block_heights.deinit(self.allocator);
     self.notification.deinit();
@@ -662,6 +666,7 @@ pub fn wire(self: *Model) !void {
     self.models = .init(self.allocator);
     self.connect = .init(self.allocator);
     self.theme_picker = .init(self.allocator);
+    self.effort_picker = .init(self.allocator);
     self.mcp_picker = .init(self.allocator);
     self.notification = .init(self.allocator, self.io);
     self.slash = .init(self.allocator);

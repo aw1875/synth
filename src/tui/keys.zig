@@ -300,6 +300,18 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (self.effort_picker.open) {
+                switch (self.effort_picker.handleKey(key)) {
+                    .none => {},
+                    .cancel => self.effort_picker.close(),
+                    .choose => {
+                        if (self.effort_picker.selected()) |level| try commands.setEffort(self, level);
+                        self.effort_picker.close();
+                    },
+                }
+                return ctx.consumeAndRedraw();
+            }
+
             if (self.theme_picker.open) {
                 switch (try self.theme_picker.handleKey(ctx, key)) {
                     .none => {},
