@@ -550,7 +550,7 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
         try writeTools(arena, w, turn.tools_json);
         try w.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
     }
-    try w.writeAll(",\"reasoning\":{\"summary\":\"auto\"");
+    try w.writeAll(",\"reasoning\":{\"summary\":\"detailed\"");
     if (self.effort_len > 0) {
         try w.writeAll(",\"effort\":");
         try writeString(w, self.chosenEffort());
