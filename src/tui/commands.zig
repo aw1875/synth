@@ -120,6 +120,11 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (std.mem.startsWith(u8, line, "/effort")) {
+        try chooseEffort(self, std.mem.trim(u8, line["/effort".len..], " "));
+        ctx.redraw = true;
+        return true;
+    }
     if (std.mem.eql(u8, line, "/usage")) {
         try openUsage(self);
         ctx.redraw = true;
@@ -489,14 +494,7 @@ pub fn showModels(self: *Model) !void {
     for (catalog.all) |entry| {
         if (!isConnected(self, entry)) continue;
 
-        const names = try listModels(self, arena, entry, active_id);
-        for (names) |name| {
-            try entries.append(arena, .{
-                .name = name,
-                .provider = entry.label,
-                .provider_id = entry.id,
-            });
-        }
+        try entries.appendSlice(arena, try listModels(self, arena, entry, active_id));
     }
 
     var recent: []const []const u8 = &.{};
@@ -526,8 +524,8 @@ pub fn listModels(
     arena: std.mem.Allocator,
     entry: catalog.Entry,
     active_id: []const u8,
-) ![]const []const u8 {
-    if (std.mem.eql(u8, entry.id, active_id)) return self.provider.models(arena) catch &.{};
+) ![]const ModelPicker.Entry {
+    if (std.mem.eql(u8, entry.id, active_id)) return modelEntries(self, arena, entry, self.provider);
 
     var host = entry.host;
     if (entry.host_editable) {
@@ -548,7 +546,103 @@ pub fn listModels(
     defer backend.deinit();
     backend.start() catch return &.{};
 
-    return backend.listModels(arena) catch &.{};
+    return modelEntries(self, arena, entry, backend.provider());
+}
+
+/// Each model a provider offers, with its effort levels and the level last
+/// chosen for it. Copied into `arena`: a listing backend dies straight after.
+fn modelEntries(
+    self: *Model,
+    arena: std.mem.Allocator,
+    entry: catalog.Entry,
+    provider: Provider,
+) ![]const ModelPicker.Entry {
+    const names = provider.models(arena) catch return &.{};
+    const entries = try arena.alloc(ModelPicker.Entry, names.len);
+    for (names, entries) |name, *model| {
+        const efforts = provider.effortsFor(name);
+        const remembered = try rememberedEffort(self, arena, entry.id, name);
+        model.* = .{
+            .name = name,
+            .provider = entry.label,
+            .provider_id = entry.id,
+            .efforts = try dupeLevels(arena, efforts.levels),
+            .effort = try arena.dupe(u8, if (remembered.len > 0) remembered else efforts.default),
+        };
+    }
+    return entries;
+}
+
+fn dupeLevels(arena: std.mem.Allocator, levels: []const []const u8) ![]const []const u8 {
+    const copies = try arena.alloc([]const u8, levels.len);
+    for (levels, copies) |level, *copy| copy.* = try arena.dupe(u8, level);
+    return copies;
+}
+
+fn effortKey(arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "effort:{s}:{s}", .{ provider_id, model });
+}
+
+/// The effort last chosen for a model, or "" when none was.
+fn rememberedEffort(self: *Model, arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
+    const db = self.loop.database() orelse return "";
+    return db.setting(arena, try effortKey(arena, provider_id, model)) catch "";
+}
+
+/// Run the current model at `level` from the next turn on, and remember it
+/// for this model.
+fn applyEffort(self: *Model, level: []const u8) !void {
+    const set = self.provider.set_effort orelse return;
+    set(self.provider.userdata, level);
+    refreshEffort(self);
+
+    const db = self.loop.database() orelse return;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const provider_id = try activeProviderId(self, arena);
+    db.setSetting(try effortKey(arena, provider_id, self.provider.model), level) catch |err| {
+        try note(self, "Could not remember the effort: {s}", .{@errorName(err)});
+    };
+}
+
+/// Put the current model back on the effort last chosen for it, or on its
+/// default. For a launch, a resumed session, or a model switch.
+pub fn restoreEffort(self: *Model) !void {
+    const set = self.provider.set_effort orelse return;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const provider_id = try activeProviderId(self, arena);
+    set(self.provider.userdata, try rememberedEffort(self, arena, provider_id, self.provider.model));
+    refreshEffort(self);
+}
+
+fn refreshEffort(self: *Model) void {
+    const effort = self.provider.current().effort;
+    self.provider.effort = effort;
+    self.loop.provider.effort = effort;
+}
+
+/// `/effort` alone says where the current model stands; with a level, sets it.
+fn chooseEffort(self: *Model, level: []const u8) !void {
+    const efforts = self.provider.effortsFor(self.provider.model);
+    if (efforts.levels.len == 0) return note(self, "`{s}` has no effort setting.", .{self.provider.model});
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const offered = try std.mem.join(arena_state.allocator(), ", ", efforts.levels);
+
+    if (level.len == 0) {
+        return note(self, "`{s}` is running at {s} effort. Levels: {s}.", .{ self.provider.model, self.provider.effort, offered });
+    }
+    const is_offered = for (efforts.levels) |candidate| {
+        if (std.mem.eql(u8, candidate, level)) break true;
+    } else false;
+    if (!is_offered) return note(self, "`{s}` is not a level `{s}` offers. Levels: {s}.", .{ level, self.provider.model, offered });
+
+    try applyEffort(self, level);
+    try note(self, "`{s}` now runs at {s} effort.", .{ self.provider.model, self.provider.effort });
 }
 
 /// The provider in use, by catalog id. Caller owns the result.
@@ -566,6 +660,7 @@ pub fn syncProvider(self: *Model) void {
     self.provider.name = self.loop.provider.name;
     self.provider.context_limit = self.loop.provider.context_limit;
     self.provider.vision = self.loop.provider.vision;
+    self.provider.effort = self.loop.provider.effort;
 }
 
 /// Switch to a model, connecting its provider first when it belongs to another
@@ -594,12 +689,14 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
             if (!try pointAt(self, connection)) return;
 
             const running = try switchModel(self, entry.name);
+            if (entry.effort.len > 0) try applyEffort(self, entry.effort);
             try announceProvider(self, connection, running);
             return;
         }
     }
 
     _ = try switchModel(self, entry.name);
+    if (entry.effort.len > 0) try applyEffort(self, entry.effort);
 }
 
 /// Point the provider at another of its models. Returns the model now in use,
@@ -617,6 +714,7 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     self.loop.provider.vision = current.vision;
     try self.loop.setModel(current.model);
     try rememberModelChoice(self, current.model);
+    try restoreEffort(self);
     return self.provider.model;
 }
 

@@ -267,6 +267,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     timing.mark("agent and session");
 
     if (!active.entry.ready(&auth, chatgpt)) try tui_commands.showProviders(model);
+    try tui_commands.restoreEffort(model);
 
     if (try resumeTarget(&db, model.loop.project_id, options)) |session_id| {
         try model.loop.resumeSession(session_id, Model.resume_messages);

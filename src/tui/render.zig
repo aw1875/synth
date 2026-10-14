@@ -987,8 +987,10 @@ pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, wid
 
     // Both: the same model tag is served by a local process and by a cloud.
     const answering = if (self.provider.model.len > 0)
-        std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{
+        std.fmt.allocPrint(ctx.arena, "{s}{s}{s}{s}{s}", .{
             self.provider.model,
+            if (self.provider.effort.len > 0) " " else "",
+            self.provider.effort,
             w.separator,
             self.provider.name,
         }) catch self.provider.name
