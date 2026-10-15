@@ -325,8 +325,8 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !bool {
 
 /// Start a ChatGPT sign-in in the background. Returns whether one is running.
 fn beginSignIn(self: *Model) !bool {
-    if (self.chatgpt_sign_in) |running| {
-        try self.connect.showSignIn(running.sign_in.url);
+    if (self.chatgpt_sign_in != null) {
+        self.connect.showSignIn();
         return true;
     }
     const store = self.chatgpt orelse {
@@ -339,19 +339,30 @@ fn beginSignIn(self: *Model) !bool {
         return false;
     };
     self.chatgpt_sign_in = task;
-    const url = task.sign_in.url;
-    try self.connect.showSignIn(url);
-    try note(self, "Sign in to ChatGPT in your browser. If it did not open, visit:\n\n{s}\n\nOn a remote machine, forward the callback first: `ssh -L {d}:127.0.0.1:{d} <host>`.", .{
-        url,
+    self.connect.showSignIn();
+    try note(self, "On a remote machine, forward the sign-in callback first: `ssh -L {d}:127.0.0.1:{d} <host>`, then copy the link with c.", .{
         chatgpt_auth.callback_port,
         chatgpt_auth.callback_port,
     });
-    keys.openUrl(self, url);
+    keys.openUrl(self, task.sign_in.url);
     return true;
 }
 
 pub fn cancelSignIn(self: *Model) void {
     if (self.chatgpt_sign_in) |task| task.cancel();
+}
+
+pub fn reopenSignIn(self: *Model) void {
+    const task = self.chatgpt_sign_in orelse return;
+    keys.openUrl(self, task.sign_in.url);
+}
+
+/// OSC 52, so the link reaches the clipboard of the machine the terminal is
+/// on, which over SSH is the one with the browser.
+pub fn copySignInLink(self: *Model, ctx: *vxfw.EventContext) !void {
+    const task = self.chatgpt_sign_in orelse return;
+    try ctx.copyToClipboard(task.sign_in.url);
+    try self.notification.show(ctx, .info, "Sign-in link copied");
 }
 
 /// Called each tick: once the browser has come back, connect or say why not.

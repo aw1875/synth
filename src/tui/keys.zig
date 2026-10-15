@@ -342,6 +342,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                         }
                     },
                     .cancel_sign_in => commands.cancelSignIn(self),
+                    .reopen_sign_in => commands.reopenSignIn(self),
+                    .copy_sign_in => try commands.copySignInLink(self, ctx),
                 }
                 return ctx.consumeAndRedraw();
             }

@@ -52,8 +52,6 @@ cursor: usize = 0,
 chosen: usize = 0,
 host: Input,
 key: Input,
-/// The page a browser sign-in is waiting on, while one is. Owned.
-sign_in_url: []const u8 = "",
 
 pub fn init(allocator: std.mem.Allocator) Connect {
     return .{
@@ -64,7 +62,6 @@ pub fn init(allocator: std.mem.Allocator) Connect {
 }
 
 pub fn deinit(self: *Connect) void {
-    self.forgetSignIn();
     self.release();
     self.rows.deinit(self.allocator);
     self.host.deinit();
@@ -112,7 +109,6 @@ fn find(states: []const State, id: []const u8) ?State {
 }
 
 pub fn close(self: *Connect) void {
-    self.forgetSignIn();
     self.stage = .closed;
     self.release();
     self.host.clear();
@@ -129,6 +125,10 @@ pub const Action = union(enum) {
     connect: Result,
     /// The user gave up waiting on the browser.
     cancel_sign_in,
+    /// Open the sign-in page in the browser again.
+    reopen_sign_in,
+    /// Put the sign-in link on the clipboard, for a browser elsewhere.
+    copy_sign_in,
 };
 
 pub const Result = struct {
@@ -143,24 +143,20 @@ pub fn handleKey(self: *Connect, ctx: *vxfw.EventContext, key_press: vaxis.Key) 
         .closed => .none,
         .choosing => self.chooseKey(key_press),
         .host, .key => self.editKey(ctx, key_press),
-        .signing_in => if (cancelsSignIn(key_press)) .cancel_sign_in else .none,
+        .signing_in => signInKey(key_press),
     };
 }
 
-fn cancelsSignIn(key_press: vaxis.Key) bool {
-    return key_press.matches(vaxis.Key.escape, .{}) or key_press.matches('c', .{ .ctrl = true });
+fn signInKey(key_press: vaxis.Key) Action {
+    if (key_press.matches(vaxis.Key.escape, .{}) or key_press.matches('c', .{ .ctrl = true })) return .cancel_sign_in;
+    if (key_press.matches('o', .{})) return .reopen_sign_in;
+    if (key_press.matches('c', .{})) return .copy_sign_in;
+    return .none;
 }
 
-/// Show the wait on a browser sign-in, with the page it is waiting on.
-pub fn showSignIn(self: *Connect, url: []const u8) !void {
-    self.forgetSignIn();
-    self.sign_in_url = try self.allocator.dupe(u8, url);
+/// Show the wait on a browser sign-in.
+pub fn showSignIn(self: *Connect) void {
     self.stage = .signing_in;
-}
-
-fn forgetSignIn(self: *Connect) void {
-    if (self.sign_in_url.len > 0) self.allocator.free(self.sign_in_url);
-    self.sign_in_url = "";
 }
 
 fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
@@ -388,8 +384,8 @@ fn drawField(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: v
 }
 
 fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxfw.Size) !?Drawn {
-    const url_rows: u16 = 4;
-    const height: u16 = 8 + url_rows;
+    _ = self;
+    const height: u16 = 9;
     if (size.width < 32 or size.height < height) return null;
 
     const width = @min(box_width, size.width -| 4);
@@ -401,16 +397,12 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
 
     _ = w.writeText(surface, pad, 1, "Sign in with ChatGPT", theme.on_card(theme.fg).bold().cell);
     w.writeTextRight(surface, 1, pad, "esc", theme.on_card(theme.fg_dim).cell);
-    _ = w.writeText(surface, pad, 3, "Finish in your browser. If it did not open, visit:", theme.on_card(theme.fg_muted).cell);
+    _ = w.writeText(surface, pad, 3, "Finish signing in in your browser.", theme.on_card(theme.fg_muted).cell);
 
-    const inner: usize = width -| (pad * 2);
-    var remaining = self.sign_in_url;
-    var line: u16 = 0;
-    while (remaining.len > 0 and line < url_rows and inner > 0) : (line += 1) {
-        const take = @min(remaining.len, inner);
-        _ = w.writeText(surface, pad, 5 + line, remaining[0..take], theme.on_card(theme.fg_dim).cell);
-        remaining = remaining[take..];
-    }
+    var action = w.writeText(surface, pad, 5, "o", theme.on_card(theme.fg_muted).bold().cell);
+    action = w.writeText(surface, action, 5, " open it again   ", theme.on_card(theme.fg_dim).cell);
+    action = w.writeText(surface, action, 5, "c", theme.on_card(theme.fg_muted).bold().cell);
+    _ = w.writeText(surface, action, 5, " copy the link", theme.on_card(theme.fg_dim).cell);
 
     const hint_row = height - 2;
     var x = w.writeText(surface, pad, hint_row, "waiting for the browser   ", theme.on_card(theme.fg_dim).cell);
@@ -582,9 +574,12 @@ test "escape while waiting on the browser cancels the sign-in" {
     var connect: Connect = .init(testing.allocator);
     defer connect.deinit();
 
-    try connect.showSignIn("https://auth.openai.com/api/accounts/authorize?x=1");
+    connect.showSignIn();
     try testing.expectEqual(Stage.signing_in, connect.stage);
     try testing.expect(connect.focus() == null);
     try testing.expectEqual(Action.none, try connect.press(.{ .codepoint = vaxis.Key.enter }));
+    try testing.expectEqual(Action.reopen_sign_in, try connect.press(.{ .codepoint = 'o', .text = "o" }));
+    try testing.expectEqual(Action.copy_sign_in, try connect.press(.{ .codepoint = 'c', .text = "c" }));
+    try testing.expectEqual(Action.cancel_sign_in, try connect.press(.{ .codepoint = 'c', .mods = .{ .ctrl = true } }));
     try testing.expectEqual(Action.cancel_sign_in, try connect.press(.{ .codepoint = vaxis.Key.escape }));
 }
