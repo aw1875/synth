@@ -30,6 +30,10 @@ pub const callback_port: u16 = 1455;
 const callback_path = "/auth/callback";
 const callback_poll_ns: u64 = 250 * std.time.ns_per_ms;
 const sign_in_timeout_ns: u64 = 10 * std.time.ns_per_min;
+const callback_page =
+    \\<h1>ChatGPT sign-in received</h1>
+    \\<p>Return to synth to finish. You can close this tab.</p>
+;
 /// Renew this long before the access token runs out, so a turn never starts
 /// on one that dies mid-stream.
 const expiry_skew_seconds: i64 = 120;
@@ -333,6 +337,7 @@ pub const SignIn = struct {
             .state = state,
             .port = callback_port,
             .path = callback_path,
+            .success_page = callback_page,
         });
         errdefer self.listener.deinit();
         self.redirect_uri = try self.listener.redirectUri(arena);
