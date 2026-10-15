@@ -42,6 +42,19 @@ pub fn dataPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, fil
     return std.fs.path.join(allocator, &.{ base, pkg.name, file });
 }
 
+/// Like `dataPath`, but never the working directory, even in a debug build:
+/// for secrets, which the agent's own tools may read there without asking.
+/// A debug build uses `<name>-dev` so it does not share a release build's.
+pub fn privateDataPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map, file: []const u8) ![]u8 {
+    const dir = if (builtin.mode == .Debug) pkg.name ++ "-dev" else pkg.name;
+    const base = env.get("XDG_DATA_HOME") orelse blk: {
+        const home = env.get("HOME") orelse return error.NoHome;
+        break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share" });
+    };
+    defer if (env.get("XDG_DATA_HOME") == null) allocator.free(base);
+    return std.fs.path.join(allocator, &.{ base, dir, file });
+}
+
 /// `$XDG_DATA_HOME/<name>/mcp-auth.json`, or `~/.local/share/<name>/...`. A
 /// debug build keeps it in the working directory. Owned by the caller.
 ///

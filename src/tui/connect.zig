@@ -21,6 +21,9 @@ const pad: u16 = 2;
 /// Ceiling on what can be typed into either field. A key is around a hundred
 /// characters; a URL is shorter. Anything past this is a paste that went wrong.
 pub const max_value_bytes: usize = 512;
+/// Rows of the sign-in link shown before it is cut short. Every row links to
+/// the whole of it, and `c` copies all of it.
+const max_url_rows: usize = 8;
 
 /// What the caller knows about one provider, for the list to show.
 pub const State = struct {
@@ -400,7 +403,7 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
     if (size.width < 32) return null;
     const width = @min(box_width, size.width -| 4);
     const inner: usize = width -| (pad * 2);
-    const url_rows: u16 = @intCast(std.math.divCeil(usize, self.sign_in_url.len, inner) catch 0);
+    const url_rows: u16 = @intCast(@min(max_url_rows, std.math.divCeil(usize, self.sign_in_url.len, inner) catch 0));
     const ssh_rows: u16 = if (self.sign_in_over_ssh) 3 else 0;
     const fixed_rows: u16 = 10;
     const height: u16 = fixed_rows + url_rows + ssh_rows;
@@ -418,9 +421,12 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
 
     var remaining = self.sign_in_url;
     var row: u16 = 5;
-    while (remaining.len > 0) : (row += 1) {
-        const take = @min(remaining.len, inner);
-        _ = w.writeLinked(surface, pad, row, remaining[0..take], theme.on_card(theme.accent_alt).cell, self.sign_in_url);
+    const last_url_row = row + url_rows - 1;
+    while (remaining.len > 0 and row <= last_url_row) : (row += 1) {
+        const is_cut = row == last_url_row and remaining.len > inner;
+        const take = if (is_cut) inner -| 1 else @min(remaining.len, inner);
+        const shown = if (is_cut) try std.fmt.allocPrint(ctx.arena, "{s}…", .{remaining[0..take]}) else remaining[0..take];
+        _ = w.writeLinked(surface, pad, row, shown, theme.on_card(theme.accent_alt).cell, self.sign_in_url);
         remaining = remaining[take..];
     }
 

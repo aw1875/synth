@@ -52,6 +52,7 @@ pub const Error = error{
     SessionExpired,
     RefreshUnavailable,
     InvalidIdToken,
+    IssuerMismatch,
 };
 
 /// What one signed-in ChatGPT account leaves on disk. The host id outlives a
@@ -85,7 +86,9 @@ pub const Credentials = struct {
         return self.scope.len > 0 and !self.hasPlanUsage();
     }
 
-    /// The same account, signed out: its tokens gone, its registration kept.
+    /// The same account with its session ended: tokens gone, registration
+    /// kept. The ID token stays as the hint that brings the next sign-in back
+    /// to this account; an expired one still identifies it.
     fn withoutTokens(self: Credentials) Credentials {
         return .{
             .client_id = self.client_id,
@@ -93,6 +96,7 @@ pub const Credentials = struct {
             .subject = self.subject,
             .email = self.email,
             .scope = self.scope,
+            .id_token = self.id_token,
         };
     }
 };
@@ -163,9 +167,24 @@ pub const Store = struct {
     /// An access token good for at least the next request, renewed first when
     /// the held one is about to run out. Allocated in `arena`.
     pub fn accessToken(self: *Store, arena: std.mem.Allocator) ![]const u8 {
+        try self.adoptFile();
         if (try self.freshToken(arena)) |token| return token;
         try self.renew(.when_expiring);
         return (try self.freshToken(arena)) orelse Error.SessionExpired;
+    }
+
+    /// Take up whatever another process left in the file: a sign-out, or a
+    /// token it renewed. The file is written by rename, so a read never sees
+    /// half of a save.
+    fn adoptFile(self: *Store) !void {
+        var scratch_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer scratch_state.deinit();
+        const scratch = scratch_state.allocator();
+        const on_disk = readFile(scratch, self.io, self.path) catch return;
+        const held = try self.snapshot(scratch);
+        const is_same = std.mem.eql(u8, on_disk.access_token, held.access_token) and
+            std.mem.eql(u8, on_disk.refresh_token, held.refresh_token);
+        if (!is_same) try self.hold(on_disk);
     }
 
     /// Renew now, whatever the held token's expiry says. For a request the
@@ -178,6 +197,7 @@ pub const Store = struct {
         self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
         if (!self.credentials.isSignedIn()) return Error.NotSignedIn;
+        if (!self.credentials.hasPlanUsage()) return Error.PlanUsageNotGranted;
         if (isExpiringSoon(self.io, self.credentials.expires_at)) return null;
         return try arena.dupe(u8, self.credentials.access_token);
     }
@@ -288,7 +308,7 @@ pub const Store = struct {
 /// token rotates: a store that rewrites every provider's key at once would
 /// eventually write a spent one back.
 fn defaultPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
-    return Config.dataPath(allocator, env, credential_file);
+    return Config.privateDataPath(allocator, env, credential_file);
 }
 
 /// A browser sign-in that has been started and not yet settled. Built on one
@@ -359,6 +379,7 @@ pub const SignIn = struct {
             .nonce = self.nonce,
             .challenge = try pkceChallenge(arena, self.verifier),
             .login_hint = saved.email,
+            .id_token_hint = saved.id_token,
             .ask_consent = saved.hasDeclinedPlanUsage(),
         });
         return self;
@@ -380,6 +401,9 @@ pub const SignIn = struct {
             .denied => return Error.AuthorizationDenied,
             .code => |code| code,
         };
+        if (code.iss) |named| {
+            if (!std.mem.eql(u8, named, issuer)) return Error.IssuerMismatch;
+        }
 
         const arena = self.arena.allocator();
         const client_id = try self.issuedClientId(code.client_id);
@@ -452,6 +476,7 @@ const AuthorizationRequest = struct {
     nonce: []const u8,
     challenge: []const u8,
     login_hint: []const u8,
+    id_token_hint: []const u8 = "",
     ask_consent: bool = false,
 };
 
@@ -472,6 +497,7 @@ fn authorizationUrl(arena: std.mem.Allocator, request: AuthorizationRequest) ![]
     try queryParam(w, &first, "code_challenge_method", "S256");
     try queryParam(w, &first, "code_challenge", request.challenge);
     if (!request.registering and request.login_hint.len > 0) try queryParam(w, &first, "login_hint", request.login_hint);
+    if (!request.registering and request.id_token_hint.len > 0) try queryParam(w, &first, "id_token_hint", request.id_token_hint);
     if (request.ask_consent) try queryParam(w, &first, "prompt", "consent");
     return url.toOwnedSlice();
 }
@@ -627,6 +653,7 @@ const IdTokenClaims = struct {
     iss: []const u8 = "",
     sub: []const u8 = "",
     aud: std.json.Value = .null,
+    azp: []const u8 = "",
     exp: i64 = 0,
     nonce: []const u8 = "",
     email: []const u8 = "",
@@ -653,18 +680,22 @@ fn verifyIdToken(arena: std.mem.Allocator, io: std.Io, id_token: []const u8, cli
 
 fn checkClaims(claims: IdTokenClaims, client_id: []const u8, nonce: []const u8, now: i64) !void {
     if (!std.mem.eql(u8, claims.iss, issuer)) return Error.InvalidIdToken;
-    if (!audienceIncludes(claims.aud, client_id)) return Error.InvalidIdToken;
+    if (!isAudienceOnly(claims.aud, client_id)) return Error.InvalidIdToken;
+    if (claims.azp.len > 0 and !std.mem.eql(u8, claims.azp, client_id)) return Error.InvalidIdToken;
     if (claims.exp <= now) return Error.InvalidIdToken;
     if (!std.mem.eql(u8, claims.nonce, nonce)) return Error.InvalidIdToken;
     if (claims.sub.len == 0) return Error.InvalidIdToken;
 }
 
-fn audienceIncludes(aud: std.json.Value, client_id: []const u8) bool {
+/// A token meant for this client and no other. OIDC Core 3.1.3.7: reject one
+/// that also names audiences the client does not trust.
+fn isAudienceOnly(aud: std.json.Value, client_id: []const u8) bool {
     return switch (aud) {
         .string => |single| std.mem.eql(u8, single, client_id),
-        .array => |list| for (list.items) |entry| {
-            if (entry == .string and std.mem.eql(u8, entry.string, client_id)) break true;
-        } else false,
+        .array => |list| list.items.len > 0 and for (list.items) |entry| {
+            const is_client = entry == .string and std.mem.eql(u8, entry.string, client_id);
+            if (!is_client) break false;
+        } else true,
         else => false,
     };
 }
@@ -893,6 +924,40 @@ test "claims must name this client, this nonce, and OpenAI" {
     var wrong_issuer = good;
     wrong_issuer.iss = "https://evil.example";
     try testing.expectError(Error.InvalidIdToken, checkClaims(wrong_issuer, "oaiapp_abc", "n1", 1000));
+
+    var shared_list = std.json.Array.init(testing.allocator);
+    defer shared_list.deinit();
+    try shared_list.append(.{ .string = "oaiapp_abc" });
+    try shared_list.append(.{ .string = "oaiapp_other" });
+    var shared = good;
+    shared.aud = .{ .array = shared_list };
+    try testing.expectError(Error.InvalidIdToken, checkClaims(shared, "oaiapp_abc", "n1", 1000));
+
+    var other_party = good;
+    other_party.azp = "oaiapp_other";
+    try testing.expectError(Error.InvalidIdToken, checkClaims(other_party, "oaiapp_abc", "n1", 1000));
+    var this_party = good;
+    this_party.azp = "oaiapp_abc";
+    try checkClaims(this_party, "oaiapp_abc", "n1", 1000);
+}
+
+test "a token without the plan permission is never handed to a request" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "chatgpt.json" });
+    defer testing.allocator.free(path);
+
+    const far_future = unixSeconds(io) + 3600;
+    try writeFile(io, path, .{ .client_id = "c", .access_token = "a", .refresh_token = "r", .scope = "openid email", .expires_at = far_future });
+    const store = try Store.open(testing.allocator, io, path);
+    defer store.destroy();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    try testing.expectError(Error.PlanUsageNotGranted, store.accessToken(arena_state.allocator()));
 }
 
 test "an RS256 signature verifies against its key and nothing else" {
@@ -952,12 +1017,12 @@ test "a token another process already renewed is adopted, not spent again" {
     const path = try std.fs.path.join(testing.allocator, &.{ root, "chatgpt.json" });
     defer testing.allocator.free(path);
 
-    try writeFile(io, path, .{ .client_id = "c", .access_token = "old", .refresh_token = "r1", .expires_at = 0 });
+    try writeFile(io, path, .{ .client_id = "c", .access_token = "old", .refresh_token = "r1", .scope = plan_scope, .expires_at = 0 });
     const store = try Store.open(testing.allocator, io, path);
     defer store.destroy();
 
     const far_future = unixSeconds(io) + 3600;
-    try writeFile(io, path, .{ .client_id = "c", .access_token = "new", .refresh_token = "r2", .expires_at = far_future });
+    try writeFile(io, path, .{ .client_id = "c", .access_token = "new", .refresh_token = "r2", .scope = plan_scope, .expires_at = far_future });
 
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();

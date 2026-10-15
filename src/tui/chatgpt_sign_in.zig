@@ -78,7 +78,7 @@ pub fn explain(err: anyerror) []const u8 {
         error.PlanUsageNotGranted => "Signed in, but synth was not allowed to use your ChatGPT plan. Pick ChatGPT plan again (ctrl+p) to allow it.",
         error.AccountMismatch => "That is a different ChatGPT account than the one synth was signed in with. Run /logout to switch accounts, then sign in again.",
         error.ClientMismatch, error.RegistrationIncomplete => "OpenAI did not finish registering synth. Try signing in again.",
-        error.InvalidIdToken => "OpenAI's sign-in response could not be verified, so it was not trusted.",
+        error.InvalidIdToken, error.IssuerMismatch => "OpenAI's sign-in response could not be verified, so it was not trusted.",
         error.NoFreePort => "Could not open a local port for the sign-in callback. Another sign-in may be open; close it and try again.",
         error.Canceled => "Sign-in canceled.",
         else => "Sign-in failed. Try again from the providers dialog (ctrl+p).",
