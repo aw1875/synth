@@ -80,7 +80,13 @@ pub const Model = struct {
     vision: bool = true,
     efforts: []const []const u8 = &.{},
     default_effort: []const u8 = "",
+    accepts_summary: bool = true,
 };
+
+/// Catalog levels that are a mode of Codex's rather than a value the API
+/// takes: `ultra` delegates to several agents. Codex never sends it either;
+/// see `resolve_reasoning_effort` in openai/codex.
+const codex_only_levels = [_][]const u8{"ultra"};
 
 pub fn start(self: *ChatGPTProvider) !void {
     self.startClient();
@@ -298,11 +304,17 @@ fn chosenEffort(self: *const ChatGPTProvider) []const u8 {
     return self.effort_buffer[0..self.effort_len];
 }
 
-/// What the next request runs at: the chosen level, else the model's default.
+/// What the next request runs at, and what it says it runs at: the chosen
+/// level, else the model's default.
 fn effectiveEffort(self: *const ChatGPTProvider) []const u8 {
     if (self.effort_len > 0) return self.chosenEffort();
     const entry = self.catalogEntry(self.model) orelse return "";
     return entry.default_effort;
+}
+
+fn acceptsSummary(self: *const ChatGPTProvider) bool {
+    const entry = self.catalogEntry(self.model) orelse return true;
+    return entry.accepts_summary;
 }
 
 fn loadCatalog(self: *ChatGPTProvider) !void {
@@ -330,6 +342,7 @@ fn parseCatalog(arena: std.mem.Allocator, body: []const u8) ![]const Model {
             input_modalities: []const []const u8 = &.{},
             supported_reasoning_levels: []const struct { effort: []const u8 = "" } = &.{},
             default_reasoning_level: []const u8 = "",
+            supports_reasoning_summary_parameter: bool = true,
         } = &.{},
     };
     const parsed = std.json.parseFromSliceLeaky(Listing, arena, body, .{ .ignore_unknown_fields = true }) catch
@@ -339,14 +352,20 @@ fn parseCatalog(arena: std.mem.Allocator, body: []const u8) ![]const Model {
     for (parsed.models) |entry| {
         const listed = std.mem.eql(u8, entry.visibility, "list");
         if (!listed or entry.slug.len == 0) continue;
-        const levels = try arena.alloc([]const u8, entry.supported_reasoning_levels.len);
-        for (entry.supported_reasoning_levels, levels) |level, *effort| effort.* = level.effort;
+        var levels: std.ArrayList([]const u8) = .empty;
+        for (entry.supported_reasoning_levels) |level| {
+            if (containsString(&codex_only_levels, level.effort)) continue;
+            try levels.append(arena, level.effort);
+        }
+        const offered = try levels.toOwnedSlice(arena);
+        const has_default = containsString(offered, entry.default_reasoning_level);
         try models.append(arena, .{
             .slug = entry.slug,
             .context_window = entry.context_window,
             .vision = containsString(entry.input_modalities, "image"),
-            .efforts = levels,
-            .default_effort = entry.default_reasoning_level,
+            .efforts = offered,
+            .default_effort = if (has_default) entry.default_reasoning_level else "",
+            .accepts_summary = entry.supports_reasoning_summary_parameter,
         });
     }
     return models.toOwnedSlice(arena);
@@ -373,8 +392,12 @@ fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8) ![]u8 
             .keep_alive = false,
             .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
         });
-        defer request.deinit();
+        defer {
+            self.forgetSocket();
+            request.deinit();
+        }
         try request.sendBodiless();
+        self.watch(&request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
@@ -406,9 +429,9 @@ fn respond(
     const store = self.store orelse return error.NotSignedIn;
     self.startClient();
     self.clearRejection();
+    self.armSocket();
     if (self.model.len == 0 or self.context_limit == 0) self.ensureModel() catch {};
 
-    self.armSocket();
     var attempt: usize = 1;
     var refreshed = false;
     while (true) {
@@ -550,10 +573,17 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
         try writeTools(arena, w, turn.tools_json);
         try w.writeAll(",\"tool_choice\":\"auto\",\"parallel_tool_calls\":true");
     }
-    try w.writeAll(",\"reasoning\":{\"summary\":\"detailed\"");
-    if (self.effort_len > 0) {
-        try w.writeAll(",\"effort\":");
-        try writeString(w, self.chosenEffort());
+    try w.writeAll(",\"reasoning\":{");
+    var reasoning_first = true;
+    if (self.acceptsSummary()) {
+        try w.writeAll("\"summary\":\"detailed\"");
+        reasoning_first = false;
+    }
+    const effort = self.effectiveEffort();
+    if (effort.len > 0) {
+        if (!reasoning_first) try w.writeByte(',');
+        try w.writeAll("\"effort\":");
+        try writeString(w, effort);
     }
     try w.writeAll("},\"include\":[\"reasoning.encrypted_content\"],\"store\":false,\"stream\":true,\"prompt_cache_key\":");
     try writeString(w, self.cacheKey(convo));
@@ -567,8 +597,10 @@ const InputWriter = struct {
     writer: *std.Io.Writer,
     supports_vision: bool,
     first: bool = true,
-    /// Whether the last assistant turn left calls for tool messages to answer.
-    /// An output with no call before it is refused.
+    /// Whether an assistant turn since the last user message made calls for
+    /// tool messages to answer. An output with no call before it is refused.
+    /// A message without calls in between, such as a note posted mid-turn,
+    /// leaves them open.
     open_calls: bool = false,
 
     fn separator(self: *InputWriter) !void {
@@ -585,7 +617,8 @@ const InputWriter = struct {
                 try self.user(content, msg.images);
             },
             .assistant => {
-                self.open_calls = try self.assistant(arena, msg, content);
+                const made_calls = try self.assistant(arena, msg, content);
+                self.open_calls = self.open_calls or made_calls;
                 try self.closeUnansweredCalls(msg, all);
             },
             .tool => {
@@ -1353,15 +1386,21 @@ fn catalogFixture(chat: *ChatGPTProvider) !void {
     chat.catalog = try parseCatalog(arena_state.allocator(),
         \\{"models":[
         \\ {"slug":"gpt-test","visibility":"list","default_reasoning_level":"medium",
-        \\  "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"ultra"}]},
-        \\ {"slug":"gpt-small","visibility":"list","default_reasoning_level":"low",
+        \\  "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"ultra"}]},
+        \\ {"slug":"gpt-small","visibility":"list","default_reasoning_level":"low","supports_reasoning_summary_parameter":false,
         \\  "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"}]}
         \\]}
     );
     chat.catalog_arena = arena_state;
 }
 
-test "effort is one of the model's levels, sent only when chosen, and dropped where unsupported" {
+fn requestReasoning(chat: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conversation) !std.json.ObjectMap {
+    const body = try chat.buildRequest(arena, convo, .{ .system = "s" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    return parsed.object.get("reasoning").?.object;
+}
+
+test "effort is one of the model's API levels, always sent, and dropped where unsupported" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const store = try testStore(&tmp);
@@ -1382,17 +1421,61 @@ test "effort is one of the model's levels, sent only when chosen, and dropped wh
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const unset = try std.json.parseFromSliceLeaky(std.json.Value, arena, try chat.buildRequest(arena, &convo, .{ .system = "s" }), .{});
-    try testing.expect(unset.object.get("reasoning").?.object.get("effort") == null);
-
-    chat.setEffort("sideways");
-    try testing.expectEqualStrings("medium", chat.current().effort);
+    try testing.expectEqualStrings("medium", (try requestReasoning(&chat, arena, &convo)).get("effort").?.string);
 
     chat.setEffort("ultra");
-    try testing.expectEqualStrings("ultra", chat.current().effort);
-    const chosen = try std.json.parseFromSliceLeaky(std.json.Value, arena, try chat.buildRequest(arena, &convo, .{ .system = "s" }), .{});
-    try testing.expectEqualStrings("ultra", chosen.object.get("reasoning").?.object.get("effort").?.string);
+    try testing.expectEqualStrings("medium", chat.current().effort);
+
+    chat.setEffort("high");
+    try testing.expectEqualStrings("high", (try requestReasoning(&chat, arena, &convo)).get("effort").?.string);
 
     try chat.setModel("gpt-small");
     try testing.expectEqualStrings("low", chat.current().effort);
+}
+
+test "a summary is asked for only from a model that takes the parameter" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+    try catalogFixture(&chat);
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "hello");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try testing.expectEqualStrings("detailed", (try requestReasoning(&chat, arena, &convo)).get("summary").?.string);
+    try chat.setModel("gpt-small");
+    try testing.expect((try requestReasoning(&chat, arena, &convo)).get("summary") == null);
+}
+
+test "a note posted mid-turn does not cut a tool call off from its result" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "list it");
+    var calls = [_]Conversation.ToolCall{.{ .id = "call_9", .name = "list", .arguments = "{}" }};
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    try convo.add(.assistant, "`gpt-test` now runs at high effort.");
+    _ = try convo.addToolResult("list", "call_9", "a b c");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try chat.buildRequest(arena_state.allocator(), &convo, .{ .system = "s" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+    const input = parsed.object.get("input").?.array.items;
+    const last = input[input.len - 1].object;
+    try testing.expectEqualStrings("function_call_output", last.get("type").?.string);
+    try testing.expectEqualStrings("a b c", last.get("output").?.string);
 }

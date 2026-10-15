@@ -41,7 +41,7 @@ describe_error: ?*const fn (*anyopaque, anyerror, std.mem.Allocator) anyerror![]
 /// The reasoning effort levels a model accepts. Borrowed until a reconnect.
 efforts: ?*const fn (*anyopaque, []const u8) Efforts = null,
 /// Ask for one of `efforts` from the next turn on; "" returns to the model's
-/// own default. A level the current model does not offer is ignored.
+/// own default, and so does a level the current model does not offer.
 set_effort: ?*const fn (*anyopaque, []const u8) void = null,
 /// Break off whatever `respond` is waiting on, from another thread.
 ///
