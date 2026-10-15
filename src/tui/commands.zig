@@ -303,7 +303,7 @@ pub fn showProviders(self: *Model) !void {
             .id = entry.id,
             .host = if (entry.host_editable and remembered.len > 0) remembered else entry.host,
             .connected = if (entry.key == .oauth) entry.ready(auth, self.chatgpt) else auth.key(entry.id) != null,
-            .active = std.mem.eql(u8, entry.id, active_id),
+            .active = !self.provider_missing and std.mem.eql(u8, entry.id, active_id),
         };
     }
 
@@ -416,7 +416,10 @@ pub fn pollSignOut(self: *Model, ctx: *vxfw.EventContext) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const active_id = try activeProviderId(self, arena_state.allocator());
-    if (std.mem.eql(u8, active_id, catalog.chatgpt_id)) try showProviders(self);
+    if (!std.mem.eql(u8, active_id, catalog.chatgpt_id)) return;
+    self.provider_missing = true;
+    const db = self.loop.database() orelse return;
+    db.setActiveProvider("") catch |err| try note(self, "Could not clear the provider: {s}", .{@errorName(err)});
 }
 
 /// Open ChatGPT's usage page, where the plan's and synth's limits are set.
@@ -457,6 +460,7 @@ fn pointAt(self: *Model, result: Connect.Result) !bool {
 
     // Wholesale: another protocol is another client, and the old one is gone.
     self.provider = provider;
+    self.provider_missing = false;
     self.loop.provider = provider;
     try self.loop.setModel(provider.model);
 
@@ -674,7 +678,7 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
         const arena = arena_state.allocator();
 
         const active_id = try activeProviderId(self, arena);
-        if (!std.mem.eql(u8, entry.provider_id, active_id)) {
+        if (self.provider_missing or !std.mem.eql(u8, entry.provider_id, active_id)) {
             const provider = catalog.findOrDefault(entry.provider_id);
             var host = provider.host;
             if (provider.host_editable) {

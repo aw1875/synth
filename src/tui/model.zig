@@ -239,6 +239,10 @@ notification: Notification = undefined,
 auth: ?*Auth = null,
 /// The ChatGPT sign-in, which lives in a file of its own. Borrowed.
 chatgpt: ?*chatgpt_auth.Store = null,
+/// Nothing usable is selected: none was ever chosen and no local server
+/// answered, or the one in use was signed out of. A prompt opens the
+/// providers dialog instead of failing against it.
+provider_missing: bool = false,
 /// A browser sign-in in progress, polled by the tick loop.
 chatgpt_sign_in: ?*SignInTask = null,
 /// A sign-out waiting on OpenAI to confirm the revocation.

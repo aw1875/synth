@@ -25,6 +25,12 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
 
     if (try commands.runCommand(self, ctx, value)) return;
 
+    if (self.provider_missing) {
+        try commands.showProviders(self);
+        ctx.redraw = true;
+        return;
+    }
+
     if (self.loop.state == .awaiting_answer) {
         try self.loop.answer(value);
         self.input.clear();

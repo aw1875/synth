@@ -266,7 +266,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try model.loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");
 
-    if (!active.entry.ready(&auth, chatgpt)) try tui_commands.showProviders(model);
+    model.provider_missing = !try hasUsableProvider(allocator, &db, &config, active, &auth, chatgpt, &backend);
+    if (model.provider_missing) try tui_commands.showProviders(model);
     try tui_commands.restoreEffort(model);
 
     if (try resumeTarget(&db, model.loop.project_id, options)) |session_id| {
@@ -296,4 +297,29 @@ fn resumeTarget(db: *Database, project_id: ?i64, options: cli.Command.Tui) !?i64
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+/// A provider someone chose, and that has what it needs; or, with nothing
+/// chosen, a local server that actually answers. Defaulting to one that is not
+/// there would only surface as an error on the first prompt.
+fn hasUsableProvider(
+    allocator: std.mem.Allocator,
+    db: *Database,
+    config: *const Config,
+    active: catalog.Active,
+    auth: *const Auth,
+    chatgpt: *chatgpt_auth.Store,
+    backend: *Backend,
+) !bool {
+    if (!active.entry.ready(auth, chatgpt)) return false;
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const chosen = try db.activeProvider(arena);
+    const was_chosen = chosen.len > 0 or config.provider_override.len > 0 or config.host_override.len > 0;
+    if (was_chosen) return true;
+
+    const offered = backend.listModels(arena) catch return false;
+    return offered.len > 0;
 }

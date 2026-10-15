@@ -995,7 +995,9 @@ pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, wid
     const room = width - Model.gutter * 2;
 
     // Both: the same model tag is served by a local process and by a cloud.
-    const answering = if (self.provider.model.len > 0)
+    const answering = if (self.provider_missing)
+        "no provider"
+    else if (self.provider.model.len > 0)
         std.fmt.allocPrint(ctx.arena, "{s}{s}{s}{s}{s}", .{
             self.provider.model,
             if (self.provider.effort.len > 0) " " else "",
