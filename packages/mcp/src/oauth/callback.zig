@@ -115,7 +115,7 @@ const poll_interval_ns: u64 = 25 * std.time.ns_per_ms;
 
 const Server = httpz.Server(*Rendezvous);
 
-pub const default_success_page =
+const default_success_page =
     \\<html><body style="font-family:system-ui;padding:3rem">
     \\<h2>Authorization received</h2>
     \\<p>Return to your terminal to finish. You can close this tab.</p>

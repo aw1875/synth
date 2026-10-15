@@ -49,9 +49,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     var auth = try Auth.open(allocator, io, init.environ_map);
     defer auth.deinit();
-    const chatgpt_path = try chatgpt_auth.defaultPath(allocator, init.environ_map);
-    defer allocator.free(chatgpt_path);
-    const chatgpt = try chatgpt_auth.Store.open(allocator, io, chatgpt_path);
+    const chatgpt = try chatgpt_auth.Store.openDefault(allocator, io, init.environ_map);
     defer chatgpt.destroy();
 
     var db = try Database.init(allocator, io, config.database_path);

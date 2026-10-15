@@ -99,9 +99,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
 
     var auth = try Auth.open(allocator, io, init.environ_map);
     defer auth.deinit();
-    const chatgpt_path = try chatgpt_auth.defaultPath(allocator, init.environ_map);
-    defer allocator.free(chatgpt_path);
-    const chatgpt = try chatgpt_auth.Store.open(allocator, io, chatgpt_path);
+    const chatgpt = try chatgpt_auth.Store.openDefault(allocator, io, init.environ_map);
     defer chatgpt.destroy();
     timing.mark("auth");
 
@@ -268,13 +266,13 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
 
     model.provider_missing = !try hasUsableProvider(allocator, &db, &config, active, &auth, chatgpt, &backend);
     if (model.provider_missing) try tui_commands.showProviders(model);
-    try tui_commands.restoreEffort(model);
 
     if (try resumeTarget(&db, model.loop.project_id, options)) |session_id| {
         try model.loop.resumeSession(session_id, Model.resume_messages);
         tui_commands.syncProvider(model);
         try model.seedHistory();
     }
+    try tui_commands.restoreEffort(model);
 
     timing.total("startup");
 

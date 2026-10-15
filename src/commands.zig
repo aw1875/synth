@@ -337,9 +337,7 @@ pub fn models(init_process: std.process.Init) !void {
     var arena_state: std.heap.ArenaAllocator = .init(ctx.allocator);
     defer arena_state.deinit();
     const active = try catalog.resolve(arena_state.allocator(), &ctx.db, &ctx.config, &ctx.auth);
-    const chatgpt_path = try chatgpt_auth.defaultPath(ctx.allocator, init_process.environ_map);
-    defer ctx.allocator.free(chatgpt_path);
-    const chatgpt = try chatgpt_auth.Store.open(ctx.allocator, ctx.io, chatgpt_path);
+    const chatgpt = try chatgpt_auth.Store.openDefault(ctx.allocator, ctx.io, init_process.environ_map);
     defer chatgpt.destroy();
     var backend: Backend = .init(active.entry.kind, .{
         .allocator = ctx.allocator,

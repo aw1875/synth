@@ -81,7 +81,7 @@ pub const Credentials = struct {
 
     /// A previous sign-in that came back without the plan permission. Asking
     /// again needs the consent screen, which a returning sign-in otherwise skips.
-    fn declinedPlanUsage(self: Credentials) bool {
+    fn hasDeclinedPlanUsage(self: Credentials) bool {
         return self.scope.len > 0 and !self.hasPlanUsage();
     }
 
@@ -125,6 +125,13 @@ pub const Store = struct {
         errdefer allocator.free(self.path);
         self.credentials = readFile(self.arena.allocator(), io, path) catch .{};
         return self;
+    }
+
+    /// The store at its usual place. The one way in, matching `Auth.open`.
+    pub fn openDefault(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !*Store {
+        const path = try defaultPath(allocator, env);
+        defer allocator.free(path);
+        return open(allocator, io, path);
     }
 
     pub fn destroy(self: *Store) void {
@@ -171,7 +178,7 @@ pub const Store = struct {
         self.state_mutex.lockUncancelable(self.io);
         defer self.state_mutex.unlock(self.io);
         if (!self.credentials.isSignedIn()) return Error.NotSignedIn;
-        if (expiresSoon(self.io, self.credentials.expires_at)) return null;
+        if (isExpiringSoon(self.io, self.credentials.expires_at)) return null;
         return try arena.dupe(u8, self.credentials.access_token);
     }
 
@@ -197,7 +204,7 @@ pub const Store = struct {
         const rotated_elsewhere = !std.mem.eql(u8, on_disk.refresh_token, held.refresh_token);
         if (rotated_elsewhere) try self.hold(on_disk);
         const needs_renewal = renewal == .always and !rotated_elsewhere;
-        if (!needs_renewal and !expiresSoon(self.io, on_disk.expires_at)) return;
+        if (!needs_renewal and !isExpiringSoon(self.io, on_disk.expires_at)) return;
 
         const tokens = requestRefresh(scratch, self.io, on_disk.client_id, on_disk.refresh_token) catch |err| {
             if (err == Error.SessionExpired) try self.save(on_disk.withoutTokens());
@@ -280,7 +287,7 @@ pub const Store = struct {
 /// `chatgpt.json`, beside `auth.json`. A file of its own because its refresh
 /// token rotates: a store that rewrites every provider's key at once would
 /// eventually write a spent one back.
-pub fn defaultPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
+fn defaultPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
     return Config.dataPath(allocator, env, credential_file);
 }
 
@@ -352,7 +359,7 @@ pub const SignIn = struct {
             .nonce = self.nonce,
             .challenge = try pkceChallenge(arena, self.verifier),
             .login_hint = saved.email,
-            .ask_consent = saved.declinedPlanUsage(),
+            .ask_consent = saved.hasDeclinedPlanUsage(),
         });
         return self;
     }
@@ -739,7 +746,7 @@ fn newHostId(arena: std.mem.Allocator, io: std.Io) ![]const u8 {
     return std.fmt.allocPrint(arena, "urn:uuid:{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
 }
 
-fn expiresSoon(io: std.Io, expires_at: i64) bool {
+fn isExpiringSoon(io: std.Io, expires_at: i64) bool {
     return unixSeconds(io) + expiry_skew_seconds >= expires_at;
 }
 
@@ -850,11 +857,11 @@ test "only the plan scope makes a sign-in usable for inference" {
     const identity_only: Credentials = .{ .access_token = "a", .scope = "openid email profile" };
     const with_plan: Credentials = .{ .access_token = "a", .scope = "openid " ++ plan_scope ++ " email" };
     try testing.expect(!identity_only.hasPlanUsage());
-    try testing.expect(identity_only.declinedPlanUsage());
+    try testing.expect(identity_only.hasDeclinedPlanUsage());
     try testing.expect(with_plan.hasPlanUsage());
-    try testing.expect(!with_plan.declinedPlanUsage());
+    try testing.expect(!with_plan.hasDeclinedPlanUsage());
     try testing.expect(!(Credentials{}).isSignedIn());
-    try testing.expect(!(Credentials{}).declinedPlanUsage());
+    try testing.expect(!(Credentials{}).hasDeclinedPlanUsage());
 }
 
 test "the PKCE challenge is the RFC 7636 example" {
