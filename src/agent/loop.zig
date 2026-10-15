@@ -580,6 +580,7 @@ pub fn syncProvider(self: *Loop) void {
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
+    self.provider.effort = now.effort;
 }
 
 /// What the loop is doing, for the UI's status row.

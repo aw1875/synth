@@ -55,6 +55,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/compact")) {
+        if (try offerProvidersInstead(self)) return true;
         try self.startCompaction(ctx);
         return true;
     }
@@ -120,8 +121,8 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/effort")) {
-        try chooseEffort(self, std.mem.trim(u8, line["/effort".len..], " "));
+    if (isCommand(line, "/effort")) {
+        try chooseEffort(self, ctx, std.mem.trim(u8, line["/effort".len..], " "));
         ctx.redraw = true;
         return true;
     }
@@ -136,6 +137,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.startsWith(u8, line, "/model")) {
+        if (try offerProvidersInstead(self)) return true;
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
             _ = switchModel(self, name) catch "";
@@ -325,8 +327,8 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !bool {
 
 /// Start a ChatGPT sign-in in the background. Returns whether one is running.
 fn beginSignIn(self: *Model) !bool {
-    if (self.chatgpt_sign_in != null) {
-        self.connect.showSignIn();
+    if (self.chatgpt_sign_in) |running| {
+        try self.connect.showSignIn(running.sign_in.url, isOverSsh(self));
         return true;
     }
     const store = self.chatgpt orelse {
@@ -339,13 +341,14 @@ fn beginSignIn(self: *Model) !bool {
         return false;
     };
     self.chatgpt_sign_in = task;
-    self.connect.showSignIn();
-    try note(self, "On a remote machine, forward the sign-in callback first: `ssh -L {d}:127.0.0.1:{d} <host>`, then copy the link with c.", .{
-        chatgpt_auth.callback_port,
-        chatgpt_auth.callback_port,
-    });
+    try self.connect.showSignIn(task.sign_in.url, isOverSsh(self));
     keys.openUrl(self, task.sign_in.url);
     return true;
+}
+
+fn isOverSsh(self: *Model) bool {
+    const environ = self.environ orelse return false;
+    return environ.get("SSH_CONNECTION") != null or environ.get("SSH_TTY") != null;
 }
 
 pub fn cancelSignIn(self: *Model) void {
@@ -484,6 +487,7 @@ fn pointAt(self: *Model, result: Connect.Result) !bool {
         };
     }
 
+    try restoreEffort(self);
     return true;
 }
 
@@ -495,8 +499,38 @@ pub fn note(self: *Model, comptime fmt: []const u8, args: anytype) !void {
     self.scroll = 0;
 }
 
+/// Whether `line` is `command` alone or followed by an argument, so `/effortx`
+/// is not read as `/effort x`.
+fn isCommand(line: []const u8, command: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, command)) return false;
+    return line.len == command.len or line[command.len] == ' ';
+}
+
+/// Nothing usable is selected: none was chosen, or the ChatGPT session in use
+/// has ended. Marked, so the title and the next prompt say so too.
+pub fn needsProvider(self: *Model) bool {
+    if (self.provider_missing) return true;
+    const store = self.chatgpt orelse return false;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const active_id = activeProviderId(self, arena_state.allocator()) catch return false;
+    const is_chatgpt_active = std.mem.eql(u8, active_id, catalog.chatgpt_id);
+    if (!is_chatgpt_active or store.isUsable()) return false;
+    self.provider_missing = true;
+    return true;
+}
+
+/// Open the providers dialog when there is nothing to act on. Returns whether
+/// it did, so the caller stops.
+pub fn offerProvidersInstead(self: *Model) !bool {
+    if (!needsProvider(self)) return false;
+    try showProviders(self);
+    return true;
+}
+
 /// Open the model switcher, asking each provider what it offers.
 pub fn showModels(self: *Model) !void {
+    if (try offerProvidersInstead(self)) return;
     if (!self.provider.switchable()) return;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -577,12 +611,15 @@ fn modelEntries(
     for (names, entries) |name, *model| {
         const efforts = provider.effortsFor(name);
         const remembered = try rememberedEffort(self, arena, entry.id, name);
+        const is_remembered_offered = for (efforts.levels) |level| {
+            if (std.mem.eql(u8, level, remembered)) break true;
+        } else false;
         model.* = .{
             .name = name,
             .provider = entry.label,
             .provider_id = entry.id,
             .efforts = try dupeLevels(arena, efforts.levels),
-            .effort = try arena.dupe(u8, if (remembered.len > 0) remembered else efforts.default),
+            .effort = try arena.dupe(u8, if (is_remembered_offered) remembered else efforts.default),
         };
     }
     return entries;
@@ -639,26 +676,39 @@ fn refreshEffort(self: *Model) void {
     self.loop.provider.effort = effort;
 }
 
-/// `/effort` alone opens the picker; with a level, sets it.
-fn chooseEffort(self: *Model, level: []const u8) !void {
-    const efforts = self.provider.effortsFor(self.provider.model);
-    if (efforts.levels.len == 0) return note(self, "`{s}` has no effort setting.", .{self.provider.model});
-    if (level.len == 0) return self.effort_picker.show(self.provider.model, efforts.levels, self.provider.effort);
-
+/// `/effort` alone opens the picker; with a level, sets it. Answers in a
+/// toast: a note would join the conversation the model is sent.
+fn chooseEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void {
+    if (try offerProvidersInstead(self)) return;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
-    const offered = try std.mem.join(arena_state.allocator(), ", ", efforts.levels);
+    const arena = arena_state.allocator();
+
+    const efforts = self.provider.effortsFor(self.provider.model);
+    if (efforts.levels.len == 0) {
+        return self.notification.show(ctx, .info, try std.fmt.allocPrint(arena, "{s} has no effort setting", .{self.provider.model}));
+    }
+    if (level.len == 0) return self.effort_picker.show(self.provider.model, efforts.levels, self.provider.current().effort);
+
     const is_offered = for (efforts.levels) |candidate| {
         if (std.mem.eql(u8, candidate, level)) break true;
     } else false;
-    if (!is_offered) return note(self, "`{s}` is not a level `{s}` offers. Levels: {s}.", .{ level, self.provider.model, offered });
-
-    try setEffort(self, level);
+    if (!is_offered) {
+        const offered = try std.mem.join(arena, ", ", efforts.levels);
+        return self.notification.show(ctx, .warn, try std.fmt.allocPrint(arena, "{s} offers: {s}", .{ self.provider.model, offered }));
+    }
+    try setEffort(self, ctx, level);
 }
 
-pub fn setEffort(self: *Model, level: []const u8) !void {
+/// Refused mid-turn: the request in flight reads the level as it is built.
+pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void {
+    if (self.loop.isBusy()) return self.notification.show(ctx, .info, "Finish the turn first");
     try applyEffort(self, level);
-    try note(self, "`{s}` now runs at {s} effort.", .{ self.provider.model, self.provider.effort });
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const said = try std.fmt.allocPrint(arena_state.allocator(), "{s} now runs at {s} effort", .{ self.provider.model, self.provider.current().effort });
+    try self.notification.show(ctx, .info, said);
 }
 
 /// The provider in use, by catalog id. Caller owns the result.
@@ -705,14 +755,14 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
             if (!try pointAt(self, connection)) return;
 
             const running = try switchModel(self, entry.name);
-            if (entry.effort.len > 0) try applyEffort(self, entry.effort);
+            if (entry.effort_changed) try applyEffort(self, entry.effort);
             try announceProvider(self, connection, running);
             return;
         }
     }
 
     _ = try switchModel(self, entry.name);
-    if (entry.effort.len > 0) try applyEffort(self, entry.effort);
+    if (entry.effort_changed) try applyEffort(self, entry.effort);
 }
 
 /// Point the provider at another of its models. Returns the model now in use,

@@ -37,6 +37,9 @@ pub const Entry = struct {
     efforts: []const []const u8 = &.{},
     /// The level it will run at if chosen, one of `efforts`.
     effort: []const u8 = "",
+    /// Whether the level was stepped here, and so is a choice worth keeping
+    /// rather than the default it was shown with.
+    effort_changed: bool = false,
 };
 
 /// A row of the drawn list: either a group heading or a model.
@@ -113,13 +116,13 @@ fn dupeEntry(allocator: std.mem.Allocator, source: Entry, recent: []const []cons
     return copy;
 }
 
-/// `requested` as it appears in `levels`, so the entry never points at memory it
-/// does not own; the first level when it is not there.
+/// `requested` as it appears in `levels`, so the entry never points at memory
+/// it does not own; "" when it is not there.
 fn matchingLevel(levels: []const []const u8, requested: []const u8) []const u8 {
     for (levels) |level| {
         if (std.mem.eql(u8, level, requested)) return level;
     }
-    return if (levels.len > 0) levels[0] else "";
+    return "";
 }
 
 /// Show the list. `models` and `recent` are borrowed for the length of the
@@ -190,11 +193,12 @@ pub fn handleKey(self: *Picker, ctx: *vxfw.EventContext, key: vaxis.Key) !Action
         self.move(1);
         return .none;
     }
-    if (key.matches(vaxis.Key.left, .{})) {
+    const offers_effort = if (self.highlighted()) |entry| entry.efforts.len > 0 else false;
+    if (offers_effort and key.matches(vaxis.Key.left, .{})) {
         self.stepEffort(-1);
         return .none;
     }
-    if (key.matches(vaxis.Key.right, .{})) {
+    if (offers_effort and key.matches(vaxis.Key.right, .{})) {
         self.stepEffort(1);
         return .none;
     }
@@ -266,15 +270,16 @@ fn highlighted(self: *Picker) ?*Entry {
 fn stepEffort(self: *Picker, delta: i32) void {
     const entry = self.highlighted() orelse return;
     if (entry.efforts.len == 0) return;
-    const at = levelIndex(entry.efforts, entry.effort);
+    const current: i32 = @intCast(levelIndex(entry.efforts, entry.effort));
     const last: i32 = @intCast(entry.efforts.len - 1);
-    const next: usize = @intCast(std.math.clamp(@as(i32, @intCast(at)) + delta, 0, last));
-    entry.effort = entry.efforts[next];
+    const stepped = std.math.clamp(current + delta, 0, last);
+    entry.effort = entry.efforts[@intCast(stepped)];
+    entry.effort_changed = true;
 }
 
 fn levelIndex(levels: []const []const u8, level: []const u8) usize {
     for (levels, 0..) |candidate, index| {
-        if (candidate.ptr == level.ptr) return index;
+        if (std.mem.eql(u8, candidate, level)) return index;
     }
     return 0;
 }
@@ -594,7 +599,7 @@ test "left and right step the highlighted model's effort, and stop at the ends" 
     try std.testing.expectEqualStrings("", picker.selected().?.effort);
 }
 
-test "an effort the model does not offer falls back to its first level" {
+test "an effort the model does not offer is not shown, and nothing counts as chosen until stepped" {
     var picker: Picker = .init(std.testing.allocator);
     defer picker.deinit();
 
@@ -602,5 +607,10 @@ test "an effort the model does not offer falls back to its first level" {
     try picker.show(&.{
         .{ .name = "gpt-a", .provider = "ChatGPT plan", .efforts = &levels, .effort = "ultra" },
     }, &.{}, "");
-    try std.testing.expectEqualStrings("low", picker.selected().?.effort);
+    try std.testing.expectEqualStrings("", picker.selected().?.effort);
+    try std.testing.expect(!picker.selected().?.effort_changed);
+
+    picker.stepEffort(1);
+    try std.testing.expectEqualStrings("high", picker.selected().?.effort);
+    try std.testing.expect(picker.selected().?.effort_changed);
 }

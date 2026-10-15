@@ -7,6 +7,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const catalog = @import("../provider/catalog.zig");
+const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const Input = @import("input.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -52,6 +53,10 @@ cursor: usize = 0,
 chosen: usize = 0,
 host: Input,
 key: Input,
+/// The page a browser sign-in is waiting on, while one is. Owned.
+sign_in_url: []const u8 = "",
+/// Whether to tell the person how to reach the callback from another machine.
+sign_in_over_ssh: bool = false,
 
 pub fn init(allocator: std.mem.Allocator) Connect {
     return .{
@@ -62,6 +67,7 @@ pub fn init(allocator: std.mem.Allocator) Connect {
 }
 
 pub fn deinit(self: *Connect) void {
+    self.forgetSignIn();
     self.release();
     self.rows.deinit(self.allocator);
     self.host.deinit();
@@ -109,6 +115,7 @@ fn find(states: []const State, id: []const u8) ?State {
 }
 
 pub fn close(self: *Connect) void {
+    self.forgetSignIn();
     self.stage = .closed;
     self.release();
     self.host.clear();
@@ -125,7 +132,6 @@ pub const Action = union(enum) {
     connect: Result,
     /// The user gave up waiting on the browser.
     cancel_sign_in,
-    /// Open the sign-in page in the browser again.
     reopen_sign_in,
     /// Put the sign-in link on the clipboard, for a browser elsewhere.
     copy_sign_in,
@@ -154,9 +160,16 @@ fn signInKey(key_press: vaxis.Key) Action {
     return .none;
 }
 
-/// Show the wait on a browser sign-in.
-pub fn showSignIn(self: *Connect) void {
+pub fn showSignIn(self: *Connect, url: []const u8, over_ssh: bool) !void {
+    self.forgetSignIn();
+    self.sign_in_url = try self.allocator.dupe(u8, url);
+    self.sign_in_over_ssh = over_ssh;
     self.stage = .signing_in;
+}
+
+fn forgetSignIn(self: *Connect) void {
+    if (self.sign_in_url.len > 0) self.allocator.free(self.sign_in_url);
+    self.sign_in_url = "";
 }
 
 fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
@@ -384,11 +397,15 @@ fn drawField(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: v
 }
 
 fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxfw.Size) !?Drawn {
-    _ = self;
-    const height: u16 = 9;
-    if (size.width < 32 or size.height < height) return null;
-
+    if (size.width < 32) return null;
     const width = @min(box_width, size.width -| 4);
+    const inner: usize = width -| (pad * 2);
+    const url_rows: u16 = @intCast(std.math.divCeil(usize, self.sign_in_url.len, inner) catch 0);
+    const ssh_rows: u16 = if (self.sign_in_over_ssh) 3 else 0;
+    const fixed_rows: u16 = 10;
+    const height: u16 = fixed_rows + url_rows + ssh_rows;
+    if (size.height < height) return null;
+
     const origin_row = (size.height -| height) / 2;
     const origin_col = (size.width -| width) / 2;
 
@@ -397,12 +414,29 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
 
     _ = w.writeText(surface, pad, 1, "Sign in with ChatGPT", theme.on_card(theme.fg).bold().cell);
     w.writeTextRight(surface, 1, pad, "esc", theme.on_card(theme.fg_dim).cell);
-    _ = w.writeText(surface, pad, 3, "Finish signing in in your browser.", theme.on_card(theme.fg_muted).cell);
+    _ = w.writeText(surface, pad, 3, "Finish in your browser. If it did not open, visit:", theme.on_card(theme.fg_muted).cell);
 
-    var action = w.writeText(surface, pad, 5, "o", theme.on_card(theme.fg_muted).bold().cell);
-    action = w.writeText(surface, action, 5, " open it again   ", theme.on_card(theme.fg_dim).cell);
-    action = w.writeText(surface, action, 5, "c", theme.on_card(theme.fg_muted).bold().cell);
-    _ = w.writeText(surface, action, 5, " copy the link", theme.on_card(theme.fg_dim).cell);
+    var remaining = self.sign_in_url;
+    var row: u16 = 5;
+    while (remaining.len > 0) : (row += 1) {
+        const take = @min(remaining.len, inner);
+        _ = w.writeLinked(surface, pad, row, remaining[0..take], theme.on_card(theme.accent_alt).cell, self.sign_in_url);
+        remaining = remaining[take..];
+    }
+
+    if (self.sign_in_over_ssh) {
+        row += 1;
+        _ = w.writeText(surface, pad, row, "Over SSH, forward the callback first: press ~C, then", theme.on_card(theme.fg_dim).cell);
+        const forward = try std.fmt.allocPrint(ctx.arena, "-L {d}:127.0.0.1:{d}", .{ chatgpt_auth.callback_port, chatgpt_auth.callback_port });
+        _ = w.writeText(surface, pad, row + 1, forward, theme.on_card(theme.fg_muted).cell);
+        row += 2;
+    }
+
+    const actions_row = row + 1;
+    var action = w.writeText(surface, pad, actions_row, "o", theme.on_card(theme.fg_muted).bold().cell);
+    action = w.writeText(surface, action, actions_row, " open it again   ", theme.on_card(theme.fg_dim).cell);
+    action = w.writeText(surface, action, actions_row, "c", theme.on_card(theme.fg_muted).bold().cell);
+    _ = w.writeText(surface, action, actions_row, " copy the link", theme.on_card(theme.fg_dim).cell);
 
     const hint_row = height - 2;
     var x = w.writeText(surface, pad, hint_row, "waiting for the browser   ", theme.on_card(theme.fg_dim).cell);
@@ -574,7 +608,7 @@ test "escape while waiting on the browser cancels the sign-in" {
     var connect: Connect = .init(testing.allocator);
     defer connect.deinit();
 
-    connect.showSignIn();
+    try connect.showSignIn("https://auth.openai.com/api/accounts/authorize?x=1", false);
     try testing.expectEqual(Stage.signing_in, connect.stage);
     try testing.expect(connect.focus() == null);
     try testing.expectEqual(Action.none, try connect.press(.{ .codepoint = vaxis.Key.enter }));

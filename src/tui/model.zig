@@ -20,6 +20,7 @@ const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const SignInTask = @import("chatgpt_sign_in.zig");
+const commands = @import("commands.zig");
 const SignOutTask = @import("chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
@@ -721,6 +722,7 @@ pub fn scheduleTick(self: *Model, ctx: *vxfw.EventContext) !void {
 /// Ask the model to summarise the transcript so far.
 pub fn startCompaction(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.loop.isBusy()) return;
+    if (commands.needsProvider(self)) return;
     try self.loop.compact();
     self.thinking.stream = self.loop.thoughts();
     self.thinking.frame = 0;
@@ -748,6 +750,7 @@ pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !voi
 /// without a scheduled tick nothing polls it, so the spinner sits still and the
 /// reply never lands until some other event wakes the loop.
 pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extras: AgentLoop.Extras) !void {
+    if (try commands.offerProvidersInstead(self)) return;
     try self.remember(prompt);
     try self.loop.submit(prompt, extras);
 
@@ -923,6 +926,8 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     if (self.loop.isBusy()) try self.loop.cancel();
 
     try self.loop.resumeSession(session_id, resume_messages);
+    commands.syncProvider(self);
+    try commands.restoreEffort(self);
 
     self.closeSubagent();
     self.subagent_sessions.clearRetainingCapacity();

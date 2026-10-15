@@ -25,8 +25,7 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
 
     if (try commands.runCommand(self, ctx, value)) return;
 
-    if (self.provider_missing) {
-        try commands.showProviders(self);
+    if (try commands.offerProvidersInstead(self)) {
         ctx.redraw = true;
         return;
     }
@@ -311,7 +310,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.effort_picker.close(),
                     .choose => {
-                        if (self.effort_picker.selected()) |level| try commands.setEffort(self, level);
+                        if (self.effort_picker.selected()) |level| try commands.setEffort(self, ctx, level);
                         self.effort_picker.close();
                     },
                 }

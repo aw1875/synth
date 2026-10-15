@@ -97,8 +97,10 @@ pub fn handleKey(self: *Picker, key: vaxis.Key) Action {
 
 fn move(self: *Picker, delta: i32) void {
     if (self.levels.len == 0) return;
+    const current: i32 = @intCast(self.cursor);
     const last: i32 = @intCast(self.levels.len - 1);
-    self.cursor = @intCast(std.math.clamp(@as(i32, @intCast(self.cursor)) + delta, 0, last));
+    const stepped = std.math.clamp(current + delta, 0, last);
+    self.cursor = @intCast(stepped);
 }
 
 pub const Drawn = struct {
@@ -109,9 +111,9 @@ pub const Drawn = struct {
 pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxfw.Size) !?Drawn {
     if (!self.open) return null;
 
-    const chrome: u16 = 6;
+    const frame_rows: u16 = 6;
     const visible: u16 = @intCast(self.levels.len);
-    const height: u16 = chrome + @max(visible, 1);
+    const height: u16 = frame_rows + @max(visible, 1);
     if (size.width < 32 or size.height < height) return null;
 
     const width = @min(box_width, size.width -| 4);
