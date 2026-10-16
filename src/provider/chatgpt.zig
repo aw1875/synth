@@ -40,6 +40,7 @@ aborted: bool = false,
 /// windows and vision. Lives in `catalog_arena`.
 catalog: []const Model = &.{},
 catalog_arena: ?std.heap.ArenaAllocator = null,
+catalog_lock: std.Io.Mutex = .init,
 model_owned: ?[]u8 = null,
 label_owned: ?[]u8 = null,
 /// What the server last said when it refused, owned here. Written on the
@@ -90,7 +91,7 @@ const codex_only_levels = [_][]const u8{"ultra"};
 
 pub fn start(self: *ChatGPTProvider) !void {
     self.startClient();
-    if (self.model.len > 0) self.loadCatalog() catch {};
+    if (self.model.len > 0) self.loadCatalog(false) catch {};
 }
 
 fn startClient(self: *ChatGPTProvider) void {
@@ -249,14 +250,23 @@ pub fn setModel(self: *ChatGPTProvider, name: []const u8) !void {
 /// The first model the account lists, in the server's own order, when none
 /// was chosen.
 pub fn ensureModel(self: *ChatGPTProvider) !void {
-    try self.loadCatalog();
+    try self.loadCatalog(false);
+    try self.chooseModel();
+}
+
+fn ensureModelForTurn(self: *ChatGPTProvider) !void {
+    try self.loadCatalog(true);
+    try self.chooseModel();
+}
+
+fn chooseModel(self: *ChatGPTProvider) !void {
     if (self.model.len > 0) return self.applyCatalogEntry();
     if (self.catalog.len == 0) return error.NoModels;
     try self.setModel(self.catalog[0].slug);
 }
 
 pub fn listModels(self: *ChatGPTProvider, allocator: std.mem.Allocator) ![][]const u8 {
-    try self.loadCatalog();
+    try self.loadCatalog(false);
     const names = try allocator.alloc([]const u8, self.catalog.len);
     var filled: usize = 0;
     errdefer {
@@ -285,7 +295,7 @@ fn catalogEntry(self: *const ChatGPTProvider, slug: []const u8) ?Model {
 }
 
 pub fn efforts(self: *ChatGPTProvider, slug: []const u8) Provider.Efforts {
-    self.loadCatalog() catch return .{};
+    self.loadCatalog(false) catch return .{};
     const entry = self.catalogEntry(slug) orelse return .{};
     return .{ .levels = entry.efforts, .default = entry.default_effort };
 }
@@ -317,7 +327,9 @@ fn acceptsSummary(self: *const ChatGPTProvider) bool {
     return entry.accepts_summary;
 }
 
-fn loadCatalog(self: *ChatGPTProvider) !void {
+fn loadCatalog(self: *ChatGPTProvider, track_turn: bool) !void {
+    self.catalog_lock.lockUncancelable(self.io);
+    defer self.catalog_lock.unlock(self.io);
     if (self.catalog_arena != null) return;
     self.startClient();
 
@@ -325,7 +337,7 @@ fn loadCatalog(self: *ChatGPTProvider) !void {
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try self.get(arena, models_url);
+    const body = try self.get(arena, models_url, track_turn);
     self.catalog = try parseCatalog(arena, body);
     self.catalog_arena = arena_state;
     self.applyCatalogEntry();
@@ -378,7 +390,7 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8) ![]u8 {
+fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8, track_turn: bool) ![]u8 {
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
     const store = self.store orelse return error.NotSignedIn;
@@ -393,11 +405,11 @@ fn get(self: *ChatGPTProvider, arena: std.mem.Allocator, url: []const u8) ![]u8 
             .headers = .{ .authorization = .{ .override = authorization }, .accept_encoding = .{ .override = "identity" } },
         });
         defer {
-            self.forgetSocket();
+            if (track_turn) self.forgetSocket();
             request.deinit();
         }
         try request.sendBodiless();
-        self.watch(&request);
+        if (track_turn) self.watch(&request);
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
@@ -430,7 +442,7 @@ fn respond(
     self.startClient();
     self.clearRejection();
     self.armSocket();
-    if (self.model.len == 0 or self.context_limit == 0) self.ensureModel() catch {};
+    if (self.model.len == 0 or self.context_limit == 0) self.ensureModelForTurn() catch {};
 
     var attempt: usize = 1;
     var refreshed = false;
