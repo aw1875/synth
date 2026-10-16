@@ -33,6 +33,13 @@ pub const Entry = struct {
     provider_id: []const u8 = "",
     /// Whether this project has used it before.
     recent: bool = false,
+    /// Reasoning effort levels it accepts, mildest first; empty when none.
+    efforts: []const []const u8 = &.{},
+    /// The level it will run at if chosen, one of `efforts`.
+    effort: []const u8 = "",
+    /// Whether the level was stepped here, and so is a choice worth keeping
+    /// rather than the default it was shown with.
+    effort_changed: bool = false,
 };
 
 /// A row of the drawn list: either a group heading or a model.
@@ -70,13 +77,52 @@ pub fn deinit(self: *Picker) void {
 }
 
 fn release(self: *Picker) void {
-    for (self.entries) |entry| {
-        self.allocator.free(entry.name);
-        self.allocator.free(entry.provider);
-        self.allocator.free(entry.provider_id);
-    }
+    for (self.entries) |entry| freeEntry(self.allocator, entry);
     self.allocator.free(self.entries);
     self.entries = &.{};
+}
+
+fn freeEntry(allocator: std.mem.Allocator, entry: Entry) void {
+    allocator.free(entry.name);
+    allocator.free(entry.provider);
+    allocator.free(entry.provider_id);
+    for (entry.efforts) |level| allocator.free(level);
+    allocator.free(entry.efforts);
+}
+
+fn dupeEntry(allocator: std.mem.Allocator, source: Entry, recent: []const []const u8) !Entry {
+    var copy: Entry = .{
+        .name = try allocator.dupe(u8, source.name),
+        .provider = "",
+        .provider_id = "",
+        .recent = isRecent(source.name, recent),
+    };
+    errdefer freeEntry(allocator, copy);
+    copy.provider = try allocator.dupe(u8, source.provider);
+    copy.provider_id = try allocator.dupe(u8, source.provider_id);
+
+    const levels = try allocator.alloc([]const u8, source.efforts.len);
+    var filled: usize = 0;
+    errdefer {
+        for (levels[0..filled]) |level| allocator.free(level);
+        allocator.free(levels);
+    }
+    for (source.efforts, levels) |level, *owned| {
+        owned.* = try allocator.dupe(u8, level);
+        filled += 1;
+    }
+    copy.efforts = levels;
+    copy.effort = matchingLevel(levels, source.effort);
+    return copy;
+}
+
+/// `requested` as it appears in `levels`, so the entry never points at memory
+/// it does not own; "" when it is not there.
+fn matchingLevel(levels: []const []const u8, requested: []const u8) []const u8 {
+    for (levels) |level| {
+        if (std.mem.eql(u8, level, requested)) return level;
+    }
+    return "";
 }
 
 /// Show the list. `models` and `recent` are borrowed for the length of the
@@ -92,20 +138,11 @@ pub fn show(
     const entries = try self.allocator.alloc(Entry, models.len);
     var filled: usize = 0;
     errdefer {
-        for (entries[0..filled]) |entry| {
-            self.allocator.free(entry.name);
-            self.allocator.free(entry.provider);
-            self.allocator.free(entry.provider_id);
-        }
+        for (entries[0..filled]) |entry| freeEntry(self.allocator, entry);
         self.allocator.free(entries);
     }
     for (models, entries) |src, *dst| {
-        dst.* = .{
-            .name = try self.allocator.dupe(u8, src.name),
-            .provider = try self.allocator.dupe(u8, src.provider),
-            .provider_id = try self.allocator.dupe(u8, src.provider_id),
-            .recent = isRecent(src.name, recent),
-        };
+        dst.* = try dupeEntry(self.allocator, src, recent);
         filled += 1;
     }
     self.entries = entries;
@@ -154,6 +191,15 @@ pub fn handleKey(self: *Picker, ctx: *vxfw.EventContext, key: vaxis.Key) !Action
     }
     if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
         self.move(1);
+        return .none;
+    }
+    const offers_effort = if (self.highlighted()) |entry| entry.efforts.len > 0 else false;
+    if (offers_effort and key.matches(vaxis.Key.left, .{})) {
+        self.stepEffort(-1);
+        return .none;
+    }
+    if (offers_effort and key.matches(vaxis.Key.right, .{})) {
+        self.stepEffort(1);
         return .none;
     }
 
@@ -210,6 +256,32 @@ fn startsAWord(text: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(word[0..needle.len], needle)) return true;
     }
     return false;
+}
+
+fn highlighted(self: *Picker) ?*Entry {
+    if (self.cursor >= self.rows.items.len) return null;
+    return switch (self.rows.items[self.cursor]) {
+        .heading => null,
+        .entry => |index| &self.entries[index],
+    };
+}
+
+/// Move the highlighted model's effort one level, stopping at either end.
+fn stepEffort(self: *Picker, delta: i32) void {
+    const entry = self.highlighted() orelse return;
+    if (entry.efforts.len == 0) return;
+    const current: i32 = @intCast(levelIndex(entry.efforts, entry.effort));
+    const last: i32 = @intCast(entry.efforts.len - 1);
+    const stepped = std.math.clamp(current + delta, 0, last);
+    entry.effort = entry.efforts[@intCast(stepped)];
+    entry.effort_changed = true;
+}
+
+fn levelIndex(levels: []const []const u8, level: []const u8) usize {
+    for (levels, 0..) |candidate, index| {
+        if (std.mem.eql(u8, candidate, level)) return index;
+    }
+    return 0;
 }
 
 /// Step the cursor by `delta` rows, skipping headings and stopping at the ends.
@@ -304,6 +376,14 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
                 const x = w.writeText(surface, pad + 2, y, entry.name, base.withFg(theme.fg).cell);
                 _ = w.writeText(surface, x + 1, y, entry.provider, base.withFg(theme.fg_dim).cell);
+                if (entry.effort.len > 0) {
+                    const shown = if (chosen)
+                        try std.fmt.allocPrint(ctx.arena, "‹ {s} ›", .{entry.effort})
+                    else
+                        entry.effort;
+                    const tone = if (chosen) theme.accent else theme.fg_dim;
+                    w.writeTextRight(surface, y, pad, shown, base.withFg(tone).cell);
+                }
             },
         }
     }
@@ -312,7 +392,12 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
     var hint = w.writeText(surface, pad, hint_row, "↑↓", theme.on_card(theme.fg_muted).bold().cell);
     hint = w.writeText(surface, hint, hint_row, " select   ", theme.on_card(theme.fg_dim).cell);
     hint = w.writeText(surface, hint, hint_row, "enter", theme.on_card(theme.fg_muted).bold().cell);
-    _ = w.writeText(surface, hint, hint_row, " switch", theme.on_card(theme.fg_dim).cell);
+    hint = w.writeText(surface, hint, hint_row, " switch", theme.on_card(theme.fg_dim).cell);
+    const offers_effort = if (self.selected()) |entry| entry.efforts.len > 0 else false;
+    if (offers_effort) {
+        hint = w.writeText(surface, hint, hint_row, "   ←→", theme.on_card(theme.fg_muted).bold().cell);
+        _ = w.writeText(surface, hint, hint_row, " effort", theme.on_card(theme.fg_dim).cell);
+    }
 
     return .{
         .surface = surface,
@@ -488,4 +573,44 @@ test "the box is drawn without overflowing its own arithmetic" {
 
     try std.testing.expect(try picker.draw(ctx, widget, .{ .width = 20, .height = 40 }) == null);
     try std.testing.expect(try picker.draw(ctx, widget, .{ .width = 100, .height = 4 }) == null);
+}
+
+test "left and right step the highlighted model's effort, and stop at the ends" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    const levels = [_][]const u8{ "low", "medium", "high" };
+    try picker.show(&.{
+        .{ .name = "gpt-a", .provider = "ChatGPT plan", .efforts = &levels, .effort = "medium" },
+        .{ .name = "qwen3:8b", .provider = "Ollama" },
+    }, &.{}, "");
+
+    try std.testing.expectEqualStrings("medium", picker.selected().?.effort);
+    picker.stepEffort(1);
+    picker.stepEffort(1);
+    try std.testing.expectEqualStrings("high", picker.selected().?.effort);
+    picker.stepEffort(-1);
+    picker.stepEffort(-1);
+    picker.stepEffort(-1);
+    try std.testing.expectEqualStrings("low", picker.selected().?.effort);
+
+    picker.move(1);
+    picker.stepEffort(1);
+    try std.testing.expectEqualStrings("", picker.selected().?.effort);
+}
+
+test "an effort the model does not offer is not shown, and nothing counts as chosen until stepped" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    const levels = [_][]const u8{ "low", "high" };
+    try picker.show(&.{
+        .{ .name = "gpt-a", .provider = "ChatGPT plan", .efforts = &levels, .effort = "ultra" },
+    }, &.{}, "");
+    try std.testing.expectEqualStrings("", picker.selected().?.effort);
+    try std.testing.expect(!picker.selected().?.effort_changed);
+
+    picker.stepEffort(1);
+    try std.testing.expectEqualStrings("high", picker.selected().?.effort);
+    try std.testing.expect(picker.selected().?.effort_changed);
 }

@@ -554,7 +554,7 @@ fn waitAndRetry(
 }
 
 /// One header off a reply, before a body reader invalidates it.
-fn headerValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u8 {
+pub fn headerValue(head: std.http.Client.Response.Head, name: []const u8) ?[]const u8 {
     var it = head.iterateHeaders();
     while (it.next()) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
@@ -945,7 +945,7 @@ fn writeParts(w: *std.Io.Writer, text: []const u8, images: []const []const u8) !
 /// The media type of a base64 image, read from what the encoding of its magic
 /// bytes always begins with. A data URL has to name one, and guessing wrong
 /// makes a model refuse to look.
-fn imageMime(base64: []const u8) []const u8 {
+pub fn imageMime(base64: []const u8) []const u8 {
     if (std.mem.startsWith(u8, base64, "iVBORw0KGgo")) return "image/png";
     if (std.mem.startsWith(u8, base64, "/9j/")) return "image/jpeg";
     if (std.mem.startsWith(u8, base64, "R0lGOD")) return "image/gif";
@@ -955,7 +955,7 @@ fn imageMime(base64: []const u8) []const u8 {
 
 /// The text a message is sent as: its own, plus inlined `@mention` files, plus
 /// a note standing in for images this model cannot be shown.
-fn messageContent(
+pub fn messageContent(
     arena: std.mem.Allocator,
     msg: Conversation.Message,
     supports_vision: bool,

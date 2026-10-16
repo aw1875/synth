@@ -18,6 +18,8 @@ context_limit: u32 = 0,
 /// dropped from the request, which the composer says up front rather than
 /// letting it be sent into a void.
 vision: bool = true,
+/// The reasoning effort in force, or "" for a backend that has no such setting.
+effort: []const u8 = "",
 
 /// Models this backend can be pointed at. Null when it has only one, which is
 /// why the UI asks rather than assuming - a hosted backend may not offer a
@@ -36,6 +38,11 @@ reconnect: ?*const fn (*anyopaque, Connection) anyerror!Current = null,
 /// Turn an error from `respond` into something a person can act on. Optional;
 /// without it the caller has only the error name.
 describe_error: ?*const fn (*anyopaque, anyerror, std.mem.Allocator) anyerror![]const u8 = null,
+/// The reasoning effort levels a model accepts. Borrowed until a reconnect.
+efforts: ?*const fn (*anyopaque, []const u8) Efforts = null,
+/// Ask for one of `efforts` from the next turn on; "" returns to the model's
+/// own default, and so does a level the current model does not offer.
+set_effort: ?*const fn (*anyopaque, []const u8) void = null,
 /// Break off whatever `respond` is waiting on, from another thread.
 ///
 /// Signalling a worker parked in a socket read does not wake it; the read
@@ -78,6 +85,7 @@ pub const Current = struct {
     name: []const u8 = "",
     context_limit: u32 = 0,
     vision: bool = true,
+    effort: []const u8 = "",
 };
 
 /// Whether this backend can be pointed somewhere else at runtime.
@@ -94,8 +102,22 @@ pub fn current(self: Provider) Current {
         .name = self.name,
         .context_limit = self.context_limit,
         .vision = self.vision,
+        .effort = self.effort,
     };
     return refresh(self.userdata);
+}
+
+/// The reasoning effort levels a model accepts, and the one it runs at when
+/// none is chosen. Empty for a model, or a backend, with no such setting.
+pub const Efforts = struct {
+    /// Mildest first.
+    levels: []const []const u8 = &.{},
+    default: []const u8 = "",
+};
+
+pub fn effortsFor(self: Provider, model: []const u8) Efforts {
+    const efforts = self.efforts orelse return .{};
+    return efforts(self.userdata, model);
 }
 
 pub fn mentionsOverflow(why: []const u8) bool {
@@ -157,12 +179,16 @@ pub const Reply = struct {
     /// Tool calls the model wants run. Owned by the caller, which frees each
     /// call with `Conversation.ToolCall.deinit`.
     tool_calls: []Conversation.ToolCall = &.{},
+    /// The provider's own record of this turn, replayed verbatim on later
+    /// turns. Opaque to everything but the provider that wrote it.
+    provider_state: ?[]const u8 = null,
     usage: Usage = .{},
 
     pub fn deinit(self: *Reply, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         for (self.tool_calls) |*call| call.deinit(allocator);
         allocator.free(self.tool_calls);
+        if (self.provider_state) |state| allocator.free(state);
     }
 };
 

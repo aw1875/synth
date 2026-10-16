@@ -209,6 +209,13 @@ pub fn fillRow(surface: vxfw.Surface, row: u16, col: u16, width: u16, style: Cel
 /// Write `text` at (col, row), clipped to the surface. Returns the column just
 /// past the last cell written.
 pub fn writeText(surface: vxfw.Surface, col: u16, row: u16, text: []const u8, style: Cell.Style) u16 {
+    return writeLinked(surface, col, row, text, style, "");
+}
+
+/// `writeText`, with every cell a hyperlink to `uri` (OSC 8). The terminal
+/// opens it on a click, on the machine it runs on, which over SSH is the
+/// one with the browser. An empty `uri` writes plain text.
+pub fn writeLinked(surface: vxfw.Surface, col: u16, row: u16, text: []const u8, style: Cell.Style, uri: []const u8) u16 {
     var x = col;
     var iter = vaxis.unicode.graphemeIterator(text);
     while (iter.next()) |g| {
@@ -218,6 +225,7 @@ pub fn writeText(surface: vxfw.Surface, col: u16, row: u16, text: []const u8, st
         surface.writeCell(x, row, .{
             .char = .{ .grapheme = bytes, .width = @intCast(w) },
             .style = style,
+            .link = .{ .uri = uri },
         });
         x += w;
     }

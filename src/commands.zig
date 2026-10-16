@@ -8,6 +8,7 @@ const pkg = @import("pkg");
 
 const cli = @import("cli.zig");
 const Auth = @import("core/auth.zig");
+const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
 const humanize = @import("core/humanize.zig");
@@ -336,6 +337,8 @@ pub fn models(init_process: std.process.Init) !void {
     var arena_state: std.heap.ArenaAllocator = .init(ctx.allocator);
     defer arena_state.deinit();
     const active = try catalog.resolve(arena_state.allocator(), &ctx.db, &ctx.config, &ctx.auth);
+    const chatgpt = try chatgpt_auth.Store.openDefault(ctx.allocator, ctx.io, init_process.environ_map);
+    defer chatgpt.destroy();
     var backend: Backend = .init(active.entry.kind, .{
         .allocator = ctx.allocator,
         .io = ctx.io,
@@ -343,6 +346,7 @@ pub fn models(init_process: std.process.Init) !void {
         .label = active.entry.label,
         .model = active.model,
         .api_key = active.api_key,
+        .chatgpt = chatgpt,
     });
     defer backend.deinit();
 

@@ -9,6 +9,7 @@ const Conversation = @import("core/conversation.zig");
 const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 const Auth = @import("core/auth.zig");
+const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const agents = @import("agent/agent.zig");
 const subagent = @import("agent/subagent.zig");
 const mcp = @import("mcp");
@@ -98,6 +99,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
 
     var auth = try Auth.open(allocator, io, init.environ_map);
     defer auth.deinit();
+    const chatgpt = try chatgpt_auth.Store.openDefault(allocator, io, init.environ_map);
+    defer chatgpt.destroy();
     timing.mark("auth");
 
     var db = try Database.init(allocator, io, config.database_path);
@@ -177,6 +180,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
+        .chatgpt = chatgpt,
     });
     defer {
         backend.deinit();
@@ -200,6 +204,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .app = &app,
         .environ = init.environ_map,
         .auth = &auth,
+        .chatgpt = chatgpt,
         .backend = &backend,
     };
     try tui_app.wire(model);
@@ -259,13 +264,15 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try model.loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");
 
-    if (!active.entry.ready(&auth)) try tui_commands.showProviders(model);
+    model.provider_missing = !try hasUsableProvider(allocator, &db, &config, active, &auth, chatgpt, &backend);
+    if (model.provider_missing) try tui_commands.showProviders(model);
 
     if (try resumeTarget(&db, model.loop.project_id, options)) |session_id| {
         try model.loop.resumeSession(session_id, Model.resume_messages);
         tui_commands.syncProvider(model);
         try model.seedHistory();
     }
+    try tui_commands.restoreEffort(model);
 
     timing.total("startup");
 
@@ -288,4 +295,29 @@ fn resumeTarget(db: *Database, project_id: ?i64, options: cli.Command.Tui) !?i64
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+/// A provider someone chose, and that has what it needs; or, with nothing
+/// chosen, a local server that actually answers. Defaulting to one that is not
+/// there would only surface as an error on the first prompt.
+fn hasUsableProvider(
+    allocator: std.mem.Allocator,
+    db: *Database,
+    config: *const Config,
+    active: catalog.Active,
+    auth: *const Auth,
+    chatgpt: *chatgpt_auth.Store,
+    backend: *Backend,
+) !bool {
+    if (!active.entry.ready(auth, chatgpt)) return false;
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const chosen = try db.activeProvider(arena);
+    const was_chosen = chosen.len > 0 or config.provider_override.len > 0 or config.host_override.len > 0;
+    if (was_chosen) return true;
+
+    const offered = backend.listModels(arena) catch return false;
+    return offered.len > 0;
 }

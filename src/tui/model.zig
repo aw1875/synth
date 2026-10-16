@@ -18,6 +18,10 @@ const Project = @import("../core/project.zig");
 const mcp_tools = @import("../tools/mcp.zig");
 const catalog = @import("../provider/catalog.zig");
 const Backend = @import("../provider/backend.zig");
+const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
+const SignInTask = @import("chatgpt_sign_in.zig");
+const commands = @import("commands.zig");
+const SignOutTask = @import("chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const Registry = @import("../tools/registry.zig");
 const image = @import("../core/image.zig");
@@ -40,6 +44,7 @@ const SessionPicker = @import("session_picker.zig");
 const Slash = @import("slash.zig");
 const theme = @import("theme.zig");
 const ThemePicker = @import("theme_picker.zig");
+const EffortPicker = @import("effort_picker.zig");
 const McpPicker = @import("mcp_picker.zig");
 const agents = @import("../agent/agent.zig");
 const themes = @import("themes.zig");
@@ -225,12 +230,24 @@ models: ModelPicker = undefined,
 connect: Connect = undefined,
 /// The theme switcher. Closed unless `/theme` opened it.
 theme_picker: ThemePicker = undefined,
+/// The reasoning effort switcher. Closed unless `/effort` opened it.
+effort_picker: EffortPicker = undefined,
 mcp_picker: McpPicker = undefined,
 /// The toast in the top-right corner.
 notification: Notification = undefined,
 /// Where credentials are stored, so connecting a provider can write one.
 /// Borrowed; it outlives the model.
 auth: ?*Auth = null,
+/// The ChatGPT sign-in, which lives in a file of its own. Borrowed.
+chatgpt: ?*chatgpt_auth.Store = null,
+/// Nothing usable is selected: none was ever chosen and no local server
+/// answered, or the one in use was signed out of. A prompt opens the
+/// providers dialog instead of failing against it.
+provider_missing: bool = false,
+/// A browser sign-in in progress, polled by the tick loop.
+chatgpt_sign_in: ?*SignInTask = null,
+/// A sign-out waiting on OpenAI to confirm the revocation.
+chatgpt_sign_out: ?*SignOutTask = null,
 /// The client behind `provider`. Borrowed; it outlives the model. Needed
 /// because connecting a provider of another protocol replaces the client, which
 /// the erased `Provider` has no way to do.
@@ -601,6 +618,14 @@ fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
 }
 
 pub fn deinit(self: *Model) void {
+    if (self.chatgpt_sign_in) |task| {
+        task.abandon();
+        self.chatgpt_sign_in = null;
+    }
+    if (self.chatgpt_sign_out) |task| {
+        task.abandon();
+        self.chatgpt_sign_out = null;
+    }
     self.closeSubagent();
     self.subagent_sessions.deinit(self.allocator);
     self.loop.deinit();
@@ -616,6 +641,7 @@ pub fn deinit(self: *Model) void {
     self.models.deinit();
     self.connect.deinit();
     self.theme_picker.deinit();
+    self.effort_picker.deinit();
     self.mcp_picker.deinit();
     self.block_heights.deinit(self.allocator);
     self.notification.deinit();
@@ -645,6 +671,7 @@ pub fn wire(self: *Model) !void {
     self.models = .init(self.allocator);
     self.connect = .init(self.allocator);
     self.theme_picker = .init(self.allocator);
+    self.effort_picker = .init(self.allocator);
     self.mcp_picker = .init(self.allocator);
     self.notification = .init(self.allocator, self.io);
     self.slash = .init(self.allocator);
@@ -695,6 +722,7 @@ pub fn scheduleTick(self: *Model, ctx: *vxfw.EventContext) !void {
 /// Ask the model to summarise the transcript so far.
 pub fn startCompaction(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.loop.isBusy()) return;
+    if (commands.needsProvider(self)) return;
     try self.loop.compact();
     self.thinking.stream = self.loop.thoughts();
     self.thinking.frame = 0;
@@ -722,6 +750,7 @@ pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !voi
 /// without a scheduled tick nothing polls it, so the spinner sits still and the
 /// reply never lands until some other event wakes the loop.
 pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extras: AgentLoop.Extras) !void {
+    if (try commands.offerProvidersInstead(self)) return;
     try self.remember(prompt);
     try self.loop.submit(prompt, extras);
 
@@ -897,6 +926,8 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     if (self.loop.isBusy()) try self.loop.cancel();
 
     try self.loop.resumeSession(session_id, resume_messages);
+    commands.syncProvider(self);
+    try commands.restoreEffort(self);
 
     self.closeSubagent();
     self.subagent_sessions.clearRetainingCapacity();

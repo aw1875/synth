@@ -52,6 +52,9 @@ pub const Outcome = union(enum) {
         /// a mix-up attack: a code minted by one server, redirected to a
         /// client that thinks it is talking to another.
         iss: ?[]const u8 = null,
+        /// The client a dynamic registration just issued, for an authorization
+        /// server that names it in the redirect rather than a separate call.
+        client_id: ?[]const u8 = null,
     };
 };
 
@@ -88,6 +91,7 @@ const Rendezvous = struct {
     /// into it before the handler returns.
     allocator: std.mem.Allocator,
     expected_state: []const u8,
+    success_page: []const u8,
     outcome: ?Outcome = null,
 
     /// Record the first outcome. Later redirects for the same state are
@@ -111,10 +115,10 @@ const poll_interval_ns: u64 = 25 * std.time.ns_per_ms;
 
 const Server = httpz.Server(*Rendezvous);
 
-const ok_body =
+const default_success_page =
     \\<html><body style="font-family:system-ui;padding:3rem">
-    \\<h2>Authorization complete</h2>
-    \\<p>You can close this tab and return to your terminal.</p>
+    \\<h2>Authorization received</h2>
+    \\<p>Return to your terminal to finish. You can close this tab.</p>
     \\</body></html>
 ;
 
@@ -155,11 +159,16 @@ fn handle(rendezvous: *Rendezvous, request: *httpz.Request, response: *httpz.Res
     else
         null;
 
-    rendezvous.settle(.{ .code = .{ .code = owned, .iss = issuer } });
+    const client_id: ?[]const u8 = if (query.get("client_id")) |raw|
+        rendezvous.allocator.dupe(u8, raw) catch return badRequest(response, "out of memory")
+    else
+        null;
+
+    rendezvous.settle(.{ .code = .{ .code = owned, .iss = issuer, .client_id = client_id } });
 
     response.status = 200;
     response.content_type = .HTML;
-    response.body = ok_body;
+    response.body = rendezvous.success_page;
 }
 
 fn badRequest(response: *httpz.Response, message: []const u8) void {
@@ -180,6 +189,9 @@ pub const Options = struct {
     /// The `state` this flow generated. Only a redirect carrying it settles
     /// the flow.
     state: []const u8,
+    /// The HTML shown in the browser once a code arrives, before anything
+    /// has been checked.
+    success_page: []const u8 = default_success_page,
     /// The first port to probe. `start` walks upward from here.
     port: u16 = default_port,
     path: []const u8 = default_path,
@@ -226,6 +238,7 @@ pub const Listener = struct {
             .io = io,
             .allocator = arena,
             .expected_state = try arena.dupe(u8, options.state),
+            .success_page = try arena.dupe(u8, options.success_page),
         };
 
         self.server = try allocator.create(Server);

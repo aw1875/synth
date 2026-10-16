@@ -9,6 +9,7 @@ const agents = @import("agent/agent.zig");
 const subagent = @import("agent/subagent.zig");
 const Loop = @import("agent/loop.zig");
 const Auth = @import("core/auth.zig");
+const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const mcp = @import("mcp");
 
 const Config = @import("core/config.zig");
@@ -48,6 +49,8 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     var auth = try Auth.open(allocator, io, init.environ_map);
     defer auth.deinit();
+    const chatgpt = try chatgpt_auth.Store.openDefault(allocator, io, init.environ_map);
+    defer chatgpt.destroy();
 
     var db = try Database.init(allocator, io, config.database_path);
     defer db.deinit();
@@ -106,6 +109,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .want_think = config.think,
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
+        .chatgpt = chatgpt,
     });
     defer backend.deinit();
 

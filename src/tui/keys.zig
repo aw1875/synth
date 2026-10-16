@@ -25,6 +25,11 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
 
     if (try commands.runCommand(self, ctx, value)) return;
 
+    if (try commands.offerProvidersInstead(self)) {
+        ctx.redraw = true;
+        return;
+    }
+
     if (self.loop.state == .awaiting_answer) {
         try self.loop.answer(value);
         self.input.clear();
@@ -132,8 +137,14 @@ pub fn trackSelection(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse)
 
 /// Hand a clicked link to the desktop's opener.
 pub fn openLink(self: *Model, point: Selection.Point) void {
-    if (builtin.is_test) return;
     const uri = self.selection.linkAt(point.row, point.col) orelse return;
+    openUrl(self, uri);
+}
+
+/// Hand a web address to the desktop's opener, in the background so a slow
+/// browser launch never holds up the screen.
+pub fn openUrl(self: *Model, uri: []const u8) void {
+    if (builtin.is_test) return;
     if (!std.mem.startsWith(u8, uri, "http://") and !std.mem.startsWith(u8, uri, "https://")) return;
 
     const opener = switch (builtin.os.tag) {
@@ -213,6 +224,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         },
         .tick => {
             self.tick_pending = false;
+            try commands.pollSignIn(self, ctx);
+            try commands.pollSignOut(self, ctx);
             commands.checkModel(self, ctx);
             try commands.applyMcp(self, ctx);
             if (self.mcp) |host| {
@@ -292,6 +305,18 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (self.effort_picker.open) {
+                switch (self.effort_picker.handleKey(key)) {
+                    .none => {},
+                    .cancel => self.effort_picker.close(),
+                    .choose => {
+                        if (self.effort_picker.selected()) |level| try commands.setEffort(self, ctx, level);
+                        self.effort_picker.close();
+                    },
+                }
+                return ctx.consumeAndRedraw();
+            }
+
             if (self.theme_picker.open) {
                 switch (try self.theme_picker.handleKey(ctx, key)) {
                     .none => {},
@@ -309,9 +334,15 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.connect.close(),
                     .connect => |result| {
-                        try commands.connectProvider(self, result);
-                        self.connect.close();
+                        if (try commands.connectProvider(self, result)) {
+                            self.connect.close();
+                        } else {
+                            try self.scheduleTick(ctx);
+                        }
                     },
+                    .cancel_sign_in => commands.cancelSignIn(self),
+                    .reopen_sign_in => commands.reopenSignIn(self),
+                    .copy_sign_in => try commands.copySignInLink(self, ctx),
                 }
                 return ctx.consumeAndRedraw();
             }
@@ -516,6 +547,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             _ = try self.input.handleEvent(ctx, event);
             try self.refreshMentions();
             try self.awaitMentions(ctx);
+            self.slash.chatgpt_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
             try self.slash.update(self.input.text.items, self.input.cursor);
             if (ctx.consume_event) return;
         },

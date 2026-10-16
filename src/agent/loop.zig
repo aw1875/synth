@@ -580,6 +580,7 @@ pub fn syncProvider(self: *Loop) void {
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
+    self.provider.effort = now.effort;
 }
 
 /// What the loop is doing, for the UI's status row.
@@ -1220,6 +1221,7 @@ fn pollRequest(self: *Loop) !bool {
         .thinking = thinking,
         .thinking_ms = thinking_ms,
         .tool_calls = reply.tool_calls,
+        .provider_state = reply.provider_state,
     });
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
@@ -1790,6 +1792,10 @@ fn persistMessage(self: *Loop, index: usize) !void {
             try db.appendBlob(message_id, 0, "reasoning", thinking);
             self.shrinkThinking(msg);
         }
+    }
+
+    if (msg.provider_state) |state| {
+        try db.appendBlob(message_id, 0, Database.provider_state_blob, state);
     }
 
     for (msg.attachments, 0..) |attachment, i| {

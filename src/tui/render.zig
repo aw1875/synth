@@ -153,6 +153,15 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
         root.cursor = dialog.cursor;
     }
 
+    if (try self.effort_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
+        try children.append(ctx.arena, .{
+            .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
+            .surface = dialog.surface,
+            .z_index = 3,
+        });
+    }
+
     if (try self.theme_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
         dialog_open = true;
         try children.append(ctx.arena, .{
@@ -986,9 +995,13 @@ pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, wid
     const room = width - Model.gutter * 2;
 
     // Both: the same model tag is served by a local process and by a cloud.
-    const answering = if (self.provider.model.len > 0)
-        std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{
+    const answering = if (self.provider_missing)
+        "no provider"
+    else if (self.provider.model.len > 0)
+        std.fmt.allocPrint(ctx.arena, "{s}{s}{s}{s}{s}", .{
             self.provider.model,
+            if (self.provider.effort.len > 0) " " else "",
+            self.provider.effort,
             w.separator,
             self.provider.name,
         }) catch self.provider.name
