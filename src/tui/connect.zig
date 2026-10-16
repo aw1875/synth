@@ -7,7 +7,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const catalog = @import("../provider/catalog.zig");
-const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const Input = @import("input.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -58,6 +57,8 @@ host: Input,
 key: Input,
 /// The page a browser sign-in is waiting on, while one is. Owned.
 sign_in_url: []const u8 = "",
+/// The loopback port the sign-in listener actually bound.
+sign_in_port: u16 = 0,
 /// Whether to tell the person how to reach the callback from another machine.
 sign_in_over_ssh: bool = false,
 
@@ -163,9 +164,10 @@ fn signInKey(key_press: vaxis.Key) Action {
     return .none;
 }
 
-pub fn showSignIn(self: *Connect, url: []const u8, over_ssh: bool) !void {
+pub fn showSignIn(self: *Connect, url: []const u8, port: u16, over_ssh: bool) !void {
     self.forgetSignIn();
     self.sign_in_url = try self.allocator.dupe(u8, url);
+    self.sign_in_port = port;
     self.sign_in_over_ssh = over_ssh;
     self.stage = .signing_in;
 }
@@ -173,6 +175,7 @@ pub fn showSignIn(self: *Connect, url: []const u8, over_ssh: bool) !void {
 fn forgetSignIn(self: *Connect) void {
     if (self.sign_in_url.len > 0) self.allocator.free(self.sign_in_url);
     self.sign_in_url = "";
+    self.sign_in_port = 0;
 }
 
 fn chooseKey(self: *Connect, key_press: vaxis.Key) Action {
@@ -433,7 +436,7 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
     if (self.sign_in_over_ssh) {
         row += 1;
         _ = w.writeText(surface, pad, row, "Over SSH, forward the callback first: press ~C, then", theme.on_card(theme.fg_dim).cell);
-        const forward = try std.fmt.allocPrint(ctx.arena, "-L {d}:127.0.0.1:{d}", .{ chatgpt_auth.callback_port, chatgpt_auth.callback_port });
+        const forward = try std.fmt.allocPrint(ctx.arena, "-L {d}:127.0.0.1:{d}", .{ self.sign_in_port, self.sign_in_port });
         _ = w.writeText(surface, pad, row + 1, forward, theme.on_card(theme.fg_muted).cell);
         row += 2;
     }
@@ -614,8 +617,9 @@ test "escape while waiting on the browser cancels the sign-in" {
     var connect: Connect = .init(testing.allocator);
     defer connect.deinit();
 
-    try connect.showSignIn("https://auth.openai.com/api/accounts/authorize?x=1", false);
+    try connect.showSignIn("https://auth.openai.com/api/accounts/authorize?x=1", 1462, false);
     try testing.expectEqual(Stage.signing_in, connect.stage);
+    try testing.expectEqual(@as(u16, 1462), connect.sign_in_port);
     try testing.expect(connect.focus() == null);
     try testing.expectEqual(Action.none, try connect.press(.{ .codepoint = vaxis.Key.enter }));
     try testing.expectEqual(Action.reopen_sign_in, try connect.press(.{ .codepoint = 'o', .text = "o" }));

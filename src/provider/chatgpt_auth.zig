@@ -26,7 +26,7 @@ const jwks_url = issuer ++ "/.well-known/jwks.json";
 const requested_scopes = "openid profile email offline_access resource.invoke " ++ plan_scope;
 const registration_client_id = "dynamic_agent_client";
 const credential_file = "chatgpt.json";
-pub const callback_port: u16 = 1455;
+const first_callback_port: u16 = 1455;
 const callback_path = "/auth/callback";
 const callback_poll_ns: u64 = 250 * std.time.ns_per_ms;
 const sign_in_timeout_ns: u64 = 10 * std.time.ns_per_min;
@@ -362,7 +362,7 @@ pub const SignIn = struct {
 
         self.listener = try Callback.Listener.start(allocator, io, .{
             .state = state,
-            .port = callback_port,
+            .port = first_callback_port,
             .path = callback_path,
             .success_page = callback_page,
         });
@@ -383,6 +383,10 @@ pub const SignIn = struct {
             .ask_consent = saved.hasDeclinedPlanUsage(),
         });
         return self;
+    }
+
+    pub fn callbackPort(self: *const SignIn) u16 {
+        return self.listener.port;
     }
 
     pub fn cancel(self: *SignIn) void {

@@ -328,7 +328,7 @@ pub fn connectProvider(self: *Model, result: Connect.Result) !bool {
 /// Start a ChatGPT sign-in in the background. Returns whether one is running.
 fn beginSignIn(self: *Model) !bool {
     if (self.chatgpt_sign_in) |running| {
-        try self.connect.showSignIn(running.sign_in.url, isOverSsh(self));
+        try self.connect.showSignIn(running.sign_in.url, running.sign_in.callbackPort(), isOverSsh(self));
         return true;
     }
     const store = self.chatgpt orelse {
@@ -341,7 +341,7 @@ fn beginSignIn(self: *Model) !bool {
         return false;
     };
     self.chatgpt_sign_in = task;
-    try self.connect.showSignIn(task.sign_in.url, isOverSsh(self));
+    try self.connect.showSignIn(task.sign_in.url, task.sign_in.callbackPort(), isOverSsh(self));
     keys.openUrl(self, task.sign_in.url);
     return true;
 }
