@@ -43,6 +43,7 @@ catalog_arena: ?std.heap.ArenaAllocator = null,
 catalog_lock: std.Io.Mutex = .init,
 model_owned: ?[]u8 = null,
 label_owned: ?[]u8 = null,
+supports_reasoning_summary: bool = true,
 /// What the server last said when it refused, owned here. Written on the
 /// worker as a turn fails and read on the UI thread after it is joined.
 rejection: ?[]u8 = null,
@@ -104,6 +105,7 @@ pub fn startLike(self: *ChatGPTProvider, other: *const ChatGPTProvider) !void {
     self.startClient();
     self.context_limit = other.context_limit;
     self.supports_vision = other.supports_vision;
+    self.supports_reasoning_summary = other.supports_reasoning_summary;
     self.effort_buffer = other.effort_buffer;
     self.effort_len = other.effort_len;
 }
@@ -284,6 +286,7 @@ fn applyCatalogEntry(self: *ChatGPTProvider) void {
     const entry = self.catalogEntry(self.model) orelse return;
     self.context_limit = entry.context_window;
     self.supports_vision = entry.vision;
+    self.supports_reasoning_summary = entry.accepts_summary;
     if (!containsString(entry.efforts, self.chosenEffort())) self.effort_len = 0;
 }
 
@@ -320,11 +323,6 @@ fn effectiveEffort(self: *const ChatGPTProvider) []const u8 {
     if (self.effort_len > 0) return self.chosenEffort();
     const entry = self.catalogEntry(self.model) orelse return "";
     return entry.default_effort;
-}
-
-fn acceptsSummary(self: *const ChatGPTProvider) bool {
-    const entry = self.catalogEntry(self.model) orelse return true;
-    return entry.accepts_summary;
 }
 
 fn loadCatalog(self: *ChatGPTProvider, track_turn: bool) !void {
@@ -587,7 +585,7 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
     }
     try w.writeAll(",\"reasoning\":{");
     var reasoning_first = true;
-    if (self.acceptsSummary()) {
+    if (self.supports_reasoning_summary) {
         try w.writeAll("\"summary\":\"detailed\"");
         reasoning_first = false;
     }
@@ -1464,6 +1462,31 @@ test "a summary is asked for only from a model that takes the parameter" {
     try testing.expectEqualStrings("detailed", (try requestReasoning(&chat, arena, &convo)).get("summary").?.string);
     try chat.setModel("gpt-small");
     try testing.expect((try requestReasoning(&chat, arena, &convo)).get("summary") == null);
+}
+
+test "a nested client keeps the model's summary support" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+
+    var parent = testProvider(store);
+    defer parent.deinit();
+    try catalogFixture(&parent);
+    try parent.setModel("gpt-small");
+
+    var child = testProvider(store);
+    defer child.deinit();
+    child.model = "gpt-small";
+    try child.startLike(&parent);
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "hello");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try testing.expect((try requestReasoning(&child, arena_state.allocator(), &convo)).get("summary") == null);
 }
 
 test "a note posted mid-turn does not cut a tool call off from its result" {
