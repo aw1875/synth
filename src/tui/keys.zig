@@ -16,6 +16,7 @@ const bell = @import("bell.zig");
 const editor = @import("editor.zig");
 const Model = @import("model.zig");
 const Selection = @import("selection.zig");
+const Slash = @import("slash.zig");
 const widget_pool = @import("widget_pool.zig");
 const themes = @import("themes.zig");
 
@@ -502,8 +503,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     const command = self.slash.selectedCommand().?;
+                    const submit = submitSlashCommand(command, self.input.text.items);
                     try self.acceptCommand();
-                    if (command.argument.len == 0) {
+                    if (submit) {
                         const line = try self.allocator.dupe(u8, self.input.text.items);
                         defer self.allocator.free(line);
                         self.input.clear();
@@ -553,6 +555,21 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         },
         else => {},
     }
+}
+
+fn submitSlashCommand(command: Slash.Command, draft: []const u8) bool {
+    if (command.argument.len == 0) return true;
+    return std.mem.eql(u8, command.name, "model") and std.ascii.eqlIgnoreCase(draft, "/model");
+}
+
+test "enter submits an exact model command instead of only completing it" {
+    const model: Slash.Command = .{ .name = "model", .description = "", .argument = "[name]" };
+    const rename: Slash.Command = .{ .name = "rename", .description = "", .argument = "[name]" };
+
+    try std.testing.expect(submitSlashCommand(model, "/model"));
+    try std.testing.expect(submitSlashCommand(model, "/MODEL"));
+    try std.testing.expect(!submitSlashCommand(model, "/mod"));
+    try std.testing.expect(!submitSlashCommand(rename, "/model"));
 }
 
 /// Say so once, for each turn that reaches the end of the loop.
