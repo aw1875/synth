@@ -136,11 +136,13 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/model")) {
+    if (isCommand(line, "/model")) {
         if (try offerProvidersInstead(self)) return true;
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
-            _ = switchModel(self, name) catch "";
+            if (!(switchListedModel(self, name) catch false)) {
+                try self.notification.showFmt(ctx, .err, "Model unavailable: {s}", .{name});
+            }
         } else {
             try showModels(self);
         }
@@ -784,6 +786,19 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     return self.provider.model;
 }
 
+fn switchListedModel(self: *Model, name: []const u8) !bool {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+
+    const names = try self.provider.models(arena_state.allocator());
+    for (names) |offered| {
+        if (!std.mem.eql(u8, offered, name)) continue;
+        _ = try switchModel(self, name);
+        return true;
+    }
+    return false;
+}
+
 /// Remember the model per provider so the next launch reopens on it.
 fn rememberModelChoice(self: *Model, model: []const u8) !void {
     if (model.len == 0) return;
@@ -902,6 +917,13 @@ fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
     return .{ .model = name };
 }
 
+fn fakeListModels(_: *anyopaque, allocator: std.mem.Allocator) anyerror![][]const u8 {
+    const names = try allocator.alloc([]const u8, 2);
+    names[0] = try allocator.dupe(u8, "qwen3-coder:30b");
+    names[1] = try allocator.dupe(u8, "glm-5.3-flash");
+    return names;
+}
+
 /// A model in a test needs only enough to hold a provider and a transcript.
 fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []const u8) !Model {
     var self: Model = .{
@@ -913,12 +935,31 @@ fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []cons
             .respond = undefined,
             .name = "Ollama",
             .model = model_name,
+            .list_models = fakeListModels,
             .set_model = fakeSetModel,
         },
         .input = .init(allocator),
     };
     try self.wire();
     return self;
+}
+
+test "a typed model name must be one the provider offers" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+
+    try testing.expect(!try switchListedModel(&model, "asdf"));
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+
+    try testing.expect(try switchListedModel(&model, "glm-5.3-flash"));
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+}
+
+test "model command rejects command-name prefixes" {
+    try testing.expect(isCommand("/model", "/model"));
+    try testing.expect(isCommand("/model glm-5.3-flash", "/model"));
+    try testing.expect(!isCommand("/models", "/model"));
 }
 
 test "the provider is announced with the model that was actually picked" {
