@@ -21,14 +21,22 @@ pub const Command = struct {
     name: []const u8,
     /// What it does, one line, lowercase.
     description: []const u8,
-    /// Argument hint, or "" when it takes none. A command with an argument
-    /// completes with a trailing space so typing can continue.
+    /// Argument hint: `[name]` when optional, `<text>` when the command has
+    /// nothing to do without it, or "" when it takes none. A command with an
+    /// argument completes with a trailing space so typing can continue.
     argument: []const u8 = "",
     /// Whether this came from a skill directory rather than the table below.
     /// What tells the dispatcher to load instructions instead of running a verb.
     is_skill: bool = false,
     /// Only offered while signed in to ChatGPT.
     needs_chatgpt: bool = false,
+
+    /// Whether Enter runs this rather than only completing it. A skill waits
+    /// for what it should work on, the way codex inserts a `$skill` mention.
+    pub fn runsOnEnter(self: Command) bool {
+        const needs_argument = std.mem.startsWith(u8, self.argument, "<");
+        return !self.is_skill and !needs_argument;
+    }
 };
 
 /// Ranked fuzzy matches kept when nothing matched by prefix. A ceiling on the
@@ -120,7 +128,7 @@ pub fn update(self: *Slash, text: []const u8, cursor: usize) !void {
         self.close();
         return;
     }
-    const word_end = std.mem.indexOfAny(u8, text, " \t\n") orelse text.len;
+    const word_end = firstWordEnd(text);
     if (cursor > word_end) {
         self.close();
         return;
@@ -170,11 +178,19 @@ pub fn selectedCommand(self: *const Slash) ?Command {
     return self.at(self.matches.items[self.selected]);
 }
 
-/// What the draft becomes when the highlighted command is accepted.
-pub fn completion(self: *const Slash, arena: std.mem.Allocator) !?[]const u8 {
+/// What the draft becomes when the highlighted command is accepted: the word
+/// being typed is replaced, and anything already typed after it is kept as the
+/// command's argument.
+pub fn completion(self: *const Slash, arena: std.mem.Allocator, draft: []const u8) !?[]const u8 {
     const command = self.selectedCommand() orelse return null;
+    const typed_argument = draft[firstWordEnd(draft)..];
+    if (typed_argument.len > 0) return try std.fmt.allocPrint(arena, "/{s}{s}", .{ command.name, typed_argument });
     if (command.argument.len == 0) return try std.fmt.allocPrint(arena, "/{s}", .{command.name});
     return try std.fmt.allocPrint(arena, "/{s} ", .{command.name});
+}
+
+fn firstWordEnd(text: []const u8) usize {
+    return std.mem.indexOfAny(u8, text, " \t\n") orelse text.len;
 }
 
 /// Keys that are not discoverable by typing, so `/help` names them. Kept here
@@ -329,10 +345,41 @@ test "completion leaves room for an argument" {
     defer slash.deinit();
 
     try slash.update("/comp", 5);
-    try std.testing.expectEqualStrings("/compact", (try slash.completion(arena)).?);
+    try std.testing.expectEqualStrings("/compact", (try slash.completion(arena, "/comp")).?);
 
     try slash.update("/ren", 4);
-    try std.testing.expectEqualStrings("/rename ", (try slash.completion(arena)).?);
+    try std.testing.expectEqualStrings("/rename ", (try slash.completion(arena, "/ren")).?);
+}
+
+test "completion keeps what was already typed after the command" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
+    try slash.update("/ren my session", 4);
+    try std.testing.expectEqualStrings("/rename my session", (try slash.completion(arena_state.allocator(), "/ren my session")).?);
+}
+
+test "enter runs a command unless it is waiting for input" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+    slash.skills = &.{
+        .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
+    };
+
+    try slash.update("/compact", 8);
+    try std.testing.expect(slash.selectedCommand().?.runsOnEnter());
+    try slash.update("/model", 6);
+    try std.testing.expect(slash.selectedCommand().?.runsOnEnter());
+    try slash.update("/theme", 6);
+    try std.testing.expect(slash.selectedCommand().?.runsOnEnter());
+
+    try slash.update("/search", 7);
+    try std.testing.expect(!slash.selectedCommand().?.runsOnEnter());
+    try slash.update("/release", 8);
+    try std.testing.expect(!slash.selectedCommand().?.runsOnEnter());
 }
 
 test "a half-remembered command still lands" {
@@ -369,7 +416,7 @@ test "a skill is offered like any other command, and says it is one" {
 
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
-    try std.testing.expectEqualStrings("/release ", (try slash.completion(arena_state.allocator())).?);
+    try std.testing.expectEqualStrings("/release ", (try slash.completion(arena_state.allocator(), "/rel")).?);
 
     try slash.update("/commit-style", 13);
     try std.testing.expectEqualStrings("run this skill", slash.selectedCommand().?.description);

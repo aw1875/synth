@@ -695,7 +695,7 @@ pub fn acceptCommand(self: *Model) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
 
-    const completion = try self.slash.completion(arena_state.allocator()) orelse return;
+    const completion = try self.slash.completion(arena_state.allocator(), self.input.text.items) orelse return;
     self.input.clear();
     try self.input.insertText(completion);
     self.slash.close();
