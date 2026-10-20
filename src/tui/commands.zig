@@ -570,7 +570,7 @@ pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
 }
 
 /// Each provider is asked through a client of its own, never the one a turn
-/// uses. Nothing is reconnected to list a model - that only happens when one is
+/// uses. Nothing is reconnected to list a model; that only happens when one is
 /// picked. A provider that cannot be given a thread is left out.
 fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !void {
     const reach = try reachOf(self, arena, entry, active_id);
@@ -604,7 +604,6 @@ fn reachOf(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_
     return .{ .host = host, .api_key = api_key, .chatgpt = self.chatgpt };
 }
 
-/// Take delivery of providers that answered while the picker is up.
 pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
     const listings = &self.models.listings;
     var index: usize = 0;
@@ -959,8 +958,7 @@ pub fn reportMcpFailures(self: *Model, ctx: *vxfw.EventContext) !void {
 
 const testing = std.testing;
 
-/// Stands in for a backend that can be pointed at another of its models, and
-/// refuses one it does not serve.
+/// Stands in for a backend that can be pointed at another of its models.
 fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
     if (std.mem.eql(u8, name, unserved_model)) return error.UnknownModel;
     return .{ .model = name };
