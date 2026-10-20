@@ -46,7 +46,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/search")) {
+    if (isCommand(line, "/search")) {
         try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
         return true;
     }
@@ -75,7 +75,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/agent")) {
+    if (isCommand(line, "/agent")) {
         const name = std.mem.trim(u8, line["/agent".len..], " ");
         if (name.len > 0) {
             try switchAgent(self, ctx, agents.findOrDefault(name).id);
@@ -84,7 +84,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         }
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/theme")) {
+    if (isCommand(line, "/theme")) {
         const name = std.mem.trim(u8, line["/theme".len..], " ");
         if (name.len > 0) {
             keepTheme(self, themes.findOrDefault(name).id);
@@ -149,7 +149,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/rename")) {
+    if (isCommand(line, "/rename")) {
         const name = std.mem.trim(u8, line["/rename".len..], " ");
         if (name.len > 0) {
             self.loop.rename(name) catch {};
@@ -956,10 +956,12 @@ test "a typed model name must be one the provider offers" {
     try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
 }
 
-test "model command rejects command-name prefixes" {
+test "a command is matched by its whole name, not as a prefix" {
     try testing.expect(isCommand("/model", "/model"));
     try testing.expect(isCommand("/model glm-5.3-flash", "/model"));
     try testing.expect(!isCommand("/models", "/model"));
+    try testing.expect(!isCommand("/themes", "/theme"));
+    try testing.expect(!isCommand("/renamed", "/rename"));
 }
 
 test "the provider is announced with the model that was actually picked" {
