@@ -22,6 +22,7 @@ const SignInTask = @import("chatgpt_sign_in.zig");
 const SignOutTask = @import("chatgpt_sign_out.zig");
 const keys = @import("keys.zig");
 const Model = @import("model.zig");
+const ModelListing = @import("model_listing.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const Slash = @import("slash.zig");
@@ -143,7 +144,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         if (name.len > 0) {
             try switchModelNamed(self, ctx, name);
         } else {
-            try showModels(self);
+            try showModels(self, ctx);
         }
         ctx.redraw = true;
         return true;
@@ -529,8 +530,10 @@ pub fn offerProvidersInstead(self: *Model) !bool {
     return true;
 }
 
-/// Open the model switcher, asking each provider what it offers.
-pub fn showModels(self: *Model) !void {
+/// Open the model switcher at once with what the provider in use offers, and
+/// ask the other connected providers in the background. Their models join the
+/// list as each answers, so the slowest one does not hold the picker shut.
+pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (try offerProvidersInstead(self)) return;
     if (!self.provider.switchable()) return;
 
@@ -538,23 +541,20 @@ pub fn showModels(self: *Model) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var entries: std.ArrayList(ModelPicker.Entry) = .empty;
     const active_id = try activeProviderId(self, arena);
-
+    var entries: []const ModelPicker.Entry = &.{};
     for (catalog.all) |entry| {
         if (!isConnected(self, entry)) continue;
-
-        try entries.appendSlice(arena, try listModels(self, arena, entry, active_id));
-    }
-
-    var recent: []const []const u8 = &.{};
-    if (self.loop.database()) |db| {
-        if (self.loop.project_id) |project_id| {
-            recent = db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
+        if (std.mem.eql(u8, entry.id, active_id)) {
+            entries = try modelEntries(self, arena, entry, try offeredByActive(self, arena));
+            continue;
         }
+        try startModelListing(self, arena, entry);
     }
 
-    try self.models.show(entries.items, recent, self.provider.model);
+    try self.models.show(entries, try recentModels(self, arena), self.provider.model);
+    self.models.waiting = self.model_listings.items.len;
+    if (self.models.waiting > 0) try self.scheduleTick(ctx);
 }
 
 /// Whether a provider has what it needs to be asked what it offers.
@@ -563,19 +563,25 @@ pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
     return entry.ready(auth, self.chatgpt);
 }
 
-/// The models one provider offers.
-///
-/// The one in use answers through the live backend; the rest get a client of
-/// their own, built from the host the database remembers and the key
-/// `auth.json` holds. Nothing is reconnected to list a model - that only
-/// happens when one is picked.
-pub fn listModels(
-    self: *Model,
-    arena: std.mem.Allocator,
-    entry: catalog.Entry,
-    active_id: []const u8,
-) ![]const ModelPicker.Entry {
-    if (std.mem.eql(u8, entry.id, active_id)) return modelEntries(self, arena, entry, self.provider);
+/// The provider in use answers through the live backend, on this thread: a
+/// turn uses the same HTTP client, and two threads in it is a race.
+fn offeredByActive(self: *Model, arena: std.mem.Allocator) ![]const ModelListing.Offered {
+    const names = self.provider.models(arena) catch return &.{};
+    const offered = try arena.alloc(ModelListing.Offered, names.len);
+    for (names, offered) |name, *model| {
+        model.* = .{ .name = name, .efforts = self.provider.effortsFor(name) };
+    }
+    return offered;
+}
+
+/// The rest get a client of their own, built from the host the database
+/// remembers and the key `auth.json` holds. Nothing is reconnected to list a
+/// model - that only happens when one is picked. A provider still answering an
+/// earlier open is left to finish rather than asked twice.
+fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry) !void {
+    for (self.model_listings.items) |listing| {
+        if (std.mem.eql(u8, listing.entry.id, entry.id)) return;
+    }
 
     var host = entry.host;
     if (entry.host_editable) {
@@ -585,51 +591,72 @@ pub fn listModels(
         }
     }
 
-    var backend: Backend = .init(entry.kind, .{
-        .allocator = arena,
-        .io = self.io,
+    const listing = try ModelListing.start(self.allocator, self.io, entry, .{
         .host = host,
-        .label = entry.label,
         .api_key = if (self.auth) |auth| auth.key(entry.id) else null,
         .chatgpt = self.chatgpt,
     });
-    defer backend.deinit();
-    backend.start() catch return &.{};
-
-    return modelEntries(self, arena, entry, backend.provider());
+    errdefer listing.abandon();
+    try self.model_listings.append(self.allocator, listing);
 }
 
-/// Each model a provider offers, with its effort levels and the level last
-/// chosen for it. Copied into `arena`: a listing backend dies straight after.
+/// Take delivery of providers that answered, into the picker if it is still up.
+pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
+    var index: usize = 0;
+    while (index < self.model_listings.items.len) {
+        const listing = self.model_listings.items[index];
+        if (!listing.isFinished()) {
+            index += 1;
+            continue;
+        }
+        _ = self.model_listings.orderedRemove(index);
+        defer listing.finish();
+        try addListedModels(self, listing);
+        ctx.redraw = true;
+    }
+    self.models.waiting = self.model_listings.items.len;
+    if (self.model_listings.items.len > 0) try self.scheduleTick(ctx);
+}
+
+fn addListedModels(self: *Model, listing: *ModelListing) !void {
+    if (!self.models.open) return;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const entries = try modelEntries(self, arena, listing.entry, listing.models);
+    try self.models.append(entries, try recentModels(self, arena));
+}
+
+fn recentModels(self: *Model, arena: std.mem.Allocator) ![]const []const u8 {
+    const db = self.loop.database() orelse return &.{};
+    const project_id = self.loop.project_id orelse return &.{};
+    return db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
+}
+
+/// Each model a provider offers, with the effort level last chosen for it.
+/// Borrows from `offered`; the picker copies what it keeps.
 fn modelEntries(
     self: *Model,
     arena: std.mem.Allocator,
     entry: catalog.Entry,
-    provider: Provider,
+    offered: []const ModelListing.Offered,
 ) ![]const ModelPicker.Entry {
-    const names = provider.models(arena) catch return &.{};
-    const entries = try arena.alloc(ModelPicker.Entry, names.len);
-    for (names, entries) |name, *model| {
-        const efforts = provider.effortsFor(name);
-        const remembered = try rememberedEffort(self, arena, entry.id, name);
-        const is_remembered_offered = for (efforts.levels) |level| {
+    const entries = try arena.alloc(ModelPicker.Entry, offered.len);
+    for (offered, entries) |model, *picked| {
+        const remembered = try rememberedEffort(self, arena, entry.id, model.name);
+        const is_remembered_offered = for (model.efforts.levels) |level| {
             if (std.mem.eql(u8, level, remembered)) break true;
         } else false;
-        model.* = .{
-            .name = name,
+        picked.* = .{
+            .name = model.name,
             .provider = entry.label,
             .provider_id = entry.id,
-            .efforts = try dupeLevels(arena, efforts.levels),
-            .effort = try arena.dupe(u8, if (is_remembered_offered) remembered else efforts.default),
+            .efforts = model.efforts.levels,
+            .effort = if (is_remembered_offered) remembered else model.efforts.default,
         };
     }
     return entries;
-}
-
-fn dupeLevels(arena: std.mem.Allocator, levels: []const []const u8) ![]const []const u8 {
-    const copies = try arena.alloc([]const u8, levels.len);
-    for (levels, copies) |level, *copy| copy.* = try arena.dupe(u8, level);
-    return copies;
 }
 
 fn effortKey(arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {

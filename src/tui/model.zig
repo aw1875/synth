@@ -36,6 +36,7 @@ const diff = @import("diff.zig");
 const Input = @import("input.zig");
 const markdown = @import("markdown.zig");
 const MentionPopup = @import("mention_popup.zig");
+const ModelListing = @import("model_listing.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const Rename = @import("rename.zig");
@@ -248,6 +249,8 @@ provider_missing: bool = false,
 chatgpt_sign_in: ?*SignInTask = null,
 /// A sign-out waiting on OpenAI to confirm the revocation.
 chatgpt_sign_out: ?*SignOutTask = null,
+/// Providers not in use being asked what they offer, for the model picker.
+model_listings: std.ArrayList(*ModelListing) = .empty,
 /// The client behind `provider`. Borrowed; it outlives the model. Needed
 /// because connecting a provider of another protocol replaces the client, which
 /// the erased `Provider` has no way to do.
@@ -626,6 +629,8 @@ pub fn deinit(self: *Model) void {
         task.abandon();
         self.chatgpt_sign_out = null;
     }
+    for (self.model_listings.items) |listing| listing.abandon();
+    self.model_listings.deinit(self.allocator);
     self.closeSubagent();
     self.subagent_sessions.deinit(self.allocator);
     self.loop.deinit();

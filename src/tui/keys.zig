@@ -226,6 +226,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             self.tick_pending = false;
             try commands.pollSignIn(self, ctx);
             try commands.pollSignOut(self, ctx);
+            try commands.pollModelListings(self, ctx);
             commands.checkModel(self, ctx);
             try commands.applyMcp(self, ctx);
             if (self.mcp) |host| {
@@ -389,7 +390,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                if (!try commands.refuseModelSwitchMidTurn(self, ctx)) try commands.showModels(self);
+                if (!try commands.refuseModelSwitchMidTurn(self, ctx)) try commands.showModels(self, ctx);
                 return ctx.consumeAndRedraw();
             }
 

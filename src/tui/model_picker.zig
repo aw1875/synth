@@ -64,6 +64,9 @@ scroll: usize = 0,
 search: Input,
 /// The model in use, marked in the list.
 current: []const u8 = "",
+/// Providers still being asked what they offer, whose models arrive by
+/// `append`.
+waiting: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) Picker {
     return .{ .allocator = allocator, .search = .init(allocator) };
@@ -155,6 +158,44 @@ pub fn show(
     self.open = true;
 }
 
+/// Add models that arrived after the list was shown, keeping the highlight on
+/// the model it was on. Borrowed like `show`.
+pub fn append(self: *Picker, models: []const Entry, recent: []const []const u8) !void {
+    const highlighted_name = if (self.selected()) |entry| try self.allocator.dupe(u8, entry.name) else null;
+    defer if (highlighted_name) |name| self.allocator.free(name);
+
+    const added = try self.allocator.alloc(Entry, models.len);
+    defer self.allocator.free(added);
+    var filled: usize = 0;
+    errdefer for (added[0..filled]) |entry| freeEntry(self.allocator, entry);
+    for (models, added) |src, *dst| {
+        dst.* = try dupeEntry(self.allocator, src, recent);
+        filled += 1;
+    }
+
+    const merged = try std.mem.concat(self.allocator, Entry, &.{ self.entries, added });
+    self.allocator.free(self.entries);
+    self.entries = merged;
+
+    try self.filter();
+    if (highlighted_name) |name| self.highlight(name);
+}
+
+/// Put the cursor back on a model by name, when it is still listed.
+fn highlight(self: *Picker, name: []const u8) void {
+    for (self.rows.items, 0..) |row, at| {
+        const index = switch (row) {
+            .heading => continue,
+            .entry => |index| index,
+        };
+        if (!std.mem.eql(u8, self.entries[index].name, name)) continue;
+        self.cursor = 0;
+        self.scroll = 0;
+        self.move(@intCast(at));
+        return;
+    }
+}
+
 fn isRecent(name: []const u8, recent: []const []const u8) bool {
     for (recent) |used| {
         if (std.mem.eql(u8, used, name)) return true;
@@ -164,6 +205,7 @@ fn isRecent(name: []const u8, recent: []const []const u8) bool {
 
 pub fn close(self: *Picker) void {
     self.open = false;
+    self.waiting = 0;
     self.search.clear();
     self.release();
     self.matches.clearRetainingCapacity();
@@ -353,7 +395,8 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
     const first_row: u16 = field_row + 2;
     if (self.rows.items.len == 0) {
-        _ = w.writeText(surface, pad, first_row, "no models", theme.on_card(theme.fg_dim).cell);
+        const empty = if (self.waiting > 0) "asking providers…" else "no models";
+        _ = w.writeText(surface, pad, first_row, empty, theme.on_card(theme.fg_dim).cell);
     }
 
     for (self.rows.items[self.scroll..][0..visible], 0..) |row, i| {
@@ -396,7 +439,12 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
     const offers_effort = if (self.selected()) |entry| entry.efforts.len > 0 else false;
     if (offers_effort) {
         hint = w.writeText(surface, hint, hint_row, "   ←→", theme.on_card(theme.fg_muted).bold().cell);
-        _ = w.writeText(surface, hint, hint_row, " effort", theme.on_card(theme.fg_dim).cell);
+        hint = w.writeText(surface, hint, hint_row, " effort", theme.on_card(theme.fg_dim).cell);
+    }
+    if (self.waiting > 0 and self.rows.items.len > 0) {
+        const waiting = try std.fmt.allocPrint(ctx.arena, "asking {d} more…", .{self.waiting});
+        const has_room = hint + 2 + waiting.len + pad <= width;
+        if (has_room) w.writeTextRight(surface, hint_row, pad, waiting, theme.on_card(theme.fg_dim).cell);
     }
 
     return .{
@@ -422,6 +470,26 @@ test "the list groups by provider and lifts what was used before" {
     try std.testing.expectEqualStrings("Ollama Cloud", picker.rows.items[5].heading);
 
     try std.testing.expectEqualStrings("llama3:70b", picker.selected().?.name);
+}
+
+test "models that arrive late join the list without moving the highlight" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    try picker.show(&.{
+        .{ .name = "qwen3:8b", .provider = "Ollama" },
+        .{ .name = "llama3:70b", .provider = "Ollama" },
+    }, &.{}, "qwen3:8b");
+    picker.move(1);
+    try std.testing.expectEqualStrings("llama3:70b", picker.selected().?.name);
+
+    try picker.append(&.{
+        .{ .name = "gpt-oss", .provider = "Ollama Cloud" },
+    }, &.{"gpt-oss"});
+
+    try std.testing.expectEqual(@as(usize, 3), picker.entries.len);
+    try std.testing.expectEqualStrings("llama3:70b", picker.selected().?.name);
+    try std.testing.expectEqualStrings("Recent", picker.rows.items[0].heading);
 }
 
 test "a model remembers which provider offers it" {
