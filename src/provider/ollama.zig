@@ -615,7 +615,7 @@ pub fn setModel(self: *OllamaProvider, name: []const u8) !void {
         return self.learnCapabilities(null);
     };
     defer response.deinit();
-    if (response.status == .not_found) return error.UnknownModel;
+    if (isUnknownModel(response.status)) return error.UnknownModel;
 
     try self.adoptModel(name);
     self.learnCapabilities(response.body() catch null);
@@ -630,19 +630,33 @@ fn adoptModel(self: *OllamaProvider, name: []const u8) !void {
 }
 
 /// Make sure the configured model is one the server actually has, and fall back
-/// to the first it lists when it is not.
+/// to the first it lists when it is not. Judged as `setModel` judges, so a
+/// `:cloud` model chosen today is still there at the next launch.
 pub fn ensureModel(self: *OllamaProvider) !void {
+    if (try self.serves(self.model)) return;
+
     const names = try self.listModels(self.allocator);
     defer {
         for (names) |name| self.allocator.free(name);
         self.allocator.free(names);
     }
     if (names.len == 0) return;
-
-    for (names) |name| {
-        if (sameModel(name, self.model)) return;
-    }
     try self.setModel(names[0]);
+}
+
+/// A server that cannot be asked counts as serving it: the first request
+/// reports an unreachable server better than this can.
+fn serves(self: *OllamaProvider, name: []const u8) !bool {
+    if (!self.started) try self.startWithoutProbe();
+    var response = self.client.show(.{ .model = name }) catch return true;
+    defer response.deinit();
+    return !isUnknownModel(response.status);
+}
+
+/// How `/api/show` refuses a name: 404 for one it does not have, 400 for one
+/// that cannot be a model name at all, such as one with a space in it.
+fn isUnknownModel(status: std.http.Status) bool {
+    return status == .not_found or status == .bad_request;
 }
 
 /// Whether a listed tag is the model that was asked for. Ollama lists
