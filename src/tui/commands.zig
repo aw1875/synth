@@ -138,6 +138,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     }
     if (isCommand(line, "/model")) {
         if (try offerProvidersInstead(self)) return true;
+        if (try refuseModelSwitchMidTurn(self, ctx)) return true;
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
             try switchModelNamed(self, ctx, name);
@@ -784,6 +785,14 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     return self.provider.model;
 }
 
+/// Refused while a turn runs, the way `/effort` is: the request in flight reads
+/// the model as it is built, and listing goes through the backend it is using.
+pub fn refuseModelSwitchMidTurn(self: *Model, ctx: *vxfw.EventContext) !bool {
+    if (!self.loop.isBusy()) return false;
+    try self.notification.show(ctx, .info, "Finish the turn first");
+    return true;
+}
+
 /// `/model <name>`. The provider judges the name, not its listing: a listing is
 /// only what a server chose to advertise.
 fn switchModelNamed(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
@@ -954,6 +963,20 @@ test "a model the provider does not serve is refused, and the one in use stays" 
 
     try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
     try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+}
+
+test "the model is not switched under a running turn" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    model.loop.state = .awaiting_answer;
+    defer model.loop.state = .idle;
+
+    try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
 }
 
 test "a command is matched by its whole name, not as a prefix" {

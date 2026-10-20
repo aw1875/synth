@@ -389,7 +389,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                try commands.showModels(self);
+                if (!try commands.refuseModelSwitchMidTurn(self, ctx)) try commands.showModels(self);
                 return ctx.consumeAndRedraw();
             }
 
