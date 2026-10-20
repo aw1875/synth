@@ -240,8 +240,12 @@ pub fn reconnect(self: *ChatGPTProvider, connection: Provider.Connection) !void 
     try self.start();
 }
 
+/// Refused for a slug the loaded catalog does not hold. Before the catalog
+/// arrives there is nothing to judge by, and the first turn reports a bad slug.
 pub fn setModel(self: *ChatGPTProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
+    const is_catalog_loaded = self.catalog.len > 0;
+    if (is_catalog_loaded and self.catalogEntry(name) == null) return error.UnknownModel;
     const owned = try self.allocator.dupe(u8, name);
     if (self.model_owned) |previous| self.allocator.free(previous);
     self.model_owned = owned;
@@ -1441,6 +1445,20 @@ test "effort is one of the model's API levels, always sent, and dropped where un
 
     try chat.setModel("gpt-small");
     try testing.expectEqualStrings("low", chat.current().effort);
+}
+
+test "a slug the catalog does not hold is refused, and the model stays put" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+    try catalogFixture(&chat);
+    try chat.setModel("gpt-test");
+
+    try testing.expectError(error.UnknownModel, chat.setModel("gpt-nope"));
+    try testing.expectEqualStrings("gpt-test", chat.model);
 }
 
 test "a summary is asked for only from a model that takes the parameter" {

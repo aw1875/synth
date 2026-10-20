@@ -352,7 +352,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.models.close(),
                     .choose => {
-                        if (self.models.selected()) |entry| try commands.switchTo(self, entry);
+                        if (self.models.selected()) |entry| {
+                            commands.switchTo(self, entry) catch |err| try commands.reportSwitchFailure(self, ctx, entry.name, err);
+                        }
                         self.models.close();
                     },
                 }

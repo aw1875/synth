@@ -124,20 +124,24 @@ pub fn startLike(self: *OllamaProvider, other: *const OllamaProvider) !void {
     self.supports_vision = other.supports_vision;
 }
 
-/// Read what this model can do and how much it can hold. Failures leave the
-/// defaults in place: a server that will not answer `show` is a problem the
-/// first request reports better than startup can.
+/// Read what this model can do and how much it can hold.
 fn probe(self: *OllamaProvider) void {
+    var response = self.client.show(.{ .model = self.model }) catch return self.learnCapabilities(null);
+    defer response.deinit();
+    self.learnCapabilities(response.body() catch null);
+}
+
+/// Take in the server's answer to `show`. No answer leaves the defaults in
+/// place: a server that will not answer is a problem the first request reports
+/// better than this can.
+fn learnCapabilities(self: *OllamaProvider, shown: ?Ollama.ShowResponse) void {
     self.context_limit = 0;
     self.runtime_limit = 0;
     self.think = self.want_think;
     self.supports_tools = true;
     self.supports_vision = true;
 
-    var response = self.client.show(.{ .model = self.model }) catch return;
-    defer response.deinit();
-    const body = response.body() catch return;
-
+    const body = shown orelse return;
     self.context_limit = contextLength(body.model_info);
 
     const capabilities = body.capabilities orelse return;
@@ -598,16 +602,31 @@ fn optionalFields(self: *const OllamaProvider) []const u8 {
 /// Point this provider at another model, re-reading the context window since
 /// that is per-model and the sidebar's "how full is the context" figure is
 /// meaningless against the wrong number.
+///
+/// Refused only when the server says it has no such model. The listing cannot
+/// judge: ollama resolves a bare name to `:latest` and serves `:cloud` models it
+/// never lists.
 pub fn setModel(self: *OllamaProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
+    if (!self.started) return self.adoptModel(name);
 
+    var response = self.client.show(.{ .model = name }) catch {
+        try self.adoptModel(name);
+        return self.learnCapabilities(null);
+    };
+    defer response.deinit();
+    if (response.status == .not_found) return error.UnknownModel;
+
+    try self.adoptModel(name);
+    self.learnCapabilities(response.body() catch null);
+}
+
+fn adoptModel(self: *OllamaProvider, name: []const u8) !void {
     const owned = try self.allocator.dupe(u8, name);
     if (self.model_owned) |previous| self.allocator.free(previous);
     self.model_owned = owned;
     self.model = owned;
     self.runtime_limit = 0;
-
-    if (self.started) self.probe();
 }
 
 /// Make sure the configured model is one the server actually has, and fall back

@@ -140,9 +140,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         if (try offerProvidersInstead(self)) return true;
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
-            if (!(switchListedModel(self, name) catch false)) {
-                try self.notification.showFmt(ctx, .err, "Model unavailable: {s}", .{name});
-            }
+            try switchModelNamed(self, ctx, name);
         } else {
             try showModels(self);
         }
@@ -786,17 +784,21 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     return self.provider.model;
 }
 
-fn switchListedModel(self: *Model, name: []const u8) !bool {
+/// `/model <name>`. The provider judges the name, not its listing: a listing is
+/// only what a server chose to advertise.
+fn switchModelNamed(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
+    _ = switchModel(self, name) catch |err| return reportSwitchFailure(self, ctx, name, err);
+}
+
+/// Say why the switch to `name` did not happen, in the backend's words where
+/// it has some.
+pub fn reportSwitchFailure(self: *Model, ctx: *vxfw.EventContext, name: []const u8, err: anyerror) !void {
+    if (err == error.UnknownModel) {
+        return self.notification.showFmt(ctx, .warn, "{s} has no model called {s}. Ctrl+o lists what it has", .{ self.provider.name, name });
+    }
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
-
-    const names = try self.provider.models(arena_state.allocator());
-    for (names) |offered| {
-        if (!std.mem.eql(u8, offered, name)) continue;
-        _ = try switchModel(self, name);
-        return true;
-    }
-    return false;
+    try self.notification.show(ctx, .err, try self.provider.explain(err, arena_state.allocator()));
 }
 
 /// Remember the model per provider so the next launch reopens on it.
@@ -912,17 +914,14 @@ pub fn reportMcpFailures(self: *Model, ctx: *vxfw.EventContext) !void {
 
 const testing = std.testing;
 
-/// Stands in for a backend that can be pointed at another of its models.
+/// Stands in for a backend that can be pointed at another of its models, and
+/// refuses one it does not serve.
 fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
+    if (std.mem.eql(u8, name, unserved_model)) return error.UnknownModel;
     return .{ .model = name };
 }
 
-fn fakeListModels(_: *anyopaque, allocator: std.mem.Allocator) anyerror![][]const u8 {
-    const names = try allocator.alloc([]const u8, 2);
-    names[0] = try allocator.dupe(u8, "qwen3-coder:30b");
-    names[1] = try allocator.dupe(u8, "glm-5.3-flash");
-    return names;
-}
+const unserved_model = "asdf";
 
 /// A model in a test needs only enough to hold a provider and a transcript.
 fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []const u8) !Model {
@@ -935,7 +934,6 @@ fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []cons
             .respond = undefined,
             .name = "Ollama",
             .model = model_name,
-            .list_models = fakeListModels,
             .set_model = fakeSetModel,
         },
         .input = .init(allocator),
@@ -944,15 +942,17 @@ fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []cons
     return self;
 }
 
-test "a typed model name must be one the provider offers" {
+test "a model the provider does not serve is refused, and the one in use stays" {
     var userdata: u8 = 0;
     var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
     defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
 
-    try testing.expect(!try switchListedModel(&model, "asdf"));
+    try testing.expect(try runCommand(&model, &ctx, "/model " ++ unserved_model));
     try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
 
-    try testing.expect(try switchListedModel(&model, "glm-5.3-flash"));
+    try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
     try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
 }
 
@@ -962,6 +962,15 @@ test "a command is matched by its whole name, not as a prefix" {
     try testing.expect(!isCommand("/models", "/model"));
     try testing.expect(!isCommand("/themes", "/theme"));
     try testing.expect(!isCommand("/renamed", "/rename"));
+}
+
+fn testContext() vxfw.EventContext {
+    return .{
+        .phase = .at_target,
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+    };
 }
 
 test "the provider is announced with the model that was actually picked" {
