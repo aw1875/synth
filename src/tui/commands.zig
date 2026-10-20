@@ -794,7 +794,10 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
             // A provider we never reached is still on the old model.
             if (!try pointAt(self, connection)) return;
 
-            const running = try switchModel(self, entry.name);
+            const running = switchModel(self, entry.name) catch |err| {
+                try announceProvider(self, connection, self.provider.model);
+                return err;
+            };
             if (entry.effort_changed) try applyEffort(self, entry.effort);
             try announceProvider(self, connection, running);
             return;
@@ -828,11 +831,15 @@ fn switchModelNamed(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !vo
     _ = switchModel(self, name) catch |err| return reportSwitchFailure(self, ctx, name, err);
 }
 
-/// Say why the switch to `name` did not happen, in the backend's words where
-/// it has some.
+/// In the backend's words where it has some. A switch that went through before
+/// a later step failed, such as remembering the choice, is said to have.
 pub fn reportSwitchFailure(self: *Model, ctx: *vxfw.EventContext, name: []const u8, err: anyerror) !void {
     if (err == error.UnknownModel) {
         return self.notification.showFmt(ctx, .warn, "{s} has no model called {s}. Ctrl+o lists what it has", .{ self.provider.name, name });
+    }
+    const is_switched = std.mem.eql(u8, self.provider.model, name);
+    if (is_switched) {
+        return self.notification.showFmt(ctx, .warn, "Switched to {s}, but could not save it: {s}", .{ name, @errorName(err) });
     }
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
