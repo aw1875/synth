@@ -192,11 +192,13 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             self.normalizePaste();
             try self.handlePaste(self.paste_buffer.items);
             self.paste_buffer.clearRetainingCapacity();
+            try self.refreshSlash();
             return ctx.consumeAndRedraw();
         },
         .paste => |text| {
             defer self.allocator.free(text);
             try self.handlePaste(text);
+            try self.refreshSlash();
             return ctx.consumeAndRedraw();
         },
         .mouse => |mouse| {
@@ -504,9 +506,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
-                    const runs_on_enter = self.slash.selectedCommand().?.runsOnEnter();
+                    const is_run_on_enter = self.slash.runsOnEnter(self.input.text.items);
                     try self.acceptCommand();
-                    if (runs_on_enter) {
+                    if (is_run_on_enter) {
                         const line = try self.allocator.dupe(u8, self.input.text.items);
                         defer self.allocator.free(line);
                         self.input.clear();
@@ -550,8 +552,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             _ = try self.input.handleEvent(ctx, event);
             try self.refreshMentions();
             try self.awaitMentions(ctx);
-            self.slash.chatgpt_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
-            try self.slash.update(self.input.text.items, self.input.cursor);
+            try self.refreshSlash();
             if (ctx.consume_event) return;
         },
         else => {},

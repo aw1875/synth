@@ -1107,6 +1107,12 @@ pub fn awaitMentions(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.mentions.isScanning()) try self.scheduleTick(ctx);
 }
 
+/// Recompute the `/` picker from the draft, after typing or a paste.
+pub fn refreshSlash(self: *Model) !void {
+    self.slash.chatgpt_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
+    try self.slash.update(self.input.text.items, self.input.cursor);
+}
+
 /// Replace the partial `@token` under the cursor with the selected path.
 pub fn acceptMention(self: *Model) !void {
     const anchor = self.mentions.anchor orelse return;

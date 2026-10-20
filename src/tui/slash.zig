@@ -21,22 +21,23 @@ pub const Command = struct {
     name: []const u8,
     /// What it does, one line, lowercase.
     description: []const u8,
-    /// Argument hint: `[name]` when optional, `<text>` when the command has
-    /// nothing to do without it, or "" when it takes none. A command with an
-    /// argument completes with a trailing space so typing can continue.
-    argument: []const u8 = "",
+    /// A command with an argument completes with a trailing space so typing
+    /// can continue.
+    argument: Argument = .none,
     /// Whether this came from a skill directory rather than the table below.
     /// What tells the dispatcher to load instructions instead of running a verb.
     is_skill: bool = false,
     /// Only offered while signed in to ChatGPT.
     needs_chatgpt: bool = false,
+};
 
-    /// Whether Enter runs this rather than only completing it. A skill waits
-    /// for what it should work on, the way codex inserts a `$skill` mention.
-    pub fn runsOnEnter(self: Command) bool {
-        const needs_argument = std.mem.startsWith(u8, self.argument, "<");
-        return !self.is_skill and !needs_argument;
-    }
+/// What a command takes after its name, and what to call it in a hint.
+pub const Argument = union(enum) {
+    none,
+    /// Shown `[name]`: the command does something without it.
+    optional: []const u8,
+    /// Shown `<text>`: the command has nothing to do until it is typed.
+    required: []const u8,
 };
 
 /// Ranked fuzzy matches kept when nothing matched by prefix. A ceiling on the
@@ -52,19 +53,19 @@ const unlabelled_skill = "run this skill";
 pub const commands: []const Command = &.{
     .{ .name = "clear", .description = "clear the transcript and start a fresh session" },
     .{ .name = "compact", .description = "summarise the conversation so far, freeing context" },
-    .{ .name = "model", .description = "switch the model this session runs on", .argument = "[name]" },
-    .{ .name = "effort", .description = "set how hard the model thinks, where it has levels" },
+    .{ .name = "model", .description = "switch the model this session runs on", .argument = .{ .optional = "name" } },
+    .{ .name = "effort", .description = "set how hard the model thinks, where it has levels", .argument = .{ .optional = "level" } },
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
     .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true },
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
-    .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = "[name]" },
+    .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = .{ .optional = "name" } },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
-    .{ .name = "theme", .description = "change the color theme", .argument = "[name]" },
-    .{ .name = "rename", .description = "name this session", .argument = "[name]" },
+    .{ .name = "theme", .description = "change the color theme", .argument = .{ .optional = "name" } },
+    .{ .name = "rename", .description = "name this session", .argument = .{ .optional = "name" } },
     .{ .name = "prune", .description = "shrink the database, dropping old stored tool output" },
-    .{ .name = "search", .description = "find text in this project's transcripts", .argument = "<text>" },
+    .{ .name = "search", .description = "find text in this project's transcripts", .argument = .{ .required = "text" } },
     .{ .name = "help", .description = "list these commands" },
 };
 
@@ -77,6 +78,9 @@ chatgpt_signed_in: bool = false,
 
 /// Indices into everything on offer, matching what has been typed, best first.
 matches: std.ArrayList(usize) = .empty,
+/// How many of `matches`, from the front, were found by the name typed rather
+/// than by a fuzzy guess. Zero for a bare `/`, where nothing has been named.
+named: usize = 0,
 selected: usize = 0,
 /// Whether the draft currently is a slash command being typed.
 active: bool = false,
@@ -105,7 +109,7 @@ pub fn at(self: *const Slash, index: usize) Command {
     return .{
         .name = found.id,
         .description = if (found.description.len > 0) found.description else unlabelled_skill,
-        .argument = "[input]",
+        .argument = .{ .optional = "input" },
         .is_skill = true,
     };
 }
@@ -117,6 +121,7 @@ pub fn isOpen(self: *const Slash) bool {
 pub fn close(self: *Slash) void {
     self.active = false;
     self.selected = 0;
+    self.named = 0;
     self.matches.clearRetainingCapacity();
 }
 
@@ -128,7 +133,7 @@ pub fn update(self: *Slash, text: []const u8, cursor: usize) !void {
         self.close();
         return;
     }
-    const word_end = firstWordEnd(text);
+    const word_end = commandWordEnd(text);
     if (cursor > word_end) {
         self.close();
         return;
@@ -139,17 +144,27 @@ pub fn update(self: *Slash, text: []const u8, cursor: usize) !void {
     if (self.selected >= self.matches.items.len) self.selected = 0;
 }
 
+/// Exact names first, then names that start with what was typed, then fuzzy
+/// guesses for a half-remembered command.
 fn filter(self: *Slash, query: []const u8) !void {
     self.matches.clearRetainingCapacity();
+    self.named = 0;
 
+    var exact_count: usize = 0;
     for (0..self.total()) |i| {
         const command = self.at(i);
         if (!self.isOffered(command)) continue;
-        if (std.ascii.startsWithIgnoreCase(command.name, query)) {
+        if (!std.ascii.startsWithIgnoreCase(command.name, query)) continue;
+        const is_exact = command.name.len == query.len;
+        if (is_exact) {
+            try self.matches.insert(self.allocator, exact_count, i);
+            exact_count += 1;
+        } else {
             try self.matches.append(self.allocator, i);
         }
     }
     if (query.len == 0) return;
+    self.named = self.matches.items.len;
 
     var top: fuzzy.Top(max_ranked) = .{};
     for (0..self.total()) |i| {
@@ -178,25 +193,51 @@ pub fn selectedCommand(self: *const Slash) ?Command {
     return self.at(self.matches.items[self.selected]);
 }
 
+/// Whether Enter runs the highlighted command rather than only completing it.
+/// As in codex, only a command picked by its name runs, never a fuzzy guess or
+/// whatever a bare `/` lists first. A skill waits for what to work on, the way
+/// codex inserts a `$skill` mention, and so does a command whose argument is
+/// required and not yet typed.
+pub fn runsOnEnter(self: *const Slash, draft: []const u8) bool {
+    const command = self.selectedCommand() orelse return false;
+    const is_named = self.selected < self.named;
+    const is_missing_argument = command.argument == .required and typedArgument(draft).len == 0;
+    return is_named and !command.is_skill and !is_missing_argument;
+}
+
 /// What the draft becomes when the highlighted command is accepted: the word
-/// being typed is replaced, and anything already typed after it is kept as the
-/// command's argument.
+/// being typed is replaced, and for a command that takes an argument, anything
+/// already typed after it is kept as that argument.
 pub fn completion(self: *const Slash, arena: std.mem.Allocator, draft: []const u8) !?[]const u8 {
     const command = self.selectedCommand() orelse return null;
-    const typed_argument = draft[firstWordEnd(draft)..];
+    if (command.argument == .none) return try std.fmt.allocPrint(arena, "/{s}", .{command.name});
+    const typed_argument = typedArgument(draft);
     if (typed_argument.len > 0) return try std.fmt.allocPrint(arena, "/{s}{s}", .{ command.name, typed_argument });
-    if (command.argument.len == 0) return try std.fmt.allocPrint(arena, "/{s}", .{command.name});
     return try std.fmt.allocPrint(arena, "/{s} ", .{command.name});
 }
 
-fn firstWordEnd(text: []const u8) usize {
-    return std.mem.indexOfAny(u8, text, " \t\n") orelse text.len;
+/// Where a command's name ends in a line typed after `/`.
+pub fn commandWordEnd(text: []const u8) usize {
+    return std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+}
+
+fn typedArgument(draft: []const u8) []const u8 {
+    return draft[commandWordEnd(draft)..];
+}
+
+fn argumentHint(arena: std.mem.Allocator, argument: Argument) ![]const u8 {
+    return switch (argument) {
+        .none => "",
+        .optional => |name| std.fmt.allocPrint(arena, "[{s}]", .{name}),
+        .required => |name| std.fmt.allocPrint(arena, "<{s}>", .{name}),
+    };
 }
 
 /// Keys that are not discoverable by typing, so `/help` names them. Kept here
 /// beside the command table for the same reason: one place to read, one place
 /// to add to.
 pub const shortcuts: []const struct { keys: []const u8, description: []const u8 } = &.{
+    .{ .keys = "enter", .description = "run the highlighted / command; tab completes it" },
     .{ .keys = "tab", .description = "cycle mode: build, plan, review" },
     .{ .keys = "ctrl+o", .description = "switch model" },
     .{ .keys = "ctrl+s", .description = "switch session" },
@@ -216,12 +257,9 @@ pub fn helpText(arena: std.mem.Allocator, available: []const skill.Skill) ![]con
 
     try out.appendSlice(arena, "**Commands**\n\n");
     for (commands) |command| {
-        try out.print(arena, "- `/{s}{s}{s}` - {s}\n", .{
-            command.name,
-            if (command.argument.len > 0) " " else "",
-            command.argument,
-            command.description,
-        });
+        const hint = try argumentHint(arena, command.argument);
+        const separator = if (hint.len > 0) " " else "";
+        try out.print(arena, "- `/{s}{s}{s}` - {s}\n", .{ command.name, separator, hint, command.description });
     }
 
     if (available.len > 0) {
@@ -284,8 +322,9 @@ pub fn draw(self: *Slash, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
 
         var x = w.writeText(surface, 2, y, "/", theme.on_card(theme.fg_dim).cell);
         x = w.writeText(surface, x, y, command.name, name_style);
-        if (command.argument.len > 0) {
-            x = w.writeText(surface, x + 1, y, command.argument, theme.on_card(theme.fg_dim).cell);
+        const hint = try argumentHint(ctx.arena, command.argument);
+        if (hint.len > 0) {
+            x = w.writeText(surface, x + 1, y, hint, theme.on_card(theme.fg_dim).cell);
         }
 
         const column = 24;
@@ -360,26 +399,42 @@ test "completion keeps what was already typed after the command" {
 
     try slash.update("/ren my session", 4);
     try std.testing.expectEqualStrings("/rename my session", (try slash.completion(arena_state.allocator(), "/ren my session")).?);
+
+    try slash.update("/comp is full", 5);
+    try std.testing.expectEqualStrings("/compact", (try slash.completion(arena_state.allocator(), "/comp is full")).?);
 }
 
-test "enter runs a command unless it is waiting for input" {
+test "enter runs a command picked by name, unless it is waiting for input" {
     var slash: Slash = .init(std.testing.allocator);
     defer slash.deinit();
     slash.skills = &.{
         .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
     };
 
-    try slash.update("/compact", 8);
-    try std.testing.expect(slash.selectedCommand().?.runsOnEnter());
-    try slash.update("/model", 6);
-    try std.testing.expect(slash.selectedCommand().?.runsOnEnter());
-    try slash.update("/theme", 6);
-    try std.testing.expect(slash.selectedCommand().?.runsOnEnter());
+    try slash.update("/mod", 4);
+    try std.testing.expect(slash.runsOnEnter("/mod"));
+    try slash.update("/sea foo", 4);
+    try std.testing.expect(slash.runsOnEnter("/sea foo"));
 
     try slash.update("/search", 7);
-    try std.testing.expect(!slash.selectedCommand().?.runsOnEnter());
+    try std.testing.expect(!slash.runsOnEnter("/search"));
     try slash.update("/release", 8);
-    try std.testing.expect(!slash.selectedCommand().?.runsOnEnter());
+    try std.testing.expect(!slash.runsOnEnter("/release"));
+    try slash.update("/opt", 4);
+    try std.testing.expect(!slash.runsOnEnter("/opt"));
+    try slash.update("/", 1);
+    try std.testing.expect(!slash.runsOnEnter("/"));
+}
+
+test "an exact name is offered before the longer names it starts" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+    slash.skills = &.{
+        .{ .id = "pr", .name = "pr", .description = "open a pull request", .dir = "/p/pr", .body = "b" },
+    };
+
+    try slash.update("/pr", 3);
+    try std.testing.expectEqualStrings("pr", slash.selectedCommand().?.name);
 }
 
 test "a half-remembered command still lands" {
