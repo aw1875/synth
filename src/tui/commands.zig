@@ -541,9 +541,9 @@ pub fn offerProvidersInstead(self: *Model) !bool {
     return true;
 }
 
-/// Open the model switcher at once with what the provider in use offers, and
-/// ask the other connected providers in the background. Their models join the
-/// list as each answers, so the slowest one does not hold the picker shut.
+/// Open the model switcher at once and ask every connected provider what it
+/// offers in the background. Models join the list as each provider answers, so
+/// a slow or hung one never holds the picker shut.
 pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (try offerProvidersInstead(self)) return;
     if (!self.provider.switchable()) return;
@@ -552,20 +552,15 @@ pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    const recent = try recentModels(self, arena);
+    try self.models.show(&.{}, recent, self.provider.model);
+
     const active_id = try activeProviderId(self, arena);
-    var entries: []const ModelPicker.Entry = &.{};
     for (catalog.all) |entry| {
         if (!isConnected(self, entry)) continue;
-        if (std.mem.eql(u8, entry.id, active_id)) {
-            entries = try modelEntries(self, arena, entry, try offeredByActive(self, arena));
-            continue;
-        }
-        try startModelListing(self, arena, entry);
+        try startModelListing(self, arena, entry, active_id);
     }
-
-    try self.models.show(entries, try recentModels(self, arena), self.provider.model);
-    self.models.waiting = self.model_listings.items.len;
-    if (self.models.waiting > 0) try self.scheduleTick(ctx);
+    if (self.models.listings.items.len > 0) try self.scheduleTick(ctx);
 }
 
 /// Whether a provider has what it needs to be asked what it offers.
@@ -574,24 +569,28 @@ pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
     return entry.ready(auth, self.chatgpt);
 }
 
-/// The provider in use answers through the live backend, on this thread: a
-/// turn uses the same HTTP client, and two threads in it is a race.
-fn offeredByActive(self: *Model, arena: std.mem.Allocator) ![]const ModelListing.Offered {
-    const names = self.provider.models(arena) catch return &.{};
-    const offered = try arena.alloc(ModelListing.Offered, names.len);
-    for (names, offered) |name, *model| {
-        model.* = .{ .name = name, .efforts = self.provider.effortsFor(name) };
-    }
-    return offered;
+/// Each provider is asked through a client of its own, never the one a turn
+/// uses. Nothing is reconnected to list a model - that only happens when one is
+/// picked. A provider that cannot be given a thread is left out.
+fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !void {
+    const reach = try reachOf(self, arena, entry, active_id);
+    const listing = ModelListing.start(self.allocator, self.io, entry, reach) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return,
+        else => return err,
+    };
+    errdefer listing.abandon();
+    try self.models.listings.append(self.allocator, listing);
 }
 
-/// The rest get a client of their own, built from the host the database
-/// remembers and the key `auth.json` holds. Nothing is reconnected to list a
-/// model - that only happens when one is picked. A provider still answering an
-/// earlier open is left to finish rather than asked twice.
-fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry) !void {
-    for (self.model_listings.items) |listing| {
-        if (std.mem.eql(u8, listing.entry.id, entry.id)) return;
+/// The provider in use is reached where it is pointed now, which a runtime
+/// connect may have moved; the rest where the database remembers, with the key
+/// `auth.json` holds.
+fn reachOf(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !ModelListing.Reach {
+    const is_active = std.mem.eql(u8, entry.id, active_id);
+    if (is_active) {
+        if (self.backend) |backend| {
+            return .{ .host = backend.currentHost(), .api_key = backend.currentKey(), .chatgpt = self.chatgpt };
+        }
     }
 
     var host = entry.host;
@@ -601,48 +600,49 @@ fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entr
             if (remembered.len > 0) host = remembered;
         }
     }
-
-    const listing = try ModelListing.start(self.allocator, self.io, entry, .{
-        .host = host,
-        .api_key = if (self.auth) |auth| auth.key(entry.id) else null,
-        .chatgpt = self.chatgpt,
-    });
-    errdefer listing.abandon();
-    try self.model_listings.append(self.allocator, listing);
+    const api_key = if (self.auth) |auth| auth.key(entry.id) else null;
+    return .{ .host = host, .api_key = api_key, .chatgpt = self.chatgpt };
 }
 
-/// Take delivery of providers that answered, into the picker if it is still up.
+/// Take delivery of providers that answered while the picker is up.
 pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
+    const listings = &self.models.listings;
     var index: usize = 0;
-    while (index < self.model_listings.items.len) {
-        const listing = self.model_listings.items[index];
+    while (index < listings.items.len) {
+        const listing = listings.items[index];
         if (!listing.isFinished()) {
             index += 1;
             continue;
         }
-        _ = self.model_listings.orderedRemove(index);
+        _ = listings.orderedRemove(index);
         defer listing.finish();
         try addListedModels(self, listing);
         ctx.redraw = true;
     }
-    self.models.waiting = self.model_listings.items.len;
-    if (self.model_listings.items.len > 0) try self.scheduleTick(ctx);
+    if (listings.items.len > 0) try self.scheduleTick(ctx);
 }
 
 fn addListedModels(self: *Model, listing: *ModelListing) !void {
-    if (!self.models.open) return;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const entries = try modelEntries(self, arena, listing.entry, listing.models);
-    try self.models.append(entries, try recentModels(self, arena));
+    const recent = try recentModels(self, arena);
+    try self.models.append(entries, recent);
 }
 
 fn recentModels(self: *Model, arena: std.mem.Allocator) ![]const []const u8 {
     const db = self.loop.database() orelse return &.{};
     const project_id = self.loop.project_id orelse return &.{};
     return db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
+}
+
+fn catalogOrder(id: []const u8) usize {
+    for (catalog.all, 0..) |entry, order| {
+        if (std.mem.eql(u8, entry.id, id)) return order;
+    }
+    return catalog.all.len;
 }
 
 /// Each model a provider offers, with the effort level last chosen for it.
@@ -665,6 +665,7 @@ fn modelEntries(
             .provider_id = entry.id,
             .efforts = model.efforts.levels,
             .effort = if (is_remembered_offered) remembered else model.efforts.default,
+            .order = catalogOrder(entry.id),
         };
     }
     return entries;

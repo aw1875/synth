@@ -11,13 +11,12 @@ const Provider = @import("../provider/provider.zig");
 
 const ModelListing = @This();
 
-/// One model on offer, and the effort levels it accepts.
 pub const Offered = struct {
     name: []const u8,
     efforts: Provider.Efforts,
 };
 
-/// Where to reach the provider. Copied by `start`.
+/// Copied by `start`.
 pub const Reach = struct {
     host: []const u8,
     api_key: ?[]const u8,
@@ -26,7 +25,8 @@ pub const Reach = struct {
 
 allocator: std.mem.Allocator,
 io: std.Io,
-/// Holds the copied reach and everything listed.
+/// Holds the copied reach and everything listed; touched only by the worker
+/// until `isFinished`.
 arena: std.heap.ArenaAllocator,
 entry: catalog.Entry,
 reach: Reach,
@@ -68,26 +68,23 @@ fn list(self: *ModelListing) ![]const Offered {
     });
     defer backend.deinit();
     try backend.start();
+    return offeredBy(arena, backend.provider());
+}
 
-    const provider = backend.provider();
+fn offeredBy(arena: std.mem.Allocator, provider: Provider) ![]const Offered {
     const names = try provider.models(arena);
     const offered = try arena.alloc(Offered, names.len);
     for (names, offered) |name, *model| {
-        const efforts = provider.effortsFor(name);
-        model.* = .{ .name = name, .efforts = .{
-            .levels = try dupeLevels(arena, efforts.levels),
-            .default = try arena.dupe(u8, efforts.default),
-        } };
+        model.* = .{ .name = name, .efforts = try copyEfforts(arena, provider.effortsFor(name)) };
     }
     return offered;
 }
 
-/// Copied because the levels are borrowed from a backend that dies with the
-/// listing.
-fn dupeLevels(arena: std.mem.Allocator, levels: []const []const u8) ![]const []const u8 {
-    const copies = try arena.alloc([]const u8, levels.len);
-    for (levels, copies) |level, *copy| copy.* = try arena.dupe(u8, level);
-    return copies;
+/// The levels are borrowed from a backend that dies with the listing.
+fn copyEfforts(arena: std.mem.Allocator, efforts: Provider.Efforts) !Provider.Efforts {
+    const levels = try arena.alloc([]const u8, efforts.levels.len);
+    for (efforts.levels, levels) |level, *copy| copy.* = try arena.dupe(u8, level);
+    return .{ .levels = levels, .default = try arena.dupe(u8, efforts.default) };
 }
 
 pub fn isFinished(self: *ModelListing) bool {
@@ -100,8 +97,8 @@ pub fn finish(self: *ModelListing) void {
     self.destroy();
 }
 
-/// For a picker that closed or reopened: stop at the next cancelation point
-/// rather than wait on the network.
+/// For a picker closing before the provider answered: stop at the next
+/// cancelation point rather than wait on the network.
 pub fn abandon(self: *ModelListing) void {
     self.future.cancel(self.io);
     self.destroy();
@@ -110,4 +107,17 @@ pub fn abandon(self: *ModelListing) void {
 fn destroy(self: *ModelListing) void {
     self.arena.deinit();
     self.allocator.destroy(self);
+}
+
+test "a provider that cannot be reached lists nothing" {
+    const testing = std.testing;
+    const listing = try start(testing.allocator, testing.io, catalog.findOrDefault(catalog.default_id), .{
+        .host = "http://127.0.0.1:1",
+        .api_key = null,
+        .chatgpt = null,
+    });
+    while (!listing.isFinished()) try std.Io.sleep(testing.io, .fromMilliseconds(5), .awake);
+
+    try testing.expectEqual(@as(usize, 0), listing.models.len);
+    listing.finish();
 }
