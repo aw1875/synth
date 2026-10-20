@@ -65,8 +65,8 @@ anything that would change the project unless `--allow` is given.
 
 | key | what it does |
 | --- | --- |
-| `enter` | send, or steer the turn already running |
-| `tab` | cycle mode: build, plan, review |
+| `enter` | send, or steer the turn already running; in the `/` menu, run the command named |
+| `tab` | cycle mode: build, plan, review; in the `/` menu, complete the command |
 | `esc` | cancel the turn, reject a pending call, or close what is open |
 | `ctrl+o` / `ctrl+p` / `ctrl+s` | model / provider / session |
 | `ctrl+r` | rename this session |
@@ -376,7 +376,7 @@ whatever `skill_paths` names, then the same pair under `$HOME`. Skills written
 for other harnesses work unchanged.
 
 Only the name and description reach the model unasked - it loads the rest when
-one applies, or you run it yourself with `/release`. `synth skills` lists what
+one applies, or you run it yourself with `/release` and what it should work on. `synth skills` lists what
 was found and every directory that was searched.
 
 ## Layout
