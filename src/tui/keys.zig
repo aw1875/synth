@@ -355,7 +355,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.models.close(),
                     .choose => {
-                        if (self.models.selected()) |entry| {
+                        if (self.loop.isBusy()) {
+                            try self.notification.show(ctx, .info, commands.finish_turn_first);
+                        } else if (self.models.selected()) |entry| {
                             commands.switchTo(self, entry) catch |err| try commands.reportSwitchFailure(self, ctx, entry.name, err);
                         }
                         self.models.close();
@@ -392,7 +394,11 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                if (!try commands.refuseModelSwitchMidTurn(self, ctx)) try commands.showModels(self, ctx);
+                if (self.loop.isBusy()) {
+                    try self.notification.show(ctx, .info, commands.finish_turn_first);
+                } else {
+                    try commands.showModels(self, ctx);
+                }
                 return ctx.consumeAndRedraw();
             }
 

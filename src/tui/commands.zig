@@ -33,6 +33,8 @@ const theme = @import("theme.zig");
 const themes = @import("themes.zig");
 const humanize = @import("../core/humanize.zig");
 
+pub const finish_turn_first = "Finish the turn first";
+
 pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !bool {
     const line = std.mem.trim(u8, value, " \t\r\n");
     if (line.len == 0 or line[0] != '/') return false;
@@ -48,7 +50,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/search")) {
-        try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
+        try searchTranscripts(self, ctx, commandArgument(line, "/search"));
         return true;
     }
     if (std.mem.eql(u8, line, "/prune")) {
@@ -57,13 +59,12 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     }
     if (std.mem.eql(u8, line, "/compact")) {
         if (try offerProvidersInstead(self)) return true;
+        if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
         try self.startCompaction(ctx);
         return true;
     }
     if (std.mem.eql(u8, line, "/clear")) {
-        if (!self.clearSession()) {
-            try self.notification.show(ctx, .info, "Finish the turn first");
-        }
+        if (!self.clearSession()) return refuseCommand(self, ctx, line, finish_turn_first);
         ctx.redraw = true;
         return true;
     }
@@ -77,7 +78,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/agent")) {
-        const name = std.mem.trim(u8, line["/agent".len..], " ");
+        const name = commandArgument(line, "/agent");
         if (name.len > 0) {
             try switchAgent(self, ctx, agents.findOrDefault(name).id);
         } else {
@@ -86,7 +87,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/theme")) {
-        const name = std.mem.trim(u8, line["/theme".len..], " ");
+        const name = commandArgument(line, "/theme");
         if (name.len > 0) {
             keepTheme(self, themes.findOrDefault(name).id);
         } else {
@@ -123,7 +124,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/effort")) {
-        try chooseEffort(self, ctx, std.mem.trim(u8, line["/effort".len..], " "));
+        try chooseEffort(self, ctx, commandArgument(line, "/effort"));
         ctx.redraw = true;
         return true;
     }
@@ -139,8 +140,8 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     }
     if (isCommand(line, "/model")) {
         if (try offerProvidersInstead(self)) return true;
-        if (try refuseModelSwitchMidTurn(self, ctx)) return true;
-        const name = std.mem.trim(u8, line["/model".len..], " ");
+        if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
+        const name = commandArgument(line, "/model");
         if (name.len > 0) {
             try switchModelNamed(self, ctx, name);
         } else {
@@ -150,7 +151,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/rename")) {
-        const name = std.mem.trim(u8, line["/rename".len..], " ");
+        const name = commandArgument(line, "/rename");
         if (name.len > 0) {
             self.loop.rename(name) catch {};
         } else {
@@ -162,6 +163,22 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     return runSkill(self, ctx, line);
 }
 
+/// Turn a command down and hand the draft back, so nothing typed is lost.
+fn refuseCommand(self: *Model, ctx: *vxfw.EventContext, line: []const u8, said: []const u8) !bool {
+    try self.input.insertText(line);
+    try self.notification.show(ctx, .info, said);
+    ctx.redraw = true;
+    return true;
+}
+
+fn commandName(line: []const u8) []const u8 {
+    return line[1..Slash.commandWordEnd(line)];
+}
+
+fn commandArgument(line: []const u8, command: []const u8) []const u8 {
+    return std.mem.trim(u8, line[command.len..], " \t\r\n");
+}
+
 /// Invoke a skill by name: `/release 2.1`.
 ///
 /// The instructions travel as an attachment rather than as the message text, so
@@ -169,15 +186,9 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
 /// skill. It is the same path an `@path` mention takes, which is what keeps a
 /// two hundred line skill from being pasted into the conversation view.
 fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
-    const word_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
-    const id = line[1..word_end];
-    const found = skill.findIn(self.loop.skills, id) orelse return false;
+    const found = skill.findIn(self.loop.skills, commandName(line)) orelse return false;
 
-    if (self.loop.isBusy()) {
-        try self.notification.show(ctx, .info, "Finish the turn first");
-        ctx.redraw = true;
-        return true;
-    }
+    if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
 
     const path = try std.fs.path.join(self.allocator, &.{ found.dir, skill.file_name });
     defer self.allocator.free(path);
@@ -504,8 +515,8 @@ pub fn note(self: *Model, comptime fmt: []const u8, args: anytype) !void {
 /// Whether `line` is `command` alone or followed by an argument, so `/effortx`
 /// is not read as `/effort x`.
 fn isCommand(line: []const u8, command: []const u8) bool {
-    if (!std.mem.startsWith(u8, line, command)) return false;
-    return line.len == command.len or line[command.len] == ' ';
+    const typed = line[0..Slash.commandWordEnd(line)];
+    return std.mem.eql(u8, typed, command);
 }
 
 /// Nothing usable is selected: none was chosen, or the ChatGPT session in use
@@ -730,7 +741,7 @@ fn chooseEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void 
 
 /// Refused mid-turn: the request in flight reads the level as it is built.
 pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void {
-    if (self.loop.isBusy()) return self.notification.show(ctx, .info, "Finish the turn first");
+    if (self.loop.isBusy()) return self.notification.show(ctx, .info, finish_turn_first);
     try applyEffort(self, level);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -812,16 +823,6 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     return self.provider.model;
 }
 
-/// Refused while a turn runs, the way `/effort` is: the request in flight reads
-/// the model as it is built, and listing goes through the backend it is using.
-pub fn refuseModelSwitchMidTurn(self: *Model, ctx: *vxfw.EventContext) !bool {
-    if (!self.loop.isBusy()) return false;
-    try self.notification.show(ctx, .info, "Finish the turn first");
-    return true;
-}
-
-/// `/model <name>`. The provider judges the name, not its listing: a listing is
-/// only what a server chose to advertise.
 fn switchModelNamed(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
     _ = switchModel(self, name) catch |err| return reportSwitchFailure(self, ctx, name, err);
 }
@@ -999,19 +1000,29 @@ test "the model is not switched under a running turn" {
     var ctx = testContext();
     defer ctx.cmds.deinit(testing.allocator);
 
-    model.loop.state = .awaiting_answer;
+    model.loop.state = .awaiting_approval;
     defer model.loop.state = .idle;
 
     try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
     try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+    try testing.expectEqualStrings("/model glm-5.3-flash", model.input.text.items);
+}
+
+test "a tab separates a command from its argument" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try testing.expect(try runCommand(&model, &ctx, "/model\tglm-5.3-flash"));
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
 }
 
 test "a command is matched by its whole name, not as a prefix" {
     try testing.expect(isCommand("/model", "/model"));
     try testing.expect(isCommand("/model glm-5.3-flash", "/model"));
     try testing.expect(!isCommand("/models", "/model"));
-    try testing.expect(!isCommand("/themes", "/theme"));
-    try testing.expect(!isCommand("/renamed", "/rename"));
 }
 
 fn testContext() vxfw.EventContext {

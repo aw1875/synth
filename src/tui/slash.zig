@@ -216,6 +216,13 @@ pub fn completion(self: *const Slash, arena: std.mem.Allocator, draft: []const u
     return try std.fmt.allocPrint(arena, "/{s} ", .{command.name});
 }
 
+pub fn isBuiltIn(name: []const u8) bool {
+    for (commands) |command| {
+        if (std.mem.eql(u8, command.name, name)) return true;
+    }
+    return false;
+}
+
 /// Where a command's name ends in a line typed after `/`.
 pub fn commandWordEnd(text: []const u8) usize {
     return std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
