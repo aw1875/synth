@@ -259,7 +259,9 @@ fn sourceModel(self: *Server) []const u8 {
 /// Start a session in `root`: a row for it now, so it has a handle to attach
 /// by before anything is said in it, and a worker to host it.
 fn open(self: *Server, root: []const u8) !*Hosted {
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, root, self.allocator);
+    const wanted = try resolveRoot(self.allocator, root, self.options.home);
+    defer self.allocator.free(wanted);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, wanted, self.allocator);
     defer self.allocator.free(cwd);
     var project = try Project.detect(self.allocator, self.io, cwd);
     defer project.deinit(self.allocator);
@@ -273,6 +275,17 @@ fn open(self: *Server, root: []const u8) !*Hosted {
     };
     defer self.allocator.free(handle);
     return self.host(id, handle, cwd);
+}
+
+/// Where `root` names on this machine. A client is elsewhere and cannot know
+/// the server's working directory, so a relative path, or one starting `~`,
+/// is taken from the home directory, as ssh would. Caller owns the result.
+fn resolveRoot(allocator: std.mem.Allocator, root: []const u8, home: ?[]const u8) ![]u8 {
+    const base = home orelse return allocator.dupe(u8, root);
+    if (std.fs.path.isAbsolute(root)) return allocator.dupe(u8, root);
+    if (std.mem.eql(u8, root, "~")) return allocator.dupe(u8, base);
+    const relative = if (std.mem.startsWith(u8, root, "~/")) root[2..] else root;
+    return std.fs.path.join(allocator, &.{ base, relative });
 }
 
 /// The session a handle names, hosting it from the database if it is not
@@ -1228,7 +1241,10 @@ const Client = struct {
                 self.reply(frame.id, sessions);
             },
             .open => |request| {
-                const hosted = self.server.open(request.root) catch |err| return self.replyError(frame.id, describe(err));
+                const hosted = self.server.open(request.root) catch |err| {
+                    const reason = std.fmt.allocPrint(arena, "{s}: {s}", .{ describe(err), request.root }) catch describe(err);
+                    return self.replyError(frame.id, reason);
+                };
                 defer hosted.release();
                 self.reply(frame.id, try hosted.summary(arena));
             },
@@ -1746,4 +1762,20 @@ test "a model is listed with its efforts, and the effort chosen for it comes bac
     try std.testing.expectEqualStrings("low", models.offered[0].efforts[0]);
 
     try std.testing.expectEqualStrings("UnknownModel", try client.expectError(try client.send(.{ .set_model = .{ .model = "missing" } })));
+}
+
+test "a session's directory is found from home unless it is absolute" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { root: []const u8, home: ?[]const u8, want: []const u8 }{
+        .{ .root = "/srv/api", .home = "/home/me", .want = "/srv/api" },
+        .{ .root = "~", .home = "/home/me", .want = "/home/me" },
+        .{ .root = "~/src/api", .home = "/home/me", .want = "/home/me/src/api" },
+        .{ .root = "src/api", .home = "/home/me", .want = "/home/me/src/api" },
+        .{ .root = "src/api", .home = null, .want = "src/api" },
+    };
+    for (cases) |case| {
+        const got = try resolveRoot(allocator, case.root, case.home);
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
 }

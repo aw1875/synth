@@ -261,12 +261,14 @@ its tools, the database and the provider all over there. A session on a server
 keeps running whoever is attached, so a turn survives a closed laptop.
 
 ```
-synth remote new devbox ~/src/api       # start a session there
+synth remote new devbox src/api         # start a session in ~/src/api there
 synth remote connect devbox             # drive it; ctrl+c leaves it running
 synth remote connect devbox ses_7k3f9a2b
 ```
 
-`connect` with no session attaches the only one live on the host. Any number
+A directory that is not absolute is taken from your home directory on the
+host; quote a `~`, or your own shell expands it first. `connect` with no
+session attaches the only one live on the host. Any number
 of TUIs can drive one session: each can type, and the first to answer an
 approval settles it for all of them.
 
