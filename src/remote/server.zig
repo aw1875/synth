@@ -672,6 +672,8 @@ const Worker = struct {
             .load_tool_result => |load| return client.reply(id, try self.loadToolResult(arena, load.seq, load.call)),
             .load_thinking => |load| return client.reply(id, try self.loadThinking(arena, load.seq)),
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
+            .sessions => |listing| return client.reply(id, try self.storedSessions(arena, listing.limit)),
+            .search => |query| return client.reply(id, try self.search(arena, query.query, query.limit)),
             .hello, .list, .open, .detach, .stop => return error.NotASessionCommand,
         }
         client.reply(id, {});
@@ -825,6 +827,7 @@ const Worker = struct {
             .label = loop.label(),
             .title = loop.title(),
             .handle = self.hosted.handle,
+            .root = self.hosted.cwd,
             .agent = loop.agent.id,
             .model = loop.provider.model,
             .provider = loop.provider.name,
@@ -880,6 +883,32 @@ const Worker = struct {
         std.mem.reverse(Conversation.Message, loaded);
         const out = try arena.alloc(wire.Message, loaded.len);
         for (loaded, out) |*msg, *wired| wired.* = try wire.Message.from(arena, msg);
+        return out;
+    }
+
+    fn storedSessions(self: *Worker, arena: std.mem.Allocator, limit: u32) ![]const wire.Stored {
+        const project_id = self.stack.loop.project_id orelse return &.{};
+        const stored = try self.db.listSessions(arena, project_id, limit);
+        const out = try arena.alloc(wire.Stored, stored.len);
+        for (stored, out) |info, *wired| wired.* = .{
+            .handle = info.public_id,
+            .title = info.title,
+            .updated_at = info.updated_at,
+            .messages = info.messages,
+        };
+        return out;
+    }
+
+    fn search(self: *Worker, arena: std.mem.Allocator, query: []const u8, limit: u32) ![]const wire.Hit {
+        const project_id = self.stack.loop.project_id orelse return &.{};
+        const hits = try self.db.search(arena, project_id, query, limit);
+        const out = try arena.alloc(wire.Hit, hits.len);
+        for (hits, out) |hit, *wired| wired.* = .{
+            .handle = hit.public_id,
+            .title = hit.title,
+            .role = hit.role,
+            .excerpt = hit.excerpt,
+        };
         return out;
     }
 

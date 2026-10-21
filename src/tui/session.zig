@@ -1,9 +1,9 @@
 //! The session the TUI drives: a loop running in this process, or one running
 //! on a server and mirrored here.
 //!
-//! What only a local session has - its database, stored sessions to resume,
-//! a provider client to reconfigure - comes back empty for a remote one, and
-//! the features built on it stand down.
+//! What only a local session has - its database, a provider client to
+//! reconfigure - comes back empty for a remote one, and the features built on
+//! it stand down. What a remote session is asked lands on a later poll.
 
 const std = @import("std");
 
@@ -109,6 +109,24 @@ pub const Session = union(enum) {
             .local => |loop| loop.dropSteering(),
             .remote => {},
         }
+    }
+
+    /// Whether the transcript was replaced by another session's since the
+    /// last call. A local session is replaced only when the TUI asks for it.
+    pub fn takeSwitched(self: Session) bool {
+        return switch (self) {
+            .local => false,
+            .remote => |mirror| mirror.takeSwitched(),
+        };
+    }
+
+    /// The answer to something asked of a remote session, which the caller
+    /// frees. A local session answers on the spot.
+    pub fn takeAnswer(self: Session) ?Mirror.Answer {
+        return switch (self) {
+            .local => null,
+            .remote => |mirror| mirror.takeAnswer(),
+        };
     }
 
     /// Something to show the person, which the caller frees.
@@ -297,22 +315,6 @@ pub const Session = union(enum) {
         return switch (self) {
             .local => |loop| loop.session_id,
             .remote => null,
-        };
-    }
-
-    /// Empty the transcript and start afresh. False while a turn runs, and
-    /// always for a remote session, which this process does not own.
-    pub fn resetForNewSession(self: Session) bool {
-        return switch (self) {
-            .local => |loop| loop.resetForNewSession(),
-            .remote => false,
-        };
-    }
-
-    pub fn resumeSession(self: Session, id: i64, limit: usize) !void {
-        return switch (self) {
-            .local => |loop| loop.resumeSession(id, limit),
-            .remote => error.RemoteSession,
         };
     }
 

@@ -44,7 +44,7 @@ pub fn run(init: std.process.Init, host: []const u8, requested: ?[]const u8) !vo
 
     // Printed once the TUI has given the terminal back, or it would be drawn
     // on the screen it is about to leave.
-    if (try drive(init, connection, host, handle, live)) {
+    if (try drive(init, connection, host, handle)) {
         var farewell: [512]u8 = undefined;
         var out = std.Io.File.stdout().writer(io, &farewell);
         try out.interface.print(
@@ -64,7 +64,6 @@ fn drive(
     connection: *client.Connection,
     host: []const u8,
     handle: []const u8,
-    live: []const wire.Summary,
 ) !bool {
     const io = init.io;
     const allocator = init.gpa;
@@ -90,7 +89,7 @@ fn drive(
         .provider = undefined,
         .input = Input.init(allocator),
         .cwd = try allocator.dupe(u8, ""),
-        .cwd_display = try describe(allocator, host, handle, live),
+        .cwd_display = try allocator.dupe(u8, host),
         .environ = init.environ_map,
         .bell = config.bell,
         .db = if (db) |*settings| settings else null,
@@ -135,15 +134,6 @@ fn onlyOne(io: std.Io, host: []const u8, live: []const wire.Summary) ![]const u8
     try complain(io, "{d} live sessions on {s}; name one:", .{ live.len, host });
     for (live) |session| try complain(io, "  {s} remote connect {s} {s}   {s}", .{ pkg.name, host, session.handle, session.root });
     return error.NoSession;
-}
-
-/// Where the session runs, for the sidebar: the host, and the directory when
-/// the session is live and so has said which.
-fn describe(allocator: std.mem.Allocator, host: []const u8, handle: []const u8, live: []const wire.Summary) ![]const u8 {
-    for (live) |session| {
-        if (std.mem.eql(u8, session.handle, handle)) return std.fmt.allocPrint(allocator, "{s}:{s}", .{ host, session.root });
-    }
-    return allocator.dupe(u8, host);
 }
 
 fn complain(io: std.Io, comptime fmt: []const u8, args: anytype) !void {

@@ -244,6 +244,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 defer self.allocator.free(notice);
                 try self.notification.show(ctx, .warn, notice);
             }
+            if (self.session.takeSwitched()) try self.showReplacedTranscript();
+            while (self.session.takeAnswer()) |answer| try commands.showAnswer(self, ctx, answer);
             if (changed) {
                 widget_pool.pruneWidgets(self);
                 commands.syncProvider(self);
@@ -291,7 +293,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.sessions.close(),
                     .choose => {
-                        if (self.sessions.selectedId()) |id| try self.switchSession(id);
+                        if (self.sessions.selectedSession()) |chosen| try self.switchSession(chosen);
                         self.sessions.close();
                     },
                 }
@@ -394,7 +396,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches('s', .{ .ctrl = true })) {
-                try commands.showSessions(self, ctx);
+                try commands.showSessions(self);
                 return ctx.consumeAndRedraw();
             }
 

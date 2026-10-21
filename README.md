@@ -282,8 +282,10 @@ another uid; what it says on starting goes to `server.log` beside it.
 
 What lives on this machine stays local to it: the theme, and the provider,
 model and effort pickers, which configure this machine's client. On a remote
-session `/model <name>` switches the server's model; the pickers, `/sessions`,
-`/search`, `/clear` and subagent transcripts are not available yet.
+session `/model <name>` switches the server's model, and `/sessions`,
+`/search` and `/clear` work on the server's stored sessions; switching away
+leaves a running turn running. The pickers and subagent transcripts are not
+available yet.
 
 ## Hooks
 

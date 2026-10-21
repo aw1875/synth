@@ -139,6 +139,8 @@ pub const Status = struct {
     label: []const u8 = "",
     title: []const u8 = "",
     handle: []const u8 = "",
+    /// The directory the session runs in, on the server's machine.
+    root: []const u8 = "",
     agent: []const u8 = "",
     model: []const u8 = "",
     provider: []const u8 = "",
@@ -189,6 +191,22 @@ pub const Summary = struct {
     state: Loop.State = .idle,
     /// Clients attached right now.
     clients: u32 = 0,
+};
+
+/// A stored session of the attached session's project.
+pub const Stored = struct {
+    handle: []const u8,
+    title: []const u8 = "",
+    updated_at: i64 = 0,
+    messages: u64 = 0,
+};
+
+/// A message matching a search, in the attached session's project.
+pub const Hit = struct {
+    handle: []const u8,
+    title: []const u8 = "",
+    role: []const u8,
+    excerpt: []const u8,
 };
 
 pub const Up = union(enum) {
@@ -253,6 +271,15 @@ pub const Up = union(enum) {
     page_history: struct {
         before_seq: u64,
         limit: u32 = 50,
+    },
+    /// Replied with `[]Stored`, most recent first.
+    sessions: struct {
+        limit: u32 = 50,
+    },
+    /// Replied with `[]Hit`, best first.
+    search: struct {
+        query: []const u8,
+        limit: u32 = 20,
     },
 };
 

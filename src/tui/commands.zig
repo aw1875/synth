@@ -21,9 +21,12 @@ const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const SignInTask = @import("chatgpt_sign_in.zig");
 const SignOutTask = @import("chatgpt_sign_out.zig");
 const keys = @import("keys.zig");
+const Database = @import("../core/database.zig");
+const Mirror = @import("../remote/mirror.zig");
 const Model = @import("model.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
+const SessionPicker = @import("session_picker.zig");
 const Slash = @import("slash.zig");
 
 /// Most transcript hits `/search` will show at once.
@@ -47,7 +50,6 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.startsWith(u8, line, "/search")) {
-        if (try localOnly(self, ctx)) return true;
         try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
         return true;
     }
@@ -61,15 +63,14 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/clear")) {
-        if (try localOnly(self, ctx)) return true;
-        if (!self.clearSession()) {
+        if (!try self.clearSession()) {
             try self.notification.show(ctx, .info, "Finish the turn first");
         }
         ctx.redraw = true;
         return true;
     }
     if (std.mem.eql(u8, line, "/sessions")) {
-        try showSessions(self, ctx);
+        try showSessions(self);
         ctx.redraw = true;
         return true;
     }
@@ -199,12 +200,32 @@ pub fn localOnly(self: *Model, ctx: *vxfw.EventContext) !bool {
     return true;
 }
 
-/// Open the session switcher on this project's stored sessions.
-pub fn showSessions(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (try localOnly(self, ctx)) return;
-    const db = self.session.database() orelse return;
-    const project_id = self.session.projectId() orelse return;
-    try self.sessions.show(db, project_id, self.session.sessionId());
+/// Open the session switcher on this project's stored sessions. A remote
+/// session's arrive on a later tick, and open it then.
+pub fn showSessions(self: *Model) !void {
+    const loop = switch (self.session) {
+        .local => |loop| loop,
+        .remote => |mirror| return mirror.listSessions(SessionPicker.fetch_limit),
+    };
+    const db = loop.db orelse return;
+    const project_id = loop.project_id orelse return;
+    const current = try loop.sessionHandle(self.allocator);
+    defer self.allocator.free(current);
+    try self.sessions.show(try db.listSessions(self.allocator, project_id, SessionPicker.fetch_limit), current);
+}
+
+/// Show what a remote session answered.
+pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) !void {
+    switch (answer) {
+        .sessions => |listed| {
+            const mirror = self.remote orelse return answer.deinit(self.allocator);
+            try self.sessions.show(listed, mirror.status.handle);
+        },
+        .search => |found| {
+            defer answer.deinit(self.allocator);
+            try showHits(self, ctx, found.query, found.hits);
+        },
+    }
 }
 
 /// The theme in use, by id. Read from the database, since that is where it is
@@ -231,17 +252,27 @@ fn searchTranscripts(self: *Model, ctx: *vxfw.EventContext, query: []const u8) !
         return;
     }
 
-    const db = self.session.database() orelse return;
-    const project_id = self.session.projectId() orelse return;
+    const loop = switch (self.session) {
+        .local => |loop| loop,
+        .remote => |mirror| return mirror.search(query, search_limit),
+    };
+    const db = loop.db orelse return;
+    const project_id = loop.project_id orelse return;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const hits = db.search(arena, project_id, query, search_limit) catch {
+    const hits = db.search(arena_state.allocator(), project_id, query, search_limit) catch {
         try self.notification.show(ctx, .warn, "Could not search the transcripts");
         return;
     };
+    try showHits(self, ctx, query, hits);
+}
+
+/// Write search hits into the view.
+fn showHits(self: *Model, ctx: *vxfw.EventContext, query: []const u8, hits: []const Database.Hit) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     var out: std.Io.Writer.Allocating = .init(arena);
     if (hits.len == 0) {

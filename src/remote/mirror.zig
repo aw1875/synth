@@ -10,6 +10,7 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const client = @import("client.zig");
 const Conversation = @import("../core/conversation.zig");
+const Database = @import("../core/database.zig");
 const todo = @import("../core/todo.zig");
 const Loop = @import("../agent/loop.zig");
 const Thought = @import("../agent/thought.zig");
@@ -45,6 +46,10 @@ content: Thought.Stream,
 
 /// What the server said for the person to read, oldest first. Owned.
 notices: std.ArrayList([]u8) = .empty,
+/// Answers to requests the TUI is waiting to show, oldest first. Owned.
+answers: std.ArrayList(Answer) = .empty,
+/// A snapshot replaced the transcript since the TUI last asked.
+switched: bool = false,
 /// Requests sent and not yet answered, by id.
 waiting: std.AutoHashMapUnmanaged(u64, Awaited) = .empty,
 paging: bool = false,
@@ -58,6 +63,32 @@ const Awaited = union(enum) {
     tool_result: struct { seq: u64, call: u32 },
     thinking: u64,
     history,
+    sessions,
+    /// The query, owned, to say what was searched for.
+    search: []const u8,
+    /// A session opened to attach once it is up.
+    fresh,
+};
+
+/// What a request the TUI made came back with, for it to show.
+pub const Answer = union(enum) {
+    /// The project's stored sessions. Ids are the server's, so zero here.
+    sessions: []Database.SessionInfo,
+    search: struct { query: []u8, hits: []Database.Hit },
+
+    pub fn deinit(self: Answer, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .sessions => |sessions| {
+                for (sessions) |info| info.deinit(allocator);
+                allocator.free(sessions);
+            },
+            .search => |found| {
+                for (found.hits) |hit| hit.deinit(allocator);
+                allocator.free(found.hits);
+                allocator.free(found.query);
+            },
+        }
+    }
 };
 
 /// One frame off the wire, in an arena of its own.
@@ -142,6 +173,10 @@ pub fn detach(self: *Mirror) void {
 fn freeState(self: *Mirror) void {
     for (self.notices.items) |notice| self.allocator.free(notice);
     self.notices.deinit(self.allocator);
+    for (self.answers.items) |unshown| unshown.deinit(self.allocator);
+    self.answers.deinit(self.allocator);
+    var awaited = self.waiting.valueIterator();
+    while (awaited.next()) |entry| if (entry.* == .search) self.allocator.free(entry.search);
     self.waiting.deinit(self.allocator);
     self.thinking.deinit();
     self.content.deinit();
@@ -217,8 +252,12 @@ fn apply(self: *Mirror, frame: wire.Frame(wire.Down)) !void {
     }
 }
 
+/// Every snapshot replaces what was there: the first one, or one for
+/// another session attached on the same connection.
 fn applySnapshot(self: *Mirror, snapshot: wire.Snapshot) !void {
     self.conversation.clear();
+    self.resetStreams(null);
+    self.switched = true;
     for (snapshot.messages) |message| try self.conversation.adoptMessage(try message.toOwned(self.allocator));
     self.conversation.dropped += snapshot.dropped;
     try self.keepStatus(snapshot.status);
@@ -236,16 +275,18 @@ fn applyMessage(self: *Mirror, message: wire.Message, changed: bool) !void {
 }
 
 fn applyStream(self: *Mirror, stream: wire.Stream) !void {
-    if (self.stream_request != stream.request) {
-        self.thinking.deinit();
-        self.thinking = .init(self.allocator, self.io);
-        self.content.deinit();
-        self.content = .init(self.allocator, self.io);
-        self.stream_request = stream.request;
-    }
+    if (self.stream_request != stream.request) self.resetStreams(stream.request);
     self.thinking.append(stream.thinking);
     self.content.append(stream.text);
     if (stream.closed and !self.thinking.isClosed()) self.thinking.close();
+}
+
+fn resetStreams(self: *Mirror, request: ?u64) void {
+    self.thinking.deinit();
+    self.thinking = .init(self.allocator, self.io);
+    self.content.deinit();
+    self.content = .init(self.allocator, self.io);
+    self.stream_request = request;
 }
 
 /// Copy a status into an arena of its own, so it outlives the frame.
@@ -257,6 +298,7 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     kept.label = try arena.dupe(u8, status.label);
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
+    kept.root = try arena.dupe(u8, status.root);
     kept.agent = try arena.dupe(u8, status.agent);
     kept.model = try arena.dupe(u8, status.model);
     kept.provider = try arena.dupe(u8, status.provider);
@@ -279,6 +321,7 @@ fn dupeAll(arena: std.mem.Allocator, texts: []const []const u8) ![]const []const
 
 fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void {
     const awaited = (self.waiting.fetchRemove(id) orelse return).value;
+    defer if (awaited == .search) self.allocator.free(awaited.search);
     if (!reply.ok) {
         if (awaited == .history) self.paging = false;
         const what = switch (awaited) {
@@ -286,6 +329,9 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             .tool_result => "loading a tool result",
             .thinking => "loading the reasoning",
             .history => "loading older messages",
+            .sessions => "listing the sessions",
+            .search => "searching",
+            .fresh => "starting a session",
         };
         return self.say("{s} failed on {s}: {s}", .{ what, self.host, reply.@"error" orelse "no reason given" });
     }
@@ -323,7 +369,77 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             }
             try self.conversation.prepend(owned);
         },
+        .sessions => {
+            const stored = try wire.parseResult([]const wire.Stored, arena, reply.result);
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            self.answers.appendAssumeCapacity(.{ .sessions = try ownSessions(self.allocator, stored) });
+        },
+        .search => |query| {
+            const hits = try wire.parseResult([]const wire.Hit, arena, reply.result);
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            const copy = try self.allocator.dupe(u8, query);
+            errdefer self.allocator.free(copy);
+            self.answers.appendAssumeCapacity(.{ .search = .{ .query = copy, .hits = try ownHits(self.allocator, hits) } });
+        },
+        .fresh => {
+            const opened = try wire.parseResult(wire.Summary, arena, reply.result);
+            try self.switchTo(opened.handle);
+        },
     }
+}
+
+fn ownSessions(allocator: std.mem.Allocator, stored: []const wire.Stored) ![]Database.SessionInfo {
+    const out = try allocator.alloc(Database.SessionInfo, stored.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |info| info.deinit(allocator);
+        allocator.free(out);
+    }
+    for (stored, out) |session, *info| {
+        const public_id = try allocator.dupe(u8, session.handle);
+        errdefer allocator.free(public_id);
+        info.* = .{
+            .id = 0,
+            .public_id = public_id,
+            .title = try allocator.dupe(u8, session.title),
+            .updated_at = session.updated_at,
+            .messages = session.messages,
+        };
+        built += 1;
+    }
+    return out;
+}
+
+fn ownHits(allocator: std.mem.Allocator, hits: []const wire.Hit) ![]Database.Hit {
+    const out = try allocator.alloc(Database.Hit, hits.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |hit| hit.deinit(allocator);
+        allocator.free(out);
+    }
+    for (hits, out) |hit, *owned| {
+        owned.* = try ownHit(allocator, hit);
+        built += 1;
+    }
+    return out;
+}
+
+fn ownHit(allocator: std.mem.Allocator, hit: wire.Hit) !Database.Hit {
+    const public_id = try allocator.dupe(u8, hit.handle);
+    errdefer allocator.free(public_id);
+    const title = try allocator.dupe(u8, hit.title);
+    errdefer allocator.free(title);
+    const role = try allocator.dupe(u8, hit.role);
+    errdefer allocator.free(role);
+    return .{
+        .session_id = 0,
+        .public_id = public_id,
+        .title = title,
+        .seq = 0,
+        .role = role,
+        .created_at = 0,
+        .excerpt = try allocator.dupe(u8, hit.excerpt),
+    };
 }
 
 fn say(self: *Mirror, comptime fmt: []const u8, args: anytype) !void {
@@ -375,6 +491,18 @@ pub fn toolNote(self: *const Mirror, seq: u64, index: usize) ?[]const u8 {
     if (self.status.pending_seq != seq or index >= self.status.notes.len) return null;
     const text = self.status.notes[index];
     return if (text.len == 0) null else text;
+}
+
+/// Whether a snapshot replaced the transcript since the last call.
+pub fn takeSwitched(self: *Mirror) bool {
+    defer self.switched = false;
+    return self.switched;
+}
+
+/// The oldest answer not yet shown, which the caller frees.
+pub fn takeAnswer(self: *Mirror) ?Answer {
+    if (self.answers.items.len == 0) return null;
+    return self.answers.orderedRemove(0);
 }
 
 /// The oldest notice not yet shown, which the caller frees.
@@ -446,6 +574,29 @@ pub fn loadThinking(self: *Mirror, msg: *Conversation.Message) !void {
     if (msg.thinking) |text| if (text.len >= msg.thinking_bytes) return;
     if (self.isWaitingFor(.{ .thinking = msg.seq })) return;
     try self.send(.{ .load_thinking = .{ .seq = msg.seq } }, .{ .thinking = msg.seq });
+}
+
+/// Drive another session on the server instead. Its snapshot replaces the
+/// transcript on a later poll; this one carries on there without us.
+pub fn switchTo(self: *Mirror, handle: []const u8) !void {
+    try self.send(.{ .attach = .{ .handle = handle } }, .{ .command = "Switching session" });
+}
+
+/// Start a session in this one's directory, and switch to it once it is up.
+pub fn startFresh(self: *Mirror) !void {
+    try self.send(.{ .open = .{ .root = self.status.root } }, .fresh);
+}
+
+/// Ask for the project's stored sessions. They land on a later poll.
+pub fn listSessions(self: *Mirror, limit: usize) !void {
+    try self.send(.{ .sessions = .{ .limit = @intCast(limit) } }, .sessions);
+}
+
+/// Search the project's transcripts. The hits land on a later poll.
+pub fn search(self: *Mirror, query: []const u8, limit: usize) !void {
+    const owned = try self.allocator.dupe(u8, query);
+    errdefer self.allocator.free(owned);
+    try self.send(.{ .search = .{ .query = query, .limit = @intCast(limit) } }, .{ .search = owned });
 }
 
 /// Ask for older messages. They land on a later poll, so this reports none.
@@ -559,4 +710,65 @@ test "a mirror hears its session stop, and says so once" {
     defer testing.allocator.free(notice);
     try testing.expect(std.mem.indexOf(u8, notice, "stopped") != null);
     try testing.expectError(error.SessionEnded, mirror.submit("anyone there?", .{}));
+}
+
+/// Poll until the mirror is on `handle`, or on any other session than it.
+fn pollUntilOn(mirror: *Mirror, handle: []const u8, on: bool) !void {
+    for (0..500) |_| {
+        _ = try mirror.poll();
+        if (std.mem.eql(u8, mirror.status.handle, handle) == on) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    return error.TimedOut;
+}
+
+fn pollForAnswer(mirror: *Mirror) !Answer {
+    for (0..500) |_| {
+        _ = try mirror.poll();
+        if (mirror.takeAnswer()) |found| return found;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    return error.TimedOut;
+}
+
+test "a mirror starts afresh, finds its old session, and goes back to it" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    const first = try testing.allocator.dupe(u8, mirror.status.handle);
+    defer testing.allocator.free(first);
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.once);
+    try pollUntil(mirror, finishedOne);
+    const held = convo.messages.items.len;
+    _ = mirror.takeSwitched();
+
+    try mirror.startFresh();
+    try pollUntilOn(mirror, first, false);
+    try testing.expect(mirror.takeSwitched());
+    try testing.expectEqual(@as(usize, 0), convo.messages.items.len);
+    try testing.expectEqualStrings(fixture.project, mirror.status.root);
+
+    try mirror.listSessions(10);
+    const listed = try pollForAnswer(mirror);
+    defer listed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), listed.sessions.len);
+    try testing.expectEqualStrings(first, listed.sessions[0].public_id);
+
+    try mirror.search("make a note", 10);
+    const found = try pollForAnswer(mirror);
+    defer found.deinit(testing.allocator);
+    try testing.expectEqualStrings("make a note", found.search.query);
+    try testing.expectEqualStrings(first, found.search.hits[0].public_id);
+
+    try mirror.switchTo(first);
+    try pollUntilOn(mirror, first, true);
+    try testing.expectEqual(held, convo.messages.items.len);
+    try testing.expectEqual(@as(u64, 1), mirror.status.finished);
 }

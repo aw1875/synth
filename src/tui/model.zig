@@ -952,43 +952,64 @@ fn holdImage(self: *Model, bytes: []const u8, label: []const u8) void {
     self.input.insertText(token) catch {};
 }
 
-/// Swap the transcript for another session's, without leaving.
-pub fn switchSession(self: *Model, session_id: i64) !void {
-    if (self.session.sessionId()) |current| {
-        if (current == session_id) return;
+/// Swap the transcript for another session's, without leaving. A local turn
+/// in progress is cancelled; a remote one carries on on its server, and the
+/// session's transcript arrives on a later tick.
+pub fn switchSession(self: *Model, chosen: Database.SessionInfo) !void {
+    switch (self.session) {
+        .local => |loop| {
+            if (loop.session_id == chosen.id) return;
+            if (loop.isBusy()) try loop.cancel();
+            try loop.resumeSession(chosen.id, resume_messages);
+            commands.syncProvider(self);
+            try commands.restoreEffort(self);
+            loop.dropSteering();
+            try self.showReplacedTranscript();
+        },
+        .remote => |mirror| {
+            if (std.mem.eql(u8, mirror.status.handle, chosen.public_id)) return;
+            try mirror.switchTo(chosen.public_id);
+        },
     }
-    if (self.session.isBusy()) try self.session.cancel();
-
-    try self.session.resumeSession(session_id, resume_messages);
-    commands.syncProvider(self);
-    try commands.restoreEffort(self);
-
-    self.closeSubagent();
-    self.subagent_sessions.clearRetainingCapacity();
-    clearMessageWidgets(self);
-    self.thinking.stream = null;
-    self.session.dropSteering();
-    try self.seedHistory();
     self.input.clear();
     self.held.clear();
-    self.scroll = 0;
 }
 
-/// Clear the visible transcript and start an empty session in this TUI.
-pub fn clearSession(self: *Model) bool {
-    if (!self.session.resetForNewSession()) return false;
+/// Start an empty session: in this TUI, or alongside this one on its server.
+/// False while a turn runs.
+pub fn clearSession(self: *Model) !bool {
+    switch (self.session) {
+        .local => |loop| {
+            if (!loop.resetForNewSession()) return false;
+            try self.showReplacedTranscript();
+        },
+        .remote => |mirror| {
+            if (mirror.isBusy()) return false;
+            try mirror.startFresh();
+        },
+    }
+    self.input.clear();
+    self.held.clear();
+    return true;
+}
 
+/// Forget what was drawn for the transcript just replaced, and recall the
+/// prompts of the one that replaced it.
+pub fn showReplacedTranscript(self: *Model) !void {
     self.closeSubagent();
     self.subagent_sessions.clearRetainingCapacity();
     clearMessageWidgets(self);
     self.thinking = .{};
-    self.clearHistory();
-    self.input.clear();
-    self.held.clear();
+    try self.seedHistory();
     self.mentions.close();
     self.selection.clear();
+    self.rung_for = self.session.finishedTurns();
     self.scroll = 0;
-    return true;
+    if (self.remote) |mirror| {
+        const where = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ mirror.host, mirror.status.root });
+        self.allocator.free(self.cwd_display);
+        self.cwd_display = where;
+    }
 }
 
 /// Keep a sent prompt for up-arrow recall. Consecutive duplicates are not worth
@@ -1640,7 +1661,7 @@ test "a cleared session forgets the subagents the old one left" {
     try testing.expect(try model.openSubagent(key, 0, 0, "task"));
     try testing.expect(model.inSubagent());
 
-    try testing.expect(model.clearSession());
+    try testing.expect(try model.clearSession());
 
     try testing.expect(!model.inSubagent());
     try testing.expectEqual(&model.conversation, model.shown());
@@ -1719,7 +1740,7 @@ test "a model drives a session on a server the way it drives one here" {
     try testing.expect(model.session.isRemote());
     try testing.expect(model.localLoop() == null);
     try testing.expect(model.session.database() == null);
-    try testing.expect(!model.session.resetForNewSession());
+    try testing.expect(model.session.takeSwitched());
 
     try model.session.submit("make a note", .{});
     for (0..500) |_| {
@@ -1741,4 +1762,16 @@ test "a model drives a session on a server the way it drives one here" {
     const owned = try model.session.sessionHandle(testing.allocator);
     defer testing.allocator.free(owned);
     try testing.expectEqualStrings(handle, owned);
+
+    try testing.expect(try model.clearSession());
+    for (0..500) |_| {
+        _ = try model.session.poll();
+        if (model.session.takeSwitched()) break;
+        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
+    } else return error.TimedOut;
+    try model.showReplacedTranscript();
+    try testing.expect(!std.mem.eql(u8, handle, model.remote.?.status.handle));
+    try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);
+    try testing.expectEqual(@as(usize, 0), model.history.items.len);
+    try testing.expect(std.mem.startsWith(u8, model.cwd_display, "test:/"));
 }
