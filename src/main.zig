@@ -32,6 +32,7 @@ const Provider = @import("provider/provider.zig");
 const mcp_tools = @import("tools/mcp.zig");
 const skill_tool = @import("tools/skill.zig");
 const web = @import("tools/web.zig");
+const Providers = @import("remote/providers.zig");
 const tui_app = @import("tui/app.zig");
 const Model = @import("tui/model.zig");
 const tui_bell = @import("tui/bell.zig");
@@ -277,7 +278,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try model.local_loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");
 
-    model.provider_missing = !try hasUsableProvider(allocator, &db, &config, active, &auth, chatgpt, &backend);
+    model.provider_missing = !try Providers.usable(init.arena.allocator(), &db, &config, active, &auth, chatgpt, &backend);
     if (model.provider_missing) try tui_commands.showProviders(model);
 
     if (try resumeTarget(&db, model.local_loop.project_id, options)) |session_id| {
@@ -308,29 +309,4 @@ fn resumeTarget(db: *Database, project_id: ?i64, options: cli.Command.Tui) !?i64
 
 test {
     std.testing.refAllDecls(@This());
-}
-
-/// A provider someone chose, and that has what it needs; or, with nothing
-/// chosen, a local server that actually answers. Defaulting to one that is not
-/// there would only surface as an error on the first prompt.
-fn hasUsableProvider(
-    allocator: std.mem.Allocator,
-    db: *Database,
-    config: *const Config,
-    active: catalog.Active,
-    auth: *const Auth,
-    chatgpt: *chatgpt_auth.Store,
-    backend: *Backend,
-) !bool {
-    if (!active.entry.ready(auth, chatgpt)) return false;
-
-    var arena_state: std.heap.ArenaAllocator = .init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const chosen = try db.activeProvider(arena);
-    const was_chosen = chosen.len > 0 or config.provider_override.len > 0 or config.host_override.len > 0;
-    if (was_chosen) return true;
-
-    const offered = backend.listModels(arena) catch return false;
-    return offered.len > 0;
 }

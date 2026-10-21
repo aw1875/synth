@@ -87,6 +87,18 @@ pub fn isOpen(self: *const Connect) bool {
     return self.stage != .closed;
 }
 
+/// Whether the list showed provider `id` as having what it needs.
+pub fn isConnected(self: *const Connect, id: []const u8) bool {
+    for (self.rows.items) |row| {
+        if (std.mem.eql(u8, row.entry.id, id)) return row.connected;
+    }
+    return false;
+}
+
+pub fn isSigningIn(self: *const Connect) bool {
+    return self.stage == .signing_in;
+}
+
 /// Open on the provider list. `states` is borrowed for the length of the call;
 /// the hosts are duped, since they come from a config that a reconnect will
 /// replace out from under this.

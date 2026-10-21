@@ -77,6 +77,7 @@ const Awaited = union(enum) {
     fresh,
     models,
     files,
+    providers,
 };
 
 /// What a request the TUI made came back with, for it to show.
@@ -84,6 +85,8 @@ pub const Answer = union(enum) {
     /// The project's stored sessions. Ids are the server's, so zero here.
     sessions: []Database.SessionInfo,
     search: struct { query: []u8, hits: []Database.Hit },
+    /// Each provider the server knows, in an arena of their own.
+    providers: struct { arena: std.heap.ArenaAllocator, states: []const wire.ProviderState },
     /// The project's files, for `@` mentions.
     files: [][]const u8,
     /// The models the server's provider offers, in an arena of their own.
@@ -102,6 +105,10 @@ pub const Answer = union(enum) {
             },
             .models => |offer| {
                 var arena = offer.arena;
+                arena.deinit();
+            },
+            .providers => |known| {
+                var arena = known.arena;
                 arena.deinit();
             },
             .files => |paths| {
@@ -373,6 +380,8 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     kept.agent = try arena.dupe(u8, status.agent);
     kept.model = try arena.dupe(u8, status.model);
     kept.provider = try arena.dupe(u8, status.provider);
+    kept.provider_id = try arena.dupe(u8, status.provider_id);
+    if (status.sign_in) |sign_in| kept.sign_in = .{ .url = try arena.dupe(u8, sign_in.url), .port = sign_in.port };
     kept.effort = try arena.dupe(u8, status.effort);
     kept.efforts = try dupeAll(arena, status.efforts);
     kept.todos = &.{};
@@ -409,6 +418,7 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             .fresh => "starting a session",
             .models => "listing the models",
             .files => "listing the files",
+            .providers => "listing the providers",
         };
         return self.say("{s} failed on {s}: {s}", .{ what, self.host, reply.@"error" orelse "no reason given" });
     }
@@ -457,6 +467,13 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             const copy = try self.allocator.dupe(u8, query);
             errdefer self.allocator.free(copy);
             self.answers.appendAssumeCapacity(.{ .search = .{ .query = copy, .hits = try ownHits(self.allocator, hits) } });
+        },
+        .providers => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const states = try wire.parseResult([]const wire.ProviderState, kept.allocator(), reply.result);
+            self.answers.appendAssumeCapacity(.{ .providers = .{ .arena = kept, .states = states } });
         },
         .files => {
             const paths = try wire.parseResult([]const []const u8, arena, reply.result);
@@ -665,8 +682,27 @@ pub fn useAgent(self: *Mirror, id: []const u8) !void {
 
 /// Switch the server's model, to run at `effort`, or at the level last
 /// chosen for it when that is null.
-pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8) !void {
-    try self.send(.{ .set_model = .{ .model = model, .effort = effort } }, .{ .command = "Switching model" });
+pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8, provider_id: ?[]const u8) !void {
+    try self.send(.{ .set_model = .{ .model = model, .effort = effort, .provider_id = provider_id } }, .{ .command = "Switching model" });
+}
+
+/// Ask what providers the server knows. They land on a later poll.
+pub fn listProviders(self: *Mirror) !void {
+    try self.send(.{ .providers = .{} }, .providers);
+}
+
+/// Point the session at a provider. A ChatGPT sign-in it needs shows up in
+/// the status until it settles.
+pub fn connectProvider(self: *Mirror, id: []const u8, host: []const u8, key: ?[]const u8) !void {
+    try self.send(.{ .connect_provider = .{ .provider = id, .host = host, .key = key } }, .{ .command = "Connecting" });
+}
+
+pub fn cancelSignIn(self: *Mirror) !void {
+    try self.send(.{ .cancel_sign_in = .{} }, .{ .command = "Cancelling the sign-in" });
+}
+
+pub fn signOut(self: *Mirror) !void {
+    try self.send(.{ .sign_out = .{} }, .{ .command = "Signing out" });
 }
 
 pub fn setEffort(self: *Mirror, level: []const u8) !void {

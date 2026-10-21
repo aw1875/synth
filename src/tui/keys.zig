@@ -226,6 +226,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         .tick => {
             self.tick_pending = false;
             try commands.pollSignIn(self, ctx);
+            try commands.followRemoteSignIn(self);
             try commands.pollSignOut(self, ctx);
             commands.checkModel(self, ctx);
             try commands.applyMcp(self, ctx);
@@ -344,7 +345,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                             try self.scheduleTick(ctx);
                         }
                     },
-                    .cancel_sign_in => commands.cancelSignIn(self),
+                    .cancel_sign_in => try commands.cancelSignIn(self),
                     .reopen_sign_in => commands.reopenSignIn(self),
                     .copy_sign_in => try commands.copySignInLink(self, ctx),
                 }
@@ -401,7 +402,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches('p', .{ .ctrl = true })) {
-                if (!try commands.localOnly(self, ctx)) try commands.showProviders(self);
+                try commands.showProviders(self);
                 return ctx.consumeAndRedraw();
             }
 

@@ -18,11 +18,12 @@ const Backend = @import("../provider/backend.zig");
 const Provider = @import("../provider/provider.zig");
 const Connect = @import("connect.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
-const SignInTask = @import("chatgpt_sign_in.zig");
-const SignOutTask = @import("chatgpt_sign_out.zig");
+const SignInTask = @import("../provider/chatgpt_sign_in.zig");
+const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const keys = @import("keys.zig");
 const Database = @import("../core/database.zig");
 const Mirror = @import("../remote/mirror.zig");
+const client = @import("../remote/client.zig");
 const Model = @import("model.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
@@ -119,7 +120,6 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/logout")) {
-        if (try localOnly(self, ctx)) return true;
         try signOutOfChatGPT(self, ctx);
         ctx.redraw = true;
         return true;
@@ -130,13 +130,11 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/usage")) {
-        if (try localOnly(self, ctx)) return true;
         try openUsage(self);
         ctx.redraw = true;
         return true;
     }
     if (std.mem.eql(u8, line, "/providers")) {
-        if (try localOnly(self, ctx)) return true;
         try showProviders(self);
         ctx.redraw = true;
         return true;
@@ -244,11 +242,25 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             const entries = try arena_state.allocator().alloc(ModelPicker.Entry, offer.models.offered.len);
             for (offer.models.offered, entries) |offered, *entry| entry.* = .{
                 .name = offered.name,
-                .provider = mirror.status.provider,
+                .provider = if (offered.provider.len > 0) offered.provider else mirror.status.provider,
+                .provider_id = offered.provider_id,
                 .efforts = offered.efforts,
                 .effort = offered.effort,
             };
             try self.models.show(entries, offer.models.recent, mirror.status.model);
+        },
+        .providers => |known| {
+            defer answer.deinit(self.allocator);
+            var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena_state.deinit();
+            const states = try arena_state.allocator().alloc(Connect.State, known.states.len);
+            for (known.states, states) |state, *out| out.* = .{
+                .id = state.id,
+                .host = state.host,
+                .connected = state.connected,
+                .active = state.active,
+            };
+            try self.connect.show(states);
         },
     }
 }
@@ -362,6 +374,7 @@ pub fn switchAgent(self: *Model, ctx: *vxfw.EventContext, id: []const u8) !void 
 }
 
 pub fn showProviders(self: *Model) !void {
+    if (self.remote) |mirror| return mirror.listProviders();
     const auth = self.auth orelse return;
     const db = self.db orelse return;
 
@@ -389,6 +402,10 @@ pub fn showProviders(self: *Model) !void {
 /// Point the harness at a provider and say so. Returns false while a browser
 /// sign-in it started is still waiting, so the dialog stays up for it.
 pub fn connectProvider(self: *Model, result: Connect.Result) !bool {
+    if (self.remote) |mirror| {
+        try mirror.connectProvider(result.id, result.host, result.key);
+        return catalog.findOrDefault(result.id).key != .oauth or self.connect.isConnected(result.id);
+    }
     const auth = self.auth orelse return true;
     const entry = catalog.findOrDefault(result.id);
     const needs_sign_in = entry.key == .oauth and !entry.ready(auth, self.chatgpt);
@@ -425,21 +442,41 @@ fn isOverSsh(self: *Model) bool {
     return environ.get("SSH_CONNECTION") != null or environ.get("SSH_TTY") != null;
 }
 
-pub fn cancelSignIn(self: *Model) void {
+pub fn cancelSignIn(self: *Model) !void {
+    if (self.remote) |mirror| return mirror.cancelSignIn();
     if (self.chatgpt_sign_in) |task| task.cancel();
 }
 
 pub fn reopenSignIn(self: *Model) void {
-    const task = self.chatgpt_sign_in orelse return;
-    keys.openUrl(self, task.sign_in.url);
+    keys.openUrl(self, signInUrl(self) orelse return);
 }
 
 /// OSC 52, so the link reaches the clipboard of the machine the terminal is
 /// on, which over SSH is the one with the browser.
 pub fn copySignInLink(self: *Model, ctx: *vxfw.EventContext) !void {
-    const task = self.chatgpt_sign_in orelse return;
-    try ctx.copyToClipboard(task.sign_in.url);
+    try ctx.copyToClipboard(signInUrl(self) orelse return);
     try self.notification.show(ctx, .info, "Sign-in link copied");
+}
+
+fn signInUrl(self: *Model) ?[]const u8 {
+    if (self.remote) |mirror| return if (mirror.status.sign_in) |sign_in| sign_in.url else null;
+    const task = self.chatgpt_sign_in orelse return null;
+    return task.sign_in.url;
+}
+
+/// Called each tick on a remote session: show its server's sign-in while one
+/// waits on a browser, and put the dialog away once it settles. The callback
+/// listens on the server's machine, so from anywhere else it takes a forward.
+pub fn followRemoteSignIn(self: *Model) !void {
+    const mirror = self.remote orelse return;
+    const sign_in = mirror.status.sign_in orelse {
+        if (self.connect.isSigningIn()) self.connect.close();
+        return;
+    };
+    if (self.connect.isSigningIn() and std.mem.eql(u8, self.connect.sign_in_url, sign_in.url)) return;
+    const elsewhere = !std.mem.eql(u8, mirror.host, client.here) or isOverSsh(self);
+    try self.connect.showSignIn(sign_in.url, sign_in.port, elsewhere);
+    keys.openUrl(self, sign_in.url);
 }
 
 /// Called each tick: once the browser has come back, connect or say why not.
@@ -477,6 +514,7 @@ fn welcomeToPlanUsage(self: *Model) !void {
 /// Revoking is a network round trip, so it runs off this thread and the tick
 /// loop reports how it went.
 fn signOutOfChatGPT(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (self.remote) |mirror| return mirror.signOut();
     const store = self.chatgpt orelse return;
     if (self.chatgpt_sign_out != null) return;
     if (!store.isSignedIn()) return note(self, "Not signed in to ChatGPT.", .{});
@@ -584,6 +622,7 @@ fn isCommand(line: []const u8, command: []const u8) bool {
 /// Nothing usable is selected: none was chosen, or the ChatGPT session in use
 /// has ended. Marked, so the title and the next prompt say so too.
 pub fn needsProvider(self: *Model) bool {
+    if (self.remote) |mirror| return mirror.status.provider_missing;
     if (self.provider_missing) return true;
     const store = self.chatgpt orelse return false;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -807,7 +846,10 @@ pub fn syncProvider(self: *Model) void {
 /// one. Picking `gpt-oss` from a list that also holds local models should just
 /// work, which means the switch is a reconnect and a model change together.
 pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
-    if (self.remote) |mirror| return mirror.switchModel(entry.name, if (entry.effort_changed) entry.effort else null);
+    if (self.remote) |mirror| {
+        const provider_id = if (entry.provider_id.len > 0) entry.provider_id else null;
+        return mirror.switchModel(entry.name, if (entry.effort_changed) entry.effort else null, provider_id);
+    }
     if (entry.provider_id.len > 0) {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
@@ -848,7 +890,7 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     const loop = switch (self.session) {
         .local => |loop| loop,
         .remote => |mirror| {
-            try mirror.switchModel(name, null);
+            try mirror.switchModel(name, null, null);
             return name;
         },
     };

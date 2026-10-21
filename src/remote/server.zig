@@ -29,6 +29,11 @@ const project_files = @import("../core/files.zig");
 const Loop = @import("../agent/loop.zig");
 const Stack = @import("../agent/stack.zig");
 const Backend = @import("../provider/backend.zig");
+const catalog = @import("../provider/catalog.zig");
+const SignInTask = @import("../provider/chatgpt_sign_in.zig");
+const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
+const Providers = @import("providers.zig");
+const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const Provider = @import("../provider/provider.zig");
 
 const Server = @This();
@@ -49,7 +54,7 @@ const max_outbox_bytes: usize = 64 * 1024 * 1024;
 pub const Source = union(enum) {
     /// Each session spawns a client of its own from this one: a client is
     /// single-writer, and sessions run turns at the same time.
-    backend: *Backend,
+    providers: *Providers,
     /// Every session answers through this provider. For tests, whose fake
     /// providers keep no per-request state.
     provider: Provider,
@@ -62,9 +67,6 @@ pub const Options = struct {
     /// The database sessions persist to. Each worker opens its own connection.
     database_path: []const u8,
     source: Source,
-    /// The catalog id of the provider sessions answer through, which the
-    /// effort chosen for each of its models is remembered under.
-    provider_id: []const u8 = "",
     home: ?[]const u8 = null,
     mcp_auth: ?*mcp.Auth = null,
     /// The program file the server runs, to notice it being replaced.
@@ -339,10 +341,11 @@ fn restrictDir(io: std.Io, socket_path: []const u8) !void {
     try dir.setPermissions(io, .fromMode(0o700));
 }
 
-fn sourceModel(self: *Server) []const u8 {
+/// The model a new session starts on. Caller owns the result.
+fn sourceModel(self: *Server, allocator: std.mem.Allocator) ![]const u8 {
     return switch (self.options.source) {
-        .backend => |backend| backend.model(),
-        .provider => |provider| provider.model,
+        .providers => |providers| providers.model(allocator),
+        .provider => |provider| allocator.dupe(u8, provider.model),
     };
 }
 
@@ -360,7 +363,9 @@ fn open(self: *Server, root: []const u8) !*Hosted {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         const project_id = try self.db.resolveProject(project.root, "git", project.name());
-        const id = try self.db.createSession(project_id, cwd, self.sourceModel());
+        const model = try self.sourceModel(self.allocator);
+        defer self.allocator.free(model);
+        const id = try self.db.createSession(project_id, cwd, model);
         break :blk .{ id, try self.db.sessionPublicId(id, self.allocator) };
     };
     defer self.allocator.free(handle);
@@ -752,6 +757,11 @@ const Worker = struct {
     io: std.Io,
     db: Database = undefined,
     spawned: ?*Backend.Spawned = null,
+    /// Catalog id of the provider the session answers through, which the
+    /// effort chosen for each of its models is remembered under.
+    provider_id: []const u8 = "",
+    sign_in: ?*SignInTask = null,
+    sign_out: ?*SignOutTask = null,
     stack: *Stack = undefined,
     subscribers: std.ArrayList(*Client) = .empty,
     /// Every message sent, by seq, with a signature of the parts of it that
@@ -790,8 +800,8 @@ const Worker = struct {
 
         const provider: Provider, const backend: ?*Backend = switch (server.options.source) {
             .provider => |provider| .{ provider, null },
-            .backend => |template| blk: {
-                self.spawned = try template.spawn(self.allocator);
+            .providers => |providers| blk: {
+                self.spawned, self.provider_id = try providers.spawn(self.allocator);
                 break :blk .{ self.spawned.?.provider(), &self.spawned.?.backend };
             },
         };
@@ -813,6 +823,8 @@ const Worker = struct {
     }
 
     fn teardown(self: *Worker) void {
+        if (self.sign_in) |task| task.abandon();
+        if (self.sign_out) |task| task.abandon();
         // Opening a session makes its row up front; one never spoken in is not worth keeping.
         if (self.stack.convo.totalCount() == 0) self.db.deleteSession(self.hosted.id) catch {};
         self.stack.loop.requestStop();
@@ -835,7 +847,7 @@ const Worker = struct {
             self.publish(arena_state.allocator()) catch |err| self.broadcastNotice("Could not report progress: {s}", .{@errorName(err)});
             _ = arena_state.reset(.retain_capacity);
 
-            const busy = self.stack.loop.isBusy() or self.stack.runner.busy();
+            const busy = self.stack.loop.isBusy() or self.stack.runner.busy() or self.sign_in != null or self.sign_out != null;
             if (busy) {
                 self.alone_since = null;
                 self.hosted.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
@@ -926,9 +938,19 @@ const Worker = struct {
                 try loop.submit(invoked.line, .{ .attachments = &.{attachment} });
             },
             .set_model => |set| {
+                const switching = if (set.provider_id) |wanted| !std.mem.eql(u8, wanted, self.provider_id) else false;
+                if (switching) {
+                    if (loop.isBusy()) return error.Busy;
+                    try self.useProvider(catalog.find(set.provider_id.?) orelse return error.UnknownProvider, null, null);
+                }
                 try loop.switchModel(set.model);
                 if (set.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
+                if (switching) self.announceProvider();
             },
+            .providers => return client.reply(id, try (try self.providerSource()).states(arena, &self.db, self.provider_id)),
+            .connect_provider => |asked| try self.connectProvider(asked.provider, asked.host, asked.key),
+            .cancel_sign_in => if (self.sign_in) |task| task.cancel(),
+            .sign_out => try self.signOut(),
             .set_effort => |set| {
                 if (loop.isBusy()) return error.Busy;
                 try self.chooseEffort(set.effort);
@@ -1010,7 +1032,9 @@ const Worker = struct {
             defer self.allocator.free(notice);
             self.broadcast(.{ .body = .{ .notice = .{ .text = notice } } });
         }
+        self.settleSignOut();
         if (loop.isBusy()) return;
+        self.settleSignIn();
         if (loop.shouldCompact()) {
             loop.compact() catch |err| self.broadcastNotice("Could not compact: {s}", .{@errorName(err)});
             return;
@@ -1105,6 +1129,9 @@ const Worker = struct {
             .agent = loop.agent.id,
             .model = loop.provider.model,
             .provider = loop.provider.name,
+            .provider_id = self.provider_id,
+            .provider_missing = if (self.providerSource()) |providers| providers.isMissing(self.provider_id) else |_| false,
+            .sign_in = if (self.sign_in) |task| .{ .url = task.sign_in.url, .port = task.sign_in.callbackPort() } else null,
             .context_limit = loop.provider.context_limit,
             .switchable = loop.provider.switchable(),
             .effort = loop.provider.effort,
@@ -1163,10 +1190,109 @@ const Worker = struct {
         return out;
     }
 
+    fn providerSource(self: *Worker) !*Providers {
+        return switch (self.hosted.server.options.source) {
+            .providers => |providers| providers,
+            .provider => error.ProviderFixed,
+        };
+    }
+
+    fn connectProvider(self: *Worker, id: []const u8, at: []const u8, key: ?[]const u8) !void {
+        const providers = try self.providerSource();
+        if (self.stack.loop.isBusy()) return error.Busy;
+        const entry = catalog.find(id) orelse return error.UnknownProvider;
+        if (entry.key == .oauth and !providers.isReady(entry)) return self.beginSignIn(providers);
+        try self.useProvider(entry, at, key);
+        self.announceProvider();
+    }
+
+    /// Point the session at a provider, at `host` or the one it was last
+    /// reached at, and remember it as the choice for sessions to come.
+    fn useProvider(self: *Worker, entry: catalog.Entry, at: ?[]const u8, key: ?[]const u8) !void {
+        const providers = try self.providerSource();
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const where = at orelse try Providers.hostOf(arena_state.allocator(), &self.db, entry);
+
+        const loop = &self.stack.loop;
+        loop.provider = try providers.connect(&self.spawned.?.backend, entry, where, key);
+        self.provider_id = entry.id;
+        try loop.setModel(loop.provider.model);
+        self.db.setProviderHost(entry.id, where) catch |err| self.broadcastNotice("Could not remember the host: {s}", .{@errorName(err)});
+        self.db.setActiveProvider(entry.id) catch |err| self.broadcastNotice("Could not remember the provider: {s}", .{@errorName(err)});
+        self.restoreEffort();
+    }
+
+    fn announceProvider(self: *Worker) void {
+        const entry = catalog.findOrDefault(self.provider_id);
+        const provider = self.stack.loop.provider;
+        if (entry.key == .oauth) return self.broadcastNotice("Connected to your {s}, running {s}.", .{ entry.label, provider.model });
+        self.broadcastNotice("Connected {s} at {s}, running {s}.", .{ entry.label, self.spawned.?.backend.currentHost(), provider.model });
+    }
+
+    fn beginSignIn(self: *Worker, providers: *Providers) !void {
+        if (self.sign_in != null) return;
+        const store = providers.chatgpt orelse return error.NoCredentialStore;
+        self.sign_in = SignInTask.start(self.allocator, self.io, store) catch |err| {
+            return self.broadcastNotice("{s}", .{SignInTask.explain(err)});
+        };
+    }
+
+    /// Once the browser has come back, between turns: connect, or say why not.
+    fn settleSignIn(self: *Worker) void {
+        const task = self.sign_in orelse return;
+        if (!task.isFinished()) return;
+        self.sign_in = null;
+        task.finish() catch |err| return self.broadcastNotice("{s}", .{SignInTask.explain(err)});
+
+        const entry = catalog.find(catalog.chatgpt_id).?;
+        self.useProvider(entry, entry.host, null) catch |err| {
+            return self.broadcastNotice("Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
+        };
+        self.announceProvider();
+        self.welcomeToPlanUsage();
+    }
+
+    /// Said once, the first time this installation signs in.
+    fn welcomeToPlanUsage(self: *Worker) void {
+        const welcomed_key = "chatgpt:welcomed";
+        var buffer: [16]u8 = undefined;
+        var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+        const welcomed = self.db.setting(fixed.allocator(), welcomed_key) catch "";
+        if (welcomed.len > 0) return;
+        self.broadcastNotice("You're using your ChatGPT plan. Requests in synth count toward its usage. Manage usage with /usage or at {s}", .{chatgpt_auth.usage_url});
+        self.db.setSetting(welcomed_key, "1") catch {};
+    }
+
+    fn signOut(self: *Worker) !void {
+        const providers = try self.providerSource();
+        const store = providers.chatgpt orelse return error.NoCredentialStore;
+        if (self.sign_out != null) return;
+        if (!store.isSignedIn()) return self.broadcastNotice("Not signed in to ChatGPT.", .{});
+        self.sign_out = try SignOutTask.start(self.allocator, self.io, store);
+    }
+
+    fn settleSignOut(self: *Worker) void {
+        const task = self.sign_out orelse return;
+        if (!task.isFinished()) return;
+        self.sign_out = null;
+        const confirmed = task.finish() catch |err| return self.broadcastNotice("Could not sign out of ChatGPT: {s}", .{@errorName(err)});
+        self.broadcastNotice("{s}", .{if (confirmed)
+            "Signed out of ChatGPT."
+        else
+            "Signed out of ChatGPT here, but OpenAI did not confirm it. You can disconnect synth in ChatGPT settings."});
+
+        const providers = self.providerSource() catch return;
+        providers.signedOut();
+        if (std.mem.eql(u8, self.provider_id, catalog.chatgpt_id)) {
+            self.db.setActiveProvider("") catch |err| self.broadcastNotice("Could not clear the provider: {s}", .{@errorName(err)});
+        }
+    }
+
     /// Put the model back on the effort last chosen for it, or its default.
     fn restoreEffort(self: *Worker) void {
         const loop = &self.stack.loop;
-        const remembered = self.db.rememberedEffort(self.allocator, self.hosted.server.options.provider_id, loop.provider.model) catch "";
+        const remembered = self.db.rememberedEffort(self.allocator, self.provider_id, loop.provider.model) catch "";
         defer self.allocator.free(remembered);
         loop.setEffort(remembered);
     }
@@ -1174,18 +1300,15 @@ const Worker = struct {
     fn chooseEffort(self: *Worker, level: []const u8) !void {
         const loop = &self.stack.loop;
         loop.setEffort(level);
-        try self.db.rememberEffort(self.allocator, self.hosted.server.options.provider_id, loop.provider.model, level);
+        try self.db.rememberEffort(self.allocator, self.provider_id, loop.provider.model, level);
     }
 
     fn models(self: *Worker, arena: std.mem.Allocator, recent: u32) !wire.Models {
         const provider = self.stack.loop.provider;
-        const names = try provider.models(arena);
-        const offered = try arena.alloc(wire.Offered, names.len);
-        for (names, offered) |name, *out| {
-            const efforts = provider.effortsFor(name);
-            const remembered = try self.db.rememberedEffort(arena, self.hosted.server.options.provider_id, name);
-            out.* = .{ .name = name, .efforts = efforts.levels, .effort = efforts.pick(remembered) };
-        }
+        const offered = switch (self.hosted.server.options.source) {
+            .providers => |providers| try providers.offered(arena, &self.db, provider, self.provider_id),
+            .provider => try Providers.offeredBy(arena, &self.db, self.provider_id, provider.name, provider),
+        };
         const project_id = self.stack.loop.project_id orelse return .{ .offered = offered };
         return .{ .offered = offered, .recent = try self.db.recentModels(arena, project_id, recent) };
     }
@@ -1254,6 +1377,9 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownSkill => "no such skill",
         error.InUse => "a session is busy or attached",
         error.NotStoppable => "this server cannot be stopped from here",
+        error.ProviderFixed => "this server's provider is fixed",
+        error.UnknownProvider => "no such provider",
+        error.NoCredentialStore => "no ChatGPT credential file could be opened",
         else => @errorName(err),
     };
 }
@@ -2099,4 +2225,54 @@ test "a server whose program was replaced says so, and steps aside once nobody i
     _ = try client.expectOk(try client.send(.{ .detach = .{} }));
     _ = try newer.expectOk(try newer.send(.{ .shutdown = .{} }));
     try std.testing.expect(shutdown_asked.load(.acquire));
+}
+
+test "a session connects a provider through its server, which keeps the key and the choice" {
+    const io = std.testing.io;
+    const Auth = @import("../core/auth.zig");
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const arena = fixture.arena.allocator();
+    const dir = std.fs.path.dirname(fixture.project).?;
+    const auth_path = try std.fs.path.join(arena, &.{ dir, "auth.json" });
+
+    var auth = try Auth.load(std.testing.allocator, io, auth_path);
+    defer auth.deinit();
+    var template: Backend = .init(.ollama, .{ .allocator = std.testing.allocator, .io = io, .host = "http://127.0.0.1:9", .label = "Ollama" });
+    defer template.deinit();
+    var providers: Providers = .init(io, &auth, null, &template, "ollama", true);
+
+    var options = fixture.server.options;
+    options.socket_path = try std.fs.path.join(arena, &.{ dir, "p.sock" });
+    options.source = .{ .providers = &providers };
+    const server = try start(std.testing.allocator, io, options);
+    defer server.stop();
+
+    const client = try TestClient.connect(server.path);
+    defer client.close();
+    try client.hello();
+    const snapshot = try client.attach((try client.open(fixture.project)).handle);
+    try std.testing.expect(snapshot.status.provider_missing);
+    try std.testing.expectEqualStrings("ollama", snapshot.status.provider_id);
+
+    const connect = try client.send(.{ .connect_provider = .{ .provider = "openai-compat", .host = "http://127.0.0.1:9", .key = "sk-test" } });
+    _ = try client.expectOk(connect);
+    while (true) {
+        const frame = try client.next();
+        if (frame.body != .status or !std.mem.eql(u8, frame.body.status.provider_id, "openai-compat")) continue;
+        try std.testing.expect(!frame.body.status.provider_missing);
+        break;
+    }
+
+    var saved = try Auth.load(std.testing.allocator, io, auth_path);
+    defer saved.deinit();
+    try std.testing.expectEqualStrings("sk-test", saved.key("openai-compat").?);
+
+    const listed = try client.expectOk(try client.send(.{ .providers = .{} }));
+    const states = try wire.parseResult([]const wire.ProviderState, client.arena.allocator(), listed);
+    for (states) |state| {
+        const chosen = std.mem.eql(u8, state.id, "openai-compat");
+        try std.testing.expectEqual(chosen, state.active);
+        if (chosen) try std.testing.expect(state.connected);
+    }
 }

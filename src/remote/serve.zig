@@ -13,6 +13,7 @@ const Database = @import("../core/database.zig");
 const Backend = @import("../provider/backend.zig");
 const catalog = @import("../provider/catalog.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
+const Providers = @import("providers.zig");
 const Server = @import("server.zig");
 
 pub fn run(init: std.process.Init) !void {
@@ -28,11 +29,9 @@ pub fn run(init: std.process.Init) !void {
 
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
-    const active = blk: {
-        var db = try Database.init(allocator, io, config.database_path);
-        defer db.deinit();
-        break :blk try catalog.resolve(arena_state.allocator(), &db, &config, &auth);
-    };
+    var db = try Database.init(allocator, io, config.database_path);
+    defer db.deinit();
+    const active = try catalog.resolve(arena_state.allocator(), &db, &config, &auth);
 
     var backend: Backend = .init(active.entry.kind, .{
         .allocator = allocator,
@@ -49,6 +48,8 @@ pub fn run(init: std.process.Init) !void {
     defer backend.deinit();
     try backend.start();
     backend.ensureModel() catch {};
+    const missing = !try Providers.usable(arena_state.allocator(), &db, &config, active, &auth, chatgpt, &backend);
+    var providers: Providers = .init(io, &auth, chatgpt, &backend, active.entry.id, missing);
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
@@ -66,8 +67,7 @@ pub fn run(init: std.process.Init) !void {
         .config = &config,
         .socket_path = socket_path,
         .database_path = config.database_path,
-        .source = .{ .backend = &backend },
-        .provider_id = active.entry.id,
+        .source = .{ .providers = &providers },
         .executable = executable,
         .on_shutdown = Signals.raise,
         .home = init.environ_map.get("HOME"),

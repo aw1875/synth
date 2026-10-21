@@ -144,6 +144,12 @@ pub const Status = struct {
     agent: []const u8 = "",
     model: []const u8 = "",
     provider: []const u8 = "",
+    /// The provider's catalog id.
+    provider_id: []const u8 = "",
+    /// Nothing usable answers the session: a turn asks for a provider first.
+    provider_missing: bool = false,
+    /// A ChatGPT sign-in this session started, waiting on a browser.
+    sign_in: ?SignIn = null,
     context_limit: u32 = 0,
     /// Whether the provider offers other models to switch to.
     switchable: bool = false,
@@ -167,6 +173,22 @@ pub const Status = struct {
     /// Turns finished so far, so a client can tell a new ending from one it
     /// has already seen.
     finished: u64 = 0,
+};
+
+pub const SignIn = struct {
+    url: []const u8,
+    /// Where the browser is sent back to, on the server's machine.
+    port: u16,
+};
+
+/// A provider in the catalog, as the server has it.
+pub const ProviderState = struct {
+    id: []const u8,
+    host: []const u8,
+    /// It has what it needs: a key, or a sign-in.
+    connected: bool = false,
+    /// The one the session answers through.
+    active: bool = false,
 };
 
 /// What the in-flight request has streamed so far, or since the last event.
@@ -229,6 +251,9 @@ pub const Stored = struct {
 /// A model the server's provider offers.
 pub const Offered = struct {
     name: []const u8,
+    /// The provider offering it, and its catalog id.
+    provider: []const u8 = "",
+    provider_id: []const u8 = "",
     /// Reasoning effort levels, mildest first; empty when there is no choice.
     efforts: []const []const u8 = &.{},
     /// The level it runs at if chosen: the last one chosen, or its default.
@@ -306,11 +331,24 @@ pub const Up = union(enum) {
         agent: []const u8,
     },
     /// Switch model, then run it at `effort`, or at the level last chosen for
-    /// it when that is null.
+    /// it when that is null. A model of another provider connects it first.
     set_model: struct {
         model: []const u8,
         effort: ?[]const u8 = null,
+        provider_id: ?[]const u8 = null,
     },
+    /// Replied with `[]ProviderState`.
+    providers: struct {},
+    /// Point the session at a provider, storing `key` when given, and make it
+    /// what new sessions start on. ChatGPT without a sign-in starts one, and
+    /// the status carries it until it settles.
+    connect_provider: struct {
+        provider: []const u8,
+        host: []const u8,
+        key: ?[]const u8 = null,
+    },
+    cancel_sign_in: struct {},
+    sign_out: struct {},
     /// Refused mid-turn: the request in flight reads the level as it is built.
     set_effort: struct {
         effort: []const u8,

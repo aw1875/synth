@@ -286,12 +286,14 @@ the old build, as soon as no session is busy or attached. A session nobody
 is attached to unloads after five idle minutes; it stays stored, and
 attaching loads it again.
 
-The theme stays local to this machine. On a remote session the model picker,
-`/model` and `/effort` choose among the server's models, and `/sessions`,
-`/search` and `/clear` work on the server's stored sessions; switching away
-leaves a running turn running. Skills and `@` mentions are the server's.
-Connecting providers, `/mcp` and subagent transcripts are not available there
-yet.
+The theme stays local to this machine. On a remote session providers are
+the server's: ctrl+p connects one there, keys are stored there, and the model
+picker, `/model` and `/effort` choose among its models. A ChatGPT sign-in
+listens on the server, so from another machine its callback port has to be
+forwarded, as the dialog says. `/sessions`, `/search` and `/clear` work on the
+server's stored sessions; switching away leaves a running turn running.
+Skills and `@` mentions are the server's too. `/mcp` and subagent transcripts
+are not available there yet.
 
 ## Hooks
 
