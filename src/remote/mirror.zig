@@ -252,25 +252,46 @@ fn apply(self: *Mirror, frame: wire.Frame(wire.Down)) !void {
     }
 }
 
+/// Server message `seq` is numbered `(seq + 1) << note_bits` here, leaving
+/// room before each for the notes the TUI appends itself - `/help`, `/search`
+/// - which would otherwise take the next server message's number. Small, since
+/// `Model.widgetKey` keeps only 31 bits of a number.
+const note_bits = 8;
+
+fn localSeq(seq: u64) u64 {
+    return (seq + 1) << note_bits;
+}
+
+/// The server message a local number names, or the one after it for a note.
+fn serverSeq(seq: u64) u64 {
+    return ((seq + (1 << note_bits) - 1) >> note_bits) -| 1;
+}
+
+fn own(self: *Mirror, message: wire.Message) !Conversation.Message {
+    var owned = try message.toOwned(self.allocator);
+    owned.seq = localSeq(message.seq);
+    return owned;
+}
+
 /// Every snapshot replaces what was there: the first one, or one for
 /// another session attached on the same connection.
 fn applySnapshot(self: *Mirror, snapshot: wire.Snapshot) !void {
     self.conversation.clear();
     self.resetStreams(null);
     self.switched = true;
-    for (snapshot.messages) |message| try self.conversation.adoptMessage(try message.toOwned(self.allocator));
+    for (snapshot.messages) |message| try self.conversation.adoptMessage(try self.own(message));
     self.conversation.dropped += snapshot.dropped;
     try self.keepStatus(snapshot.status);
     if (snapshot.stream) |stream| try self.applyStream(stream);
 }
 
 fn applyMessage(self: *Mirror, message: wire.Message, changed: bool) !void {
-    if (self.conversation.find(message.seq)) |held| {
-        const replacement = try message.toOwned(self.allocator);
+    if (self.conversation.find(localSeq(message.seq))) |held| {
+        const replacement = try self.own(message);
         held.deinit(self.allocator);
         held.* = replacement;
     } else if (!changed) {
-        try self.conversation.adoptMessage(try message.toOwned(self.allocator));
+        try self.conversation.adoptMessage(try self.own(message));
     }
 }
 
@@ -303,6 +324,7 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     kept.model = try arena.dupe(u8, status.model);
     kept.provider = try arena.dupe(u8, status.provider);
     kept.todos = &.{};
+    kept.pending_seq = if (status.pending_seq) |seq| localSeq(seq) else null;
     kept.notes = try dupeAll(arena, status.notes);
     kept.steering = try dupeAll(arena, status.steering);
     self.status = kept;
@@ -364,7 +386,7 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             var built: usize = 0;
             errdefer for (owned[0..built]) |*msg| msg.deinit(self.allocator);
             for (older, owned) |message, *out| {
-                out.* = try message.toOwned(self.allocator);
+                out.* = try self.own(message);
                 built += 1;
             }
             try self.conversation.prepend(owned);
@@ -566,14 +588,14 @@ pub fn loadToolResult(self: *Mirror, msg: *Conversation.Message, index: usize) !
     if (call.result_bytes <= Conversation.preview_bytes) return;
     if (call.result) |result| if (result.len >= call.result_bytes) return;
     if (self.isWaitingFor(.{ .tool_result = .{ .seq = msg.seq, .call = @intCast(index) } })) return;
-    try self.send(.{ .load_tool_result = .{ .seq = msg.seq, .call = @intCast(index) } }, .{ .tool_result = .{ .seq = msg.seq, .call = @intCast(index) } });
+    try self.send(.{ .load_tool_result = .{ .seq = serverSeq(msg.seq), .call = @intCast(index) } }, .{ .tool_result = .{ .seq = msg.seq, .call = @intCast(index) } });
 }
 
 pub fn loadThinking(self: *Mirror, msg: *Conversation.Message) !void {
     if (msg.thinking_bytes <= Conversation.preview_bytes) return;
     if (msg.thinking) |text| if (text.len >= msg.thinking_bytes) return;
     if (self.isWaitingFor(.{ .thinking = msg.seq })) return;
-    try self.send(.{ .load_thinking = .{ .seq = msg.seq } }, .{ .thinking = msg.seq });
+    try self.send(.{ .load_thinking = .{ .seq = serverSeq(msg.seq) } }, .{ .thinking = msg.seq });
 }
 
 /// Drive another session on the server instead. Its snapshot replaces the
@@ -602,7 +624,7 @@ pub fn search(self: *Mirror, query: []const u8, limit: usize) !void {
 /// Ask for older messages. They land on a later poll, so this reports none.
 pub fn pageHistory(self: *Mirror, limit: usize) !usize {
     if (self.paging) return 0;
-    const before = self.conversation.firstSeq() orelse return 0;
+    const before = serverSeq(self.conversation.firstSeq() orelse return 0);
     if (before == 0) return 0;
     try self.send(.{ .page_history = .{ .before_seq = before, .limit = @intCast(limit) } }, .history);
     self.paging = true;
@@ -771,4 +793,35 @@ test "a mirror starts afresh, finds its old session, and goes back to it" {
     try pollUntilOn(mirror, first, true);
     try testing.expectEqual(held, convo.messages.items.len);
     try testing.expectEqual(@as(u64, 1), mirror.status.finished);
+}
+
+test "a note written here keeps its place when the server's next message lands" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    _ = try convo.append(.{ .role = .assistant, .text = "a note from /help" });
+
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try testing.expectEqualStrings("a note from /help", convo.messages.items[0].text);
+    try testing.expectEqualStrings("make a note", convo.messages.items[1].text);
+    try testing.expectEqualStrings("write", mirror.pendingCall().?.name);
+
+    try mirror.decide(.once);
+    try pollUntil(mirror, finishedOne);
+    try testing.expectEqualStrings("a note from /help", convo.messages.items[0].text);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, convo.messages.items[2].tool_calls[0].status);
+}
+
+test "a server number survives the trip here and back, and a note maps to the message after it" {
+    const testing = std.testing;
+    for ([_]u64{ 0, 1, 41, 1 << 22 }) |seq| try testing.expectEqual(seq, serverSeq(localSeq(seq)));
+    try testing.expectEqual(@as(u64, 0), serverSeq(0));
+    try testing.expectEqual(@as(u64, 0), serverSeq(3));
+    try testing.expectEqual(@as(u64, 8), serverSeq(localSeq(7) + 1));
 }
