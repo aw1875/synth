@@ -957,7 +957,7 @@ fn ask(self: *Loop) !void {
         return self.startCompaction(true);
     }
     self.steps += 1;
-    if (self.steps > self.agent.steps) {
+    if (self.steps > self.agent.steps and !self.isRunningWithoutLimit()) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
     self.request = try Request.start(
@@ -2150,6 +2150,10 @@ fn appendToolResults(self: *Loop) !void {
 
     self.pending_seq = null;
     self.pending_index = 0;
+}
+
+fn isRunningWithoutLimit(self: *const Loop) bool {
+    return self.max_stall_ms == 0 and self.max_turn_ms == 0 and self.max_turn_tokens == 0;
 }
 
 /// A provider that asks for `list` on its first turn and answers on its
