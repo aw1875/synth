@@ -20,6 +20,7 @@ const testing = std.testing;
 const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const todo = @import("../core/todo.zig");
+const mcp_tools = @import("../tools/mcp.zig");
 const Loop = @import("../agent/loop.zig");
 
 /// Bumped only on a breaking change. A mismatch is refused with an error that
@@ -158,6 +159,8 @@ pub const Status = struct {
     efforts: []const []const u8 = &.{},
     usage: Loop.Usage = .{},
     todos: []const todo.Item = &.{},
+    /// Every configured MCP server, and where it stands.
+    mcp: []const mcp_tools.Status = &.{},
     /// The message whose tool calls are being decided or run, and the call
     /// waiting on a decision, if one is.
     pending_seq: ?u64 = null,
@@ -348,6 +351,10 @@ pub const Up = union(enum) {
         key: ?[]const u8 = null,
     },
     cancel_sign_in: struct {},
+    /// Turn an MCP server off, or back on, and remember which.
+    toggle_mcp: struct {
+        name: []const u8,
+    },
     sign_out: struct {},
     /// Refused mid-turn: the request in flight reads the level as it is built.
     set_effort: struct {

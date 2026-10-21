@@ -12,6 +12,7 @@ const client = @import("client.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const skill = @import("../core/skill.zig");
+const mcp_tools = @import("../tools/mcp.zig");
 const todo = @import("../core/todo.zig");
 const Loop = @import("../agent/loop.zig");
 const Thought = @import("../agent/thought.zig");
@@ -385,6 +386,13 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     kept.effort = try arena.dupe(u8, status.effort);
     kept.efforts = try dupeAll(arena, status.efforts);
     kept.todos = &.{};
+    const servers = try arena.alloc(mcp_tools.Status, status.mcp.len);
+    for (status.mcp, servers) |server, *copy| copy.* = .{
+        .name = try arena.dupe(u8, server.name),
+        .state = server.state,
+        .reason = try arena.dupe(u8, server.reason),
+    };
+    kept.mcp = servers;
     kept.pending_seq = if (status.pending_seq) |seq| localSeq(seq) else null;
     kept.notes = try dupeAll(arena, status.notes);
     kept.steering = try dupeAll(arena, status.steering);
@@ -695,6 +703,10 @@ pub fn listProviders(self: *Mirror) !void {
 /// the status until it settles.
 pub fn connectProvider(self: *Mirror, id: []const u8, host: []const u8, key: ?[]const u8) !void {
     try self.send(.{ .connect_provider = .{ .provider = id, .host = host, .key = key } }, .{ .command = "Connecting" });
+}
+
+pub fn toggleMcp(self: *Mirror, name: []const u8) !void {
+    try self.send(.{ .toggle_mcp = .{ .name = name } }, .{ .command = "Toggling the MCP server" });
 }
 
 pub fn cancelSignIn(self: *Mirror) !void {

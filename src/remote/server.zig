@@ -33,6 +33,7 @@ const catalog = @import("../provider/catalog.zig");
 const SignInTask = @import("../provider/chatgpt_sign_in.zig");
 const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const Providers = @import("providers.zig");
+const mcp_tools = @import("../tools/mcp.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const Provider = @import("../provider/provider.zig");
 
@@ -68,7 +69,9 @@ pub const Options = struct {
     database_path: []const u8,
     source: Source,
     home: ?[]const u8 = null,
-    mcp_auth: ?*mcp.Auth = null,
+    /// Where MCP tokens and on/off choices are kept. Each session reads its
+    /// own copy: the store has no lock, and sessions connect at once.
+    mcp_auth_path: ?[]const u8 = null,
     /// The program file the server runs, to notice it being replaced.
     executable: ?[]const u8 = null,
     /// Called when a client asks the server to stop, to let it go.
@@ -761,6 +764,7 @@ const Worker = struct {
     /// effort chosen for each of its models is remembered under.
     provider_id: []const u8 = "",
     sign_in: ?*SignInTask = null,
+    mcp_auth: ?mcp.Auth = null,
     sign_out: ?*SignOutTask = null,
     stack: *Stack = undefined,
     subscribers: std.ArrayList(*Client) = .empty,
@@ -797,6 +801,10 @@ const Worker = struct {
         const server = self.hosted.server;
         self.db = try Database.init(self.allocator, self.io, server.options.database_path);
         errdefer self.db.deinit();
+        if (server.options.mcp_auth_path) |path| {
+            self.mcp_auth = mcp.Auth.load(self.allocator, self.io, path) catch mcp.Auth.init(self.allocator);
+        }
+        errdefer if (self.mcp_auth) |*store| store.deinit();
 
         const provider: Provider, const backend: ?*Backend = switch (server.options.source) {
             .provider => |provider| .{ provider, null },
@@ -814,7 +822,7 @@ const Worker = struct {
             .cwd = self.hosted.cwd,
             .home = server.options.home,
             .db = &self.db,
-            .mcp_auth = server.options.mcp_auth,
+            .mcp_auth = if (self.mcp_auth) |*store| store else null,
         });
         errdefer self.stack.destroy();
         self.stack.convo.max_messages = max_messages;
@@ -830,6 +838,7 @@ const Worker = struct {
         self.stack.loop.requestStop();
         self.stack.destroy();
         if (self.spawned) |spawned| spawned.deinit();
+        if (self.mcp_auth) |*store| store.deinit();
         self.db.deinit();
         self.subscribers.deinit(self.allocator);
         self.sent.deinit(self.allocator);
@@ -847,7 +856,8 @@ const Worker = struct {
             self.publish(arena_state.allocator()) catch |err| self.broadcastNotice("Could not report progress: {s}", .{@errorName(err)});
             _ = arena_state.reset(.retain_capacity);
 
-            const busy = self.stack.loop.isBusy() or self.stack.runner.busy() or self.sign_in != null or self.sign_out != null;
+            const busy = self.stack.loop.isBusy() or self.stack.runner.busy() or self.sign_in != null or
+                self.sign_out != null or self.stack.mcp_host.connecting();
             if (busy) {
                 self.alone_since = null;
                 self.hosted.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
@@ -950,6 +960,7 @@ const Worker = struct {
             .providers => return client.reply(id, try (try self.providerSource()).states(arena, &self.db, self.provider_id)),
             .connect_provider => |asked| try self.connectProvider(asked.provider, asked.host, asked.key),
             .cancel_sign_in => if (self.sign_in) |task| task.cancel(),
+            .toggle_mcp => |toggle| try self.toggleMcp(toggle.name),
             .sign_out => try self.signOut(),
             .set_effort => |set| {
                 if (loop.isBusy()) return error.Busy;
@@ -1033,6 +1044,7 @@ const Worker = struct {
             self.broadcast(.{ .body = .{ .notice = .{ .text = notice } } });
         }
         self.settleSignOut();
+        self.settleMcp();
         if (loop.isBusy()) return;
         self.settleSignIn();
         if (loop.shouldCompact()) {
@@ -1138,6 +1150,7 @@ const Worker = struct {
             .efforts = loop.provider.effortsFor(loop.provider.model).levels,
             .usage = loop.usage,
             .todos = loop.todos.items.items,
+            .mcp = try self.stack.mcp_host.statuses(arena),
             .pending_seq = loop.pending_seq,
             .pending_call = if (pending_call) |index| @intCast(index) else null,
             .notes = notes,
@@ -1289,6 +1302,36 @@ const Worker = struct {
         }
     }
 
+    fn toggleMcp(self: *Worker, name: []const u8) !void {
+        const mcp_host = &self.stack.mcp_host;
+        const server = for (mcp_host.servers) |server| {
+            if (std.mem.eql(u8, server.name, name)) break server;
+        } else return error.UnknownServer;
+        if (mcp_host.connecting()) return error.StillConnecting;
+        const store = mcp_host.auth orelse return error.NoMcpState;
+
+        const wanted = mcp_host.wants(server);
+        try store.setEnabled(server.name, !wanted);
+        store.save(self.io, null) catch |err| self.broadcastNotice("Could not remember that: {s}", .{@errorName(err)});
+        if (wanted) {
+            if (mcp_host.disconnect(&self.stack.registry, server.name)) try self.stack.loop.useAgent(self.stack.loop.agent.id);
+        } else {
+            try mcp_host.beginConnectAll(mcp_host.servers, mcp_host.client);
+        }
+    }
+
+    /// Once servers turned on have been reached: offer their tools, and say
+    /// which would not come up.
+    fn settleMcp(self: *Worker) void {
+        const mcp_host = &self.stack.mcp_host;
+        if (!mcp_host.settled()) return;
+        const added = mcp_host.install(&self.stack.registry) catch 0;
+        if (added > 0) self.stack.loop.useAgent(self.stack.loop.agent.id) catch |err| {
+            self.broadcastNotice("Could not offer the new tools: {s}", .{@errorName(err)});
+        };
+        for (mcp_host.failures.items) |failure| self.broadcastNotice("MCP server {s} failed: {s}", .{ failure.server, failure.reason });
+    }
+
     /// Put the model back on the effort last chosen for it, or its default.
     fn restoreEffort(self: *Worker) void {
         const loop = &self.stack.loop;
@@ -1380,6 +1423,9 @@ fn describe(err: anyerror) []const u8 {
         error.ProviderFixed => "this server's provider is fixed",
         error.UnknownProvider => "no such provider",
         error.NoCredentialStore => "no ChatGPT credential file could be opened",
+        error.UnknownServer => "no such MCP server",
+        error.StillConnecting => "still connecting - try again in a moment",
+        error.NoMcpState => "no MCP state file, so this cannot be remembered",
         else => @errorName(err),
     };
 }
@@ -2275,4 +2321,44 @@ test "a session connects a provider through its server, which keeps the key and 
         try std.testing.expectEqual(chosen, state.active);
         if (chosen) try std.testing.expect(state.connected);
     }
+}
+
+/// Read until a status whose first MCP server is in `state`.
+fn awaitMcp(client: *TestClient, state: mcp_tools.Status.State) !wire.Status {
+    while (true) {
+        const frame = try client.next();
+        if (frame.body != .status) continue;
+        const status = frame.body.status;
+        if (status.mcp.len > 0 and status.mcp[0].state == state) return status;
+    }
+}
+
+test "a session's MCP servers are reported, and one turned off stays off" {
+    const io = std.testing.io;
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const arena = fixture.arena.allocator();
+    fixture.config.mcp = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"servers":{"broken":{"command":"/nonexistent/synth-test-mcp"}}}
+    , .{});
+    const auth_path = try std.fs.path.join(arena, &.{ std.fs.path.dirname(fixture.project).?, "mcp-auth.json" });
+    fixture.server.options.mcp_auth_path = auth_path;
+
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+    const snapshot = try client.attach((try client.open(fixture.project)).handle);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.status.mcp.len);
+    try std.testing.expectEqualStrings("broken", snapshot.status.mcp[0].name);
+    try std.testing.expectEqual(mcp_tools.Status.State.failed, snapshot.status.mcp[0].state);
+
+    _ = try client.expectOk(try client.send(.{ .toggle_mcp = .{ .name = "broken" } }));
+    _ = try awaitMcp(client, .off);
+    var saved = try mcp.Auth.load(std.testing.allocator, io, auth_path);
+    defer saved.deinit();
+    try std.testing.expect(!saved.isEnabled("broken"));
+
+    _ = try client.expectOk(try client.send(.{ .toggle_mcp = .{ .name = "broken" } }));
+    _ = try awaitMcp(client, .failed);
+    try std.testing.expectEqualStrings("no such MCP server", try client.expectError(try client.send(.{ .toggle_mcp = .{ .name = "missing" } })));
 }

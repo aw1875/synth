@@ -5,8 +5,6 @@
 const std = @import("std");
 const posix = std.posix;
 
-const mcp = @import("mcp");
-
 const Auth = @import("../core/auth.zig");
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
@@ -53,8 +51,6 @@ pub fn run(init: std.process.Init) !void {
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
-    var mcp_auth = mcp.Auth.load(allocator, io, mcp_auth_path) catch mcp.Auth.init(allocator);
-    defer mcp_auth.deinit();
 
     const socket_path = try Server.socketPath(allocator, init.environ_map);
     defer allocator.free(socket_path);
@@ -71,7 +67,7 @@ pub fn run(init: std.process.Init) !void {
         .executable = executable,
         .on_shutdown = Signals.raise,
         .home = init.environ_map.get("HOME"),
-        .mcp_auth = &mcp_auth,
+        .mcp_auth_path = mcp_auth_path,
     }) catch |err| switch (err) {
         error.AlreadyRunning => {
             try say(io, "a server is already listening on {s}\n", .{socket_path});

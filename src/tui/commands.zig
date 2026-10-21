@@ -95,9 +95,12 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/mcp")) {
-        if (try localOnly(self, ctx)) return true;
-        if (self.mcp) |host| {
-            try self.mcp_picker.show(host);
+        if (self.remote) |mirror| {
+            try self.mcp_picker.show(mirror.status.mcp);
+        } else if (self.mcp) |host| {
+            const statuses = try host.statuses(self.allocator);
+            defer self.allocator.free(statuses);
+            try self.mcp_picker.show(statuses);
         } else {
             try self.notification.show(ctx, .info, "No MCP servers configured");
         }
@@ -930,36 +933,54 @@ fn rememberModelChoice(self: *Model, model: []const u8) !void {
 /// what is already up and reaches only the one that changed. Either way the
 /// model has to be told again, because the tool schema was built once.
 pub fn toggleMcpServer(self: *Model, ctx: *vxfw.EventContext) !void {
-    const host = self.mcp orelse return;
-    const server = self.mcp_picker.selected() orelse return;
-
-    if (host.connecting()) {
-        try self.notification.show(ctx, .info, "Still connecting - try again in a moment");
-        return;
-    }
-
-    const store = host.auth orelse {
-        try self.notification.show(ctx, .warn, "No MCP state file, so this cannot be remembered");
-        return;
-    };
-
-    const wanted = server.enabled and store.isEnabled(server.name);
-    try store.setEnabled(server.name, !wanted);
-    store.save(self.io, null) catch {};
-
-    if (wanted) {
-        if (host.disconnect(&self.registry, server.name)) {
-            try self.session.useAgent(self.session.agentId());
-        }
-        try self.notification.showFmt(ctx, .info, "{s} off", .{server.name});
+    const chosen = self.mcp_picker.selected() orelse return;
+    const turning_off = chosen.state != .off;
+    if (self.remote) |mirror| {
+        try mirror.toggleMcp(chosen.name);
     } else {
-        try host.beginConnectAll(host.servers, host.client);
-        try self.scheduleTick(ctx);
-        try self.notification.showFmt(ctx, .info, "Connecting to {s}", .{server.name});
+        const host = self.mcp orelse return;
+        const server = for (host.servers) |server| {
+            if (std.mem.eql(u8, server.name, chosen.name)) break server;
+        } else return;
+
+        if (host.connecting()) {
+            try self.notification.show(ctx, .info, "Still connecting - try again in a moment");
+            return;
+        }
+        const store = host.auth orelse {
+            try self.notification.show(ctx, .warn, "No MCP state file, so this cannot be remembered");
+            return;
+        };
+
+        try store.setEnabled(server.name, !turning_off);
+        store.save(self.io, null) catch {};
+        if (turning_off) {
+            if (host.disconnect(&self.registry, server.name)) {
+                try self.session.useAgent(self.session.agentId());
+            }
+        } else {
+            try host.beginConnectAll(host.servers, host.client);
+            try self.scheduleTick(ctx);
+        }
+        try refreshMcpPicker(self);
     }
 
-    try self.mcp_picker.filter();
+    if (turning_off) {
+        try self.notification.showFmt(ctx, .info, "{s} off", .{chosen.name});
+    } else {
+        try self.notification.showFmt(ctx, .info, "Connecting to {s}", .{chosen.name});
+    }
     ctx.redraw = true;
+}
+
+/// Show the MCP servers as they stand now, if the picker is open.
+pub fn refreshMcpPicker(self: *Model) !void {
+    if (!self.mcp_picker.isOpen()) return;
+    if (self.remote) |mirror| return self.mcp_picker.refresh(mirror.status.mcp);
+    const host = self.mcp orelse return;
+    const statuses = try host.statuses(self.allocator);
+    defer self.allocator.free(statuses);
+    try self.mcp_picker.refresh(statuses);
 }
 
 /// Check the configured model against what the provider has, once.
@@ -989,6 +1010,7 @@ pub fn applyMcp(self: *Model, ctx: *vxfw.EventContext) !void {
 
     const added = host.install(&self.registry) catch 0;
     if (added > 0) try self.session.useAgent(self.session.agentId());
+    try refreshMcpPicker(self);
 
     try reportMcpFailures(self, ctx);
     ctx.redraw = true;

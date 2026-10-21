@@ -248,6 +248,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (self.session.takeSwitched()) try self.showReplacedTranscript();
             while (self.session.takeAnswer()) |answer| try commands.showAnswer(self, ctx, answer);
             if (changed) {
+                try commands.refreshMcpPicker(self);
                 widget_pool.pruneWidgets(self);
                 commands.syncProvider(self);
                 self.mentions.invalidate();
