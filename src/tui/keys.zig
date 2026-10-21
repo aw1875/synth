@@ -30,8 +30,8 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
         return;
     }
 
-    if (self.loop.state == .awaiting_answer) {
-        try self.loop.answer(value);
+    if (self.session.state() == .awaiting_answer) {
+        try self.session.answer(value);
         self.input.clear();
         self.scroll = 0;
         try self.scheduleTick(ctx);
@@ -39,7 +39,7 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
         return;
     }
 
-    if (try self.loop.steer(value)) {
+    if (try self.session.steer(value)) {
         self.scroll = 0;
         ctx.redraw = true;
         return;
@@ -93,7 +93,7 @@ fn trackPlan(self: *Model, ctx: *vxfw.EventContext, mouse: vaxis.Mouse) !bool {
     }
     if (mouse.type != .press) return true;
 
-    self.loop.todos.expanded = !self.loop.todos.expanded;
+    self.session.todos().expanded = !self.session.todos().expanded;
     ctx.consumeAndRedraw();
     return true;
 }
@@ -177,6 +177,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
     switch (event) {
         .init => {
             try commands.applyMcp(self, ctx);
+            if (self.session.isRemote()) try self.scheduleTick(ctx);
             if (self.pending_model_check) try self.scheduleTick(ctx);
             if (self.mcp) |host| {
                 if (host.connecting()) try self.scheduleTick(ctx);
@@ -238,8 +239,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (self.mentions.isScanning()) try self.scheduleTick(ctx);
             const nested = if (self.subagents) |runner| try runner.poll() else false;
             if (nested) self.refreshViewing();
-            const changed = try self.loop.poll() or nested;
-            if (self.loop.takeHookNotice()) |notice| {
+            const changed = try self.session.poll() or nested;
+            if (self.session.takeNotice()) |notice| {
                 defer self.allocator.free(notice);
                 try self.notification.show(ctx, .warn, notice);
             }
@@ -248,11 +249,11 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 commands.syncProvider(self);
                 self.mentions.invalidate();
             }
-            if (!self.loop.isBusy() and self.loop.shouldCompact()) {
+            if (!self.session.isBusy() and self.session.shouldCompact()) {
                 try self.startCompaction(ctx);
             }
             try self.drainSteering(ctx);
-            if (!self.loop.isBusy()) self.quit_confirm.reset();
+            if (!self.session.isBusy()) self.quit_confirm.reset();
             ringIfFinished(self);
             const watched = self.shownLoop();
             if (watched.isBusy()) {
@@ -263,7 +264,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             } else {
                 self.thinking.stream = null;
             }
-            if (self.loop.isBusy()) try self.scheduleTick(ctx);
+            // A server speaks whenever it likes, and vxfw has no way in but a tick.
+            if (self.session.isBusy() or self.session.isRemote()) try self.scheduleTick(ctx);
             if (self.subagents) |runner| {
                 if (runner.busy()) try self.scheduleTick(ctx);
             }
@@ -364,7 +366,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.rename.close(),
                     .submit => {
-                        self.loop.rename(self.rename.value()) catch {};
+                        self.session.rename(self.rename.value()) catch {};
                         self.rename.close();
                     },
                 }
@@ -376,32 +378,28 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches('r', .{ .ctrl = true })) {
-                try self.rename.show(self.loop.title());
+                try self.rename.show(self.session.title());
                 return ctx.consumeAndRedraw();
             }
 
             if (key.matches(vaxis.Key.tab, .{})) {
-                try commands.switchAgent(self, ctx, agents.next(self.loop.agent.id).id);
+                try commands.switchAgent(self, ctx, agents.next(self.session.agentId()).id);
                 return ctx.consumeAndRedraw();
             }
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                try commands.showModels(self);
+                if (!try commands.localOnly(self, ctx)) try commands.showModels(self);
                 return ctx.consumeAndRedraw();
             }
 
             if (key.matches('s', .{ .ctrl = true })) {
-                if (self.loop.database()) |db| {
-                    if (self.loop.project_id) |project_id| {
-                        try self.sessions.show(db, project_id, self.loop.session_id);
-                    }
-                }
+                try commands.showSessions(self, ctx);
                 return ctx.consumeAndRedraw();
             }
 
             if (key.matches('p', .{ .ctrl = true })) {
-                try commands.showProviders(self);
+                if (!try commands.localOnly(self, ctx)) try commands.showProviders(self);
                 return ctx.consumeAndRedraw();
             }
 
@@ -411,7 +409,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches('t', .{ .ctrl = true })) {
-                self.loop.todos.expanded = !self.loop.todos.expanded;
+                self.session.todos().expanded = !self.session.todos().expanded;
                 return ctx.consumeAndRedraw();
             }
             if (key.matches('z', .{ .ctrl = true })) {
@@ -450,16 +448,16 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches(vaxis.Key.escape, .{}) and
-                self.loop.isBusy() and
-                self.loop.state != .awaiting_approval)
+                self.session.isBusy() and
+                self.session.state() != .awaiting_approval)
             {
-                try self.loop.cancel();
+                try self.session.cancel();
                 self.thinking.stream = null;
                 try self.scheduleTick(ctx);
                 return ctx.consumeAndRedraw();
             }
 
-            if (self.loop.state == .awaiting_approval) {
+            if (self.session.state() == .awaiting_approval) {
                 if (key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
                     self.approval.move(-1);
                     return ctx.consumeAndRedraw();
@@ -469,7 +467,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
-                    try self.loop.decide(switch (self.approval.selected) {
+                    try self.session.decide(switch (self.approval.selected) {
                         .once => .once,
                         .always => .always,
                         .reject => .deny,
@@ -477,7 +475,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     return self.afterDecision(ctx);
                 }
                 if (key.matches(vaxis.Key.escape, .{})) {
-                    try self.loop.decide(.deny);
+                    try self.session.decide(.deny);
                     return self.afterDecision(ctx);
                 }
                 return ctx.consumeEvent();
@@ -557,19 +555,19 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
 /// Say so once, for each turn that reaches the end of the loop.
 fn ringIfFinished(self: *Model) void {
-    if (self.loop.finished == self.rung_for) return;
-    self.rung_for = self.loop.finished;
+    if (self.session.finishedTurns() == self.rung_for) return;
+    self.rung_for = self.session.finishedTurns();
 
     if (!bell.shouldRing(self.bell, self.focused)) return;
     const app = self.app orelse return;
 
-    const said = if (self.loop.outcome) |outcome| outcome.label() else "done";
+    const said = if (self.session.outcome()) |outcome| outcome.label() else "done";
     bell.ring(app, self.environ, said);
 }
 
 /// Compose the draft in `$EDITOR`, and take back what was written.
 fn openEditor(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.loop.isBusy()) return;
+    if (self.session.isBusy()) return;
     const app = self.app orelse return;
     const environ = self.environ orelse return;
 

@@ -22,6 +22,7 @@ const Project = @import("core/project.zig");
 const skill = @import("core/skill.zig");
 const headless = @import("headless.zig");
 const remote_bridge = @import("remote/bridge.zig");
+const remote_connect = @import("remote/connect.zig");
 const remote_serve = @import("remote/serve.zig");
 const remote_verbs = @import("remote/verbs.zig");
 const prompt_dump = @import("prompt_dump.zig");
@@ -79,6 +80,7 @@ pub fn main(init: std.process.Init) !void {
             .serve => try remote_serve.run(init),
             .bridge => try remote_bridge.run(init),
             .list => |host| try remote_verbs.list(init, host),
+            .connect => |target| try remote_connect.run(init, target.host, target.session),
             .new => |target| try remote_verbs.new(init, target.host, target.root),
             .stop => |target| try remote_verbs.stop(init, target.host, target.session),
         },
@@ -220,8 +222,8 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try tui_app.wire(model);
 
     // Installed here so the loop never needs the thing that runs a subagent.
-    var runner: subagent.Runner = .{ .parent = &model.loop, .backend = &backend };
-    model.loop.delegate = runner.delegate();
+    var runner: subagent.Runner = .{ .parent = &model.local_loop, .backend = &backend };
+    model.local_loop.delegate = runner.delegate();
     model.subagents = &runner;
 
     // Ordered: the loop joins the workers still writing to the runner.
@@ -232,6 +234,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         timing.mark("exit: subagents");
     }
     model.mcp = &mcp_host;
+    model.db = &db;
     model.prune_policy = config.prune;
     model.bell = config.bell;
     tui_bell.askForFocusReports(&app);
@@ -254,31 +257,31 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     model.pending_model_check = options.model == null;
     timing.mark("mcp start");
 
-    model.loop.auto_approve_safe = config.auto_approve_safe_commands;
-    if (config.max_turn_ms) |ms| model.loop.max_turn_ms = ms;
-    if (config.max_stall_ms) |ms| model.loop.max_stall_ms = ms;
-    if (config.max_turn_tokens) |tokens| model.loop.max_turn_tokens = tokens;
-    if (config.system_prompt) |text| model.loop.system_prompt = text;
-    model.loop.project = &project;
-    model.loop.skills = skills.skills;
+    model.local_loop.auto_approve_safe = config.auto_approve_safe_commands;
+    if (config.max_turn_ms) |ms| model.local_loop.max_turn_ms = ms;
+    if (config.max_stall_ms) |ms| model.local_loop.max_stall_ms = ms;
+    if (config.max_turn_tokens) |tokens| model.local_loop.max_turn_tokens = tokens;
+    if (config.system_prompt) |text| model.local_loop.system_prompt = text;
+    model.local_loop.project = &project;
+    model.local_loop.skills = skills.skills;
     var hook_runner: Hooks.Runner = .{
         .io = io,
         .root = project.root,
         .set = config.hooks,
         .timeout_ms = config.hook_timeout_ms,
     };
-    model.loop.hooks = &hook_runner;
+    model.local_loop.hooks = &hook_runner;
     model.slash.skills = skills.skills;
     model.skills = &skills;
-    try model.loop.useAgent(agents.default_id);
-    try model.loop.attachDatabase(&db, project.name(), cwd, backend.model());
+    try model.local_loop.useAgent(agents.default_id);
+    try model.local_loop.attachDatabase(&db, project.name(), cwd, backend.model());
     timing.mark("agent and session");
 
     model.provider_missing = !try hasUsableProvider(allocator, &db, &config, active, &auth, chatgpt, &backend);
     if (model.provider_missing) try tui_commands.showProviders(model);
 
-    if (try resumeTarget(&db, model.loop.project_id, options)) |session_id| {
-        try model.loop.resumeSession(session_id, Model.resume_messages);
+    if (try resumeTarget(&db, model.local_loop.project_id, options)) |session_id| {
+        try model.local_loop.resumeSession(session_id, Model.resume_messages);
         tui_commands.syncProvider(model);
         try model.seedHistory();
     }
@@ -289,7 +292,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
     try app.run(tui_app.widget(model), .{});
 
     if (model.conversation.totalCount() == 0) return null;
-    const handle = try model.loop.sessionHandle(init.arena.allocator());
+    const handle = try model.local_loop.sessionHandle(init.arena.allocator());
     return if (handle.len > 0) handle else null;
 }
 
@@ -305,7 +308,6 @@ fn resumeTarget(db: *Database, project_id: ?i64, options: cli.Command.Tui) !?i64
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("remote/mirror.zig");
 }
 
 /// A provider someone chose, and that has what it needs; or, with nothing

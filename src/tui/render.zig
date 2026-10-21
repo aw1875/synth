@@ -56,7 +56,7 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     const column_w = main_w -| (Model.gutter * 2);
 
     // The composer spans the frame, so its rule reads as the frame's own edge.
-    const approving = self.loop.state == .awaiting_approval;
+    const approving = self.session.state() == .awaiting_approval;
     const bottom = if (approving)
         try drawApproval(self, ctx, column_w)
     else
@@ -359,7 +359,7 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
         try blocks.append(arena, .streaming);
     }
 
-    const steering = self.loop.pendingSteering();
+    const steering = self.session.pendingSteering();
     for (steering, 0..) |prompt, i| {
         if (i == Model.max_steering_shown) {
             try blocks.append(arena, .{ .steering_more = steering.len - i });
@@ -522,8 +522,8 @@ pub fn drawTranscript(
     const messages = self.shown().messages.items;
     const watched = self.shownLoop();
     const pending: usize = if (watched.isBusy() and
-        watched.state != .awaiting_approval) 1 else 0;
-    if (height == 0 or messages.len + pending + self.loop.pendingSteering().len == 0) return null;
+        watched.state() != .awaiting_approval) 1 else 0;
+    if (height == 0 or messages.len + pending + self.session.pendingSteering().len == 0) return null;
 
     const constraints = ctx.withConstraints(
         .{ .width = width },
@@ -860,12 +860,12 @@ pub fn plainText(
 pub fn drawApproval(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface {
     self.input_cursor = null;
 
-    const call = self.loop.pendingCall() orelse return drawPrompt(self, ctx, width);
-    const seq = self.loop.pending_seq orelse 0;
-    const call_index = self.loop.firstPending() orelse 0;
+    const call = self.session.pendingCall() orelse return drawPrompt(self, ctx, width);
+    const seq = self.session.pendingSeq() orelse 0;
+    const call_index = self.session.firstPending() orelse 0;
     self.approval.sync((seq << 32) | call_index);
 
-    const definition = self.loop.registry.get(call.name);
+    const definition = self.registry.get(call.name);
     return self.approval.draw(ctx, self.plainWidget(), .{
         .name = call.name,
         .description = if (definition) |found| found.description else "",
@@ -883,8 +883,8 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
 
     const chip = try modeChip(self, ctx.arena);
     const chip_w = w.textWidth(chip.text);
-    const waiting = if (self.loop.pendingSteering().len > 0)
-        try std.fmt.allocPrint(ctx.arena, "{d} waiting", .{self.loop.pendingSteering().len})
+    const waiting = if (self.session.pendingSteering().len > 0)
+        try std.fmt.allocPrint(ctx.arena, "{d} waiting", .{self.session.pendingSteering().len})
     else
         "";
     const right_w = chip_w + if (waiting.len > 0) w.textWidth(waiting) + 1 else 0;
@@ -915,15 +915,15 @@ pub fn drawPrompt(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surface
     _ = w.writeText(surface, Model.gutter, 1, w.prompt_mark, theme.on_bg(if (self.inSubagent())
         theme.fg_dim
     else
-        Model.agentColor(self.loop.agent.id)).bold().cell);
+        Model.agentColor(self.session.agentId())).bold().cell);
 
     self.input_cursor = null;
     if (inner > 0) {
         self.input.placeholder = if (self.viewing) |view|
             view.hint
-        else if (self.loop.state == .awaiting_answer)
+        else if (self.session.state() == .awaiting_answer)
             "Answer to continue..."
-        else if (self.loop.isBusy())
+        else if (self.session.isBusy())
             "Type to queue a message..."
         else
             "Ask anything...    / for commands, @ for files";
@@ -977,7 +977,7 @@ fn modeChip(self: *Model, arena: std.mem.Allocator) !Chip {
         return .{ .text = "ctrl+o  this model cannot see images", .lead = "ctrl+o", .color = theme.warning };
     }
 
-    const id = self.loop.agent.id;
+    const id = self.session.agentId();
     return .{
         .text = try std.fmt.allocPrint(arena, "{s} mode{s}tab to switch", .{ id, w.separator }),
         .lead = id,
@@ -1094,7 +1094,7 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16,
     if (inner == 0 or height == 0) return surface;
 
     const faint = theme.on_bg(theme.fg_dim).cell;
-    const usage = self.loop.usage;
+    const usage = self.session.usage();
     const limit = self.provider.context_limit;
 
     var row: u16 = 1;
@@ -1136,7 +1136,7 @@ pub fn drawSidebar(self: *Model, ctx: vxfw.DrawContext, width: u16, height: u16,
         row += 1;
     }
 
-    if (self.loop.todos.any() and row + 2 < height) {
+    if (self.session.todos().any() and row + 2 < height) {
         row += 1;
         railSeparator(surface, left, inner, row);
         row += 2;
@@ -1172,7 +1172,7 @@ fn drawPlan(
     /// the ones a mouse event arrives in, not the rail's own.
     top: u16,
 ) !u16 {
-    const list = &self.loop.todos;
+    const list = self.session.todos();
     self.plan_top = 0;
     self.plan_bottom = 0;
     if (!list.any() or start >= height) return start;
@@ -1290,7 +1290,7 @@ pub fn compact(arena: std.mem.Allocator, value: anytype) ![]const u8 {
 }
 
 pub fn projectName(self: *Model) []const u8 {
-    if (self.loop.title().len > 0) return self.loop.title();
+    if (self.session.title().len > 0) return self.session.title();
     if (self.cwd.len == 0) return pkg.name;
     return std.fs.path.basename(self.cwd);
 }
@@ -1590,9 +1590,10 @@ fn rowText(arena: std.mem.Allocator, surface: vxfw.Surface, row: u16) ![]const u
     return out.items;
 }
 
-/// A model wired up enough to draw chrome against.
-fn chromeFixture(allocator: std.mem.Allocator, userdata: *u8, project: *Project) !Model {
-    var model: Model = .{
+/// A model wired up enough to draw chrome against, built where it will stay:
+/// a wired model points into itself.
+fn chromeFixture(model: *Model, allocator: std.mem.Allocator, userdata: *u8, project: *Project) !void {
+    model.* = .{
         .allocator = allocator,
         .io = std.testing.io,
         .conversation = .init(allocator),
@@ -1609,7 +1610,6 @@ fn chromeFixture(allocator: std.mem.Allocator, userdata: *u8, project: *Project)
         .plain_vtable = .{ .userdata = userdata, .drawFn = undefined },
     };
     try model.wire();
-    return model;
 }
 
 /// A project with a branch, for drawing chrome against.
@@ -1636,7 +1636,8 @@ test "the title row names the session, the path, and the branch it is on" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     const width: u16 = 96;
@@ -1690,7 +1691,8 @@ test "the branch keeps its room when the path has to be trimmed" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     const width: u16 = 73;
@@ -1726,7 +1728,8 @@ test "a title row too narrow for everything keeps the session and the model" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     const width: u16 = 43;
@@ -1765,7 +1768,8 @@ test "the composer hangs under a rule rather than sitting in a box" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     const width: u16 = 72;
@@ -1793,7 +1797,7 @@ test "the composer hangs under a rule rather than sitting in a box" {
 
     // The mark a sent turn wears, in the colour of whichever agent answers.
     try testing.expectEqualStrings(w.prompt_mark, surface.buffer[width + Model.gutter].char.grapheme);
-    try testing.expectEqual(Model.agentColor(model.loop.agent.id), surface.buffer[width + Model.gutter].style.fg);
+    try testing.expectEqual(Model.agentColor(model.local_loop.agent.id), surface.buffer[width + Model.gutter].style.fg);
 
     // The mode closes the row, on the same ground as everything else.
     try testing.expect(std.mem.indexOf(u8, typed, "build mode") != null);
@@ -1817,7 +1821,8 @@ test "the frame runs from the title rule down to the composer rule" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     // Something to lay out: with nothing said yet there is no transcript to place.
@@ -1868,7 +1873,8 @@ test "a terminal too big to address still keeps the composer on screen" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     _ = try model.conversation.addUser("hello", &.{}, &.{});
@@ -1911,7 +1917,8 @@ test "the rail divides itself from the transcript with a border, not a ground" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     const width: u16 = Model.sidebar_width;
@@ -1950,17 +1957,18 @@ test "the rail counts the context down before it lists the plan" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     model.provider.context_limit = 200_000;
-    model.loop.usage = .{ .context_tokens = 42_300, .input_tokens = 12_100, .output_tokens = 3_400, .calls = 7 };
-    try model.loop.todos.replace(&.{
+    model.local_loop.usage = .{ .context_tokens = 42_300, .input_tokens = 12_100, .output_tokens = 3_400, .calls = 7 };
+    try model.local_loop.todos.replace(&.{
         .{ .text = "add fake clock helper", .status = .done },
         .{ .text = "run 20x to confirm no flake", .status = .active },
         .{ .text = "apply same fix to token.spec.ts", .status = .pending },
     });
-    model.loop.todos.expanded = true;
+    model.local_loop.todos.expanded = true;
 
     const width: u16 = Model.sidebar_width;
     const height: u16 = 26;
@@ -2021,14 +2029,15 @@ test "the rows the plan records are the ones a click arrives in" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
-    try model.loop.todos.replace(&.{
+    try model.local_loop.todos.replace(&.{
         .{ .text = "add fake clock helper", .status = .done },
         .{ .text = "run 20x to confirm no flake", .status = .active },
     });
-    model.loop.todos.expanded = false;
+    model.local_loop.todos.expanded = false;
 
     const size: vxfw.Size = .{ .width = Model.sidebar_min_term_width, .height = 30 };
     const ctx: vxfw.DrawContext = .{
@@ -2068,11 +2077,12 @@ test "the rail is narrow enough to be the design's and wide enough for its numbe
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     model.provider.context_limit = 200_000;
-    model.loop.usage = .{ .context_tokens = 142_300, .input_tokens = 12_100, .output_tokens = 3_400, .calls = 7 };
+    model.local_loop.usage = .{ .context_tokens = 142_300, .input_tokens = 12_100, .output_tokens = 3_400, .calls = 7 };
 
     const width: u16 = Model.sidebar_width;
     const ctx: vxfw.DrawContext = .{
@@ -2105,11 +2115,12 @@ test "the rail can be sent away, and takes its click targets with it" {
     defer project.deinit(testing.allocator);
 
     var userdata: u8 = 0;
-    var model = try chromeFixture(testing.allocator, &userdata, &project);
+    var model: Model = undefined;
+    try chromeFixture(&model, testing.allocator, &userdata, &project);
     defer model.deinit();
 
     _ = try model.conversation.addUser("hello", &.{}, &.{});
-    try model.loop.todos.replace(&.{.{ .text = "run the suite", .status = .active }});
+    try model.local_loop.todos.replace(&.{.{ .text = "run the suite", .status = .active }});
 
     const size: vxfw.Size = .{ .width = Model.sidebar_min_term_width, .height = 24 };
     const ctx: vxfw.DrawContext = .{

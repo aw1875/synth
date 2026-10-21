@@ -62,6 +62,8 @@ pub const Command = union(enum) {
         serve,
         bridge,
         list: []const u8,
+        /// Drive a session there in the TUI: the one named, or the only one.
+        connect: struct { host: []const u8, session: ?[]const u8 },
         new: struct { host: []const u8, root: []const u8 },
         stop: struct { host: []const u8, session: []const u8 },
     };
@@ -109,9 +111,9 @@ const session_params = clap.parseParamsComptime(
 
 const remote_params = clap.parseParamsComptime(
     \\-h, --help    show this help and exit
-    \\<str>         serve, bridge, list, new, or stop
+    \\<str>         connect, list, new, stop, serve, or bridge
     \\<str>         the host: anything ssh reaches, or . for this machine
-    \\<str>         for new, the directory; for stop, the session handle
+    \\<str>         for new, the directory; for connect and stop, the session handle
     \\
 );
 
@@ -288,6 +290,10 @@ fn parseRemote(
 
     const host = try allocator.dupe(u8, res.positionals[1] orelse return error.MissingHost);
     if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .remote = .{ .list = host } };
+    if (std.mem.eql(u8, verb, "connect")) {
+        const session = if (res.positionals[2]) |handle| try allocator.dupe(u8, handle) else null;
+        return .{ .remote = .{ .connect = .{ .host = host, .session = session } } };
+    }
 
     const target = try allocator.dupe(u8, res.positionals[2] orelse return error.MissingArgument);
     if (std.mem.eql(u8, verb, "new")) return .{ .remote = .{ .new = .{ .host = host, .root = target } } };
@@ -392,6 +398,7 @@ const help_sections: []const Section = &.{
             .{ .left = "session show <id>", .right = "print a session's transcript" },
             .{ .left = "session rm <id>", .right = "delete a session" },
             .{ .left = "session search <text>", .right = "find messages in this project's transcripts" },
+            .{ .left = "remote connect <host> [session]", .right = "drive a session on a host in the TUI" },
             .{ .left = "remote list <host>", .right = "live sessions on a host (. is this machine)" },
             .{ .left = "remote new <host> <dir>", .right = "start a session there" },
             .{ .left = "remote stop <host> <session>", .right = "end a session there; its transcript stays" },

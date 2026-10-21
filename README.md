@@ -47,6 +47,7 @@ synth session search <text>    find text in this project's transcripts
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
+synth remote connect <host>    drive a session on a host in the TUI
 synth remote list <host>       live sessions on a host (. is this machine)
 synth remote new <host> <dir>  start a session there
 synth remote stop <host> <id>  end one; its transcript stays
@@ -259,6 +260,16 @@ Sessions can run on another machine - a dev VM, a bigger box - with the agent,
 its tools, the database and the provider all over there. A session on a server
 keeps running whoever is attached, so a turn survives a closed laptop.
 
+```
+synth remote new devbox ~/src/api       # start a session there
+synth remote connect devbox             # drive it; ctrl+c leaves it running
+synth remote connect devbox ses_7k3f9a2b
+```
+
+`connect` with no session attaches the only one live on the host. Any number
+of TUIs can drive one session: each can type, and the first to answer an
+approval settles it for all of them.
+
 `<host>` is anything `ssh` accepts: a `Host` alias, `user@host`, an address.
 synth runs `ssh <host> synth remote bridge`, so keys, agents, `ProxyJump` and
 the rest of `~/.ssh/config` apply, and the far end needs only `synth` on its
@@ -268,6 +279,11 @@ The bridge starts the host's server if none is running. It listens on
 `$XDG_RUNTIME_DIR/synth/server.sock`, owner-only, and refuses peers with
 another uid; what it says on starting goes to `server.log` beside it.
 `synth remote serve` runs one in the foreground, until SIGINT or SIGTERM.
+
+What lives on this machine stays local to it: the theme, and the provider,
+model and effort pickers, which configure this machine's client. On a remote
+session `/model <name>` switches the server's model; the pickers, `/sessions`,
+`/search`, `/clear` and subagent transcripts are not available yet.
 
 ## Hooks
 

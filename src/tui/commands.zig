@@ -40,13 +40,14 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (std.mem.eql(u8, line, "/help")) {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
-        const text = try Slash.helpText(arena_state.allocator(), self.loop.skills);
+        const text = try Slash.helpText(arena_state.allocator(), self.skillsOffered());
         _ = try self.conversation.append(.{ .role = .assistant, .text = text });
         self.scroll = 0;
         ctx.redraw = true;
         return true;
     }
     if (std.mem.startsWith(u8, line, "/search")) {
+        if (try localOnly(self, ctx)) return true;
         try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
         return true;
     }
@@ -60,6 +61,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/clear")) {
+        if (try localOnly(self, ctx)) return true;
         if (!self.clearSession()) {
             try self.notification.show(ctx, .info, "Finish the turn first");
         }
@@ -67,11 +69,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/sessions")) {
-        if (self.loop.database()) |db| {
-            if (self.loop.project_id) |project_id| {
-                try self.sessions.show(db, project_id, self.loop.session_id);
-            }
-        }
+        try showSessions(self, ctx);
         ctx.redraw = true;
         return true;
     }
@@ -80,7 +78,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         if (name.len > 0) {
             try switchAgent(self, ctx, agents.findOrDefault(name).id);
         } else {
-            try switchAgent(self, ctx, agents.next(self.loop.agent.id).id);
+            try switchAgent(self, ctx, agents.next(self.session.agentId()).id);
         }
         return true;
     }
@@ -117,21 +115,25 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/logout")) {
+        if (try localOnly(self, ctx)) return true;
         try signOutOfChatGPT(self, ctx);
         ctx.redraw = true;
         return true;
     }
     if (isCommand(line, "/effort")) {
+        if (try localOnly(self, ctx)) return true;
         try chooseEffort(self, ctx, std.mem.trim(u8, line["/effort".len..], " "));
         ctx.redraw = true;
         return true;
     }
     if (std.mem.eql(u8, line, "/usage")) {
+        if (try localOnly(self, ctx)) return true;
         try openUsage(self);
         ctx.redraw = true;
         return true;
     }
     if (std.mem.eql(u8, line, "/providers")) {
+        if (try localOnly(self, ctx)) return true;
         try showProviders(self);
         ctx.redraw = true;
         return true;
@@ -142,6 +144,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         if (name.len > 0) {
             _ = switchModel(self, name) catch "";
         } else {
+            if (try localOnly(self, ctx)) return true;
             try showModels(self);
         }
         ctx.redraw = true;
@@ -150,9 +153,9 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (std.mem.startsWith(u8, line, "/rename")) {
         const name = std.mem.trim(u8, line["/rename".len..], " ");
         if (name.len > 0) {
-            self.loop.rename(name) catch {};
+            self.session.rename(name) catch {};
         } else {
-            try self.rename.show(self.loop.title());
+            try self.rename.show(self.session.title());
         }
         ctx.redraw = true;
         return true;
@@ -169,9 +172,9 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
 fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
     const word_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
     const id = line[1..word_end];
-    const found = skill.findIn(self.loop.skills, id) orelse return false;
+    const found = skill.findIn(self.skillsOffered(), id) orelse return false;
 
-    if (self.loop.isBusy()) {
+    if (self.session.isBusy()) {
         try self.notification.show(ctx, .info, "Finish the turn first");
         ctx.redraw = true;
         return true;
@@ -188,11 +191,26 @@ fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
     return true;
 }
 
-/// Open the provider connect flow.
+/// Refuse what needs a session running in this process, and say so. True
+/// when it was refused.
+pub fn localOnly(self: *Model, ctx: *vxfw.EventContext) !bool {
+    if (!self.session.isRemote()) return false;
+    try self.notification.show(ctx, .info, "Not available on a remote session");
+    return true;
+}
+
+/// Open the session switcher on this project's stored sessions.
+pub fn showSessions(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (try localOnly(self, ctx)) return;
+    const db = self.session.database() orelse return;
+    const project_id = self.session.projectId() orelse return;
+    try self.sessions.show(db, project_id, self.session.sessionId());
+}
+
 /// The theme in use, by id. Read from the database, since that is where it is
 /// kept; the default when there is none.
 pub fn themeId(self: *Model) []const u8 {
-    const db = self.loop.database() orelse return themes.default_id;
+    const db = self.db orelse return themes.default_id;
     var buffer: [64]u8 = undefined;
     var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
     const stored = db.setting(fixed.allocator(), "theme") catch return themes.default_id;
@@ -203,7 +221,7 @@ pub fn themeId(self: *Model) []const u8 {
 /// stored the way the provider is.
 pub fn keepTheme(self: *Model, id: []const u8) void {
     const chosen = themes.apply(id);
-    if (self.loop.database()) |db| db.setSetting("theme", chosen.id) catch {};
+    if (self.db) |db| db.setSetting("theme", chosen.id) catch {};
 }
 
 /// Find text in this project's transcripts, and write the hits into the view.
@@ -213,8 +231,8 @@ fn searchTranscripts(self: *Model, ctx: *vxfw.EventContext, query: []const u8) !
         return;
     }
 
-    const db = self.loop.database() orelse return;
-    const project_id = self.loop.project_id orelse return;
+    const db = self.session.database() orelse return;
+    const project_id = self.session.projectId() orelse return;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
@@ -248,7 +266,7 @@ fn searchTranscripts(self: *Model, ctx: *vxfw.EventContext, query: []const u8) !
 
 /// Apply the configured policy now, and say what it took out.
 fn pruneNow(self: *Model, ctx: *vxfw.EventContext) !void {
-    const db = self.loop.database() orelse {
+    const db = self.db orelse {
         try self.notification.show(ctx, .info, "No database to prune");
         return;
     };
@@ -283,13 +301,13 @@ fn pruneNow(self: *Model, ctx: *vxfw.EventContext) !void {
 /// Change mode and say so. The change is silent otherwise: the tool schema and
 /// the prompt both move, and neither is visible from the transcript.
 pub fn switchAgent(self: *Model, ctx: *vxfw.EventContext, id: []const u8) !void {
-    try self.loop.useAgent(id);
+    try self.session.useAgent(id);
     ctx.redraw = true;
 }
 
 pub fn showProviders(self: *Model) !void {
     const auth = self.auth orelse return;
-    const db = self.loop.database() orelse return;
+    const db = self.db orelse return;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
@@ -391,7 +409,7 @@ pub fn pollSignIn(self: *Model, ctx: *vxfw.EventContext) !void {
 /// Said once, the first time this installation signs in.
 fn welcomeToPlanUsage(self: *Model) !void {
     const welcomed_key = "chatgpt:welcomed";
-    const db = self.loop.database() orelse return;
+    const db = self.db orelse return;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const welcomed = db.setting(arena_state.allocator(), welcomed_key) catch "";
@@ -432,7 +450,7 @@ pub fn pollSignOut(self: *Model, ctx: *vxfw.EventContext) !void {
     const active_id = try activeProviderId(self, arena_state.allocator());
     if (!std.mem.eql(u8, active_id, catalog.chatgpt_id)) return;
     self.provider_missing = true;
-    const db = self.loop.database() orelse return;
+    const db = self.db orelse return;
     db.setActiveProvider("") catch |err| try note(self, "Could not clear the provider: {s}", .{@errorName(err)});
 }
 
@@ -473,12 +491,13 @@ fn pointAt(self: *Model, result: Connect.Result) !bool {
     };
 
     // Wholesale: another protocol is another client, and the old one is gone.
+    const loop = self.localLoop() orelse return false;
     self.provider = provider;
     self.provider_missing = false;
-    self.loop.provider = provider;
-    try self.loop.setModel(provider.model);
+    loop.provider = provider;
+    try loop.setModel(provider.model);
 
-    if (self.loop.database()) |db| {
+    if (self.db) |db| {
         db.setProviderHost(entry.id, result.host) catch |err| {
             try note(self, "Could not remember the host: {s}", .{@errorName(err)});
         };
@@ -547,8 +566,8 @@ pub fn showModels(self: *Model) !void {
     }
 
     var recent: []const []const u8 = &.{};
-    if (self.loop.database()) |db| {
-        if (self.loop.project_id) |project_id| {
+    if (self.db) |db| {
+        if (self.session.projectId()) |project_id| {
             recent = db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
         }
     }
@@ -578,7 +597,7 @@ pub fn listModels(
 
     var host = entry.host;
     if (entry.host_editable) {
-        if (self.loop.database()) |db| {
+        if (self.db) |db| {
             const remembered = try db.providerHost(arena, entry.id);
             if (remembered.len > 0) host = remembered;
         }
@@ -637,7 +656,7 @@ fn effortKey(arena: std.mem.Allocator, provider_id: []const u8, model: []const u
 
 /// The effort last chosen for a model, or "" when none was.
 fn rememberedEffort(self: *Model, arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
-    const db = self.loop.database() orelse return "";
+    const db = self.db orelse return "";
     return db.setting(arena, try effortKey(arena, provider_id, model)) catch "";
 }
 
@@ -648,7 +667,7 @@ fn applyEffort(self: *Model, level: []const u8) !void {
     set(self.provider.userdata, level);
     refreshEffort(self);
 
-    const db = self.loop.database() orelse return;
+    const db = self.db orelse return;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -673,7 +692,7 @@ pub fn restoreEffort(self: *Model) !void {
 fn refreshEffort(self: *Model) void {
     const effort = self.provider.current().effort;
     self.provider.effort = effort;
-    self.loop.provider.effort = effort;
+    if (self.localLoop()) |loop| loop.provider.effort = effort;
 }
 
 /// `/effort` alone opens the picker; with a level, sets it. Answers in a
@@ -702,7 +721,7 @@ fn chooseEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void 
 
 /// Refused mid-turn: the request in flight reads the level as it is built.
 pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void {
-    if (self.loop.isBusy()) return self.notification.show(ctx, .info, "Finish the turn first");
+    if (self.session.isBusy()) return self.notification.show(ctx, .info, "Finish the turn first");
     try applyEffort(self, level);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -713,7 +732,7 @@ pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void
 
 /// The provider in use, by catalog id. Caller owns the result.
 pub fn activeProviderId(self: *Model, arena: std.mem.Allocator) ![]const u8 {
-    const db = self.loop.database() orelse return catalog.default_id;
+    const db = self.db orelse return catalog.default_id;
     const chosen = try db.activeProvider(arena);
     return catalog.findOrDefault(chosen).id;
 }
@@ -722,11 +741,12 @@ pub fn activeProviderId(self: *Model, arena: std.mem.Allocator) ![]const u8 {
 /// reads. Both are values, and the loop's is the one that changes: resuming a
 /// session switches models, and a turn re-reads the context window.
 pub fn syncProvider(self: *Model) void {
-    self.provider.model = self.loop.provider.model;
-    self.provider.name = self.loop.provider.name;
-    self.provider.context_limit = self.loop.provider.context_limit;
-    self.provider.vision = self.loop.provider.vision;
-    self.provider.effort = self.loop.provider.effort;
+    const now = self.session.provider();
+    self.provider.model = now.model;
+    self.provider.name = now.name;
+    self.provider.context_limit = now.context_limit;
+    self.provider.vision = now.vision;
+    self.provider.effort = now.effort;
 }
 
 /// Switch to a model, connecting its provider first when it belongs to another
@@ -743,7 +763,7 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
             const provider = catalog.findOrDefault(entry.provider_id);
             var host = provider.host;
             if (provider.host_editable) {
-                if (self.loop.database()) |db| {
+                if (self.db) |db| {
                     const remembered = try db.providerHost(arena, provider.id);
                     if (remembered.len > 0) host = remembered;
                 }
@@ -767,18 +787,26 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
 
 /// Point the provider at another of its models. Returns the model now in use,
 /// which is what a caller announcing the change has to wait for: until this
-/// returns, the backend is still on whatever it was.
+/// returns, the backend is still on whatever it was. A remote session's server
+/// switches, and its status says what it landed on.
 pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
+    const loop = switch (self.session) {
+        .local => |loop| loop,
+        .remote => |mirror| {
+            try mirror.switchModel(name);
+            return name;
+        },
+    };
     const set = self.provider.set_model orelse return self.provider.model;
     const current = try set(self.provider.userdata, name);
 
     self.provider.model = current.model;
     self.provider.context_limit = current.context_limit;
     self.provider.vision = current.vision;
-    self.loop.provider.model = current.model;
-    self.loop.provider.context_limit = current.context_limit;
-    self.loop.provider.vision = current.vision;
-    try self.loop.setModel(current.model);
+    loop.provider.model = current.model;
+    loop.provider.context_limit = current.context_limit;
+    loop.provider.vision = current.vision;
+    try loop.setModel(current.model);
     try rememberModelChoice(self, current.model);
     try restoreEffort(self);
     return self.provider.model;
@@ -787,7 +815,7 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
 /// Remember the model per provider so the next launch reopens on it.
 fn rememberModelChoice(self: *Model, model: []const u8) !void {
     if (model.len == 0) return;
-    const db = self.loop.database() orelse return;
+    const db = self.db orelse return;
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -824,7 +852,7 @@ pub fn toggleMcpServer(self: *Model, ctx: *vxfw.EventContext) !void {
 
     if (wanted) {
         if (host.disconnect(&self.registry, server.name)) {
-            try self.loop.useAgent(self.loop.agent.id);
+            try self.session.useAgent(self.session.agentId());
         }
         try self.notification.showFmt(ctx, .info, "{s} off", .{server.name});
     } else {
@@ -863,7 +891,7 @@ pub fn applyMcp(self: *Model, ctx: *vxfw.EventContext) !void {
     if (!host.settled()) return;
 
     const added = host.install(&self.registry) catch 0;
-    if (added > 0) try self.loop.useAgent(self.loop.agent.id);
+    if (added > 0) try self.session.useAgent(self.session.agentId());
 
     try reportMcpFailures(self, ctx);
     ctx.redraw = true;
@@ -903,8 +931,9 @@ fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
 }
 
 /// A model in a test needs only enough to hold a provider and a transcript.
-fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []const u8) !Model {
-    var self: Model = .{
+/// Built where it will stay: a wired model points into itself.
+fn switchFixture(self: *Model, allocator: std.mem.Allocator, userdata: *u8, model_name: []const u8) !void {
+    self.* = .{
         .allocator = allocator,
         .io = testing.io,
         .conversation = .init(allocator),
@@ -918,12 +947,12 @@ fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []cons
         .input = .init(allocator),
     };
     try self.wire();
-    return self;
 }
 
 test "the provider is announced with the model that was actually picked" {
     var userdata: u8 = 0;
-    var model = try switchFixture(testing.allocator, &userdata, "deepseek-v4-pro:0813");
+    var model: Model = undefined;
+    try switchFixture(&model, testing.allocator, &userdata, "deepseek-v4-pro:0813");
     defer model.deinit();
 
     // What the connect settled on, which is not what the backend defaulted to.
@@ -938,7 +967,8 @@ test "the provider is announced with the model that was actually picked" {
 
 test "a model whose provider could not be reached is not set on the one in use" {
     var userdata: u8 = 0;
-    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    var model: Model = undefined;
+    try switchFixture(&model, testing.allocator, &userdata, "qwen3-coder:30b");
     defer model.deinit();
 
     // No backend to connect with, so the switch cannot go through.

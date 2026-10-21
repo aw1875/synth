@@ -10,6 +10,8 @@ const Database = @import("../core/database.zig");
 const Conversation = @import("../core/conversation.zig");
 const Role = Conversation.Role;
 const AgentLoop = @import("../agent/loop.zig");
+const Mirror = @import("../remote/mirror.zig");
+const Session = @import("session.zig").Session;
 const Subagent = @import("../agent/subagent.zig");
 const mention = @import("../core/mention.zig");
 const Auth = @import("../core/auth.zig");
@@ -145,9 +147,18 @@ cwd_display: []const u8 = "",
 /// is the focused one.
 input_cursor: ?vxfw.CursorState = null,
 
-/// The agent loop. Owns the conversation's mutations, the in-flight request,
-/// and any running tools.
-loop: AgentLoop = undefined,
+/// The session on screen: the loop below, or a session on a server. Set by
+/// `wire`.
+session: Session = undefined,
+/// The agent loop, when the session runs in this process. Owns the
+/// conversation's mutations, the in-flight request, and any running tools.
+local_loop: AgentLoop = undefined,
+/// A session on a server to drive instead of a loop here. Set before `wire`,
+/// and owned from then on.
+remote: ?*Mirror = null,
+/// This machine's database, for what belongs to the person rather than to a
+/// session: the theme, the providers they connected. Borrowed.
+db: ?*Database = null,
 /// Rows the plan occupied in the last frame, so a click can find it. Both zero
 /// when there is no plan on screen.
 plan_top: u16 = 0,
@@ -448,7 +459,7 @@ pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_inde
 
     // A run still going is in memory, not the database, so it is asked every time.
     if (self.subagents) |runner| {
-        if (self.loop.pending_seq) |pending| {
+        if (self.session.pendingSeq()) |pending| {
             if (msg.seq == pending and runner.viewable(call_index) != null) return true;
         }
     }
@@ -469,8 +480,8 @@ pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_inde
 /// Resolved through the session rather than `message_ids`: that map holds only
 /// what this run persisted, so a resumed transcript is absent from it entirely.
 fn resolveSubagent(self: *Model, seq: u64, call_index: usize) ?i64 {
-    const db = self.loop.db orelse return null;
-    const session = self.loop.session_id orelse return null;
+    const db = self.session.database() orelse return null;
+    const session = self.session.sessionId() orelse return null;
 
     const message = db.messageId(session, @intCast(seq)) catch return null;
     const message_id = message orelse return null;
@@ -494,19 +505,34 @@ pub fn shown(self: *Model) *Conversation {
     return &self.conversation;
 }
 
-/// The loop whose progress belongs on screen: a subagent's while its transcript
-/// is open, the session's own otherwise.
-pub fn shownLoop(self: *Model) *AgentLoop {
+/// The session whose progress belongs on screen: a subagent's while its
+/// transcript is open, this one's otherwise.
+pub fn shownLoop(self: *Model) Session {
     if (self.viewing) |*view| {
         if (view.source == .live) {
             if (self.subagents) |runner| {
                 if (runner.viewable(view.index)) |child| {
-                    if (child.started) return &child.loop;
+                    if (child.started) return .{ .local = &child.loop };
                 }
             }
         }
     }
-    return &self.loop;
+    return self.session;
+}
+
+/// The loop, for what only a session in this process can do: reconfigure
+/// the provider client it runs on, say.
+pub fn localLoop(self: *Model) ?*AgentLoop {
+    return switch (self.session) {
+        .local => |loop| loop,
+        .remote => null,
+    };
+}
+
+/// The skills this machine offers, for `/help` and running one by name.
+pub fn skillsOffered(self: *const Model) []const skill.Skill {
+    const set = self.skills orelse return &.{};
+    return set.skills;
 }
 
 /// Follow a subagent past the end of its run.
@@ -566,7 +592,7 @@ pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []con
             if (runner.viewable(index) != null) break :live .live;
         }
 
-        const db = self.loop.db orelse return false;
+        const db = self.session.database() orelse return false;
         const session = self.subagent_sessions.get(key) orelse
             self.resolveSubagent(seq, index) orelse return false;
 
@@ -628,7 +654,10 @@ pub fn deinit(self: *Model) void {
     }
     self.closeSubagent();
     self.subagent_sessions.deinit(self.allocator);
-    self.loop.deinit();
+    switch (self.session) {
+        .local => |loop| loop.deinit(),
+        .remote => |mirror| mirror.detach(),
+    }
     self.registry.deinit();
     self.reads.deinit();
     self.thinking.stream = null;
@@ -679,7 +708,11 @@ pub fn wire(self: *Model) !void {
     self.reads = .init(self.allocator);
     self.registry = try Registry.init(self.allocator);
     self.conversation.max_messages = max_transcript_messages;
-    self.loop = .init(
+    if (self.remote) |mirror| {
+        self.session = .{ .remote = mirror };
+        return;
+    }
+    self.local_loop = .init(
         self.allocator,
         self.io,
         self.provider,
@@ -688,6 +721,7 @@ pub fn wire(self: *Model) !void {
         &self.reads,
         if (self.project) |project| project.root else self.cwd,
     );
+    self.session = .{ .local = &self.local_loop };
 }
 
 /// Replace the half-typed command with the highlighted one.
@@ -721,10 +755,10 @@ pub fn scheduleTick(self: *Model, ctx: *vxfw.EventContext) !void {
 
 /// Ask the model to summarise the transcript so far.
 pub fn startCompaction(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.loop.isBusy()) return;
+    if (self.session.isBusy()) return;
     if (commands.needsProvider(self)) return;
-    try self.loop.compact();
-    self.thinking.stream = self.loop.thoughts();
+    try self.session.compact();
+    self.thinking.stream = self.session.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = false;
     self.scroll = 0;
@@ -752,9 +786,9 @@ pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !voi
 pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extras: AgentLoop.Extras) !void {
     if (try commands.offerProvidersInstead(self)) return;
     try self.remember(prompt);
-    try self.loop.submit(prompt, extras);
+    try self.session.submit(prompt, extras);
 
-    self.thinking.stream = self.loop.thoughts();
+    self.thinking.stream = self.session.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = true;
     self.scroll = 0;
@@ -767,8 +801,8 @@ pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extr
 /// the loop has gone idle. A cancelled turn leaves its steering behind, and
 /// what was a correction is now simply the next thing to do.
 pub fn drainSteering(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.loop.isBusy()) return;
-    const prompt = self.loop.takeSteering() orelse return;
+    if (self.session.isBusy()) return;
+    const prompt = self.session.takeSteering() orelse return;
     defer self.allocator.free(prompt);
     try self.startTurn(ctx, prompt);
 }
@@ -827,7 +861,7 @@ fn flattenPaste(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// Route a paste: a dialog's field, a dropped image file, an image on the
 /// clipboard, a block big enough to be worth holding back, or just text.
 pub fn handlePaste(self: *Model, text: []const u8) !void {
-    if (self.loop.state == .awaiting_approval) return;
+    if (self.session.state() == .awaiting_approval) return;
 
     if (self.focusedField()) |focus| {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -920,12 +954,12 @@ fn holdImage(self: *Model, bytes: []const u8, label: []const u8) void {
 
 /// Swap the transcript for another session's, without leaving.
 pub fn switchSession(self: *Model, session_id: i64) !void {
-    if (self.loop.session_id) |current| {
+    if (self.session.sessionId()) |current| {
         if (current == session_id) return;
     }
-    if (self.loop.isBusy()) try self.loop.cancel();
+    if (self.session.isBusy()) try self.session.cancel();
 
-    try self.loop.resumeSession(session_id, resume_messages);
+    try self.session.resumeSession(session_id, resume_messages);
     commands.syncProvider(self);
     try commands.restoreEffort(self);
 
@@ -933,7 +967,7 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     self.subagent_sessions.clearRetainingCapacity();
     clearMessageWidgets(self);
     self.thinking.stream = null;
-    self.loop.dropSteering();
+    self.session.dropSteering();
     try self.seedHistory();
     self.input.clear();
     self.held.clear();
@@ -942,7 +976,7 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
 
 /// Clear the visible transcript and start an empty session in this TUI.
 pub fn clearSession(self: *Model) bool {
-    if (!self.loop.resetForNewSession()) return false;
+    if (!self.session.resetForNewSession()) return false;
 
     self.closeSubagent();
     self.subagent_sessions.clearRetainingCapacity();
@@ -1043,7 +1077,7 @@ fn showRecalled(self: *Model, text: []const u8) void {
 /// then ask before abandoning a running turn, then quit.
 pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.quit_confirm.armed(self.io)) {
-        self.loop.requestStop();
+        self.session.requestStop();
         ctx.quit = true;
         return;
     }
@@ -1051,14 +1085,14 @@ pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
         self.input.clear();
         self.mentions.close();
         self.endRecall();
-        if (self.loop.pendingSteering().len == 0) self.held.clear();
+        if (self.session.pendingSteering().len == 0) self.held.clear();
         return ctx.consumeAndRedraw();
     }
-    if (self.loop.isBusy()) {
+    if (self.session.isBusy()) {
         self.quit_confirm.arm(self.io);
         return ctx.consumeAndRedraw();
     }
-    self.loop.requestStop();
+    self.session.requestStop();
     ctx.quit = true;
 }
 
@@ -1078,7 +1112,7 @@ pub fn copySelection(self: *Model, ctx: *vxfw.EventContext) !void {
 
 /// A decision may have started tools running, which needs the tick loop back.
 pub fn afterDecision(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.loop.isBusy()) try self.scheduleTick(ctx);
+    if (self.session.isBusy()) try self.scheduleTick(ctx);
     self.scroll = 0;
     return ctx.consumeAndRedraw();
 }
@@ -1137,7 +1171,7 @@ pub fn pageHistoryIfNeeded(self: *Model) !void {
     if (!self.transcript_exhausted) return;
     if (self.scroll < self.max_scroll) return;
     if (self.conversation.dropped == 0) return;
-    _ = try self.loop.pageHistory(history_page_size);
+    _ = try self.session.pageHistory(history_page_size);
 }
 
 test "a running subagent can be read before it has finished" {
@@ -1155,8 +1189,9 @@ test "a running subagent can be read before it has finished" {
     defer model.subagent_sessions.deinit(testing.allocator);
     defer model.closeSubagent();
 
-    model.loop.db = null;
-    model.loop.pending_seq = null;
+    model.session = .{ .local = &model.local_loop };
+    model.local_loop.db = null;
+    model.local_loop.pending_seq = null;
 
     var child: Subagent.Child = .{
         .agent = "task",
@@ -1172,7 +1207,7 @@ test "a running subagent can be read before it has finished" {
     defer child.reads.deinit();
     _ = try child.convo.addUser("where is it", &.{}, &.{});
 
-    var runner: Subagent.Runner = .{ .parent = &model.loop };
+    var runner: Subagent.Runner = .{ .parent = &model.local_loop };
     defer runner.active.deinit(testing.allocator);
     try runner.active.append(testing.allocator, &child);
     model.subagents = &runner;
@@ -1186,10 +1221,10 @@ test "a running subagent can be read before it has finished" {
     try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
 
     // Its progress, not the parent's, which is stuck on "running tools".
-    try testing.expectEqual(&model.loop, model.shownLoop());
+    try testing.expectEqual(&model.local_loop, model.shownLoop().local);
     child.started = true;
-    child.loop = model.loop;
-    try testing.expectEqual(&child.loop, model.shownLoop());
+    child.loop = model.local_loop;
+    try testing.expectEqual(&child.loop, model.shownLoop().local);
 
     // Once the run is gone and nothing was written down, the view lets go.
     _ = runner.active.orderedRemove(0);
@@ -1219,8 +1254,9 @@ test "a finishing subagent hands its reader over to the stored transcript" {
     defer model.subagent_sessions.deinit(testing.allocator);
     defer model.closeSubagent();
 
-    model.loop.db = &db;
-    model.loop.session_id = parent;
+    model.session = .{ .local = &model.local_loop };
+    model.local_loop.db = &db;
+    model.local_loop.session_id = parent;
 
     var calls = [_]Conversation.ToolCall{.{
         .id = "call_0",
@@ -1248,7 +1284,7 @@ test "a finishing subagent hands its reader over to the stored transcript" {
     defer child.reads.deinit();
     _ = try child.convo.addUser("where is it", &.{}, &.{});
 
-    var runner: Subagent.Runner = .{ .parent = &model.loop };
+    var runner: Subagent.Runner = .{ .parent = &model.local_loop };
     defer runner.active.deinit(testing.allocator);
     try runner.active.append(testing.allocator, &child);
     model.subagents = &runner;
@@ -1293,8 +1329,9 @@ test "a task card only offers its transcript once the call has settled" {
     defer model.closeSubagent();
 
     // Only the fields this path reads; the loop itself needs no wiring here.
-    model.loop.db = &db;
-    model.loop.session_id = parent;
+    model.session = .{ .local = &model.local_loop };
+    model.local_loop.db = &db;
+    model.local_loop.session_id = parent;
 
     var calls = [_]Conversation.ToolCall{.{
         .id = "call_0",
@@ -1354,8 +1391,9 @@ test "a resumed session still offers the transcripts it stored" {
     defer model.closeSubagent();
 
     // Nothing persisted this run, which is what a resumed transcript looks like.
-    model.loop.db = &db;
-    model.loop.session_id = resumed;
+    model.session = .{ .local = &model.local_loop };
+    model.local_loop.db = &db;
+    model.local_loop.session_id = resumed;
 
     var calls = [_]Conversation.ToolCall{.{
         .id = "c",
@@ -1400,7 +1438,8 @@ test "a subagent transcript takes over the view, and ctrl+b gives it back" {
     defer model.subagent_sessions.deinit(testing.allocator);
     defer model.closeSubagent();
 
-    model.loop.db = &db;
+    model.session = .{ .local = &model.local_loop };
+    model.local_loop.db = &db;
     _ = try model.conversation.addUser("go", &.{}, &.{});
 
     const key: u64 = 0;
@@ -1592,8 +1631,8 @@ test "a cleared session forgets the subagents the old one left" {
     try model.wire();
     defer model.deinit();
 
-    model.loop.db = &db;
-    model.loop.session_id = parent;
+    model.local_loop.db = &db;
+    model.local_loop.session_id = parent;
     _ = try model.conversation.addUser("go", &.{}, &.{});
 
     const key: u64 = 0;
@@ -1642,4 +1681,64 @@ test "a card is handed the duration the call it draws recorded" {
     msg.tool_calls[0].status = .running;
     const again = try widget_pool.toolCard(&model, msg, 0, &msg.tool_calls[0]);
     try testing.expect(again.elapsed_ms == null);
+}
+
+test "a model drives a session on a server the way it drives one here" {
+    const testing = std.testing;
+    const Server = @import("../remote/server.zig");
+    const client = @import("../remote/client.zig");
+    const wire_types = @import("../remote/wire.zig");
+
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const stream = try (try std.Io.net.UnixAddress.init(fixture.server.path)).connect(testing.io);
+    const connection = try client.Connection.openStream(testing.allocator, testing.io, stream, null);
+    const opened = try connection.call(arena, .{ .open = .{ .root = fixture.project } }, null);
+    const handle = (try wire_types.parseResult(wire_types.Summary, arena, opened)).handle;
+
+    const model = try testing.allocator.create(Model);
+    defer testing.allocator.destroy(model);
+    model.* = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .conversation = .init(testing.allocator),
+        .provider = undefined,
+        .input = .init(testing.allocator),
+        .cwd = try testing.allocator.dupe(u8, ""),
+        .cwd_display = try testing.allocator.dupe(u8, "test"),
+    };
+    model.remote = try Mirror.attach(testing.allocator, testing.io, connection, &model.conversation, "test", handle, null);
+    model.provider = model.remote.?.provider;
+    try model.wire();
+    defer model.deinit();
+
+    try testing.expect(model.session.isRemote());
+    try testing.expect(model.localLoop() == null);
+    try testing.expect(model.session.database() == null);
+    try testing.expect(!model.session.resetForNewSession());
+
+    try model.session.submit("make a note", .{});
+    for (0..500) |_| {
+        _ = try model.session.poll();
+        if (model.shownLoop().state() == .awaiting_approval) break;
+        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
+    } else return error.TimedOut;
+    try testing.expectEqualStrings("write", model.session.pendingCall().?.name);
+    try testing.expectEqual(model.session.pendingSeq().?, model.conversation.messages.items[1].seq);
+
+    try model.session.decide(.once);
+    for (0..500) |_| {
+        _ = try model.session.poll();
+        if (model.session.finishedTurns() == 1 and !model.session.isBusy()) break;
+        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
+    } else return error.TimedOut;
+    try testing.expectEqual(@as(?AgentLoop.Outcome, .done), model.session.outcome());
+
+    const owned = try model.session.sessionHandle(testing.allocator);
+    defer testing.allocator.free(owned);
+    try testing.expectEqualStrings(handle, owned);
 }
