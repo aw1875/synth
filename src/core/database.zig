@@ -616,6 +616,24 @@ pub fn setSetting(self: *Database, key: []const u8, value: []const u8) !void {
     );
 }
 
+fn effortKey(allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "effort:{s}:{s}", .{ provider_id, model });
+}
+
+/// The reasoning effort last chosen for a provider's model, or "" when none
+/// was. Caller owns the result.
+pub fn rememberedEffort(self: *Database, allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
+    const key = try effortKey(allocator, provider_id, model);
+    defer allocator.free(key);
+    return self.setting(allocator, key);
+}
+
+pub fn rememberEffort(self: *Database, allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8, level: []const u8) !void {
+    const key = try effortKey(allocator, provider_id, model);
+    defer allocator.free(key);
+    try self.setSetting(key, level);
+}
+
 pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
     try self.conn.exec(
         \\INSERT INTO approval (project_id, tool, pattern) VALUES (?, ?, ?)

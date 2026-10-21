@@ -62,7 +62,7 @@ cursor: usize = 0,
 /// First visible row.
 scroll: usize = 0,
 search: Input,
-/// The model in use, marked in the list.
+/// The model in use, marked in the list. Owned.
 current: []const u8 = "",
 
 pub fn init(allocator: std.mem.Allocator) Picker {
@@ -80,6 +80,8 @@ fn release(self: *Picker) void {
     for (self.entries) |entry| freeEntry(self.allocator, entry);
     self.allocator.free(self.entries);
     self.entries = &.{};
+    self.allocator.free(self.current);
+    self.current = "";
 }
 
 fn freeEntry(allocator: std.mem.Allocator, entry: Entry) void {
@@ -147,7 +149,7 @@ pub fn show(
     }
     self.entries = entries;
 
-    self.current = current;
+    self.current = try self.allocator.dupe(u8, current);
     self.search.clear();
     self.cursor = 0;
     self.scroll = 0;

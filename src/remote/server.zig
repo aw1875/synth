@@ -59,6 +59,9 @@ pub const Options = struct {
     /// The database sessions persist to. Each worker opens its own connection.
     database_path: []const u8,
     source: Source,
+    /// The catalog id of the provider sessions answer through, which the
+    /// effort chosen for each of its models is remembered under.
+    provider_id: []const u8 = "",
     home: ?[]const u8 = null,
     mcp_auth: ?*mcp.Auth = null,
 };
@@ -589,6 +592,7 @@ const Worker = struct {
         errdefer self.stack.destroy();
         self.stack.convo.max_messages = max_messages;
         try self.stack.loop.resumeSession(self.hosted.id, max_messages);
+        self.restoreEffort();
     }
 
     fn teardown(self: *Worker) void {
@@ -668,7 +672,15 @@ const Worker = struct {
             .compact => try loop.compact(),
             .rename => |rename| try loop.rename(rename.title),
             .use_agent => |use| try loop.useAgent(use.id),
-            .set_model => |set| try loop.switchModel(set.model),
+            .set_model => |set| {
+                try loop.switchModel(set.model);
+                if (set.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
+            },
+            .set_effort => |set| {
+                if (loop.isBusy()) return error.Busy;
+                try self.chooseEffort(set.effort);
+            },
+            .models => |listing| return client.reply(id, try self.models(arena, listing.recent)),
             .load_tool_result => |load| return client.reply(id, try self.loadToolResult(arena, load.seq, load.call)),
             .load_thinking => |load| return client.reply(id, try self.loadThinking(arena, load.seq)),
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
@@ -832,6 +844,9 @@ const Worker = struct {
             .model = loop.provider.model,
             .provider = loop.provider.name,
             .context_limit = loop.provider.context_limit,
+            .switchable = loop.provider.switchable(),
+            .effort = loop.provider.effort,
+            .efforts = loop.provider.effortsFor(loop.provider.model).levels,
             .usage = loop.usage,
             .todos = loop.todos.items.items,
             .pending_seq = loop.pending_seq,
@@ -886,6 +901,33 @@ const Worker = struct {
         return out;
     }
 
+    /// Put the model back on the effort last chosen for it, or its default.
+    fn restoreEffort(self: *Worker) void {
+        const loop = &self.stack.loop;
+        const remembered = self.db.rememberedEffort(self.allocator, self.hosted.server.options.provider_id, loop.provider.model) catch "";
+        defer self.allocator.free(remembered);
+        loop.setEffort(remembered);
+    }
+
+    fn chooseEffort(self: *Worker, level: []const u8) !void {
+        const loop = &self.stack.loop;
+        loop.setEffort(level);
+        try self.db.rememberEffort(self.allocator, self.hosted.server.options.provider_id, loop.provider.model, level);
+    }
+
+    fn models(self: *Worker, arena: std.mem.Allocator, recent: u32) !wire.Models {
+        const provider = self.stack.loop.provider;
+        const names = try provider.models(arena);
+        const offered = try arena.alloc(wire.Offered, names.len);
+        for (names, offered) |name, *out| {
+            const efforts = provider.effortsFor(name);
+            const remembered = try self.db.rememberedEffort(arena, self.hosted.server.options.provider_id, name);
+            out.* = .{ .name = name, .efforts = efforts.levels, .effort = efforts.pick(remembered) };
+        }
+        const project_id = self.stack.loop.project_id orelse return .{ .offered = offered };
+        return .{ .offered = offered, .recent = try self.db.recentModels(arena, project_id, recent) };
+    }
+
     fn storedSessions(self: *Worker, arena: std.mem.Allocator, limit: u32) ![]const wire.Stored {
         const project_id = self.stack.loop.project_id orelse return &.{};
         const stored = try self.db.listSessions(arena, project_id, limit);
@@ -938,6 +980,7 @@ fn describe(err: anyerror) []const u8 {
         error.NotDir => "not a directory",
         error.ModelFixed => "this provider has only the one model",
         error.NotASessionCommand => "not a session command",
+        error.Busy => "finish the turn first",
         else => @errorName(err),
     };
 }
@@ -1211,12 +1254,56 @@ test "socketPath sits under XDG_RUNTIME_DIR when there is one" {
 
 /// Answers the first turn by thinking aloud and asking to write a note, and
 /// the second, once the note is written, with "done". Each answer waits on
-/// `gate` after the thinking, so a test can catch a request mid-stream.
+/// `gate` after the thinking, so a test can catch a request mid-stream. Offers
+/// two models, each at two efforts.
 pub const Script = struct {
     gate: std.Io.Event = .is_set,
+    model: []const u8 = offered[0],
+    effort: []const u8 = "",
+
+    const offered = [_][]const u8{ "scripted", "bigger" };
+    const levels = [_][]const u8{ "low", "high" };
 
     fn provider(self: *Script) Provider {
-        return .{ .name = "script", .model = "scripted", .userdata = self, .respond = respond };
+        return .{
+            .name = "script",
+            .model = self.model,
+            .userdata = self,
+            .respond = respond,
+            .list_models = listModels,
+            .set_model = setModel,
+            .refresh = refresh,
+            .efforts = efforts,
+            .set_effort = setEffort,
+        };
+    }
+
+    fn listModels(_: *anyopaque, allocator: std.mem.Allocator) ![][]const u8 {
+        const names = try allocator.alloc([]const u8, offered.len);
+        for (offered, names) |name, *copy| copy.* = try allocator.dupe(u8, name);
+        return names;
+    }
+
+    fn setModel(ptr: *anyopaque, name: []const u8) !Provider.Current {
+        const self: *Script = @ptrCast(@alignCast(ptr));
+        self.model = for (offered) |known| {
+            if (std.mem.eql(u8, known, name)) break known;
+        } else return error.UnknownModel;
+        return refresh(ptr);
+    }
+
+    fn refresh(ptr: *anyopaque) Provider.Current {
+        const self: *Script = @ptrCast(@alignCast(ptr));
+        return .{ .model = self.model, .name = "script", .effort = efforts(ptr, self.model).pick(self.effort) };
+    }
+
+    fn efforts(_: *anyopaque, _: []const u8) Provider.Efforts {
+        return .{ .levels = &levels, .default = levels[0] };
+    }
+
+    fn setEffort(ptr: *anyopaque, level: []const u8) void {
+        const self: *Script = @ptrCast(@alignCast(ptr));
+        self.effort = efforts(ptr, self.model).pick(level);
     }
 
     fn respond(ptr: *anyopaque, convo: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
@@ -1364,6 +1451,16 @@ const TestClient = struct {
             if (frame.body != .reply or frame.id != id) continue;
             try std.testing.expect(!frame.body.reply.ok);
             return frame.body.reply.@"error".?;
+        }
+    }
+
+    /// Read until a status running `model` at `effort`.
+    fn awaitModel(self: *TestClient, model: []const u8, effort: []const u8) !void {
+        while (true) {
+            const frame = try self.next();
+            if (frame.body != .status) continue;
+            const status = frame.body.status;
+            if (std.mem.eql(u8, status.model, model) and std.mem.eql(u8, status.effort, effort)) return;
         }
     }
 
@@ -1585,4 +1682,33 @@ test "a live server is left alone, and a dead one's socket replaced" {
     options.socket_path = path;
     const replacement = try start(std.testing.allocator, std.testing.io, options);
     replacement.stop();
+}
+
+test "a model is listed with its efforts, and the effort chosen for it comes back with it" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+    const snapshot = try client.attach((try client.open(fixture.project)).handle);
+    try std.testing.expect(snapshot.status.switchable);
+    try std.testing.expectEqualStrings("low", snapshot.status.effort);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.status.efforts.len);
+
+    _ = try client.expectOk(try client.send(.{ .set_effort = .{ .effort = "high" } }));
+    try client.awaitModel("scripted", "high");
+    _ = try client.expectOk(try client.send(.{ .set_model = .{ .model = "bigger" } }));
+    try client.awaitModel("bigger", "low");
+    _ = try client.expectOk(try client.send(.{ .set_model = .{ .model = "scripted" } }));
+    try client.awaitModel("scripted", "high");
+    _ = try client.expectOk(try client.send(.{ .set_model = .{ .model = "bigger", .effort = "high" } }));
+    try client.awaitModel("bigger", "high");
+
+    const result = try client.expectOk(try client.send(.{ .models = .{} }));
+    const models = try wire.parseResult(wire.Models, client.arena.allocator(), result);
+    try std.testing.expectEqual(@as(usize, 2), models.offered.len);
+    for (models.offered) |offered| try std.testing.expectEqualStrings("high", offered.effort);
+    try std.testing.expectEqualStrings("low", models.offered[0].efforts[0]);
+
+    try std.testing.expectEqualStrings("UnknownModel", try client.expectError(try client.send(.{ .set_model = .{ .model = "missing" } })));
 }

@@ -68,6 +68,7 @@ const Awaited = union(enum) {
     search: []const u8,
     /// A session opened to attach once it is up.
     fresh,
+    models,
 };
 
 /// What a request the TUI made came back with, for it to show.
@@ -75,6 +76,8 @@ pub const Answer = union(enum) {
     /// The project's stored sessions. Ids are the server's, so zero here.
     sessions: []Database.SessionInfo,
     search: struct { query: []u8, hits: []Database.Hit },
+    /// The models the server's provider offers, in an arena of their own.
+    models: struct { arena: std.heap.ArenaAllocator, models: wire.Models },
 
     pub fn deinit(self: Answer, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -86,6 +89,10 @@ pub const Answer = union(enum) {
                 for (found.hits) |hit| hit.deinit(allocator);
                 allocator.free(found.hits);
                 allocator.free(found.query);
+            },
+            .models => |offer| {
+                var arena = offer.arena;
+                arena.deinit();
             },
         }
     }
@@ -135,7 +142,7 @@ pub fn attach(
         .lost = lost,
         .status_arena = .init(allocator),
         .todos = .init(allocator),
-        .provider = .{ .name = "", .userdata = self, .respond = answerNothing },
+        .provider = .{ .name = "", .userdata = self, .respond = answerNothing, .efforts = effortsOffered },
         .thinking = .init(allocator, io),
         .content = .init(allocator, io),
     };
@@ -187,6 +194,14 @@ fn freeState(self: *Mirror) void {
 
 fn answerNothing(_: *anyopaque, _: *Conversation, _: Provider.Turn, _: std.mem.Allocator, _: ?Provider.Sink) !Provider.Reply {
     return error.RemoteSession;
+}
+
+/// Only the current model's levels are known here, which is all `/effort`
+/// asks about; the model picker brings each model's own.
+fn effortsOffered(ptr: *anyopaque, model: []const u8) Provider.Efforts {
+    const self: *Mirror = @ptrCast(@alignCast(ptr));
+    if (!std.mem.eql(u8, model, self.status.model)) return .{};
+    return .{ .levels = self.status.efforts, .default = self.status.effort };
 }
 
 fn readLoop(self: *Mirror) void {
@@ -323,6 +338,8 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     kept.agent = try arena.dupe(u8, status.agent);
     kept.model = try arena.dupe(u8, status.model);
     kept.provider = try arena.dupe(u8, status.provider);
+    kept.effort = try arena.dupe(u8, status.effort);
+    kept.efforts = try dupeAll(arena, status.efforts);
     kept.todos = &.{};
     kept.pending_seq = if (status.pending_seq) |seq| localSeq(seq) else null;
     kept.notes = try dupeAll(arena, status.notes);
@@ -333,6 +350,7 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     self.provider.name = kept.provider;
     self.provider.model = kept.model;
     self.provider.context_limit = kept.context_limit;
+    self.provider.effort = kept.effort;
 }
 
 fn dupeAll(arena: std.mem.Allocator, texts: []const []const u8) ![]const []const u8 {
@@ -354,6 +372,7 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             .sessions => "listing the sessions",
             .search => "searching",
             .fresh => "starting a session",
+            .models => "listing the models",
         };
         return self.say("{s} failed on {s}: {s}", .{ what, self.host, reply.@"error" orelse "no reason given" });
     }
@@ -402,6 +421,13 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             const copy = try self.allocator.dupe(u8, query);
             errdefer self.allocator.free(copy);
             self.answers.appendAssumeCapacity(.{ .search = .{ .query = copy, .hits = try ownHits(self.allocator, hits) } });
+        },
+        .models => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const models = try wire.parseResult(wire.Models, kept.allocator(), reply.result);
+            self.answers.appendAssumeCapacity(.{ .models = .{ .arena = kept, .models = models } });
         },
         .fresh => {
             const opened = try wire.parseResult(wire.Summary, arena, reply.result);
@@ -577,8 +603,19 @@ pub fn useAgent(self: *Mirror, id: []const u8) !void {
     try self.send(.{ .use_agent = .{ .id = id } }, .{ .command = "Switching mode" });
 }
 
-pub fn switchModel(self: *Mirror, model: []const u8) !void {
-    try self.send(.{ .set_model = .{ .model = model } }, .{ .command = "Switching model" });
+/// Switch the server's model, to run at `effort`, or at the level last
+/// chosen for it when that is null.
+pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8) !void {
+    try self.send(.{ .set_model = .{ .model = model, .effort = effort } }, .{ .command = "Switching model" });
+}
+
+pub fn setEffort(self: *Mirror, level: []const u8) !void {
+    try self.send(.{ .set_effort = .{ .effort = level } }, .{ .command = "Setting the effort" });
+}
+
+/// Ask what models the server's provider offers. They land on a later poll.
+pub fn listModels(self: *Mirror, recent: usize) !void {
+    try self.send(.{ .models = .{ .recent = @intCast(recent) } }, .models);
 }
 
 /// Ask for the whole result behind a preview. It lands on a later poll.
@@ -824,4 +861,30 @@ test "a server number survives the trip here and back, and a note maps to the me
     try testing.expectEqual(@as(u64, 0), serverSeq(0));
     try testing.expectEqual(@as(u64, 0), serverSeq(3));
     try testing.expectEqual(@as(u64, 8), serverSeq(localSeq(7) + 1));
+}
+
+fn runsHigh(mirror: *Mirror) bool {
+    return std.mem.eql(u8, mirror.provider.effort, "high");
+}
+
+test "a mirror lists the server's models, and its provider answers for the effort" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    try testing.expectEqual(@as(usize, 2), mirror.provider.effortsFor("scripted").levels.len);
+    try testing.expectEqual(@as(usize, 0), mirror.provider.effortsFor("bigger").levels.len);
+
+    try mirror.setEffort("high");
+    try pollUntil(mirror, runsHigh);
+
+    try mirror.listModels(5);
+    const listed = try pollForAnswer(mirror);
+    defer listed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), listed.models.models.offered.len);
+    try testing.expectEqualStrings("high", listed.models.models.offered[0].effort);
 }

@@ -145,6 +145,11 @@ pub const Status = struct {
     model: []const u8 = "",
     provider: []const u8 = "",
     context_limit: u32 = 0,
+    /// Whether the provider offers other models to switch to.
+    switchable: bool = false,
+    /// The reasoning effort in force, and the levels the model offers.
+    effort: []const u8 = "",
+    efforts: []const []const u8 = &.{},
     usage: Loop.Usage = .{},
     todos: []const todo.Item = &.{},
     /// The message whose tool calls are being decided or run, and the call
@@ -201,6 +206,21 @@ pub const Stored = struct {
     messages: u64 = 0,
 };
 
+/// A model the server's provider offers.
+pub const Offered = struct {
+    name: []const u8,
+    /// Reasoning effort levels, mildest first; empty when there is no choice.
+    efforts: []const []const u8 = &.{},
+    /// The level it runs at if chosen: the last one chosen, or its default.
+    effort: []const u8 = "",
+};
+
+pub const Models = struct {
+    offered: []const Offered = &.{},
+    /// Models this project has used, most recently first.
+    recent: []const []const u8 = &.{},
+};
+
 /// A message matching a search, in the attached session's project.
 pub const Hit = struct {
     handle: []const u8,
@@ -255,8 +275,19 @@ pub const Up = union(enum) {
     use_agent: struct {
         id: []const u8,
     },
+    /// Switch model, then run it at `effort`, or at the level last chosen for
+    /// it when that is null.
     set_model: struct {
         model: []const u8,
+        effort: ?[]const u8 = null,
+    },
+    /// Refused mid-turn: the request in flight reads the level as it is built.
+    set_effort: struct {
+        effort: []const u8,
+    },
+    /// Replied with `Models`, naming up to `recent` recently used.
+    models: struct {
+        recent: u32 = 5,
     },
     /// Replied with the whole result as a string.
     load_tool_result: struct {

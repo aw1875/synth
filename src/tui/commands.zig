@@ -122,7 +122,6 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/effort")) {
-        if (try localOnly(self, ctx)) return true;
         try chooseEffort(self, ctx, std.mem.trim(u8, line["/effort".len..], " "));
         ctx.redraw = true;
         return true;
@@ -145,7 +144,6 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         if (name.len > 0) {
             _ = switchModel(self, name) catch "";
         } else {
-            if (try localOnly(self, ctx)) return true;
             try showModels(self);
         }
         ctx.redraw = true;
@@ -224,6 +222,20 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
         .search => |found| {
             defer answer.deinit(self.allocator);
             try showHits(self, ctx, found.query, found.hits);
+        },
+        .models => |offer| {
+            defer answer.deinit(self.allocator);
+            const mirror = self.remote orelse return;
+            var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+            defer arena_state.deinit();
+            const entries = try arena_state.allocator().alloc(ModelPicker.Entry, offer.models.offered.len);
+            for (offer.models.offered, entries) |offered, *entry| entry.* = .{
+                .name = offered.name,
+                .provider = mirror.status.provider,
+                .efforts = offered.efforts,
+                .effort = offered.effort,
+            };
+            try self.models.show(entries, offer.models.recent, mirror.status.model);
         },
     }
 }
@@ -581,6 +593,10 @@ pub fn offerProvidersInstead(self: *Model) !bool {
 /// Open the model switcher, asking each provider what it offers.
 pub fn showModels(self: *Model) !void {
     if (try offerProvidersInstead(self)) return;
+    if (self.remote) |mirror| {
+        if (mirror.status.switchable) try mirror.listModels(ModelPicker.max_recent);
+        return;
+    }
     if (!self.provider.switchable()) return;
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -660,16 +676,12 @@ fn modelEntries(
     const entries = try arena.alloc(ModelPicker.Entry, names.len);
     for (names, entries) |name, *model| {
         const efforts = provider.effortsFor(name);
-        const remembered = try rememberedEffort(self, arena, entry.id, name);
-        const is_remembered_offered = for (efforts.levels) |level| {
-            if (std.mem.eql(u8, level, remembered)) break true;
-        } else false;
         model.* = .{
             .name = name,
             .provider = entry.label,
             .provider_id = entry.id,
             .efforts = try dupeLevels(arena, efforts.levels),
-            .effort = try arena.dupe(u8, if (is_remembered_offered) remembered else efforts.default),
+            .effort = try arena.dupe(u8, efforts.pick(try rememberedEffort(self, arena, entry.id, name))),
         };
     }
     return entries;
@@ -681,19 +693,16 @@ fn dupeLevels(arena: std.mem.Allocator, levels: []const []const u8) ![]const []c
     return copies;
 }
 
-fn effortKey(arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "effort:{s}:{s}", .{ provider_id, model });
-}
-
 /// The effort last chosen for a model, or "" when none was.
 fn rememberedEffort(self: *Model, arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
     const db = self.db orelse return "";
-    return db.setting(arena, try effortKey(arena, provider_id, model)) catch "";
+    return db.rememberedEffort(arena, provider_id, model) catch "";
 }
 
 /// Run the current model at `level` from the next turn on, and remember it
-/// for this model.
+/// for this model. A remote session's server does both.
 fn applyEffort(self: *Model, level: []const u8) !void {
+    if (self.remote) |mirror| return mirror.setEffort(level);
     const set = self.provider.set_effort orelse return;
     set(self.provider.userdata, level);
     refreshEffort(self);
@@ -703,7 +712,7 @@ fn applyEffort(self: *Model, level: []const u8) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const provider_id = try activeProviderId(self, arena);
-    db.setSetting(try effortKey(arena, provider_id, self.provider.model), level) catch |err| {
+    db.rememberEffort(arena, provider_id, self.provider.model, level) catch |err| {
         try note(self, "Could not remember the effort: {s}", .{@errorName(err)});
     };
 }
@@ -757,7 +766,8 @@ pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
-    const said = try std.fmt.allocPrint(arena_state.allocator(), "{s} now runs at {s} effort", .{ self.provider.model, self.provider.current().effort });
+    const now = if (self.remote != null) level else self.provider.current().effort;
+    const said = try std.fmt.allocPrint(arena_state.allocator(), "{s} now runs at {s} effort", .{ self.provider.model, now });
     try self.notification.show(ctx, .info, said);
 }
 
@@ -784,6 +794,7 @@ pub fn syncProvider(self: *Model) void {
 /// one. Picking `gpt-oss` from a list that also holds local models should just
 /// work, which means the switch is a reconnect and a model change together.
 pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
+    if (self.remote) |mirror| return mirror.switchModel(entry.name, if (entry.effort_changed) entry.effort else null);
     if (entry.provider_id.len > 0) {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
@@ -824,7 +835,7 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     const loop = switch (self.session) {
         .local => |loop| loop,
         .remote => |mirror| {
-            try mirror.switchModel(name);
+            try mirror.switchModel(name, null);
             return name;
         },
     };

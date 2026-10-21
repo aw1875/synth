@@ -391,7 +391,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                if (!try commands.localOnly(self, ctx)) try commands.showModels(self);
+                try commands.showModels(self);
                 return ctx.consumeAndRedraw();
             }
 

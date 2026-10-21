@@ -280,12 +280,11 @@ The bridge starts the host's server if none is running. It listens on
 another uid; what it says on starting goes to `server.log` beside it.
 `synth remote serve` runs one in the foreground, until SIGINT or SIGTERM.
 
-What lives on this machine stays local to it: the theme, and the provider,
-model and effort pickers, which configure this machine's client. On a remote
-session `/model <name>` switches the server's model, and `/sessions`,
+The theme stays local to this machine. On a remote session the model picker,
+`/model` and `/effort` choose among the server's models, and `/sessions`,
 `/search` and `/clear` work on the server's stored sessions; switching away
-leaves a running turn running. The pickers and subagent transcripts are not
-available yet.
+leaves a running turn running. Connecting providers and subagent transcripts
+are not available there yet.
 
 ## Hooks
 

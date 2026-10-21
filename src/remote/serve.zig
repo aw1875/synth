@@ -65,6 +65,7 @@ pub fn run(init: std.process.Init) !void {
         .socket_path = socket_path,
         .database_path = config.database_path,
         .source = .{ .backend = &backend },
+        .provider_id = active.entry.id,
         .home = init.environ_map.get("HOME"),
         .mcp_auth = &mcp_auth,
     }) catch |err| switch (err) {

@@ -596,6 +596,14 @@ pub fn syncProvider(self: *Loop) void {
     self.provider.effort = now.effort;
 }
 
+/// Run the current model at `level` from the next turn on. Between turns
+/// only: the request in flight reads the level as it is built.
+pub fn setEffort(self: *Loop, level: []const u8) void {
+    const set = self.provider.set_effort orelse return;
+    set(self.provider.userdata, level);
+    self.syncProvider();
+}
+
 /// What the loop is doing, for the UI's status row.
 pub fn label(self: *Loop) []const u8 {
     if (self.state == .thinking) {
