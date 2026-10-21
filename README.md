@@ -283,8 +283,9 @@ another uid; what it says on starting goes to `server.log` beside it.
 The theme stays local to this machine. On a remote session the model picker,
 `/model` and `/effort` choose among the server's models, and `/sessions`,
 `/search` and `/clear` work on the server's stored sessions; switching away
-leaves a running turn running. Connecting providers and subagent transcripts
-are not available there yet.
+leaves a running turn running. Skills and `@` mentions are the server's.
+Connecting providers, `/mcp` and subagent transcripts are not available there
+yet.
 
 ## Hooks
 

@@ -11,6 +11,7 @@ const wire = @import("wire.zig");
 const client = @import("client.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
+const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
 const Loop = @import("../agent/loop.zig");
 const Thought = @import("../agent/thought.zig");
@@ -39,6 +40,12 @@ todos: todo.List,
 /// What the sidebar and the composer read about the model. Never asked
 /// anything: the server's own client answers the turns.
 provider: Provider,
+
+/// The skills the server offers, from the last snapshot, in `skills_arena`.
+/// Only what describes them: running one is the server's job.
+skills: []const skill.Skill = &.{},
+skill_paths: []const []const u8 = &.{},
+skills_arena: std.heap.ArenaAllocator,
 
 stream_request: ?u64 = null,
 thinking: Thought.Stream,
@@ -148,6 +155,7 @@ pub fn attach(
         .host = try allocator.dupe(u8, host),
         .lost = lost,
         .status_arena = .init(allocator),
+        .skills_arena = .init(allocator),
         .todos = .init(allocator),
         .provider = .{ .name = "", .userdata = self, .respond = answerNothing, .efforts = effortsOffered },
         .thinking = .init(allocator, io),
@@ -196,6 +204,7 @@ fn freeState(self: *Mirror) void {
     self.content.deinit();
     self.todos.deinit();
     self.status_arena.deinit();
+    self.skills_arena.deinit();
     self.allocator.free(self.host);
 }
 
@@ -305,6 +314,25 @@ fn applySnapshot(self: *Mirror, snapshot: wire.Snapshot) !void {
     self.conversation.dropped += snapshot.dropped;
     try self.keepStatus(snapshot.status);
     if (snapshot.stream) |stream| try self.applyStream(stream);
+    try self.keepSkills(snapshot.skills);
+}
+
+fn keepSkills(self: *Mirror, offered: wire.Skills) !void {
+    self.skills = &.{};
+    self.skill_paths = &.{};
+    _ = self.skills_arena.reset(.retain_capacity);
+    const arena = self.skills_arena.allocator();
+
+    const kept = try arena.alloc(skill.Skill, offered.found.len);
+    for (offered.found, kept) |found, *out| out.* = .{
+        .id = try arena.dupe(u8, found.id),
+        .name = try arena.dupe(u8, found.name),
+        .description = try arena.dupe(u8, found.description),
+        .dir = try arena.dupe(u8, found.dir),
+        .body = "",
+    };
+    self.skill_paths = try dupeAll(arena, offered.looked_in);
+    self.skills = kept;
 }
 
 fn applyMessage(self: *Mirror, message: wire.Message, changed: bool) !void {
@@ -624,6 +652,11 @@ pub fn compact(self: *Mirror) !void {
 
 pub fn rename(self: *Mirror, title: []const u8) !void {
     try self.send(.{ .rename = .{ .title = title } }, .{ .command = "Renaming" });
+}
+
+/// Start a turn on one of the server's skills, as typed: `/id args`.
+pub fn runSkill(self: *Mirror, line: []const u8) !void {
+    try self.send(.{ .run_skill = .{ .line = line } }, .{ .command = "Running the skill" });
 }
 
 pub fn useAgent(self: *Mirror, id: []const u8) !void {
@@ -948,4 +981,30 @@ test "a mirror lists its session's project files" {
     try testing.expectEqual(here.len, listed.files.len);
     for (here, listed.files) |expected, got| try testing.expectEqualStrings(expected, got);
     try testing.expect(mirror.takeAnswer() == null);
+}
+
+test "a mirror offers the server's skills, and running one sends the server's instructions" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try fixture.tmp.dir.createDirPath(testing.io, "project/.agents/skills/release");
+    try fixture.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "project/.agents/skills/release/SKILL.md",
+        .data = "---\ndescription: Cut a release\n---\nTag it and push.\n",
+    });
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    try testing.expectEqual(@as(usize, 1), mirror.skills.len);
+    try testing.expectEqualStrings("release", mirror.skills[0].id);
+    try testing.expectEqualStrings("Cut a release", mirror.skills[0].description);
+    try testing.expect(mirror.skill_paths.len > 0);
+
+    try mirror.runSkill("/release 2.1");
+    try pollUntil(mirror, awaitingApproval);
+    const asked = convo.messages.items[0];
+    try testing.expectEqualStrings("/release 2.1", asked.text);
+    try testing.expect(std.mem.indexOf(u8, asked.attachments[0].content, "Tag it and push.") != null);
 }

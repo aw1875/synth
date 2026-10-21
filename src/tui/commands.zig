@@ -94,6 +94,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (std.mem.eql(u8, line, "/mcp")) {
+        if (try localOnly(self, ctx)) return true;
         if (self.mcp) |host| {
             try self.mcp_picker.show(host);
         } else {
@@ -106,7 +107,9 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
         defer arena_state.deinit();
 
-        const text = if (self.skills) |set|
+        const text = if (self.remote) |mirror|
+            try skill.describe(arena_state.allocator(), mirror.skills, mirror.skill_paths)
+        else if (self.skills) |set|
             try set.listText(arena_state.allocator())
         else
             "No skills found.";
@@ -169,13 +172,18 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
 /// skill. It is the same path an `@path` mention takes, which is what keeps a
 /// two hundred line skill from being pasted into the conversation view.
 fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
-    const word_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
-    const id = line[1..word_end];
-    const found = skill.findIn(self.skillsOffered(), id) orelse return false;
+    const found = skill.findIn(self.skillsOffered(), skill.idOf(line)) orelse return false;
 
     if (self.session.isBusy()) {
         try self.notification.show(ctx, .info, "Finish the turn first");
         ctx.redraw = true;
+        return true;
+    }
+    if (self.remote) |mirror| {
+        if (try offerProvidersInstead(self)) return true;
+        try self.remember(line);
+        try mirror.runSkill(line);
+        try self.followTurn(ctx);
         return true;
     }
 

@@ -179,6 +179,20 @@ pub const Stream = struct {
     closed: bool = false,
 };
 
+/// A skill the server offers. Its instructions stay there: `run_skill` uses them.
+pub const Skill = struct {
+    id: []const u8,
+    name: []const u8 = "",
+    description: []const u8 = "",
+    dir: []const u8 = "",
+};
+
+pub const Skills = struct {
+    found: []const Skill = &.{},
+    /// Every directory the server looked in.
+    looked_in: []const []const u8 = &.{},
+};
+
 pub const Snapshot = struct {
     status: Status,
     /// The tail of the transcript, oldest first.
@@ -186,6 +200,7 @@ pub const Snapshot = struct {
     /// Messages before the first one here, still in the database.
     dropped: u64 = 0,
     stream: ?Stream = null,
+    skills: Skills = .{},
 };
 
 /// A session in a listing.
@@ -271,6 +286,10 @@ pub const Up = union(enum) {
     compact: struct {},
     rename: struct {
         title: []const u8,
+    },
+    /// Start a turn on a skill, as `/id args` does: `line` is what was typed.
+    run_skill: struct {
+        line: []const u8,
     },
     use_agent: struct {
         id: []const u8,

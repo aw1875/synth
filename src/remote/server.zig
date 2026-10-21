@@ -23,6 +23,8 @@ const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const mention = @import("../core/mention.zig");
 const Project = @import("../core/project.zig");
+const skill = @import("../core/skill.zig");
+const skill_tool = @import("../tools/skill.zig");
 const project_files = @import("../core/files.zig");
 const Loop = @import("../agent/loop.zig");
 const Stack = @import("../agent/stack.zig");
@@ -673,6 +675,15 @@ const Worker = struct {
             .compact => try loop.compact(),
             .rename => |rename| try loop.rename(rename.title),
             .use_agent => |use| try loop.useAgent(use.id),
+            .run_skill => |invoked| {
+                if (loop.isBusy()) return error.Busy;
+                const found = skill.findIn(self.stack.skills.skills, skill.idOf(invoked.line)) orelse return error.UnknownSkill;
+                const attachment: mention.Attachment = .{
+                    .path = try std.fs.path.join(arena, &.{ found.dir, skill.file_name }),
+                    .content = try skill_tool.render(arena, found),
+                };
+                try loop.submit(invoked.line, .{ .attachments = &.{attachment} });
+            },
             .set_model => |set| {
                 try loop.switchModel(set.model);
                 if (set.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
@@ -710,11 +721,20 @@ const Worker = struct {
             .closed = self.stream_closed,
         } else null;
 
+        const skills = try arena.alloc(wire.Skill, self.stack.skills.skills.len);
+        for (self.stack.skills.skills, skills) |found, *out| out.* = .{
+            .id = found.id,
+            .name = found.name,
+            .description = found.description,
+            .dir = found.dir,
+        };
+
         client.send(.{ .body = .{ .snapshot = .{
             .status = try self.currentStatus(arena),
             .messages = wired,
             .dropped = self.stack.convo.dropped + (messages.len - kept.len),
             .stream = stream,
+            .skills = .{ .found = skills, .looked_in = self.stack.skills.paths },
         } } });
         self.subscribers.appendAssumeCapacity(client);
         self.recordClients();
@@ -990,6 +1010,7 @@ fn describe(err: anyerror) []const u8 {
         error.ModelFixed => "this provider has only the one model",
         error.NotASessionCommand => "not a session command",
         error.Busy => "finish the turn first",
+        error.UnknownSkill => "no such skill",
         else => @errorName(err),
     };
 }

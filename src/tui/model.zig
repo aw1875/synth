@@ -531,6 +531,7 @@ pub fn localLoop(self: *Model) ?*AgentLoop {
 
 /// The skills this machine offers, for `/help` and running one by name.
 pub fn skillsOffered(self: *const Model) []const skill.Skill {
+    if (self.remote) |mirror| return mirror.skills;
     const set = self.skills orelse return &.{};
     return set.skills;
 }
@@ -787,7 +788,11 @@ pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extr
     if (try commands.offerProvidersInstead(self)) return;
     try self.remember(prompt);
     try self.session.submit(prompt, extras);
+    try self.followTurn(ctx);
+}
 
+/// Watch a turn just started, from its first tick.
+pub fn followTurn(self: *Model, ctx: *vxfw.EventContext) !void {
     self.thinking.stream = self.session.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = true;
@@ -1006,6 +1011,7 @@ pub fn showReplacedTranscript(self: *Model) !void {
     self.rung_for = self.session.finishedTurns();
     self.scroll = 0;
     if (self.remote) |mirror| {
+        self.slash.skills = mirror.skills;
         const where = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ mirror.host, mirror.status.root });
         self.allocator.free(self.cwd_display);
         self.cwd_display = where;
@@ -1014,7 +1020,7 @@ pub fn showReplacedTranscript(self: *Model) !void {
 
 /// Keep a sent prompt for up-arrow recall. Consecutive duplicates are not worth
 /// two entries.
-fn remember(self: *Model, prompt: []const u8) !void {
+pub fn remember(self: *Model, prompt: []const u8) !void {
     self.endRecall();
     if (prompt.len == 0) return;
     if (self.history.items.len > 0) {
