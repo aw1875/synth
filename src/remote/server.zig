@@ -145,7 +145,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Serve
 /// the socket file.
 pub fn stop(self: *Server) void {
     // Closing a listener leaves `accept` blocked on a dead descriptor; `shutdown` wakes it.
-    _ = linux.shutdown(self.listener.socket.handle, linux.SHUT.RDWR);
+    _ = std.posix.system.shutdown(self.listener.socket.handle, std.posix.SHUT.RDWR);
     self.accept_thread.join();
     self.listener.deinit(self.io);
     std.Io.Dir.cwd().deleteFile(self.io, self.path) catch {};
@@ -637,7 +637,7 @@ const Worker = struct {
                     done.set(self.io);
                 },
                 .request => |request| self.perform(command.client, command.id, request, command.arena.allocator()) catch |err| {
-                    command.client.replyError(command.id, @errorName(err));
+                    command.client.replyError(command.id, describe(err));
                 },
             }
         }
@@ -894,6 +894,18 @@ const Worker = struct {
     }
 };
 
+/// Why a request failed, for the person who made it.
+fn describe(err: anyerror) []const u8 {
+    return switch (err) {
+        error.UnknownSession => "no such session",
+        error.FileNotFound => "no such directory",
+        error.NotDir => "not a directory",
+        error.ModelFixed => "this provider has only the one model",
+        error.NotASessionCommand => "not a session command",
+        else => @errorName(err),
+    };
+}
+
 /// What can change about a message once it is in the transcript: calls
 /// settle, and heavy bodies shrink to previews once they are persisted.
 fn signature(msg: *const Conversation.Message) u64 {
@@ -1103,16 +1115,16 @@ const Client = struct {
         switch (frame.body) {
             .hello => self.replyError(frame.id, "already said hello"),
             .list => {
-                const sessions = self.server.summaries(arena) catch |err| return self.replyError(frame.id, @errorName(err));
+                const sessions = self.server.summaries(arena) catch |err| return self.replyError(frame.id, describe(err));
                 self.reply(frame.id, sessions);
             },
             .open => |request| {
-                const hosted = self.server.open(request.root) catch |err| return self.replyError(frame.id, @errorName(err));
+                const hosted = self.server.open(request.root) catch |err| return self.replyError(frame.id, describe(err));
                 defer hosted.release();
                 self.reply(frame.id, try hosted.summary(arena));
             },
             .stop => |request| {
-                self.server.stopSession(request.handle) catch |err| return self.replyError(frame.id, @errorName(err));
+                self.server.stopSession(request.handle) catch |err| return self.replyError(frame.id, describe(err));
                 self.reply(frame.id, {});
             },
             .detach => {
@@ -1124,7 +1136,7 @@ const Client = struct {
                 const leave = try Command.create(self.server.allocator, self, .{ .detach = &self.left });
                 const hosted = self.server.acquire(request.handle) catch |err| {
                     leave.destroy();
-                    return self.replyError(frame.id, @errorName(err));
+                    return self.replyError(frame.id, describe(err));
                 };
                 self.attached = hosted;
                 self.leave = leave;
@@ -1370,7 +1382,7 @@ test "a session opens, is listed, and attaches with a snapshot" {
     const after = try client.list();
     try std.testing.expectEqual(@as(u32, 1), after[0].clients);
 
-    try std.testing.expect(std.mem.startsWith(u8, try client.expectError(try client.send(.{ .attach = .{ .handle = "ses_00000000" } })), "UnknownSession"));
+    try std.testing.expectEqualStrings("no such session", try client.expectError(try client.send(.{ .attach = .{ .handle = "ses_00000000" } })));
 }
 
 test "a turn runs over the socket, its approval included" {

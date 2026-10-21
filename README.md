@@ -47,6 +47,10 @@ synth session search <text>    find text in this project's transcripts
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
+synth remote list <host>       live sessions on a host (. is this machine)
+synth remote new <host> <dir>  start a session there
+synth remote stop <host> <id>  end one; its transcript stays
+synth remote serve|bridge      host sessions here, or reach them over stdio
 synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
@@ -249,6 +253,22 @@ A `command` runs a child process; a `url` is a remote server over Streamable
 HTTP, signed in with `synth mcp auth <name>` where it needs OAuth. `/mcp` turns
 servers on and off without leaving the TUI.
 
+## Remote
+
+Sessions can run on another machine - a dev VM, a bigger box - with the agent,
+its tools, the database and the provider all over there. A session on a server
+keeps running whoever is attached, so a turn survives a closed laptop.
+
+`<host>` is anything `ssh` accepts: a `Host` alias, `user@host`, an address.
+synth runs `ssh <host> synth remote bridge`, so keys, agents, `ProxyJump` and
+the rest of `~/.ssh/config` apply, and the far end needs only `synth` on its
+`PATH` and plain exec - no port forwarding. `.` is this machine.
+
+The bridge starts the host's server if none is running. It listens on
+`$XDG_RUNTIME_DIR/synth/server.sock`, owner-only, and refuses peers with
+another uid; what it says on starting goes to `server.log` beside it.
+`synth remote serve` runs one in the foreground, until SIGINT or SIGTERM.
+
 ## Hooks
 
 Hooks run commands from the project root at selected lifecycle events. Each
@@ -388,6 +408,7 @@ src/
   agent/      the turn state machine: ask -> approve -> run -> repeat
   tools/      read, list, glob, grep, write, edit, bash, task, ask_user, skill, todo
   tui/        the vxfw widget tree: transcript, composer, pickers, sidebar
+  remote/     the session server, its protocol, and the ssh bridge to it
 packages/
   mcp/        the MCP client, its own package, importing nothing from synth
 ```

@@ -21,6 +21,9 @@ const Timing = @import("core/timing.zig");
 const Project = @import("core/project.zig");
 const skill = @import("core/skill.zig");
 const headless = @import("headless.zig");
+const remote_bridge = @import("remote/bridge.zig");
+const remote_serve = @import("remote/serve.zig");
+const remote_verbs = @import("remote/verbs.zig");
 const prompt_dump = @import("prompt_dump.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
@@ -72,6 +75,13 @@ pub fn main(init: std.process.Init) !void {
         .models => try commands.models(init),
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),
+        .remote => |sub| switch (sub) {
+            .serve => try remote_serve.run(init),
+            .bridge => try remote_bridge.run(init),
+            .list => |host| try remote_verbs.list(init, host),
+            .new => |target| try remote_verbs.new(init, target.host, target.root),
+            .stop => |target| try remote_verbs.stop(init, target.host, target.session),
+        },
         .mcp => |sub| try commands.mcp_command(init, sub),
         .db => |sub| try commands.database(init, sub),
     }
@@ -295,7 +305,6 @@ fn resumeTarget(db: *Database, project_id: ?i64, options: cli.Command.Tui) !?i64
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("remote/server.zig");
 }
 
 /// A provider someone chose, and that has what it needs; or, with nothing
