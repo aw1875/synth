@@ -113,11 +113,23 @@ pub fn socketPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) !
 }
 
 /// Whether something answers on `path` right now.
-pub fn probe(io: std.Io, path: []const u8) bool {
-    const address = std.Io.net.UnixAddress.init(path) catch return false;
-    const stream = address.connect(io) catch return false;
-    stream.close(io);
-    return true;
+///
+/// Connects with plain posix calls rather than `std.Io.net`, whose unix connect
+/// treats a refusal - a dead server's socket, the very answer asked for here -
+/// as an unexpected errno, and prints a stack trace for it in a debug build.
+pub fn probe(path: []const u8) bool {
+    const posix = std.posix;
+    var address: posix.sockaddr.un = .{ .path = undefined };
+    if (path.len >= address.path.len) return false;
+    @memset(&address.path, 0);
+    @memcpy(address.path[0..path.len], path);
+
+    const cloexec: u32 = if (std.Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+    const opened = posix.system.socket(posix.AF.UNIX, posix.SOCK.STREAM | cloexec, 0);
+    if (posix.errno(opened) != .SUCCESS) return false;
+    const fd: posix.fd_t = @intCast(opened);
+    defer _ = posix.system.close(fd);
+    return posix.errno(posix.system.connect(fd, @ptrCast(&address), @sizeOf(posix.sockaddr.un))) == .SUCCESS;
 }
 
 /// Bind the socket and start accepting. A live server already on the path is
@@ -134,7 +146,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Serve
     const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .lock = .exclusive });
     defer lock.close(io);
 
-    if (probe(io, path)) return error.AlreadyRunning;
+    if (probe(path)) return error.AlreadyRunning;
     std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,

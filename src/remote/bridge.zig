@@ -17,7 +17,7 @@ pub fn run(init: std.process.Init) !void {
     const path = try Server.socketPath(init.gpa, init.environ_map);
     defer init.gpa.free(path);
 
-    if (Server.probe(io, path)) try replaceOutdated(init, path) else try startServer(init, path);
+    if (Server.probe(path)) try replaceOutdated(init, path) else try startServer(init, path);
 
     const stream = try (try std.Io.net.UnixAddress.init(path)).connect(io);
     defer stream.close(io);
@@ -54,7 +54,7 @@ fn startServer(init: std.process.Init, path: []const u8) !void {
 
     var waited: std.Io.Duration = .zero;
     while (waited.nanoseconds < start_timeout.nanoseconds) : (waited.nanoseconds += start_poll.nanoseconds) {
-        if (Server.probe(io, path)) return;
+        if (Server.probe(path)) return;
         try std.Io.sleep(io, start_poll, .awake);
     }
 
@@ -90,7 +90,7 @@ fn replaceOutdated(init: std.process.Init, path: []const u8) !void {
     };
 
     var waited: std.Io.Duration = .zero;
-    while (Server.probe(io, path)) : (waited.nanoseconds += start_poll.nanoseconds) {
+    while (Server.probe(path)) : (waited.nanoseconds += start_poll.nanoseconds) {
         if (waited.nanoseconds >= start_timeout.nanoseconds) return error.ServerDidNotStop;
         try std.Io.sleep(io, start_poll, .awake);
     }
