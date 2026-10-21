@@ -21,6 +21,7 @@ const wire = @import("wire.zig");
 const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
+const mention = @import("../core/mention.zig");
 const Project = @import("../core/project.zig");
 const Loop = @import("../agent/loop.zig");
 const Stack = @import("../agent/stack.zig");
@@ -651,7 +652,13 @@ const Worker = struct {
                 if (loop.isBusy()) {
                     _ = try loop.steer(submit.text);
                 } else {
-                    try loop.submit(submit.text, .{ .images = submit.images });
+                    const attachments = try arena.alloc(mention.Attachment, submit.attachments.len);
+                    for (submit.attachments, attachments) |attachment, *out| out.* = .{
+                        .path = attachment.path,
+                        .content = attachment.content,
+                        .content_bytes = attachment.content_bytes,
+                    };
+                    try loop.submit(submit.text, .{ .attachments = attachments, .images = submit.images });
                 }
             },
             .steer => |steer| _ = try loop.steer(steer.text),
@@ -1176,7 +1183,7 @@ test "socketPath sits under XDG_RUNTIME_DIR when there is one" {
 /// Answers the first turn by thinking aloud and asking to write a note, and
 /// the second, once the note is written, with "done". Each answer waits on
 /// `gate` after the thinking, so a test can catch a request mid-stream.
-const Script = struct {
+pub const Script = struct {
     gate: std.Io.Event = .is_set,
 
     fn provider(self: *Script) Provider {
@@ -1204,8 +1211,8 @@ const Script = struct {
 };
 
 /// A server in a scratch directory, hosting sessions in `project/` and
-/// answering through `Script`.
-const Fixture = struct {
+/// answering through `Script`. For tests, here and of the clients.
+pub const Fixture = struct {
     tmp: std.testing.TmpDir,
     arena: std.heap.ArenaAllocator,
     config: Config,
@@ -1213,7 +1220,7 @@ const Fixture = struct {
     project: []const u8,
     server: *Server,
 
-    fn create() !*Fixture {
+    pub fn create() !*Fixture {
         const allocator = std.testing.allocator;
         const io = std.testing.io;
         const self = try allocator.create(Fixture);
@@ -1242,7 +1249,7 @@ const Fixture = struct {
         return self;
     }
 
-    fn destroy(self: *Fixture) void {
+    pub fn destroy(self: *Fixture) void {
         self.server.stop();
         self.config.arena.deinit();
         self.arena.deinit();

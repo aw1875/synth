@@ -371,6 +371,27 @@ pub fn append(self: *Conversation, msg: Message) !*Message {
     return &self.messages.items[self.messages.items.len - 1];
 }
 
+/// Take over a message numbered elsewhere, keeping its `seq`: a mirror of
+/// another process's transcript keeps that process's numbers. Ownership of
+/// every string passes here.
+pub fn adoptMessage(self: *Conversation, msg: Message) !void {
+    try self.messages.append(self.allocator, msg);
+    self.next_seq = @max(self.next_seq, msg.seq + 1);
+    self.trim();
+}
+
+/// The message numbered `seq`, if it is in memory.
+pub fn find(self: *Conversation, seq: u64) ?*Message {
+    var at = self.messages.items.len;
+    while (at > 0) {
+        at -= 1;
+        const msg = &self.messages.items[at];
+        if (msg.seq == seq) return msg;
+        if (msg.seq < seq) return null;
+    }
+    return null;
+}
+
 /// Drop the oldest messages until the in-memory count is within `max_messages`.
 /// The dropped count is remembered so `totalCount` stays correct and the UI
 /// knows there is history to page in.
@@ -713,4 +734,24 @@ test "a call keeps how long it took, and only once it has run" {
     var refused: ToolCall = .{ .id = "", .name = "", .arguments = "" };
     refused.settle(.rejected, 9_000);
     try testing.expect(refused.elapsed_ms == null);
+}
+
+test "an adopted message keeps its number, and the next append follows it" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    convo.max_messages = 2;
+
+    for ([_]u64{ 7, 9, 12 }) |seq| {
+        try convo.adoptMessage(try (Message{ .seq = seq, .role = .user, .text = "hi" }).clone(testing.allocator));
+    }
+    try testing.expectEqual(@as(usize, 2), convo.messages.items.len);
+    try testing.expectEqual(@as(u64, 1), convo.dropped);
+    try testing.expectEqual(@as(?u64, 9), convo.firstSeq());
+    try testing.expect(convo.find(12) != null);
+    try testing.expect(convo.find(7) == null);
+    try testing.expect(convo.find(10) == null);
+
+    const next = try convo.append(.{ .role = .assistant, .text = "hello" });
+    try testing.expectEqual(@as(u64, 13), next.seq);
 }

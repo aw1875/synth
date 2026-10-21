@@ -216,6 +216,8 @@ pub const Up = union(enum) {
     },
     submit: struct {
         text: []const u8,
+        /// Text the composer held back from the prompt, a long paste say.
+        attachments: []const Attachment = &.{},
         images: []const []const u8 = &.{},
     },
     steer: struct {

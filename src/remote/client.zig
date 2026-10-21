@@ -74,7 +74,7 @@ pub const Diagnostic = struct {
     buffer: [256]u8 = undefined,
     message: []const u8 = "",
 
-    fn say(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
+    pub fn say(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
         self.message = std.fmt.bufPrint(&self.buffer, fmt, args) catch fmt;
     }
 };
