@@ -12,25 +12,16 @@ const Role = Conversation.Role;
 const AgentLoop = @import("../agent/loop.zig");
 const Mirror = @import("../remote/mirror.zig");
 const remote_client = @import("../remote/client.zig");
-const Session = @import("session.zig").Session;
 const Subagent = @import("../agent/subagent.zig");
 const mention = @import("../core/mention.zig");
-const Auth = @import("../core/auth.zig");
 const Config = @import("../core/config.zig");
-const Project = @import("../core/project.zig");
-const mcp_tools = @import("../tools/mcp.zig");
 const catalog = @import("../provider/catalog.zig");
-const Backend = @import("../provider/backend.zig");
-const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
-const SignInTask = @import("../provider/chatgpt_sign_in.zig");
 const commands = @import("commands.zig");
-const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
-const Provider = @import("../provider/provider.zig");
-const Registry = @import("../tools/registry.zig");
 const image = @import("../core/image.zig");
 const skill = @import("../core/skill.zig");
 const tool = @import("../tools/tool.zig");
 const widget_pool = @import("widget_pool.zig");
+const test_model = @import("test_model.zig");
 const Approval = @import("approval.zig");
 const AttachmentCard = @import("attachment_card.zig");
 const Attachments = @import("attachments.zig");
@@ -120,9 +111,6 @@ const max_history: usize = 200;
 /// prompt box with something nobody is going to read there.
 const paste_minify_lines: usize = 4;
 const paste_minify_bytes: usize = 400;
-/// Messages loaded into memory when a session is resumed or switched. Older
-/// ones page in from the database when the transcript is scrolled to the top.
-pub const resume_messages: usize = 50;
 
 /// Attachment-card slot for a message's compaction summary. Its own index, so
 /// it cannot collide with a mentioned file on the same message.
@@ -135,7 +123,6 @@ io: std.Io,
 allocator: std.mem.Allocator,
 
 conversation: Conversation,
-provider: Provider,
 input: Input,
 
 /// Absolute path of the working directory, owned by the model.
@@ -148,17 +135,11 @@ cwd_display: []const u8 = "",
 /// is the focused one.
 input_cursor: ?vxfw.CursorState = null,
 
-/// The session on screen: the loop below, or a session on a server. Set by
-/// `wire`.
-session: Session = undefined,
-/// The agent loop, when the session runs in this process. Owns the
-/// conversation's mutations, the in-flight request, and any running tools.
-local_loop: AgentLoop = undefined,
-/// A session on a server to drive instead of a loop here. Set before `wire`,
-/// and owned from then on.
-remote: ?*Mirror = null,
+/// The session on screen, mirrored from the server running it. Set before
+/// `wire`, and owned from then on.
+mirror: *Mirror = undefined,
 /// This machine's database, for what belongs to the person rather than to a
-/// session: the theme, the providers they connected. Borrowed.
+/// session: the theme. Borrowed.
 db: ?*Database = null,
 /// Rows the plan occupied in the last frame, so a click can find it. Both zero
 /// when there is no plan on screen.
@@ -170,14 +151,8 @@ plan_hover: bool = false,
 /// Whether the right-hand rail is showing. Off gives the transcript the whole
 /// frame, which is what a narrow terminal or a long diff wants.
 sidebar_open: bool = true,
-/// Every skill found at startup, for `/skills`. Borrowed, and null where
-/// nothing looked.
-skills: ?*const skill.Set = null,
 /// What `/prune` is allowed to throw away, as config.json set it.
 prune_policy: Database.Policy = .{},
-/// Tool registry, and the read log the tools share. Owned.
-registry: Registry = undefined,
-reads: tool.ReadLog = undefined,
 /// The clickable loading indicator. Lives on the model so its expanded state
 /// survives the requests coming and going.
 thinking: ThoughtView.View = .{},
@@ -192,17 +167,11 @@ thought_rows: std.AutoHashMapUnmanaged(u64, *ThoughtView.View) = .empty,
 /// state survives redraws and trimming. Individually allocated: each is a
 /// widget whose address is baked into its `userdata`.
 tool_cards: std.AutoHashMapUnmanaged(u64, *ToolCard) = .empty,
-/// Which tool calls left a subagent transcript, keyed like `tool_cards`. Looked
-/// up once per call rather than once per frame.
-subagent_sessions: std.AutoHashMapUnmanaged(u64, i64) = .empty,
 /// A subagent's transcript, shown in place of this session's own.
 viewing: ?Viewing = null,
-/// The remote subagent transcript asked for and not yet come. Its title is
+/// The subagent transcript asked for and not yet come. Its title is
 /// owned.
 subagent_asked: ?struct { key: u64, seq: u64, index: usize, title: []u8 } = null,
-/// The nested runs, which this model drives on its own tick. Null where
-/// subagents are not available at all.
-subagents: ?*Subagent.Runner = null,
 /// Expandable cards for the files an `@path` mention pulled in, keyed by
 /// `(message seq << 32) | attachment index`.
 attachment_cards: std.AutoHashMapUnmanaged(u64, *AttachmentCard) = .empty,
@@ -250,23 +219,6 @@ effort_picker: EffortPicker = undefined,
 mcp_picker: McpPicker = undefined,
 /// The toast in the top-right corner.
 notification: Notification = undefined,
-/// Where credentials are stored, so connecting a provider can write one.
-/// Borrowed; it outlives the model.
-auth: ?*Auth = null,
-/// The ChatGPT sign-in, which lives in a file of its own. Borrowed.
-chatgpt: ?*chatgpt_auth.Store = null,
-/// Nothing usable is selected: none was ever chosen and no local server
-/// answered, or the one in use was signed out of. A prompt opens the
-/// providers dialog instead of failing against it.
-provider_missing: bool = false,
-/// A browser sign-in in progress, polled by the tick loop.
-chatgpt_sign_in: ?*SignInTask = null,
-/// A sign-out waiting on OpenAI to confirm the revocation.
-chatgpt_sign_out: ?*SignOutTask = null,
-/// The client behind `provider`. Borrowed; it outlives the model. Needed
-/// because connecting a provider of another protocol replaces the client, which
-/// the erased `Provider` has no way to do.
-backend: ?*Backend = null,
 /// The `/` command picker, open while one is being typed.
 slash: Slash = undefined,
 /// Where the left button went down, so a drag can anchor there. The first
@@ -289,17 +241,6 @@ held: Attachments = undefined,
 /// character at a time.
 paste_buffer: std.ArrayList(u8) = .empty,
 pasting: bool = false,
-/// Where the harness is running, for resolving mentions. Borrowed.
-project: ?*const Project = null,
-/// The MCP servers, connected on a worker while the first frame draws.
-/// Borrowed. Their tools are registered once the worker lands, which is also
-/// when a server that did not come up is reported.
-mcp: ?*mcp_tools.Host = null,
-/// Whether the configured model still needs checking against what the provider
-/// actually has. Done after the first frame rather than before it: the check is
-/// a round trip, and a model that has gone missing fails the first turn with a
-/// message saying so anyway.
-pending_model_check: bool = false,
 
 /// Tracks the ctrl+c pressed during a running turn. A second press inside
 /// `quit_confirm_ms` quits; otherwise the arming lapses.
@@ -425,27 +366,12 @@ fn clearMessageWidgets(self: *Model) void {
 
 /// A subagent's transcript, shown in place of the session's own. Read-only.
 pub const Viewing = struct {
-    /// Where a shown transcript comes from.
-    pub const Source = union(enum) {
-        /// Looked up by call index every time rather than held: the run it
-        /// belongs to is freed the moment its tool call collects the answer.
-        live,
-        stored: Conversation,
-        /// A remote session's, as its server last sent it.
-        mirrored: Mirrored,
-    };
-
-    pub const Mirrored = struct {
-        convo: Conversation,
-        /// Still running there, so asked for again while it is read.
-        live: bool,
-        asked_ms: i64,
-    };
-
-    /// Where the transcript comes from. A running subagent's is borrowed and
-    /// grows while it is read; a finished one is a copy from the database.
-    source: Source,
-    /// The call this belongs to, for finding it again once it is written down.
+    /// As the server last sent it.
+    convo: Conversation,
+    /// Still running there, so asked for again while it is read.
+    live: bool,
+    asked_ms: i64,
+    /// The call this belongs to, for asking again.
     key: u64,
     seq: u64,
     index: usize,
@@ -455,151 +381,46 @@ pub const Viewing = struct {
     hint: []u8,
 
     fn deinit(self: *Viewing, allocator: std.mem.Allocator) void {
-        switch (self.source) {
-            .stored => |*convo| convo.deinit(),
-            .mirrored => |*mirrored| mirrored.convo.deinit(),
-            .live => {},
-        }
+        self.convo.deinit();
         allocator.free(self.title);
         allocator.free(self.hint);
     }
 };
 
-/// Whether this call left a subagent transcript. Looked up once and then
-/// remembered, including the answer that there is none.
-pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_index: usize) bool {
+/// Whether this call may have left a subagent transcript. The database that
+/// knows is the server's, so any subagent call that has started is offered.
+pub fn hasSubagent(self: *Model, msg: *Conversation.Message, call_index: usize) bool {
     if (self.viewing != null) return false;
-    // A remote session's database is not here to ask, so any subagent call may hold one.
-    if (self.remote != null) {
-        const call = msg.tool_calls[call_index];
-        return std.mem.eql(u8, call.name, task_tool) and call.status != .pending and call.status != .rejected;
-    }
-
-    // A run still going is in memory, not the database, so it is asked every time.
-    if (self.subagents) |runner| {
-        if (self.session.pendingSeq()) |pending| {
-            if (msg.seq == pending and runner.viewable(call_index) != null) return true;
-        }
-    }
-
-    if (self.subagent_sessions.get(key)) |id| return id != 0;
-
-    // A "no" cached before the call settles would outlive the transcript landing.
     const call = msg.tool_calls[call_index];
-    if (call.status != .ok and call.status != .failed) return false;
-
-    const session = self.resolveSubagent(msg.seq, call_index);
-    self.subagent_sessions.put(self.allocator, key, session orelse 0) catch return false;
-    return session != null;
-}
-
-/// The stored transcript a call left, straight from the database.
-///
-/// Resolved through the session rather than `message_ids`: that map holds only
-/// what this run persisted, so a resumed transcript is absent from it entirely.
-fn resolveSubagent(self: *Model, seq: u64, call_index: usize) ?i64 {
-    const db = self.session.database() orelse return null;
-    const session = self.session.sessionId() orelse return null;
-
-    const message = db.messageId(session, @intCast(seq)) catch return null;
-    const message_id = message orelse return null;
-    const found = db.toolCallId(message_id, @intCast(call_index)) catch return null;
-    const call_row = found orelse return null;
-    return db.subagentSession(call_row) catch null;
+    return std.mem.eql(u8, call.name, task_tool) and call.status != .pending and call.status != .rejected;
 }
 
 /// The transcript on screen, which is a subagent's while one is open.
 pub fn shown(self: *Model) *Conversation {
-    if (self.viewing) |*view| {
-        switch (view.source) {
-            .stored => |*convo| return convo,
-            .mirrored => |*mirrored| return &mirrored.convo,
-            .live => {
-                if (self.subagents) |runner| {
-                    if (runner.viewable(view.index)) |child| return &child.convo;
-                }
-            },
-        }
-    }
+    if (self.viewing) |*view| return &view.convo;
     return &self.conversation;
 }
 
-/// The session whose progress belongs on screen: a subagent's while its
-/// transcript is open, this one's otherwise.
-pub fn shownLoop(self: *Model) Session {
-    if (self.viewing) |*view| {
-        if (view.source == .live) {
-            if (self.subagents) |runner| {
-                if (runner.viewable(view.index)) |child| {
-                    if (child.started) return .{ .local = &child.loop };
-                }
-            }
-        }
-    }
-    return self.session;
-}
-
-/// The loop, for what only a session in this process can do: reconfigure
-/// the provider client it runs on, say.
-pub fn localLoop(self: *Model) ?*AgentLoop {
-    return switch (self.session) {
-        .local => |loop| loop,
-        .remote => null,
-    };
-}
-
-/// The project's root, when its files can be read from here: a remote
-/// session's only when its server is this machine.
+/// The project's root, when its files can be read from here: only when the
+/// server running the session is this machine.
 pub fn readableRoot(self: *const Model) ?[]const u8 {
-    if (self.remote) |mirror| {
-        if (!std.mem.eql(u8, mirror.host, remote_client.here) or mirror.status.project.len == 0) return null;
-        return mirror.status.project;
-    }
-    const project = self.project orelse return null;
-    return project.root;
+    if (!std.mem.eql(u8, self.mirror.host, remote_client.here) or self.mirror.status.project.len == 0) return null;
+    return self.mirror.status.project;
 }
 
 /// The project's name, or "" when the session is in none.
 pub fn projectLabel(self: *const Model) []const u8 {
-    if (self.remote) |mirror| return std.fs.path.basename(mirror.status.project);
-    const project = self.project orelse return "";
-    return project.name();
+    return std.fs.path.basename(self.mirror.status.project);
 }
 
 /// The branch the project has checked out, or "".
 pub fn projectBranch(self: *const Model) []const u8 {
-    if (self.remote) |mirror| return mirror.status.branch;
-    const project = self.project orelse return "";
-    return project.branch orelse "";
+    return self.mirror.status.branch;
 }
 
-/// The skills this machine offers, for `/help` and running one by name.
+/// The skills the session's server offers, for `/help` and running one by name.
 pub fn skillsOffered(self: *const Model) []const skill.Skill {
-    if (self.remote) |mirror| return mirror.skills;
-    const set = self.skills orelse return &.{};
-    return set.skills;
-}
-
-/// Follow a subagent past the end of its run.
-///
-/// Its transcript lives in memory only until the tool call collects the answer,
-/// and is in the database from that moment, so the view swaps sources rather
-/// than emptying out under whoever is reading it.
-pub fn refreshViewing(self: *Model) void {
-    const view = if (self.viewing) |*v| v else return;
-    if (view.source != .live) return;
-
-    const runner = self.subagents orelse return;
-    if (runner.viewable(view.index) != null) return;
-
-    const key = view.key;
-    const seq = view.seq;
-    const index = view.index;
-    const title = self.allocator.dupe(u8, view.title) catch return;
-    defer self.allocator.free(title);
-
-    const opened = self.openSubagent(key, seq, index, title) catch false;
-    if (!opened) self.closeSubagent();
+    return self.mirror.skills;
 }
 
 /// Whether a subagent's transcript is what the person is reading.
@@ -627,54 +448,32 @@ pub fn viewKey(self: *const Model, seq: u64) u64 {
 /// a card that does nothing, which is what it did before it could be opened.
 pub fn openFromCard(ptr: *anyopaque, key: u64, seq: u64, index: usize, name: []const u8) void {
     const self: *Model = @ptrCast(@alignCast(ptr));
-    _ = self.openSubagent(key, seq, index, name) catch return;
+    self.openSubagent(key, seq, index, name) catch return;
 }
 
-/// Show the transcript a tool call left behind. Silent when it left none. A
-/// remote session's arrives on a later tick, and opens then.
-pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []const u8) !bool {
-    if (self.remote) |mirror| {
-        try mirror.loadSubagent(seq, @intCast(index));
-        if (self.subagent_asked) |asked| self.allocator.free(asked.title);
-        self.subagent_asked = .{ .key = key, .seq = seq, .index = index, .title = try self.allocator.dupe(u8, title) };
-        return true;
-    }
-    const source: Viewing.Source = live: {
-        if (self.subagents) |runner| {
-            if (runner.viewable(index) != null) break :live .live;
-        }
-
-        const db = self.session.database() orelse return false;
-        const session = self.subagent_sessions.get(key) orelse
-            self.resolveSubagent(seq, index) orelse return false;
-
-        var convo: Conversation = .init(self.allocator);
-        errdefer convo.deinit();
-        try loadInto(db, session, &convo);
-        break :live .{ .stored = convo };
-    };
-    errdefer if (source == .stored) {
-        var owned_convo = source.stored;
-        owned_convo.deinit();
-    };
-
-    try self.showViewing(source, key, seq, index, title);
-    return true;
+/// Ask for the transcript a tool call left behind. It opens on the tick it
+/// arrives, or a notice says there is none.
+pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []const u8) !void {
+    try self.mirror.loadSubagent(seq, @intCast(index));
+    const owned = try self.allocator.dupe(u8, title);
+    if (self.subagent_asked) |asked| self.allocator.free(asked.title);
+    self.subagent_asked = .{ .key = key, .seq = seq, .index = index, .title = owned };
 }
 
-/// A remote session's subagent transcript came: open it if it was asked for,
-/// or take it as the newer copy of the one open. Takes `messages`.
+/// A subagent's transcript came: open it if it was asked for, or take it as
+/// the newer copy of the one open. Takes `messages`.
 pub fn receiveSubagent(self: *Model, seq: u64, index: usize, live: bool, messages: []Conversation.Message) !void {
     var convo: Conversation = .init(self.allocator);
     convo.messages = .fromOwnedSlice(messages);
     errdefer convo.deinit();
     if (convo.messages.items.len > 0) convo.next_seq = convo.messages.items[convo.messages.items.len - 1].seq + 1;
-    const mirrored: Viewing.Mirrored = .{ .convo = convo, .live = live, .asked_ms = nowMs(self.io) };
 
     if (self.viewing) |*view| {
-        if (view.source == .mirrored and view.seq == seq and view.index == index) {
-            view.source.mirrored.convo.deinit();
-            view.source.mirrored = mirrored;
+        if (view.seq == seq and view.index == index) {
+            view.convo.deinit();
+            view.convo = convo;
+            view.live = live;
+            view.asked_ms = nowMs(self.io);
             return;
         }
     }
@@ -682,48 +481,41 @@ pub fn receiveSubagent(self: *Model, seq: u64, index: usize, live: bool, message
     if (asked.seq != seq or asked.index != index) return convo.deinit();
     self.subagent_asked = null;
     defer self.allocator.free(asked.title);
-    try self.showViewing(.{ .mirrored = mirrored }, asked.key, seq, index, asked.title);
+
+    const title = try self.allocator.dupe(u8, asked.title);
+    errdefer self.allocator.free(title);
+    const hint = try std.fmt.allocPrint(self.allocator, "reading the {s} subagent \u{b7} ctrl+b to go back", .{title});
+    errdefer self.allocator.free(hint);
+
+    self.closeSubagent();
+    self.viewing = .{
+        .convo = convo,
+        .live = live,
+        .asked_ms = nowMs(self.io),
+        .key = asked.key,
+        .seq = seq,
+        .index = index,
+        .title = title,
+        .hint = hint,
+    };
 }
 
-/// Ask again for a remote subagent still running, about twice a second.
-pub fn followMirroredSubagent(self: *Model) !void {
-    const mirror = self.remote orelse return;
+/// Ask again for a subagent still running, about twice a second.
+pub fn followSubagent(self: *Model) !void {
     const view = if (self.viewing) |*v| v else return;
-    if (view.source != .mirrored or !view.source.mirrored.live) return;
-    if (nowMs(self.io) - view.source.mirrored.asked_ms < mirrored_refresh_ms) return;
-    view.source.mirrored.asked_ms = nowMs(self.io);
-    try mirror.loadSubagent(view.seq, @intCast(view.index));
+    if (!view.live) return;
+    if (nowMs(self.io) - view.asked_ms < subagent_refresh_ms) return;
+    view.asked_ms = nowMs(self.io);
+    try self.mirror.loadSubagent(view.seq, @intCast(view.index));
 }
 
-const mirrored_refresh_ms: i64 = 500;
+const subagent_refresh_ms: i64 = 500;
 
 /// The tool a subagent runs behind.
 const task_tool = "task";
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Clock.now(.awake, io).toMilliseconds();
-}
-
-fn showViewing(self: *Model, source: Viewing.Source, key: u64, seq: u64, index: usize, title: []const u8) !void {
-    const owned = try self.allocator.dupe(u8, title);
-    errdefer self.allocator.free(owned);
-
-    const hint = try std.fmt.allocPrint(
-        self.allocator,
-        "reading the {s} subagent \u{b7} ctrl+b to go back",
-        .{owned},
-    );
-    errdefer self.allocator.free(hint);
-
-    self.closeSubagent();
-    self.viewing = .{
-        .source = source,
-        .key = key,
-        .seq = seq,
-        .index = index,
-        .title = owned,
-        .hint = hint,
-    };
 }
 
 /// Back to the session's own transcript.
@@ -733,32 +525,10 @@ pub fn closeSubagent(self: *Model) void {
     clearMessageWidgets(self);
 }
 
-fn loadInto(db: *Database, session: i64, convo: *Conversation) !void {
-    const loaded = try db.loadMessages(convo.allocator, session, std.math.maxInt(i64), max_transcript_messages);
-    defer convo.allocator.free(loaded);
-
-    for (loaded) |message| try convo.messages.append(convo.allocator, message);
-    std.mem.reverse(Conversation.Message, convo.messages.items);
-}
-
 pub fn deinit(self: *Model) void {
-    if (self.chatgpt_sign_in) |task| {
-        task.abandon();
-        self.chatgpt_sign_in = null;
-    }
-    if (self.chatgpt_sign_out) |task| {
-        task.abandon();
-        self.chatgpt_sign_out = null;
-    }
     self.closeSubagent();
     if (self.subagent_asked) |asked| self.allocator.free(asked.title);
-    self.subagent_sessions.deinit(self.allocator);
-    switch (self.session) {
-        .local => |loop| loop.deinit(),
-        .remote => |mirror| mirror.detach(),
-    }
-    self.registry.deinit();
-    self.reads.deinit();
+    self.mirror.detach();
     self.thinking.stream = null;
     clearMessageWidgets(self);
     self.thought_rows.deinit(self.allocator);
@@ -788,9 +558,8 @@ pub fn deinit(self: *Model) void {
     self.allocator.free(self.cwd_display);
 }
 
-/// Wire the input's submit callback back to the model. Call after the
-/// model's fields are initialized.
-/// Build the pieces that need the model's final address, then hook up input.
+/// Build the pieces that need the model's final address. Call once its fields,
+/// the mirror included, are set.
 pub fn wire(self: *Model) !void {
     self.mentions = .init(self.allocator);
     self.held = .init(self.allocator);
@@ -804,23 +573,7 @@ pub fn wire(self: *Model) !void {
     self.notification = .init(self.allocator, self.io);
     self.slash = .init(self.allocator);
     self.selection = .init(self.allocator);
-    self.reads = .init(self.allocator);
-    self.registry = try Registry.init(self.allocator);
     self.conversation.max_messages = max_transcript_messages;
-    if (self.remote) |mirror| {
-        self.session = .{ .remote = mirror };
-        return;
-    }
-    self.local_loop = .init(
-        self.allocator,
-        self.io,
-        self.provider,
-        &self.registry,
-        &self.conversation,
-        &self.reads,
-        if (self.project) |project| project.root else self.cwd,
-    );
-    self.session = .{ .local = &self.local_loop };
 }
 
 /// Replace the half-typed command with the highlighted one.
@@ -854,10 +607,10 @@ pub fn scheduleTick(self: *Model, ctx: *vxfw.EventContext) !void {
 
 /// Ask the model to summarise the transcript so far.
 pub fn startCompaction(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.session.isBusy()) return;
+    if (self.mirror.isBusy()) return;
     if (commands.needsProvider(self)) return;
-    try self.session.compact();
-    self.thinking.stream = self.session.thoughts();
+    try self.mirror.compact();
+    self.thinking.stream = self.mirror.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = false;
     self.scroll = 0;
@@ -885,29 +638,19 @@ pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !voi
 pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extras: AgentLoop.Extras) !void {
     if (try commands.offerProvidersInstead(self)) return;
     try self.remember(prompt);
-    try self.session.submit(prompt, extras);
+    try self.mirror.submit(prompt, extras);
     try self.followTurn(ctx);
 }
 
 /// Watch a turn just started, from its first tick.
 pub fn followTurn(self: *Model, ctx: *vxfw.EventContext) !void {
-    self.thinking.stream = self.session.thoughts();
+    self.thinking.stream = self.mirror.thoughts();
     self.thinking.frame = 0;
     self.thinking.expanded = true;
     self.scroll = 0;
 
     try self.scheduleTick(ctx);
     ctx.redraw = true;
-}
-
-/// Start a turn with whatever was typed mid-turn but never handed over, once
-/// the loop has gone idle. A cancelled turn leaves its steering behind, and
-/// what was a correction is now simply the next thing to do.
-pub fn drainSteering(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.session.isBusy()) return;
-    const prompt = self.session.takeSteering() orelse return;
-    defer self.allocator.free(prompt);
-    try self.startTurn(ctx, prompt);
 }
 
 /// Terminals send a carriage return for each pasted newline, so the buffer is
@@ -964,7 +707,7 @@ fn flattenPaste(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 /// Route a paste: a dialog's field, a dropped image file, an image on the
 /// clipboard, a block big enough to be worth holding back, or just text.
 pub fn handlePaste(self: *Model, text: []const u8) !void {
-    if (self.session.state() == .awaiting_approval) return;
+    if (self.mirror.state() == .awaiting_approval) return;
 
     if (self.focusedField()) |focus| {
         var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -1055,42 +798,21 @@ fn holdImage(self: *Model, bytes: []const u8, label: []const u8) void {
     self.input.insertText(token) catch {};
 }
 
-/// Swap the transcript for another session's, without leaving. A local turn
-/// in progress is cancelled; a remote one carries on on its server, and the
-/// session's transcript arrives on a later tick.
+/// Swap the transcript for another session's, without leaving. A turn in
+/// progress carries on on the server, and the other session's transcript
+/// arrives on a later tick.
 pub fn switchSession(self: *Model, chosen: Database.SessionInfo) !void {
-    switch (self.session) {
-        .local => |loop| {
-            if (loop.session_id == chosen.id) return;
-            if (loop.isBusy()) try loop.cancel();
-            try loop.resumeSession(chosen.id, resume_messages);
-            commands.syncProvider(self);
-            try commands.restoreEffort(self);
-            loop.dropSteering();
-            try self.showReplacedTranscript();
-        },
-        .remote => |mirror| {
-            if (std.mem.eql(u8, mirror.status.handle, chosen.public_id)) return;
-            try mirror.switchTo(chosen.public_id);
-        },
-    }
+    if (std.mem.eql(u8, self.mirror.status.handle, chosen.public_id)) return;
+    try self.mirror.switchTo(chosen.public_id);
     self.input.clear();
     self.held.clear();
 }
 
-/// Start an empty session: in this TUI, or alongside this one on its server.
-/// False while a turn runs.
+/// Start an empty session alongside this one on its server. False while a
+/// turn runs.
 pub fn clearSession(self: *Model) !bool {
-    switch (self.session) {
-        .local => |loop| {
-            if (!loop.resetForNewSession()) return false;
-            try self.showReplacedTranscript();
-        },
-        .remote => |mirror| {
-            if (mirror.isBusy()) return false;
-            try mirror.startFresh();
-        },
-    }
+    if (self.mirror.isBusy()) return false;
+    try self.mirror.startFresh();
     self.input.clear();
     self.held.clear();
     return true;
@@ -1126,23 +848,20 @@ pub fn showReplacedTranscript(self: *Model) !void {
     self.closeSubagent();
     if (self.subagent_asked) |asked| self.allocator.free(asked.title);
     self.subagent_asked = null;
-    self.subagent_sessions.clearRetainingCapacity();
     clearMessageWidgets(self);
     self.thinking = .{};
     try self.seedHistory();
     self.mentions.close();
     self.selection.clear();
-    self.rung_for = self.session.finishedTurns();
+    self.rung_for = self.mirror.finishedTurns();
     self.scroll = 0;
-    if (self.remote) |mirror| {
-        self.slash.skills = mirror.skills;
-        const where = if (std.mem.eql(u8, mirror.host, remote_client.here))
-            try homeRelative(self.allocator, if (self.environ) |env| env.get("HOME") else null, mirror.status.root)
-        else
-            try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ mirror.host, mirror.status.root });
-        self.allocator.free(self.cwd_display);
-        self.cwd_display = where;
-    }
+    self.slash.skills = self.mirror.skills;
+    const where = if (std.mem.eql(u8, self.mirror.host, remote_client.here))
+        try homeRelative(self.allocator, if (self.environ) |env| env.get("HOME") else null, self.mirror.status.root)
+    else
+        try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ self.mirror.host, self.mirror.status.root });
+    self.allocator.free(self.cwd_display);
+    self.cwd_display = where;
 }
 
 /// Keep a sent prompt for up-arrow recall. Consecutive duplicates are not worth
@@ -1231,7 +950,6 @@ fn showRecalled(self: *Model, text: []const u8) void {
 /// then ask before abandoning a running turn, then quit.
 pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.quit_confirm.armed(self.io)) {
-        self.session.requestStop();
         ctx.quit = true;
         return;
     }
@@ -1239,14 +957,13 @@ pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
         self.input.clear();
         self.mentions.close();
         self.endRecall();
-        if (self.session.pendingSteering().len == 0) self.held.clear();
+        if (self.mirror.pendingSteering().len == 0) self.held.clear();
         return ctx.consumeAndRedraw();
     }
-    if (self.session.isBusy()) {
+    if (self.mirror.isBusy()) {
         self.quit_confirm.arm(self.io);
         return ctx.consumeAndRedraw();
     }
-    self.session.requestStop();
     ctx.quit = true;
 }
 
@@ -1266,33 +983,17 @@ pub fn copySelection(self: *Model, ctx: *vxfw.EventContext) !void {
 
 /// A decision may have started tools running, which needs the tick loop back.
 pub fn afterDecision(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.session.isBusy()) try self.scheduleTick(ctx);
+    if (self.mirror.isBusy()) try self.scheduleTick(ctx);
     self.scroll = 0;
     return ctx.consumeAndRedraw();
 }
 
-/// Recompute the file picker from the current input. Cheap enough to run on
-/// every keystroke: the index is built once and the filter is a substring scan
-/// capped at the number of visible rows.
+/// Recompute the file picker from the current input, asking the server for
+/// its files when the index is stale. Cheap enough to run on every keystroke:
+/// the filter is a substring scan capped at the number of visible rows.
 pub fn refreshMentions(self: *Model) !void {
-    if (self.remote) |mirror| {
-        self.mentions.update(self.io, null, self.input.text.items, self.input.cursor) catch {};
-        if (self.mentions.isCompleting() and self.mentions.stale(self.io)) try mirror.listFiles();
-        return;
-    }
-    const project = self.project orelse return;
-    self.mentions.update(
-        self.io,
-        project.root,
-        self.input.text.items,
-        self.input.cursor,
-    ) catch {};
-}
-
-/// The picker's index is built on a worker, so the first `@` in a session needs
-/// the tick loop running to notice the scan land.
-pub fn awaitMentions(self: *Model, ctx: *vxfw.EventContext) !void {
-    if (self.mentions.isScanning()) try self.scheduleTick(ctx);
+    self.mentions.update(self.input.text.items, self.input.cursor) catch {};
+    if (self.mentions.isCompleting() and self.mentions.stale(self.io)) try self.mirror.listFiles();
 }
 
 /// Replace the partial `@token` under the cursor with the selected path.
@@ -1330,295 +1031,97 @@ pub fn pageHistoryIfNeeded(self: *Model) !void {
     if (!self.transcript_exhausted) return;
     if (self.scroll < self.max_scroll) return;
     if (self.conversation.dropped == 0) return;
-    _ = try self.session.pageHistory(history_page_size);
+    _ = try self.mirror.pageHistory(history_page_size);
 }
 
-test "a running subagent can be read before it has finished" {
+/// A subagent's transcript as its server sends it, owned: one message per text,
+/// the first the user's and the rest the subagent's.
+fn transcript(texts: []const []const u8) ![]Conversation.Message {
+    const allocator = std.testing.allocator;
+    const messages = try allocator.alloc(Conversation.Message, texts.len);
+    for (texts, messages, 0..) |text, *msg, i| {
+        const view: Conversation.Message = .{ .seq = i, .role = if (i == 0) .user else .assistant, .text = text };
+        msg.* = try view.clone(allocator);
+    }
+    return messages;
+}
+
+/// Ask for a subagent's transcript the way a click on its card does, without
+/// a server to send the request to.
+fn expectSubagent(model: *Model, seq: u64, index: usize) !void {
+    model.subagent_asked = .{ .key = 7, .seq = seq, .index = index, .title = try std.testing.allocator.dupe(u8, "task") };
+}
+
+test "a subagent's transcript opens when it arrives, and only the one asked for" {
     const testing = std.testing;
+    var model: Model = undefined;
+    try test_model.offline(&model);
+    defer model.deinit();
+    try expectSubagent(&model, 3, 0);
 
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-    };
-    defer model.conversation.deinit();
-    defer model.input.deinit();
-    defer model.subagent_sessions.deinit(testing.allocator);
-    defer model.closeSubagent();
-
-    model.session = .{ .local = &model.local_loop };
-    model.local_loop.db = null;
-    model.local_loop.pending_seq = null;
-
-    var child: Subagent.Child = .{
-        .agent = "task",
-        .prompt = "where is it",
-        .label = "find it",
-        .index = 2,
-        .cancelled = null,
-        .progress = null,
-        .convo = .init(testing.allocator),
-        .reads = .init(testing.allocator),
-    };
-    defer child.convo.deinit();
-    defer child.reads.deinit();
-    _ = try child.convo.addUser("where is it", &.{}, &.{});
-
-    var runner: Subagent.Runner = .{ .parent = &model.local_loop };
-    defer runner.active.deinit(testing.allocator);
-    try runner.active.append(testing.allocator, &child);
-    model.subagents = &runner;
-
-    // Borrowed, not copied: what the run writes next is what the reader sees.
-    try testing.expect(try model.openSubagent(0, 0, 2, "task"));
-    try testing.expectEqual(&child.convo, model.shown());
-    try testing.expectEqual(@as(usize, 1), model.shown().messages.items.len);
-
-    _ = try child.convo.addAssistant("still looking", null, null);
-    try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
-
-    // Its progress, not the parent's, which is stuck on "running tools".
-    try testing.expectEqual(&model.local_loop, model.shownLoop().local);
-    child.started = true;
-    child.loop = model.local_loop;
-    try testing.expectEqual(&child.loop, model.shownLoop().local);
-
-    // Once the run is gone and nothing was written down, the view lets go.
-    _ = runner.active.orderedRemove(0);
-    model.refreshViewing();
+    try model.receiveSubagent(9, 0, true, try transcript(&.{"not this one"}));
     try testing.expect(!model.inSubagent());
-    try testing.expectEqual(&model.conversation, model.shown());
-}
 
-test "a finishing subagent hands its reader over to the stored transcript" {
-    const testing = std.testing;
-
-    var db = try Database.init(testing.allocator, testing.io, ":memory:");
-    defer db.deinit();
-
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const parent = try db.createSession(project, "/repo", "model");
-
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-    };
-    defer model.conversation.deinit();
-    defer model.input.deinit();
-    defer model.subagent_sessions.deinit(testing.allocator);
-    defer model.closeSubagent();
-
-    model.session = .{ .local = &model.local_loop };
-    model.local_loop.db = &db;
-    model.local_loop.session_id = parent;
-
-    var calls = [_]Conversation.ToolCall{.{
-        .id = "call_0",
-        .name = "task",
-        .arguments = "{}",
-        .status = .running,
-    }};
-    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
-    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
-
-    const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
-    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "ok", "done", 4, null);
-
-    var child: Subagent.Child = .{
-        .agent = "task",
-        .prompt = "where is it",
-        .label = "find it",
-        .index = 0,
-        .cancelled = null,
-        .progress = null,
-        .convo = .init(testing.allocator),
-        .reads = .init(testing.allocator),
-    };
-    defer child.convo.deinit();
-    defer child.reads.deinit();
-    _ = try child.convo.addUser("where is it", &.{}, &.{});
-
-    var runner: Subagent.Runner = .{ .parent = &model.local_loop };
-    defer runner.active.deinit(testing.allocator);
-    try runner.active.append(testing.allocator, &child);
-    model.subagents = &runner;
-
-    const key = model.widgetKey(msg.seq, 0);
-    try testing.expect(try model.openSubagent(key, msg.seq, 0, "task"));
-    try testing.expectEqual(&child.convo, model.shown());
-
-    // What the tick does when the call settles: store it, then drop the child.
-    const stored = try db.createSubagentSession(project, "/repo", "model", parent, call_row);
-    _ = try db.appendMessage(stored, 0, "user", "where is it", null, 0);
-    _ = try db.appendMessage(stored, 1, "assistant", "found it", null, 0);
-    _ = runner.active.orderedRemove(0);
-
-    // The reader stays put, on the copy rather than the borrowed convo.
-    model.refreshViewing();
+    try model.receiveSubagent(3, 0, true, try transcript(&.{"where is it"}));
     try testing.expect(model.inSubagent());
-    try testing.expect(model.viewing.?.source == .stored);
+    try testing.expectEqualStrings("where is it", model.shown().messages.items[0].text);
+    try testing.expect(std.mem.indexOf(u8, model.viewing.?.hint, "task") != null);
+    try testing.expect(model.subagent_asked == null);
+
+    // A newer copy replaces the one being read, in place.
+    try model.receiveSubagent(3, 0, false, try transcript(&.{ "where is it", "found it" }));
     try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
-    try testing.expectEqualStrings("found it", model.shown().messages.items[1].text);
-}
-
-test "a task card only offers its transcript once the call has settled" {
-    const testing = std.testing;
-
-    var db = try Database.init(testing.allocator, testing.io, ":memory:");
-    defer db.deinit();
-
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const parent = try db.createSession(project, "/repo", "model");
-
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-    };
-    defer model.conversation.deinit();
-    defer model.input.deinit();
-    defer model.subagent_sessions.deinit(testing.allocator);
-    defer model.closeSubagent();
-
-    // Only the fields this path reads; the loop itself needs no wiring here.
-    model.session = .{ .local = &model.local_loop };
-    model.local_loop.db = &db;
-    model.local_loop.session_id = parent;
-
-    var calls = [_]Conversation.ToolCall{.{
-        .id = "call_0",
-        .name = "task",
-        .arguments = "{}",
-        .status = .running,
-    }};
-    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
-
-    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
-    const message_id = try db.appendMessage(parent, @intCast(msg.seq), "assistant", "", null, 0);
-    const call_row = try db.appendToolCall(message_id, 0, "call_0", "task", "{}", "running", null, 0, null);
-
-    const key = model.widgetKey(msg.seq, 0);
-
-    // Still running, so nothing is looked up and nothing is remembered.
-    try testing.expect(!model.hasSubagent(key, msg, 0));
-    try testing.expect(model.subagent_sessions.get(key) == null);
-
-    _ = try db.createSubagentSession(project, "/repo", "model", parent, call_row);
-    msg.tool_calls[0].status = .ok;
-
-    try testing.expect(model.hasSubagent(key, msg, 0));
-}
-
-test "a resumed session still offers the transcripts it stored" {
-    const testing = std.testing;
-
-    var db = try Database.init(testing.allocator, testing.io, ":memory:");
-    defer db.deinit();
-
-    const project = try db.resolveProject("/repo", "git", "repo");
-
-    // An earlier run, plus a second session whose seqs start over at the same numbers.
-    const earlier = try db.createSession(project, "/repo", "model");
-    const earlier_msg = try db.appendMessage(earlier, 0, "assistant", "", null, 0);
-    const earlier_call = try db.appendToolCall(earlier_msg, 0, "c", "task", "{}", "ok", "done", 4, null);
-    const earlier_child = try db.createSubagentSession(project, "/repo", "model", earlier, earlier_call);
-    _ = try db.appendMessage(earlier_child, 0, "assistant", "the earlier answer", null, 0);
-
-    const resumed = try db.createSession(project, "/repo", "model");
-    const resumed_msg = try db.appendMessage(resumed, 0, "assistant", "", null, 0);
-    const resumed_call = try db.appendToolCall(resumed_msg, 0, "c", "task", "{}", "ok", "done", 4, null);
-    const resumed_child = try db.createSubagentSession(project, "/repo", "model", resumed, resumed_call);
-    _ = try db.appendMessage(resumed_child, 0, "assistant", "the resumed answer", null, 0);
-
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-    };
-    defer model.conversation.deinit();
-    defer model.input.deinit();
-    defer model.subagent_sessions.deinit(testing.allocator);
-    defer model.closeSubagent();
-
-    // Nothing persisted this run, which is what a resumed transcript looks like.
-    model.session = .{ .local = &model.local_loop };
-    model.local_loop.db = &db;
-    model.local_loop.session_id = resumed;
-
-    var calls = [_]Conversation.ToolCall{.{
-        .id = "c",
-        .name = "task",
-        .arguments = "{}",
-        .status = .ok,
-    }};
-    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
-    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
-
-    const key = model.widgetKey(msg.seq, 0);
-    try testing.expect(model.hasSubagent(key, msg, 0));
-
-    // And it is this session's transcript, not the one at the same seq before it.
-    try testing.expect(try model.openSubagent(key, msg.seq, 0, "task"));
-    try testing.expectEqualStrings("the resumed answer", model.shown().messages.items[0].text);
-}
-
-test "a subagent transcript takes over the view, and ctrl+b gives it back" {
-    const testing = std.testing;
-
-    var db = try Database.init(testing.allocator, testing.io, ":memory:");
-    defer db.deinit();
-
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const parent = try db.createSession(project, "/repo", "model");
-    const message = try db.appendMessage(parent, 0, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8, null);
-    const child = try db.createSubagentSession(project, "/repo", "model", parent, call);
-    _ = try db.appendMessage(child, 0, "user", "where is the parser", null, 0);
-    _ = try db.appendMessage(child, 1, "assistant", "src/parse.zig:40", null, 0);
-
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-    };
-    defer model.conversation.deinit();
-    defer model.input.deinit();
-    defer model.subagent_sessions.deinit(testing.allocator);
-    defer model.closeSubagent();
-
-    model.session = .{ .local = &model.local_loop };
-    model.local_loop.db = &db;
-    _ = try model.conversation.addUser("go", &.{}, &.{});
-
-    const key: u64 = 0;
-    try model.subagent_sessions.put(testing.allocator, key, child);
-
-    try testing.expect(!model.inSubagent());
-    try testing.expectEqual(&model.conversation, model.shown());
-
-    try testing.expect(try model.openSubagent(key, 0, 0, "task"));
-    try testing.expect(model.inSubagent());
-    try testing.expectEqual(@as(usize, 2), model.shown().messages.items.len);
-    try testing.expectEqualStrings("where is the parser", model.shown().messages.items[0].text);
-    try testing.expect(std.mem.indexOf(u8, model.viewing.?.hint, "ctrl+b") != null);
+    try testing.expect(!model.viewing.?.live);
 
     model.closeSubagent();
-    try testing.expect(!model.inSubagent());
     try testing.expectEqual(&model.conversation, model.shown());
+}
 
-    // A call that left nothing behind stays where it is.
-    try testing.expect(!try model.openSubagent(99, 5, 7, "task"));
+test "a task card offers its transcript once its call has started" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    try test_model.offline(&model);
+    defer model.deinit();
+
+    var calls = [_]Conversation.ToolCall{
+        .{ .id = "c0", .name = "task", .arguments = "{}", .status = .pending },
+        .{ .id = "c1", .name = "task", .arguments = "{}", .status = .running },
+        .{ .id = "c2", .name = "task", .arguments = "{}", .status = .ok },
+        .{ .id = "c3", .name = "task", .arguments = "{}", .status = .rejected },
+        .{ .id = "c4", .name = "read", .arguments = "{}", .status = .ok },
+    };
+    const msg = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    try testing.expect(!model.hasSubagent(msg, 0));
+    try testing.expect(model.hasSubagent(msg, 1));
+    try testing.expect(model.hasSubagent(msg, 2));
+    try testing.expect(!model.hasSubagent(msg, 3));
+    try testing.expect(!model.hasSubagent(msg, 4));
+
+    // Inside a subagent's transcript there is nothing further to open.
+    try expectSubagent(&model, msg.seq, 1);
+    try model.receiveSubagent(msg.seq, 1, true, try transcript(&.{"go"}));
+    try testing.expect(!model.hasSubagent(msg, 2));
+}
+
+test "a running subagent is asked for again while it is read, a finished one is not" {
+    const testing = std.testing;
+    const served = try test_model.Served.create();
+    defer served.destroy();
+    const model = served.model;
+
+    try expectSubagent(model, 3, 0);
+    try model.receiveSubagent(3, 0, true, try transcript(&.{"where is it"}));
+    try model.followSubagent();
+    try testing.expectEqual(@as(usize, 0), model.mirror.waiting.count());
+
+    model.viewing.?.asked_ms -= subagent_refresh_ms;
+    try model.followSubagent();
+    try testing.expectEqual(@as(usize, 1), model.mirror.waiting.count());
+
+    model.viewing.?.live = false;
+    model.viewing.?.asked_ms -= subagent_refresh_ms;
+    try model.followSubagent();
+    try testing.expectEqual(@as(usize, 1), model.mirror.waiting.count());
 }
 
 test "a confirmation lapses if the second press never comes" {
@@ -1640,7 +1143,6 @@ test "up walks back through sent prompts, down returns the draft" {
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .conversation = .init(std.testing.allocator),
-        .provider = undefined,
         .input = .init(std.testing.allocator),
     };
     defer model.conversation.deinit();
@@ -1678,7 +1180,6 @@ test "recall stays out of the way inside a multi-line draft" {
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .conversation = .init(std.testing.allocator),
-        .provider = undefined,
         .input = .init(std.testing.allocator),
     };
     defer model.conversation.deinit();
@@ -1700,7 +1201,6 @@ test "a resumed session fills the recall list" {
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .conversation = .init(std.testing.allocator),
-        .provider = undefined,
         .input = .init(std.testing.allocator),
     };
     defer model.conversation.deinit();
@@ -1728,7 +1228,6 @@ test "recall stops growing once it is full" {
         .allocator = std.testing.allocator,
         .io = std.testing.io,
         .conversation = .init(std.testing.allocator),
-        .provider = undefined,
         .input = .init(std.testing.allocator),
     };
     defer model.conversation.deinit();
@@ -1765,61 +1264,42 @@ test "a paste for a one-line field arrives as one line" {
     try testing.expectEqualStrings("", try flattenPaste(arena, "\n\t  \r\n"));
 }
 
-test "a cleared session forgets the subagents the old one left" {
+fn switchedAway(model: *Model) bool {
+    return model.mirror.takeSwitched();
+}
+
+fn awaitingApproval(model: *Model) bool {
+    return model.mirror.state() == .awaiting_approval;
+}
+
+fn finishedOne(model: *Model) bool {
+    return model.mirror.finishedTurns() == 1 and !model.mirror.isBusy();
+}
+
+test "a cleared session forgets the subagent the old one was showing" {
     const testing = std.testing;
+    const served = try test_model.Served.create();
+    defer served.destroy();
+    const model = served.model;
 
-    var db = try Database.init(testing.allocator, testing.io, ":memory:");
-    defer db.deinit();
-
-    const project = try db.resolveProject("/repo", "git", "repo");
-    const parent = try db.createSession(project, "/repo", "model");
-    const message = try db.appendMessage(parent, 0, "assistant", "", null, 0);
-    const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "found it", 8, null);
-    const child = try db.createSubagentSession(project, "/repo", "model", parent, call);
-    _ = try db.appendMessage(child, 0, "user", "where is the parser", null, 0);
-
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-        .cwd = try testing.allocator.dupe(u8, "/repo"),
-        .cwd_display = try testing.allocator.dupe(u8, "/repo"),
-    };
-    try model.wire();
-    defer model.deinit();
-
-    model.local_loop.db = &db;
-    model.local_loop.session_id = parent;
-    _ = try model.conversation.addUser("go", &.{}, &.{});
-
-    const key: u64 = 0;
-    try model.subagent_sessions.put(testing.allocator, key, child);
-    try testing.expect(try model.openSubagent(key, 0, 0, "task"));
+    try expectSubagent(model, 3, 0);
+    try model.receiveSubagent(3, 0, false, try transcript(&.{"where is the parser"}));
+    try expectSubagent(model, 5, 1);
     try testing.expect(model.inSubagent());
 
     try testing.expect(try model.clearSession());
+    try served.pollUntil(switchedAway);
+    try model.showReplacedTranscript();
 
     try testing.expect(!model.inSubagent());
+    try testing.expect(model.subagent_asked == null);
     try testing.expectEqual(&model.conversation, model.shown());
-    try testing.expectEqual(@as(usize, 0), model.subagent_sessions.count());
-    try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);
 }
 
 test "a card is handed the duration the call it draws recorded" {
     const testing = std.testing;
-
-    var model: Model = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-        .cwd = try testing.allocator.dupe(u8, "/repo"),
-        .cwd_display = try testing.allocator.dupe(u8, "/repo"),
-    };
-    try model.wire();
+    var model: Model = undefined;
+    try test_model.offline(&model);
     defer model.deinit();
 
     var calls = [_]Conversation.ToolCall{.{
@@ -1829,8 +1309,7 @@ test "a card is handed the duration the call it draws recorded" {
         .status = .ok,
         .elapsed_ms = 250,
     }};
-    _ = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
-    const msg = &model.conversation.messages.items[model.conversation.messages.items.len - 1];
+    const msg = try model.conversation.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
 
     const card = try widget_pool.toolCard(&model, msg, 0, &msg.tool_calls[0]);
     try testing.expectEqual(@as(?u64, 250), card.elapsed_ms);
@@ -1842,75 +1321,29 @@ test "a card is handed the duration the call it draws recorded" {
     try testing.expect(again.elapsed_ms == null);
 }
 
-test "a model drives a session on a server the way it drives one here" {
+test "a model drives a session on its server, and starts afresh beside it" {
     const testing = std.testing;
-    const Server = @import("../remote/server.zig");
-    const client = @import("../remote/client.zig");
-    const wire_types = @import("../remote/wire.zig");
-
-    const fixture = try Server.Fixture.create();
-    defer fixture.destroy();
-    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const stream = try (try std.Io.net.UnixAddress.init(fixture.server.path)).connect(testing.io);
-    const connection = try client.Connection.openStream(testing.allocator, testing.io, stream, null);
-    const opened = try connection.call(arena, .{ .open = .{ .root = fixture.project } }, null);
-    const handle = (try wire_types.parseResult(wire_types.Summary, arena, opened)).handle;
-
-    const model = try testing.allocator.create(Model);
-    defer testing.allocator.destroy(model);
-    model.* = .{
-        .allocator = testing.allocator,
-        .io = testing.io,
-        .conversation = .init(testing.allocator),
-        .provider = undefined,
-        .input = .init(testing.allocator),
-        .cwd = try testing.allocator.dupe(u8, ""),
-        .cwd_display = try testing.allocator.dupe(u8, "test"),
-    };
-    model.remote = try Mirror.attach(testing.allocator, testing.io, connection, &model.conversation, "test", handle, null);
-    model.provider = model.remote.?.provider;
-    try model.wire();
-    defer model.deinit();
-
-    try testing.expect(model.session.isRemote());
-    try testing.expect(model.localLoop() == null);
-    try testing.expect(model.session.database() == null);
-    try testing.expect(model.session.takeSwitched());
+    const served = try test_model.Served.create();
+    defer served.destroy();
+    const model = served.model;
+    const handle = try testing.allocator.dupe(u8, model.mirror.status.handle);
+    defer testing.allocator.free(handle);
     try testing.expectEqualStrings("project", model.projectLabel());
     try testing.expect(model.readableRoot() == null);
 
-    try model.session.submit("make a note", .{});
-    for (0..500) |_| {
-        _ = try model.session.poll();
-        if (model.shownLoop().state() == .awaiting_approval) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
-    } else return error.TimedOut;
-    try testing.expectEqualStrings("write", model.session.pendingCall().?.name);
-    try testing.expectEqual(model.session.pendingSeq().?, model.conversation.messages.items[1].seq);
+    try model.mirror.submit("make a note", .{});
+    try served.pollUntil(awaitingApproval);
+    try testing.expectEqualStrings("write", model.mirror.pendingCall().?.name);
+    try testing.expectEqual(model.mirror.pendingSeq().?, model.conversation.messages.items[1].seq);
 
-    try model.session.decide(.once);
-    for (0..500) |_| {
-        _ = try model.session.poll();
-        if (model.session.finishedTurns() == 1 and !model.session.isBusy()) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
-    } else return error.TimedOut;
-    try testing.expectEqual(@as(?AgentLoop.Outcome, .done), model.session.outcome());
-
-    const owned = try model.session.sessionHandle(testing.allocator);
-    defer testing.allocator.free(owned);
-    try testing.expectEqualStrings(handle, owned);
+    try model.mirror.decide(.once);
+    try served.pollUntil(finishedOne);
+    try testing.expectEqual(@as(?AgentLoop.Outcome, .done), model.mirror.outcome());
 
     try testing.expect(try model.clearSession());
-    for (0..500) |_| {
-        _ = try model.session.poll();
-        if (model.session.takeSwitched()) break;
-        try std.Io.sleep(testing.io, .fromMilliseconds(10), .awake);
-    } else return error.TimedOut;
+    try served.pollUntil(switchedAway);
     try model.showReplacedTranscript();
-    try testing.expect(!std.mem.eql(u8, handle, model.remote.?.status.handle));
+    try testing.expect(!std.mem.eql(u8, handle, model.mirror.status.handle));
     try testing.expectEqual(@as(usize, 0), model.conversation.messages.items.len);
     try testing.expectEqual(@as(usize, 0), model.history.items.len);
     try testing.expect(std.mem.startsWith(u8, model.cwd_display, "test:/"));

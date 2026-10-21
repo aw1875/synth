@@ -974,6 +974,7 @@ const Worker = struct {
             .models => |asked| return client.reply(id, try self.models(arena, asked.recent)),
             .load_tool_result => |load| return client.reply(id, try self.loadToolResult(arena, load.seq, load.call)),
             .load_thinking => |load| return client.reply(id, try self.loadThinking(arena, load.seq)),
+            .load_attachment => |load| return client.reply(id, try self.loadAttachment(arena, load.seq, load.index)),
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
             .subagent => |asked| return client.reply(id, try self.subagentTranscript(arena, asked.seq, asked.call)),
             .sessions => |asked| return client.reply(id, try self.storedSessions(arena, asked.limit)),
@@ -1152,6 +1153,7 @@ const Worker = struct {
             .provider_id = self.provider_id,
             .provider_missing = if (self.providerSource()) |providers| providers.isMissing(self.provider_id) else |_| false,
             .sign_in = if (self.sign_in) |task| .{ .url = task.sign_in.url, .port = task.sign_in.callbackPort() } else null,
+            .chatgpt_signed_in = self.chatgptSignedIn(),
             .context_limit = loop.provider.context_limit,
             .switchable = loop.provider.switchable(),
             .effort = loop.provider.effort,
@@ -1161,12 +1163,29 @@ const Worker = struct {
             .mcp = try self.stack.mcp_host.statuses(arena),
             .pending_seq = loop.pending_seq,
             .pending_call = if (pending_call) |index| @intCast(index) else null,
+            .pending_description = self.pendingDescription(),
             .notes = notes,
             .steering = loop.pendingSteering(),
             .outcome = loop.outcome,
             .request = if (loop.request != null) loop.requests_started else null,
             .finished = loop.finished,
         };
+    }
+
+    fn chatgptSignedIn(self: *Worker) bool {
+        const providers = self.providerSource() catch return false;
+        const store = providers.chatgpt orelse return false;
+        return store.isSignedIn();
+    }
+
+    fn pendingDescription(self: *Worker) []const u8 {
+        const loop = &self.stack.loop;
+        const index = loop.firstPending() orelse return "";
+        const seq = loop.pending_seq orelse return "";
+        const msg = self.held(seq) orelse return "";
+        if (index >= msg.tool_calls.len) return "";
+        const definition = self.stack.registry.get(msg.tool_calls[index].name) orelse return "";
+        return definition.description;
     }
 
     fn recordSummary(self: *Worker, status: wire.Status) void {
@@ -1190,6 +1209,15 @@ const Worker = struct {
         }
         const session_id = self.stack.loop.session_id orelse return error.UnknownMessage;
         return try self.db.loadToolResult(arena, session_id, @intCast(seq), index) orelse error.UnknownToolCall;
+    }
+
+    fn loadAttachment(self: *Worker, arena: std.mem.Allocator, seq: u64, index: u32) ![]const u8 {
+        if (self.held(seq)) |msg| {
+            if (index >= msg.attachments.len) return error.UnknownAttachment;
+            if (!msg.attachments[index].shortened()) return msg.attachments[index].content;
+        }
+        const session_id = self.stack.loop.session_id orelse return error.UnknownMessage;
+        return try self.db.loadAttachment(arena, session_id, @intCast(seq), index) orelse error.UnknownAttachment;
     }
 
     fn loadThinking(self: *Worker, arena: std.mem.Allocator, seq: u64) ![]const u8 {
@@ -1468,6 +1496,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownProvider => "no such provider",
         error.NoCredentialStore => "no ChatGPT credential file could be opened",
         error.UnknownServer => "no such MCP server",
+        error.UnknownAttachment => "no such attachment",
         error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
         error.NoMcpState => "no MCP state file, so this cannot be remembered",
@@ -2354,13 +2383,23 @@ test "a session connects a provider through its server, which keeps the key and 
     try std.testing.expectEqualStrings("ollama", snapshot.status.provider_id);
 
     const connect = try client.send(.{ .connect_provider = .{ .provider = "openai-compat", .host = "http://127.0.0.1:9", .key = "sk-test" } });
-    _ = try client.expectOk(connect);
+    var announced = false;
     while (true) {
         const frame = try client.next();
-        if (frame.body != .status or !std.mem.eql(u8, frame.body.status.provider_id, "openai-compat")) continue;
-        try std.testing.expect(!frame.body.status.provider_missing);
-        break;
+        switch (frame.body) {
+            .notice => |notice| if (std.mem.startsWith(u8, notice.text, "Connected ")) {
+                try std.testing.expect(std.mem.indexOf(u8, notice.text, "http://127.0.0.1:9") != null);
+                announced = true;
+            },
+            .reply => try std.testing.expect(frame.id != connect or frame.body.reply.ok),
+            .status => |status| if (std.mem.eql(u8, status.provider_id, "openai-compat")) {
+                try std.testing.expect(!status.provider_missing);
+                break;
+            },
+            else => {},
+        }
     }
+    try std.testing.expect(announced);
 
     var saved = try Auth.load(std.testing.allocator, io, auth_path);
     defer saved.deinit();

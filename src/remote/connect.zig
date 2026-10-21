@@ -106,7 +106,6 @@ pub fn drive(
         .io = io,
         .allocator = allocator,
         .conversation = .init(allocator),
-        .provider = undefined,
         .input = Input.init(allocator),
         .cwd = try allocator.dupe(u8, ""),
         .cwd_display = try allocator.dupe(u8, host),
@@ -127,8 +126,7 @@ pub fn drive(
         return null;
     };
     attached = true;
-    model.remote = mirror;
-    model.provider = mirror.provider;
+    model.mirror = mirror;
     if (options.model) |name| try mirror.switchModel(name, null, null);
 
     var buffer: [1024]u8 = undefined;

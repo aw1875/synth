@@ -22,7 +22,8 @@ const Mirror = @This();
 
 allocator: std.mem.Allocator,
 io: std.Io,
-connection: *client.Connection,
+/// Null for a mirror with nothing behind it: see `offline`.
+connection: ?*client.Connection,
 /// The transcript the TUI draws, kept in step with the server's. Borrowed.
 conversation: *Conversation,
 host: []const u8,
@@ -71,6 +72,7 @@ const Awaited = union(enum) {
     /// A command, named for the notice should it fail.
     command: []const u8,
     tool_result: struct { seq: u64, call: u32 },
+    attachment: struct { seq: u64, index: u32 },
     thinking: u64,
     history,
     sessions,
@@ -162,6 +164,34 @@ pub fn attach(
     handle: []const u8,
     failure: ?*client.Diagnostic,
 ) !*Mirror {
+    const self = try create(allocator, io, connection, conversation, host);
+    errdefer self.destroy();
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const id = try connection.send(.{ .attach = .{ .handle = handle } });
+    while (try connection.next(arena_state.allocator())) |frame| {
+        if (frame.body == .snapshot) try self.applySnapshot(frame.body.snapshot);
+        if (frame.body != .reply or frame.id != id) continue;
+        if (frame.body.reply.ok) break;
+        if (failure) |d| d.say("{s}: {s}", .{ host, frame.body.reply.@"error" orelse "refused" });
+        return error.Refused;
+    } else return error.ConnectionLost;
+
+    self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
+    return self;
+}
+
+/// A mirror with no server behind it, whose status a test sets by hand to
+/// draw a session that is not there. Every command fails as if the session
+/// had ended.
+pub fn offline(allocator: std.mem.Allocator, io: std.Io, conversation: *Conversation, host: []const u8) !*Mirror {
+    const self = try create(allocator, io, null, conversation, host);
+    self.ended = true;
+    return self;
+}
+
+fn create(allocator: std.mem.Allocator, io: std.Io, connection: ?*client.Connection, conversation: *Conversation, host: []const u8) !*Mirror {
     const self = try allocator.create(Mirror);
     errdefer allocator.destroy(self);
     const lost = try Inbound.create(allocator);
@@ -180,33 +210,26 @@ pub fn attach(
         .thinking = .init(allocator, io),
         .content = .init(allocator, io),
     };
-    errdefer self.freeState();
-
-    var arena_state: std.heap.ArenaAllocator = .init(allocator);
-    defer arena_state.deinit();
-    const id = try connection.send(.{ .attach = .{ .handle = handle } });
-    while (try connection.next(arena_state.allocator())) |frame| {
-        if (frame.body == .snapshot) try self.applySnapshot(frame.body.snapshot);
-        if (frame.body != .reply or frame.id != id) continue;
-        if (frame.body.reply.ok) break;
-        if (failure) |d| d.say("{s}: {s}", .{ host, frame.body.reply.@"error" orelse "refused" });
-        return error.Refused;
-    } else return error.ConnectionLost;
-
-    self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
     return self;
 }
 
 /// Leave the session, which carries on without us, and hang up.
 pub fn detach(self: *Mirror) void {
-    self.connection.interrupt();
-    self.reader.join();
+    if (self.connection) |connection| {
+        connection.interrupt();
+        self.reader.join();
+        connection.close();
+    }
+    self.destroy();
+}
+
+/// Free what `create` made, the connection aside.
+fn destroy(self: *Mirror) void {
     while (self.inbox.popFirst()) |node| {
         const inbound: *Inbound = @fieldParentPtr("node", node);
         if (inbound != self.lost) inbound.destroy();
     }
     self.lost.destroy();
-    self.connection.close();
     self.freeState();
     self.allocator.destroy(self);
 }
@@ -242,7 +265,7 @@ fn effortsOffered(ptr: *anyopaque, model: []const u8) Provider.Efforts {
 fn readLoop(self: *Mirror) void {
     while (true) {
         const inbound = Inbound.create(self.allocator) catch break;
-        const frame = self.connection.next(inbound.arena.allocator()) catch null;
+        const frame = self.connection.?.next(inbound.arena.allocator()) catch null;
         inbound.frame = frame orelse {
             inbound.destroy();
             break;
@@ -388,6 +411,7 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
 
     var kept = status;
     kept.label = try arena.dupe(u8, status.label);
+    kept.pending_description = try arena.dupe(u8, status.pending_description);
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
     kept.root = try arena.dupe(u8, status.root);
@@ -434,6 +458,7 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
         const what = switch (awaited) {
             .command => |name| name,
             .tool_result => "loading a tool result",
+            .attachment => "loading an attachment",
             .thinking => "loading the reasoning",
             .history => "loading older messages",
             .sessions => "listing the sessions",
@@ -460,6 +485,15 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             const full = try self.allocator.dupe(u8, text);
             if (call.result) |old| self.allocator.free(old);
             call.result = full;
+        },
+        .attachment => |at| {
+            const text = try wire.parseResult([]const u8, arena, reply.result);
+            const msg = self.conversation.find(at.seq) orelse return;
+            if (at.index >= msg.attachments.len) return;
+            const attachment = &msg.attachments[at.index];
+            const full = try self.allocator.dupe(u8, text);
+            self.allocator.free(attachment.content);
+            attachment.content = full;
         },
         .thinking => |seq| {
             const text = try wire.parseResult([]const u8, arena, reply.result);
@@ -586,14 +620,14 @@ fn ownHits(allocator: std.mem.Allocator, hits: []const wire.Hit) ![]Database.Hit
 fn ownHit(allocator: std.mem.Allocator, hit: wire.Hit) !Database.Hit {
     const public_id = try allocator.dupe(u8, hit.handle);
     errdefer allocator.free(public_id);
-    const title = try allocator.dupe(u8, hit.title);
-    errdefer allocator.free(title);
+    const named = try allocator.dupe(u8, hit.title);
+    errdefer allocator.free(named);
     const role = try allocator.dupe(u8, hit.role);
     errdefer allocator.free(role);
     return .{
         .session_id = 0,
         .public_id = public_id,
-        .title = title,
+        .title = named,
         .seq = 0,
         .role = role,
         .created_at = 0,
@@ -609,13 +643,54 @@ fn say(self: *Mirror, comptime fmt: []const u8, args: anytype) !void {
 
 fn send(self: *Mirror, body: wire.Up, awaited: Awaited) !void {
     if (self.ended) return error.SessionEnded;
+    const connection = self.connection orelse return error.SessionEnded;
     try self.waiting.ensureUnusedCapacity(self.allocator, 1);
-    const id = try self.connection.send(body);
+    const id = try connection.send(body);
     self.waiting.putAssumeCapacity(id, awaited);
 }
 
 pub fn isBusy(self: *const Mirror) bool {
     return self.status.state != .idle;
+}
+
+pub fn state(self: *const Mirror) Loop.State {
+    return self.status.state;
+}
+
+pub fn title(self: *const Mirror) []const u8 {
+    return self.status.title;
+}
+
+pub fn agentId(self: *const Mirror) []const u8 {
+    return self.status.agent;
+}
+
+pub fn usage(self: *const Mirror) Loop.Usage {
+    return self.status.usage;
+}
+
+pub fn outcome(self: *const Mirror) ?Loop.Outcome {
+    return self.status.outcome;
+}
+
+/// Turns finished so far, to tell a new ending from one already seen.
+pub fn finishedTurns(self: *const Mirror) u64 {
+    return self.status.finished;
+}
+
+/// The message whose calls are being decided or run, as numbered here.
+pub fn pendingSeq(self: *const Mirror) ?u64 {
+    return self.status.pending_seq;
+}
+
+/// The call waiting on a decision, by index into the pending message's.
+pub fn firstPending(self: *const Mirror) ?usize {
+    return if (self.status.pending_call) |index| index else null;
+}
+
+/// Prompts typed while busy, waiting for the next step.
+pub fn pendingSteering(self: *const Mirror) []const []const u8 {
+    return self.status.steering;
 }
 
 pub fn label(self: *const Mirror) []const u8 {
@@ -706,8 +781,8 @@ pub fn compact(self: *Mirror) !void {
     try self.send(.{ .compact = .{} }, .{ .command = "Compacting" });
 }
 
-pub fn rename(self: *Mirror, title: []const u8) !void {
-    try self.send(.{ .rename = .{ .title = title } }, .{ .command = "Renaming" });
+pub fn rename(self: *Mirror, name: []const u8) !void {
+    try self.send(.{ .rename = .{ .title = name } }, .{ .command = "Renaming" });
 }
 
 /// Start a turn on one of the server's skills, as typed: `/id args`.
@@ -772,6 +847,15 @@ pub fn loadToolResult(self: *Mirror, msg: *Conversation.Message, index: usize) !
     if (call.result) |result| if (result.len >= call.result_bytes) return;
     if (self.isWaitingFor(.{ .tool_result = .{ .seq = msg.seq, .call = @intCast(index) } })) return;
     try self.send(.{ .load_tool_result = .{ .seq = serverSeq(msg.seq), .call = @intCast(index) } }, .{ .tool_result = .{ .seq = msg.seq, .call = @intCast(index) } });
+}
+
+/// Ask for the whole of an attachment held back as a preview. It lands on a
+/// later poll.
+pub fn loadAttachment(self: *Mirror, msg: *Conversation.Message, index: usize) !void {
+    if (index >= msg.attachments.len or !msg.attachments[index].shortened()) return;
+    const wanted: Awaited = .{ .attachment = .{ .seq = msg.seq, .index = @intCast(index) } };
+    if (self.isWaitingFor(wanted)) return;
+    try self.send(.{ .load_attachment = .{ .seq = serverSeq(msg.seq), .index = @intCast(index) } }, wanted);
 }
 
 pub fn loadThinking(self: *Mirror, msg: *Conversation.Message) !void {

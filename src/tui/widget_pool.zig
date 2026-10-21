@@ -111,7 +111,7 @@ pub fn attachmentCard(
     card.body = attachment.content;
 
     if (card.expanded and attachment.shortened()) {
-        if (!self.inSubagent()) self.session.loadAttachment(msg, index) catch {};
+        if (!self.inSubagent()) self.mirror.loadAttachment(msg, index) catch {};
         card.body = attachment.content;
     }
 
@@ -141,10 +141,10 @@ pub fn toolCard(
     card.arguments = call.arguments;
     card.start_line = diffStart(self, key, call);
     card.result = call.result;
-    card.note = self.session.toolNote(msg.seq, call_index);
+    card.note = self.mirror.toolNote(msg.seq, call_index);
     card.status = call.status;
     card.elapsed_ms = call.elapsed_ms;
-    card.open = if (self.hasSubagent(key, msg, call_index))
+    card.open = if (self.hasSubagent(msg, call_index))
         .{ .userdata = self, .key = key, .seq = msg.seq, .index = call_index, .call = Model.openFromCard }
     else
         null;
@@ -152,7 +152,7 @@ pub fn toolCard(
     if (card.expanded and call.result_bytes > Conversation.preview_bytes) {
         if (call.result) |r| {
             if (r.len < call.result_bytes) {
-                if (!self.inSubagent()) self.session.loadToolResult(msg, call_index) catch {};
+                if (!self.inSubagent()) self.mirror.loadToolResult(msg, call_index) catch {};
                 card.result = call.result;
             }
         }
@@ -182,7 +182,7 @@ pub fn thoughtRow(self: *Model, msg: *Conversation.Message) !?*ThoughtView.View 
     if (row.expanded and msg.thinking_bytes > Conversation.preview_bytes) {
         if (msg.thinking) |t| {
             if (t.len < msg.thinking_bytes) {
-                if (!self.inSubagent()) self.session.loadThinking(msg) catch {};
+                if (!self.inSubagent()) self.mirror.loadThinking(msg) catch {};
                 row.text = msg.thinking.?;
             }
         }

@@ -6,7 +6,6 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const Cell = vaxis.Cell;
 
-const project_files = @import("../core/files.zig");
 const fuzzy = @import("../core/fuzzy.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -17,7 +16,8 @@ const Popup = @This();
 pub const max_rows: u16 = 8;
 
 allocator: std.mem.Allocator,
-/// Project-relative paths, owned. Empty until the first `@`.
+/// Project-relative paths, owned, as the session's server listed them. Empty
+/// until the first `@`.
 files: std.ArrayList([]const u8) = .empty,
 /// When the index was last built, in milliseconds. Null means never. An index
 /// is a snapshot of a directory that keeps changing underneath it - not least
@@ -30,38 +30,14 @@ selected: usize = 0,
 /// Byte offset of the `@` being completed, within the input buffer.
 anchor: ?usize = null,
 
-/// The index is built on a worker: on a large project it is a `git ls-files`
-/// or a whole-tree walk, and neither belongs between two keystrokes. The
-/// picker opens immediately and fills in when the scan lands.
-scanning: bool = false,
-scan_done: std.atomic.Value(bool) = .init(false),
-scan_future: std.Io.Future(void) = undefined,
-/// Captured when the scan starts, since the worker has no other way to them.
-/// `root` is borrowed from the project, which outlives the picker.
-scan_io: std.Io = undefined,
-scan_root: []const u8 = "",
-/// Written by the worker, read by the UI thread only after `scan_done`.
-scan_result: []const []const u8 = &.{},
-
 pub fn init(allocator: std.mem.Allocator) Popup {
     return .{ .allocator = allocator };
 }
 
 pub fn deinit(self: *Popup) void {
-    self.stopScan();
     for (self.files.items) |path| self.allocator.free(path);
     self.files.deinit(self.allocator);
     self.matches.deinit(self.allocator);
-}
-
-/// Unwind a scan still running. The worker owns memory the picker is about to
-/// stop tracking, so this waits rather than detaching.
-fn stopScan(self: *Popup) void {
-    if (!self.scanning) return;
-    self.scan_future.cancel(self.scan_io);
-    self.scanning = false;
-    project_files.free(self.allocator, self.scan_result);
-    self.scan_result = &.{};
 }
 
 /// Whether the cursor sits in an `@` token, matches or not.
@@ -69,14 +45,10 @@ pub fn isCompleting(self: *const Popup) bool {
     return self.anchor != null;
 }
 
+/// Open while completing and something matches, or while there is no index
+/// yet to match against and the first listing is on its way.
 pub fn isOpen(self: *const Popup) bool {
-    if (self.anchor == null) return false;
-    return self.matches.items.len > 0 or self.scanning;
-}
-
-/// Whether a scan is still out, so the caller keeps the frames coming.
-pub fn isScanning(self: *const Popup) bool {
-    return self.scanning;
+    return self.anchor != null and (self.matches.items.len > 0 or self.indexed_at == null);
 }
 
 pub fn close(self: *Popup) void {
@@ -86,21 +58,12 @@ pub fn close(self: *Popup) void {
 }
 
 /// Recompute the popup state from the input buffer. Opens when the cursor sits
-/// inside an `@token`, closes otherwise.
-/// `root` is where to index from; null when the index is `supply`'d.
-pub fn update(
-    self: *Popup,
-    io: std.Io,
-    root: ?[]const u8,
-    text: []const u8,
-    cursor: usize,
-) !void {
+/// inside an `@token` and something matches, closes otherwise.
+pub fn update(self: *Popup, text: []const u8, cursor: usize) !void {
     const anchor = mentionStart(text, cursor) orelse {
         self.close();
         return;
     };
-
-    if (root) |dir| try self.startScan(io, dir);
 
     const query = std.mem.trimStart(u8, text[anchor + 1 .. cursor], "\"");
     self.anchor = anchor;
@@ -178,60 +141,14 @@ pub fn invalidate(self: *Popup) void {
     self.indexed_at = null;
 }
 
-/// Start indexing the project. What counts as a file is
-/// `core/files.zig`'s business: in a git repository that means whatever the
-/// project does not ignore, so a build directory never shows up here without
-/// anyone listing it. Directories carry a trailing separator, both to mark them
-/// in the picker and so `@src/` resolves to a listing rather than a read.
-fn startScan(self: *Popup, io: std.Io, root: []const u8) !void {
-    if (self.scanning) return;
-    if (!self.stale(io)) return;
-
-    self.scan_io = io;
-    self.scan_root = root;
-    self.scan_result = &.{};
-    self.scan_done.store(false, .release);
-    self.scan_future = try io.concurrent(runScan, .{self});
-    self.scanning = true;
-}
-
-/// Worker thread. A failed scan is an empty index rather than a failed
-/// keystroke: the picker offers nothing, and typing a path by hand still works.
-fn runScan(self: *Popup) void {
-    defer self.scan_done.store(true, .release);
-    self.scan_result = project_files.list(
-        self.allocator,
-        self.scan_io,
-        self.scan_root,
-        .{ .directories = true },
-    ) catch &.{};
-}
-
-/// Take an index built elsewhere: a remote session's, listed on its server.
-/// The popup owns `paths` from here on.
+/// Take the project's files as the session's server listed them, which the
+/// popup owns from here on. Directories carry a trailing separator, both to
+/// mark them in the picker and so `@src/` resolves to a listing, not a read.
 pub fn supply(self: *Popup, io: std.Io, paths: []const []const u8) void {
     for (self.files.items) |path| self.allocator.free(path);
     self.files.deinit(self.allocator);
     self.files = .fromOwnedSlice(@constCast(paths));
     self.indexed_at = nowMilliseconds(io);
-}
-
-/// Take delivery of a finished scan. Returns true when the index changed, so
-/// the caller knows to refilter and redraw.
-pub fn poll(self: *Popup) bool {
-    if (!self.scanning) return false;
-    if (!self.scan_done.load(.acquire)) return false;
-
-    self.scan_future.await(self.scan_io);
-    self.scanning = false;
-    self.indexed_at = nowMilliseconds(self.scan_io);
-
-    for (self.files.items) |path| self.allocator.free(path);
-    self.files.clearRetainingCapacity();
-    self.files.deinit(self.allocator);
-    self.files = .fromOwnedSlice(@constCast(self.scan_result));
-    self.scan_result = &.{};
-    return true;
 }
 
 /// Render the match list. The caller positions it above the prompt.
@@ -271,59 +188,29 @@ pub fn draw(self: *Popup, ctx: vxfw.DrawContext, widget: vxfw.Widget, width: u16
     return surface;
 }
 
-test "the index is built off the caller's thread" {
+test "a supplied index is searched as the mention is typed" {
     const testing = std.testing;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(testing.io, &buffer);
-    const root = buffer[0..n];
-
-    try tmp.dir.createDirPath(testing.io, "src");
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "src/main.zig", .data = "" });
-
     var popup: Popup = .init(testing.allocator);
     defer popup.deinit();
 
-    try popup.update(testing.io, root, "@ma", 3);
-
-    try testing.expect(popup.isScanning());
+    try popup.update("@ma", 3);
     try testing.expect(popup.isOpen());
     try testing.expectEqual(@as(usize, 0), popup.matches.items.len);
 
-    while (!popup.poll()) {
-        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch break;
-    }
-    try testing.expect(!popup.isScanning());
-    try testing.expect(popup.indexed_at != null);
+    const paths = try testing.allocator.alloc([]const u8, 2);
+    paths[0] = try testing.allocator.dupe(u8, "src/");
+    paths[1] = try testing.allocator.dupe(u8, "src/main.zig");
+    popup.supply(testing.io, paths);
+    try testing.expect(!popup.stale(testing.io));
 
-    try popup.update(testing.io, root, "@ma", 3);
-    try testing.expect(popup.matches.items.len > 0);
-    try testing.expectEqualStrings("src/main.zig", popup.files.items[popup.matches.items[0]]);
+    try popup.update("@ma", 3);
+    try testing.expect(popup.isOpen());
+    try testing.expectEqualStrings("src/main.zig", popup.selectedPath().?);
 
-    try popup.update(testing.io, root, "@sr", 3);
-    try testing.expect(!popup.isScanning());
-}
-
-test "closing while a scan is out does not leave it running" {
-    const testing = std.testing;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(testing.io, &buffer);
-    const root = buffer[0..n];
-
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "build.zig", .data = "" });
-
-    var popup: Popup = .init(testing.allocator);
-    try popup.update(testing.io, root, "@b", 2);
-    try testing.expect(popup.isScanning());
-
-    popup.deinit();
+    try popup.update("@zzz", 4);
+    try testing.expect(!popup.isOpen());
+    try popup.update("done ", 5);
+    try testing.expect(!popup.isCompleting());
 }
 
 test "mentionStart only fires at a word boundary" {
@@ -430,33 +317,15 @@ test "filter prefers basename matches" {
     try std.testing.expectEqualStrings("src/tui/app.zig", popup.files.items[popup.matches.items[0]]);
 }
 
-test "an index that has been invalidated is rebuilt on the next mention" {
+test "an index that has been invalidated is stale at once" {
     const testing = std.testing;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(testing.io, &root_buffer)];
-
     var popup: Popup = .init(testing.allocator);
     defer popup.deinit();
 
-    try popup.update(testing.io, root, "@", 1);
-    while (!popup.poll()) {
-        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch break;
-    }
-    try testing.expect(popup.indexed_at != null);
-    try popup.update(testing.io, root, "@a", 2);
-    try testing.expect(!popup.isScanning());
-
+    popup.supply(testing.io, try testing.allocator.alloc([]const u8, 0));
+    try testing.expect(!popup.stale(testing.io));
     popup.invalidate();
-    try popup.update(testing.io, root, "@ab", 3);
-    try testing.expect(popup.isScanning());
-
-    while (!popup.poll()) {
-        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch break;
-    }
+    try testing.expect(popup.stale(testing.io));
 }
 
 test "an index with no build time behind it is stale" {
@@ -475,25 +344,9 @@ test "an index with no build time behind it is stale" {
 }
 
 test "typing the opening quote does not break the search" {
-    const testing = std.testing;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(testing.io, &buffer);
-    const root = buffer[0..n];
-
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "Pasted image.png", .data = "" });
-
-    var popup: Popup = .init(testing.allocator);
+    var popup = try fixture(&.{"Pasted image.png"});
     defer popup.deinit();
 
-    try popup.update(testing.io, root, "@\"Pas", 5);
-    while (!popup.poll()) {
-        std.Io.sleep(testing.io, .fromMilliseconds(1), .real) catch break;
-    }
-
-    try popup.update(testing.io, root, "@\"Pas", 5);
-    try testing.expectEqualStrings("Pasted image.png", popup.selectedPath().?);
+    try popup.update("@\"Pas", 5);
+    try std.testing.expectEqualStrings("Pasted image.png", popup.selectedPath().?);
 }

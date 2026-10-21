@@ -154,6 +154,8 @@ pub const Status = struct {
     provider_missing: bool = false,
     /// A ChatGPT sign-in this session started, waiting on a browser.
     sign_in: ?SignIn = null,
+    /// The server holds a ChatGPT sign-in, which `/logout` would end.
+    chatgpt_signed_in: bool = false,
     context_limit: u32 = 0,
     /// Whether the provider offers other models to switch to.
     switchable: bool = false,
@@ -168,6 +170,8 @@ pub const Status = struct {
     /// waiting on a decision, if one is.
     pending_seq: ?u64 = null,
     pending_call: ?u32 = null,
+    /// What the tool waiting on a decision does, for the person deciding.
+    pending_description: []const u8 = "",
     /// What each running call last said it was doing, by index into the
     /// pending message's calls.
     notes: []const []const u8 = &.{},
@@ -383,6 +387,11 @@ pub const Up = union(enum) {
     load_tool_result: struct {
         seq: u64,
         call: u32,
+    },
+    /// Replied with the whole of a held-back attachment as a string.
+    load_attachment: struct {
+        seq: u64,
+        index: u32,
     },
     /// Replied with the whole reasoning as a string.
     load_thinking: struct {
