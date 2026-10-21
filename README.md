@@ -281,6 +281,10 @@ The bridge starts the host's server if none is running. It listens on
 `$XDG_RUNTIME_DIR/synth/server.sock`, owner-only, and refuses peers with
 another uid; what it says on starting goes to `server.log` beside it.
 `synth remote serve` runs one in the foreground, until SIGINT or SIGTERM.
+When synth is upgraded, the next connection replaces a server still running
+the old build, as soon as no session is busy or attached. A session nobody
+is attached to unloads after five idle minutes; it stays stored, and
+attaching loads it again.
 
 The theme stays local to this machine. On a remote session the model picker,
 `/model` and `/effort` choose among the server's models, and `/sessions`,

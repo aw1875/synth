@@ -67,6 +67,10 @@ pub const Options = struct {
     provider_id: []const u8 = "",
     home: ?[]const u8 = null,
     mcp_auth: ?*mcp.Auth = null,
+    /// The program file the server runs, to notice it being replaced.
+    executable: ?[]const u8 = null,
+    /// Called when a client asks the server to stop, to let it go.
+    on_shutdown: ?*const fn () void = null,
     /// How long a session with nothing to do and nobody attached stays
     /// loaded. It stays stored after, and attaching loads it again.
     idle_unload: std.Io.Duration = .fromSeconds(5 * 60),
@@ -86,6 +90,8 @@ db_mutex: std.Io.Mutex = .init,
 /// Guards `sessions`, `retired` and `clients`.
 mutex: std.Io.Mutex = .init,
 sessions: std.ArrayList(*Hosted) = .empty,
+/// What the program file looked like at start, while `options.executable` is set.
+started_from: ?Build = null,
 /// Sessions taken out of the list, unloading or stopped, until their worker
 /// is joined. Loading one again waits for it to finish first.
 retired: std.ArrayList(*Hosted) = .empty,
@@ -149,6 +155,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Serve
         .path = path,
         .listener = listener,
         .db = db,
+        .started_from = if (options.executable) |file| Build.of(io, file) else null,
     };
     self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     return self;
@@ -188,6 +195,40 @@ pub fn stop(self: *Server) void {
     self.db.deinit();
     self.allocator.free(self.path);
     self.allocator.destroy(self);
+}
+
+/// A build of the program, told apart by its file.
+const Build = struct {
+    inode: std.Io.File.INode,
+    size: u64,
+    mtime: i96,
+
+    fn of(io: std.Io, path: []const u8) ?Build {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+        return .{ .inode = stat.inode, .size = stat.size, .mtime = stat.mtime.nanoseconds };
+    }
+};
+
+/// Whether the program file has been replaced since the server started.
+fn outdated(self: *Server) bool {
+    const file = self.options.executable orelse return false;
+    const started = self.started_from orelse return false;
+    const now = Build.of(self.io, file) orelse return true;
+    return !std.meta.eql(started, now);
+}
+
+/// Let the server go, if nobody would notice: no session busy, and nobody
+/// attached to one.
+fn shutdown(self: *Server) !void {
+    const let_go = self.options.on_shutdown orelse return error.NotStoppable;
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.sessions.items) |hosted| {
+            if (hosted.inUse()) return error.InUse;
+        }
+    }
+    let_go();
 }
 
 fn acceptLoop(self: *Server) void {
@@ -683,6 +724,12 @@ const Hosted = struct {
         }
     }
 
+    fn inUse(self: *Hosted) bool {
+        self.summary_mutex.lockUncancelable(self.server.io);
+        defer self.summary_mutex.unlock(self.server.io);
+        return self.state != .idle or self.clients > 0;
+    }
+
     fn summary(self: *Hosted, arena: std.mem.Allocator) !wire.Summary {
         self.summary_mutex.lockUncancelable(self.server.io);
         defer self.summary_mutex.unlock(self.server.io);
@@ -892,7 +939,7 @@ const Worker = struct {
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
             .sessions => |asked| return client.reply(id, try self.storedSessions(arena, asked.limit)),
             .search => |query| return client.reply(id, try self.search(arena, query.query, query.limit)),
-            .hello, .list, .open, .detach, .stop, .files => return error.NotASessionCommand,
+            .hello, .list, .open, .detach, .stop, .files, .shutdown => return error.NotASessionCommand,
         }
         client.reply(id, {});
     }
@@ -1205,6 +1252,8 @@ fn describe(err: anyerror) []const u8 {
         error.NotASessionCommand => "not a session command",
         error.Busy => "finish the turn first",
         error.UnknownSkill => "no such skill",
+        error.InUse => "a session is busy or attached",
+        error.NotStoppable => "this server cannot be stopped from here",
         else => @errorName(err),
     };
 }
@@ -1395,7 +1444,11 @@ const Client = struct {
         const line = try wire.readLine(reader) orelse return false;
         const frame = try wire.Frame(wire.Up).decode(arena_state.allocator(), line) orelse return false;
         if (frame.body != .hello) return false;
-        self.send(.{ .body = .{ .hello = .{ .protocol = wire.version, .server = pkg.name ++ " " ++ pkg.version } } });
+        self.send(.{ .body = .{ .hello = .{
+            .protocol = wire.version,
+            .server = pkg.name ++ " " ++ pkg.version,
+            .outdated = self.server.outdated(),
+        } } });
         return frame.body.hello.protocol == wire.version;
     }
 
@@ -1428,6 +1481,10 @@ const Client = struct {
                 };
                 defer hosted.release();
                 self.reply(frame.id, try hosted.summary(arena));
+            },
+            .shutdown => {
+                self.server.shutdown() catch |err| return self.replyError(frame.id, describe(err));
+                self.reply(frame.id, {});
             },
             .stop => |request| {
                 self.server.stopSession(request.handle) catch |err| return self.replyError(frame.id, describe(err));
@@ -1645,8 +1702,15 @@ const TestClient = struct {
     }
 
     fn hello(self: *TestClient) !void {
+        _ = try self.greet();
+    }
+
+    /// Say hello, returning whether the server says it is outdated.
+    fn greet(self: *TestClient) !bool {
         _ = try self.send(.{ .hello = .{ .protocol = wire.version, .client = "test" } });
-        try std.testing.expect((try self.next()).body == .hello);
+        const frame = try self.next();
+        try std.testing.expect(frame.body == .hello);
+        return frame.body.hello.outdated;
     }
 
     fn send(self: *TestClient, body: wire.Up) !u64 {
@@ -2001,4 +2065,38 @@ test "an idle session nobody watches unloads, and attaching loads it again" {
     const empty = (try client.open(fixture.project)).handle;
     try awaitLive(client, 0);
     try std.testing.expectEqualStrings("no such session", try client.expectError(try client.send(.{ .attach = .{ .handle = empty } })));
+}
+
+var shutdown_asked: std.atomic.Value(bool) = .init(false);
+
+fn noteShutdown() void {
+    shutdown_asked.store(true, .release);
+}
+
+test "a server whose program was replaced says so, and steps aside once nobody is using it" {
+    const io = std.testing.io;
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "program", .data = "old build" });
+    const program = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "program" });
+    fixture.server.options.executable = program;
+    fixture.server.options.on_shutdown = noteShutdown;
+    fixture.server.started_from = Build.of(io, program);
+
+    const client = try fixture.connect();
+    defer client.close();
+    try std.testing.expect(!try client.greet());
+
+    try fixture.tmp.dir.writeFile(io, .{ .sub_path = "program", .data = "a newer build" });
+    const newer = try fixture.connect();
+    defer newer.close();
+    try std.testing.expect(try newer.greet());
+
+    _ = try client.attach((try client.open(fixture.project)).handle);
+    try std.testing.expectEqualStrings("a session is busy or attached", try newer.expectError(try newer.send(.{ .shutdown = .{} })));
+    try std.testing.expect(!shutdown_asked.load(.acquire));
+
+    _ = try client.expectOk(try client.send(.{ .detach = .{} }));
+    _ = try newer.expectOk(try newer.send(.{ .shutdown = .{} }));
+    try std.testing.expect(shutdown_asked.load(.acquire));
 }

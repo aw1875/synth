@@ -57,6 +57,8 @@ pub fn run(init: std.process.Init) !void {
 
     const socket_path = try Server.socketPath(allocator, init.environ_map);
     defer allocator.free(socket_path);
+    const executable = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(executable);
 
     try Signals.install();
 
@@ -66,6 +68,8 @@ pub fn run(init: std.process.Init) !void {
         .database_path = config.database_path,
         .source = .{ .backend = &backend },
         .provider_id = active.entry.id,
+        .executable = executable,
+        .on_shutdown = Signals.raise,
         .home = init.environ_map.get("HOME"),
         .mcp_auth = &mcp_auth,
     }) catch |err| switch (err) {
@@ -106,6 +110,11 @@ const Signals = struct {
     }
 
     fn onSignal(_: posix.SIG) callconv(.c) void {
+        raise();
+    }
+
+    /// Let `wait` return, as a signal would.
+    fn raise() void {
         _ = posix.system.write(pipe[1], "x", 1);
     }
 

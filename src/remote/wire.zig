@@ -271,6 +271,9 @@ pub const Up = union(enum) {
         history: u32 = 200,
     },
     detach: struct {},
+    /// Stop the server, so a newer build can take its place. Refused while a
+    /// session is busy or anyone is attached to one.
+    shutdown: struct {},
     /// End a session: cancel it, unload it, keep its transcript.
     stop: struct {
         handle: []const u8,
@@ -348,6 +351,9 @@ pub const Down = union(enum) {
     hello: struct {
         protocol: u32,
         server: []const u8 = "",
+        /// The program the server runs has been replaced on disk since it
+        /// started: a newer client may ask it to `shutdown`.
+        outdated: bool = false,
     },
     /// The answer to the request with the same `id`. `result` is whatever
     /// that request is documented to return.

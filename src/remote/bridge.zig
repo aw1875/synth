@@ -5,6 +5,7 @@
 const std = @import("std");
 
 const Config = @import("../core/config.zig");
+const client = @import("client.zig");
 const Server = @import("server.zig");
 
 /// How long a server just started may take to bind.
@@ -16,7 +17,7 @@ pub fn run(init: std.process.Init) !void {
     const path = try Server.socketPath(init.gpa, init.environ_map);
     defer init.gpa.free(path);
 
-    if (!Server.probe(io, path)) try startServer(init, path);
+    if (Server.probe(io, path)) try replaceOutdated(init, path) else try startServer(init, path);
 
     const stream = try (try std.Io.net.UnixAddress.init(path)).connect(io);
     defer stream.close(io);
@@ -62,6 +63,38 @@ fn startServer(init: std.process.Init, path: []const u8) !void {
     try stderr.interface.print("the session server did not start; see {s}\n", .{log_path});
     try stderr.interface.flush();
     return error.ServerDidNotStart;
+}
+
+/// This bridge is the newest program on the machine: whatever ssh or a
+/// client just ran. A server started from an older one makes way for it,
+/// unless that would cut someone off.
+fn replaceOutdated(init: std.process.Init, path: []const u8) !void {
+    const io = init.io;
+    const stream = (try std.Io.net.UnixAddress.init(path)).connect(io) catch return;
+    const connection = client.Connection.openStream(init.gpa, io, stream, null) catch {
+        stream.close(io);
+        return;
+    };
+    defer connection.close();
+    if (!connection.outdated) return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(init.gpa);
+    defer arena_state.deinit();
+    var failure: client.Diagnostic = .{};
+    _ = connection.call(arena_state.allocator(), .{ .shutdown = .{} }, &failure) catch {
+        var buffer: [512]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(io, &buffer);
+        try stderr.interface.print("the session server here runs an older build ({s}); it is replaced once nothing is attached to it\n", .{failure.message});
+        try stderr.interface.flush();
+        return;
+    };
+
+    var waited: std.Io.Duration = .zero;
+    while (Server.probe(io, path)) : (waited.nanoseconds += start_poll.nanoseconds) {
+        if (waited.nanoseconds >= start_timeout.nanoseconds) return error.ServerDidNotStop;
+        try std.Io.sleep(io, start_poll, .awake);
+    }
+    try startServer(init, path);
 }
 
 fn pumpDown(io: std.Io, stream: std.Io.net.Stream) !void {

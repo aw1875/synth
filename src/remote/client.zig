@@ -88,6 +88,8 @@ pub const Connection = struct {
     next_id: u64 = 1,
     /// What the server said it is, from its hello.
     server: []const u8 = "",
+    /// The server runs a program since replaced on disk.
+    outdated: bool = false,
     hello_arena: std.heap.ArenaAllocator,
 
     const Transport = union(enum) {
@@ -223,6 +225,7 @@ pub const Connection = struct {
             return error.ProtocolMismatch;
         }
         self.server = frame.body.hello.server;
+        self.outdated = frame.body.hello.outdated;
     }
 
     /// Send a request, returning the id its reply will carry.
