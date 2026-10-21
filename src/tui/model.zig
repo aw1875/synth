@@ -196,6 +196,9 @@ tool_cards: std.AutoHashMapUnmanaged(u64, *ToolCard) = .empty,
 subagent_sessions: std.AutoHashMapUnmanaged(u64, i64) = .empty,
 /// A subagent's transcript, shown in place of this session's own.
 viewing: ?Viewing = null,
+/// The remote subagent transcript asked for and not yet come. Its title is
+/// owned.
+subagent_asked: ?struct { key: u64, seq: u64, index: usize, title: []u8 } = null,
 /// The nested runs, which this model drives on its own tick. Null where
 /// subagents are not available at all.
 subagents: ?*Subagent.Runner = null,
@@ -419,8 +422,7 @@ fn clearMessageWidgets(self: *Model) void {
     self.block_heights.clearRetainingCapacity();
 }
 
-/// A subagent's transcript, loaded from the database and shown in place of the
-/// session's own. Read-only: the run it records is over.
+/// A subagent's transcript, shown in place of the session's own. Read-only.
 pub const Viewing = struct {
     /// Where a shown transcript comes from.
     pub const Source = union(enum) {
@@ -428,6 +430,15 @@ pub const Viewing = struct {
         /// belongs to is freed the moment its tool call collects the answer.
         live,
         stored: Conversation,
+        /// A remote session's, as its server last sent it.
+        mirrored: Mirrored,
+    };
+
+    pub const Mirrored = struct {
+        convo: Conversation,
+        /// Still running there, so asked for again while it is read.
+        live: bool,
+        asked_ms: i64,
     };
 
     /// Where the transcript comes from. A running subagent's is borrowed and
@@ -445,6 +456,7 @@ pub const Viewing = struct {
     fn deinit(self: *Viewing, allocator: std.mem.Allocator) void {
         switch (self.source) {
             .stored => |*convo| convo.deinit(),
+            .mirrored => |*mirrored| mirrored.convo.deinit(),
             .live => {},
         }
         allocator.free(self.title);
@@ -456,6 +468,11 @@ pub const Viewing = struct {
 /// remembered, including the answer that there is none.
 pub fn hasSubagent(self: *Model, key: u64, msg: *Conversation.Message, call_index: usize) bool {
     if (self.viewing != null) return false;
+    // A remote session's database is not here to ask, so any subagent call may hold one.
+    if (self.remote != null) {
+        const call = msg.tool_calls[call_index];
+        return std.mem.eql(u8, call.name, task_tool) and call.status != .pending and call.status != .rejected;
+    }
 
     // A run still going is in memory, not the database, so it is asked every time.
     if (self.subagents) |runner| {
@@ -495,6 +512,7 @@ pub fn shown(self: *Model) *Conversation {
     if (self.viewing) |*view| {
         switch (view.source) {
             .stored => |*convo| return convo,
+            .mirrored => |*mirrored| return &mirrored.convo,
             .live => {
                 if (self.subagents) |runner| {
                     if (runner.viewable(view.index)) |child| return &child.convo;
@@ -586,8 +604,15 @@ pub fn openFromCard(ptr: *anyopaque, key: u64, seq: u64, index: usize, name: []c
     _ = self.openSubagent(key, seq, index, name) catch return;
 }
 
-/// Show the transcript a tool call left behind. Silent when it left none.
+/// Show the transcript a tool call left behind. Silent when it left none. A
+/// remote session's arrives on a later tick, and opens then.
 pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []const u8) !bool {
+    if (self.remote) |mirror| {
+        try mirror.loadSubagent(seq, @intCast(index));
+        if (self.subagent_asked) |asked| self.allocator.free(asked.title);
+        self.subagent_asked = .{ .key = key, .seq = seq, .index = index, .title = try self.allocator.dupe(u8, title) };
+        return true;
+    }
     const source: Viewing.Source = live: {
         if (self.subagents) |runner| {
             if (runner.viewable(index) != null) break :live .live;
@@ -607,6 +632,53 @@ pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []con
         owned_convo.deinit();
     };
 
+    try self.showViewing(source, key, seq, index, title);
+    return true;
+}
+
+/// A remote session's subagent transcript came: open it if it was asked for,
+/// or take it as the newer copy of the one open. Takes `messages`.
+pub fn receiveSubagent(self: *Model, seq: u64, index: usize, live: bool, messages: []Conversation.Message) !void {
+    var convo: Conversation = .init(self.allocator);
+    convo.messages = .fromOwnedSlice(messages);
+    errdefer convo.deinit();
+    if (convo.messages.items.len > 0) convo.next_seq = convo.messages.items[convo.messages.items.len - 1].seq + 1;
+    const mirrored: Viewing.Mirrored = .{ .convo = convo, .live = live, .asked_ms = nowMs(self.io) };
+
+    if (self.viewing) |*view| {
+        if (view.source == .mirrored and view.seq == seq and view.index == index) {
+            view.source.mirrored.convo.deinit();
+            view.source.mirrored = mirrored;
+            return;
+        }
+    }
+    const asked = self.subagent_asked orelse return convo.deinit();
+    if (asked.seq != seq or asked.index != index) return convo.deinit();
+    self.subagent_asked = null;
+    defer self.allocator.free(asked.title);
+    try self.showViewing(.{ .mirrored = mirrored }, asked.key, seq, index, asked.title);
+}
+
+/// Ask again for a remote subagent still running, about twice a second.
+pub fn followMirroredSubagent(self: *Model) !void {
+    const mirror = self.remote orelse return;
+    const view = if (self.viewing) |*v| v else return;
+    if (view.source != .mirrored or !view.source.mirrored.live) return;
+    if (nowMs(self.io) - view.source.mirrored.asked_ms < mirrored_refresh_ms) return;
+    view.source.mirrored.asked_ms = nowMs(self.io);
+    try mirror.loadSubagent(view.seq, @intCast(view.index));
+}
+
+const mirrored_refresh_ms: i64 = 500;
+
+/// The tool a subagent runs behind.
+const task_tool = "task";
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Clock.now(.awake, io).toMilliseconds();
+}
+
+fn showViewing(self: *Model, source: Viewing.Source, key: u64, seq: u64, index: usize, title: []const u8) !void {
     const owned = try self.allocator.dupe(u8, title);
     errdefer self.allocator.free(owned);
 
@@ -626,7 +698,6 @@ pub fn openSubagent(self: *Model, key: u64, seq: u64, index: usize, title: []con
         .title = owned,
         .hint = hint,
     };
-    return true;
 }
 
 /// Back to the session's own transcript.
@@ -654,6 +725,7 @@ pub fn deinit(self: *Model) void {
         self.chatgpt_sign_out = null;
     }
     self.closeSubagent();
+    if (self.subagent_asked) |asked| self.allocator.free(asked.title);
     self.subagent_sessions.deinit(self.allocator);
     switch (self.session) {
         .local => |loop| loop.deinit(),
@@ -1002,6 +1074,8 @@ pub fn clearSession(self: *Model) !bool {
 /// prompts of the one that replaced it.
 pub fn showReplacedTranscript(self: *Model) !void {
     self.closeSubagent();
+    if (self.subagent_asked) |asked| self.allocator.free(asked.title);
+    self.subagent_asked = null;
     self.subagent_sessions.clearRetainingCapacity();
     clearMessageWidgets(self);
     self.thinking = .{};

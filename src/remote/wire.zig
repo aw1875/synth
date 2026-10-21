@@ -251,6 +251,13 @@ pub const Stored = struct {
     messages: u64 = 0,
 };
 
+/// What a subagent said: its transcript, oldest first.
+pub const Transcript = struct {
+    /// Still running, so this is how far it has got.
+    live: bool = false,
+    messages: []const Message = &.{},
+};
+
 /// A model the server's provider offers.
 pub const Offered = struct {
     name: []const u8,
@@ -376,6 +383,11 @@ pub const Up = union(enum) {
     load_thinking: struct {
         seq: u64,
     },
+    /// The subagent a tool call ran. Replied with `Transcript`.
+    subagent: struct {
+        seq: u64,
+        call: u32,
+    },
     /// Replied with up to `limit` messages before `before_seq`, oldest first.
     page_history: struct {
         before_seq: u64,
@@ -426,6 +438,7 @@ pub const Down = union(enum) {
 };
 
 pub fn Frame(comptime Body: type) type {
+    @setEvalBranchQuota(20_000);
     comptime for (std.meta.fields(Body)) |variant| {
         for (std.meta.fields(variant.type)) |field| {
             if (std.mem.eql(u8, field.name, "type") or std.mem.eql(u8, field.name, "id")) {

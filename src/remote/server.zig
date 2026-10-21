@@ -970,6 +970,7 @@ const Worker = struct {
             .load_tool_result => |load| return client.reply(id, try self.loadToolResult(arena, load.seq, load.call)),
             .load_thinking => |load| return client.reply(id, try self.loadThinking(arena, load.seq)),
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
+            .subagent => |asked| return client.reply(id, try self.subagentTranscript(arena, asked.seq, asked.call)),
             .sessions => |asked| return client.reply(id, try self.storedSessions(arena, asked.limit)),
             .search => |query| return client.reply(id, try self.search(arena, query.query, query.limit)),
             .hello, .list, .open, .detach, .stop, .files, .shutdown => return error.NotASessionCommand,
@@ -1382,6 +1383,30 @@ const Worker = struct {
         return out;
     }
 
+    /// The transcript of the subagent call `index` of message `seq` ran: in
+    /// memory while it runs, from the database once it has answered.
+    fn subagentTranscript(self: *Worker, arena: std.mem.Allocator, seq: u64, index: u32) !wire.Transcript {
+        const loop = &self.stack.loop;
+        if (loop.pending_seq == seq) {
+            if (self.stack.runner.viewable(index)) |child| {
+                const messages = child.convo.messages.items;
+                const out = try arena.alloc(wire.Message, messages.len);
+                for (messages, out) |*msg, *wired| wired.* = try wire.Message.from(arena, msg);
+                return .{ .live = true, .messages = out };
+            }
+        }
+
+        const session_id = loop.session_id orelse return error.NoTranscript;
+        const message = try self.db.messageId(session_id, @intCast(seq)) orelse return error.NoTranscript;
+        const call = try self.db.toolCallId(message, index) orelse return error.NoTranscript;
+        const child = try self.db.subagentSession(call) orelse return error.NoTranscript;
+        const loaded = try self.db.loadMessages(arena, child, std.math.maxInt(i64), max_messages);
+        std.mem.reverse(Conversation.Message, loaded);
+        const out = try arena.alloc(wire.Message, loaded.len);
+        for (loaded, out) |*msg, *wired| wired.* = try wire.Message.from(arena, msg);
+        return .{ .messages = out };
+    }
+
     fn held(self: *Worker, seq: u64) ?*const Conversation.Message {
         for (self.stack.convo.messages.items) |*msg| {
             if (msg.seq == seq) return msg;
@@ -1424,6 +1449,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownProvider => "no such provider",
         error.NoCredentialStore => "no ChatGPT credential file could be opened",
         error.UnknownServer => "no such MCP server",
+        error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
         error.NoMcpState => "no MCP state file, so this cannot be remembered",
         else => @errorName(err),

@@ -252,6 +252,7 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             };
             try self.models.show(entries, offer.models.recent, mirror.status.model);
         },
+        .subagent => |transcript| try self.receiveSubagent(transcript.seq, transcript.call, transcript.live, transcript.messages),
         .providers => |known| {
             defer answer.deinit(self.allocator);
             var arena_state: std.heap.ArenaAllocator = .init(self.allocator);

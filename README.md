@@ -292,8 +292,9 @@ picker, `/model` and `/effort` choose among its models. A ChatGPT sign-in
 listens on the server, so from another machine its callback port has to be
 forwarded, as the dialog says. `/sessions`, `/search` and `/clear` work on the
 server's stored sessions; switching away leaves a running turn running.
-Skills, MCP servers (`/mcp`) and `@` mentions are the server's too. Subagent
-transcripts are not available there yet.
+Skills, MCP servers (`/mcp`) and `@` mentions are the server's too. A running
+subagent's transcript shows what it has finished saying, refreshed twice a
+second, rather than streaming.
 
 ## Hooks
 

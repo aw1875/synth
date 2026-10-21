@@ -79,6 +79,8 @@ const Awaited = union(enum) {
     models,
     files,
     providers,
+    /// The call whose subagent, by the TUI's own numbering.
+    subagent: struct { seq: u64, call: u32 },
 };
 
 /// What a request the TUI made came back with, for it to show.
@@ -86,6 +88,9 @@ pub const Answer = union(enum) {
     /// The project's stored sessions. Ids are the server's, so zero here.
     sessions: []Database.SessionInfo,
     search: struct { query: []u8, hits: []Database.Hit },
+    /// A subagent's transcript, for the call `call` of message `seq` as the
+    /// TUI numbers it. Owned, numbered as the transcript is shown.
+    subagent: struct { seq: u64, call: u32, live: bool, messages: []Conversation.Message },
     /// Each provider the server knows, in an arena of their own.
     providers: struct { arena: std.heap.ArenaAllocator, states: []const wire.ProviderState },
     /// The project's files, for `@` mentions.
@@ -111,6 +116,10 @@ pub const Answer = union(enum) {
             .providers => |known| {
                 var arena = known.arena;
                 arena.deinit();
+            },
+            .subagent => |transcript| {
+                for (transcript.messages) |*msg| msg.deinit(allocator);
+                allocator.free(transcript.messages);
             },
             .files => |paths| {
                 for (paths) |path| allocator.free(path);
@@ -427,6 +436,7 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             .models => "listing the models",
             .files => "listing the files",
             .providers => "listing the providers",
+            .subagent => "loading the subagent's transcript",
         };
         return self.say("{s} failed on {s}: {s}", .{ what, self.host, reply.@"error" orelse "no reason given" });
     }
@@ -475,6 +485,21 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             const copy = try self.allocator.dupe(u8, query);
             errdefer self.allocator.free(copy);
             self.answers.appendAssumeCapacity(.{ .search = .{ .query = copy, .hits = try ownHits(self.allocator, hits) } });
+        },
+        .subagent => |at| {
+            const transcript = try wire.parseResult(wire.Transcript, arena, reply.result);
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            const messages = try self.allocator.alloc(Conversation.Message, transcript.messages.len);
+            var built: usize = 0;
+            errdefer {
+                for (messages[0..built]) |*msg| msg.deinit(self.allocator);
+                self.allocator.free(messages);
+            }
+            for (transcript.messages, messages) |message, *out| {
+                out.* = try message.toOwned(self.allocator);
+                built += 1;
+            }
+            self.answers.appendAssumeCapacity(.{ .subagent = .{ .seq = at.seq, .call = at.call, .live = transcript.live, .messages = messages } });
         },
         .providers => {
             try self.answers.ensureUnusedCapacity(self.allocator, 1);
@@ -771,6 +796,14 @@ pub fn search(self: *Mirror, query: []const u8, limit: usize) !void {
     const owned = try self.allocator.dupe(u8, query);
     errdefer self.allocator.free(owned);
     try self.send(.{ .search = .{ .query = query, .limit = @intCast(limit) } }, .{ .search = owned });
+}
+
+/// Ask for the transcript of the subagent that call `call` of message `seq`
+/// ran, unless that is already on its way. It lands on a later poll.
+pub fn loadSubagent(self: *Mirror, seq: u64, call: u32) !void {
+    const wanted: Awaited = .{ .subagent = .{ .seq = seq, .call = call } };
+    if (self.isWaitingFor(wanted)) return;
+    try self.send(.{ .subagent = .{ .seq = serverSeq(seq), .call = call } }, wanted);
 }
 
 /// Ask for older messages. They land on a later poll, so this reports none.
@@ -1073,4 +1106,50 @@ test "a mirror switches its session's mode" {
     try testing.expectEqualStrings("build", mirror.status.agent);
     try mirror.useAgent("plan");
     try pollUntil(mirror, planning);
+}
+
+fn hasNotice(mirror: *Mirror) bool {
+    return mirror.notices.items.len > 0;
+}
+
+test "a mirror loads the transcript a subagent call left" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.once);
+    try pollUntil(mirror, finishedOne);
+    const asking = convo.messages.items[1];
+    try testing.expectEqualStrings("write", asking.tool_calls[0].name);
+
+    var db = try Database.init(testing.allocator, testing.io, fixture.server.options.database_path);
+    defer db.deinit();
+    const session = (try db.sessionByHandle(mirror.status.handle)).?;
+    const message = (try db.messageId(session, @intCast(serverSeq(asking.seq)))).?;
+    const call = (try db.toolCallId(message, 0)).?;
+    const project = try db.resolveProject(fixture.project, "git", "project");
+    const child = try db.createSubagentSession(project, fixture.project, "scripted", session, call);
+    _ = try db.appendMessage(child, 0, "user", "look around", null, 0);
+    _ = try db.appendMessage(child, 1, "assistant", "found it", null, 0);
+
+    try mirror.loadSubagent(asking.seq, 0);
+    const loaded = try pollForAnswer(mirror);
+    defer loaded.deinit(testing.allocator);
+    try testing.expect(!loaded.subagent.live);
+    try testing.expectEqual(asking.seq, loaded.subagent.seq);
+    try testing.expectEqual(@as(usize, 2), loaded.subagent.messages.len);
+    try testing.expectEqualStrings("look around", loaded.subagent.messages[0].text);
+    try testing.expectEqualStrings("found it", loaded.subagent.messages[1].text);
+
+    try mirror.loadSubagent(asking.seq, 5);
+    try pollUntil(mirror, hasNotice);
+    const notice = mirror.takeNotice().?;
+    defer testing.allocator.free(notice);
+    try testing.expect(std.mem.indexOf(u8, notice, "no transcript") != null);
 }
