@@ -507,6 +507,17 @@ pub fn Frame(comptime Body: type) type {
     };
 }
 
+/// The `id` of a frame `decode` did not know, so a request a newer peer made
+/// can still be answered, if only to say it was not understood.
+pub fn idOf(arena: std.mem.Allocator, line: []const u8) ?u64 {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return null;
+    if (value != .object) return null;
+    return switch (value.object.get("id") orelse return null) {
+        .integer => |id| if (id >= 0) @intCast(id) else null,
+        else => null,
+    };
+}
+
 /// Running out of memory is not the peer's fault, and is not reported as if it were.
 fn malformed(err: anyerror) error{ OutOfMemory, MalformedMessage } {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedMessage;

@@ -1668,7 +1668,10 @@ const Client = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.MalformedMessage => return self.replyError(null, "malformed message"),
         };
-        const frame = decoded orelse return;
+        const frame = decoded orelse {
+            const id = wire.idOf(arena, line) orelse return;
+            return self.replyError(id, "unknown request; update " ++ pkg.name ++ " on the server");
+        };
         command.id = frame.id;
         command.body = .{ .request = frame.body };
 
@@ -2393,4 +2396,17 @@ test "a session's MCP servers are reported, and one turned off stays off" {
     _ = try client.expectOk(try client.send(.{ .toggle_mcp = .{ .name = "broken" } }));
     _ = try awaitMcp(client, .failed);
     try std.testing.expectEqualStrings("no such MCP server", try client.expectError(try client.send(.{ .toggle_mcp = .{ .name = "missing" } })));
+}
+
+test "a request this server does not know is answered, not left hanging" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+
+    try client.writer.interface.writeAll("{\"type\":\"from_the_future\",\"id\":41}\n");
+    try client.writer.interface.flush();
+    const reason = try client.expectError(41);
+    try std.testing.expect(std.mem.startsWith(u8, reason, "unknown request"));
 }
