@@ -303,7 +303,7 @@ pub const Up = union(enum) {
         line: []const u8,
     },
     use_agent: struct {
-        id: []const u8,
+        agent: []const u8,
     },
     /// Switch model, then run it at `effort`, or at the level last chosen for
     /// it when that is null.
@@ -381,6 +381,13 @@ pub const Down = union(enum) {
 };
 
 pub fn Frame(comptime Body: type) type {
+    comptime for (std.meta.fields(Body)) |variant| {
+        for (std.meta.fields(variant.type)) |field| {
+            if (std.mem.eql(u8, field.name, "type") or std.mem.eql(u8, field.name, "id")) {
+                @compileError(variant.name ++ "." ++ field.name ++ " would collide with the frame's own");
+            }
+        }
+    };
     return struct {
         id: ?u64 = null,
         body: Body,

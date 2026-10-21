@@ -915,7 +915,7 @@ const Worker = struct {
             .answer => |answer| try loop.answer(answer.text),
             .compact => try loop.compact(),
             .rename => |rename| try loop.rename(rename.title),
-            .use_agent => |use| try loop.useAgent(use.id),
+            .use_agent => |use| try loop.useAgent(use.agent),
             .run_skill => |invoked| {
                 if (loop.isBusy()) return error.Busy;
                 const found = skill.findIn(self.stack.skills.skills, skill.idOf(invoked.line)) orelse return error.UnknownSkill;

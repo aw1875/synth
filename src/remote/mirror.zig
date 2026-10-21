@@ -660,7 +660,7 @@ pub fn runSkill(self: *Mirror, line: []const u8) !void {
 }
 
 pub fn useAgent(self: *Mirror, id: []const u8) !void {
-    try self.send(.{ .use_agent = .{ .id = id } }, .{ .command = "Switching mode" });
+    try self.send(.{ .use_agent = .{ .agent = id } }, .{ .command = "Switching mode" });
 }
 
 /// Switch the server's model, to run at `effort`, or at the level last
@@ -1007,4 +1007,22 @@ test "a mirror offers the server's skills, and running one sends the server's in
     const asked = convo.messages.items[0];
     try testing.expectEqualStrings("/release 2.1", asked.text);
     try testing.expect(std.mem.indexOf(u8, asked.attachments[0].content, "Tag it and push.") != null);
+}
+
+fn planning(mirror: *Mirror) bool {
+    return std.mem.eql(u8, mirror.status.agent, "plan");
+}
+
+test "a mirror switches its session's mode" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    try testing.expectEqualStrings("build", mirror.status.agent);
+    try mirror.useAgent("plan");
+    try pollUntil(mirror, planning);
 }
