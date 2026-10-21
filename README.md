@@ -115,6 +115,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
+| `auto_approve_all` | bool | `false` | Run every tool call without a prompt, including reads and writes outside the project. Meant for a machine set aside for the agent. `PreToolUse` hooks still run and can still refuse a call. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
