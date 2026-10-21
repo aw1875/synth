@@ -384,6 +384,24 @@ pub fn findSession(self: *Database, project_id: i64, public_id: []const u8) !?i6
     return row.int(0);
 }
 
+/// The top-level session a handle names, in any project.
+pub fn sessionByHandle(self: *Database, public_id: []const u8) !?i64 {
+    const row = try self.conn.row(
+        "SELECT id FROM session WHERE public_id = ? AND parent_tool_call IS NULL",
+        .{public_id},
+    ) orelse return null;
+    defer row.deinit();
+    return row.int(0);
+}
+
+/// Where a session ran. Caller owns the result.
+pub fn sessionCwd(self: *Database, session_id: i64, allocator: std.mem.Allocator) ![]const u8 {
+    const row = try self.conn.row("SELECT cwd FROM session WHERE id = ?", .{session_id}) orelse
+        return error.UnknownSession;
+    defer row.deinit();
+    return allocator.dupe(u8, row.text(0));
+}
+
 /// The most recently touched session with anything in it, for `--continue`.
 pub fn latestSession(self: *Database, project_id: i64) !?i64 {
     const row = try self.conn.row(
@@ -1722,6 +1740,11 @@ test "sessions get a handle, and are found by it" {
 
     try std.testing.expectEqual(session_id, (try db.findSession(project_id, handle)).?);
     try std.testing.expect(try db.findSession(project_id, "ses_00000000") == null);
+    try std.testing.expectEqual(session_id, (try db.sessionByHandle(handle)).?);
+    try std.testing.expect(try db.sessionByHandle("ses_00000000") == null);
+    const cwd = try db.sessionCwd(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectEqualStrings("/tmp/project", cwd);
 
     try std.testing.expectEqual(@as(usize, 0), (try db.listSessions(std.testing.allocator, project_id, 10)).len);
     try std.testing.expect(try db.latestSession(project_id) == null);

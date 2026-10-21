@@ -155,6 +155,8 @@ pub const Status = struct {
     /// Prompts typed while busy, waiting for the next step.
     steering: []const []const u8 = &.{},
     outcome: ?Loop.Outcome = null,
+    /// The request streaming right now, as `Stream.request` numbers it.
+    request: ?u64 = null,
     /// Turns finished so far, so a client can tell a new ending from one it
     /// has already seen.
     finished: u64 = 0,
@@ -312,9 +314,8 @@ pub fn Frame(comptime Body: type) type {
         /// Null for a `type` this build does not know: a newer peer may send
         /// messages we predate, and skipping them is the versioning rule.
         /// Strings point into `arena` or `line`.
-        pub fn decode(arena: std.mem.Allocator, line: []const u8) !?Self {
-            const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch
-                return error.MalformedMessage;
+        pub fn decode(arena: std.mem.Allocator, line: []const u8) error{ OutOfMemory, MalformedMessage }!?Self {
+            const value = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| return malformed(err);
             if (value != .object) return error.MalformedMessage;
 
             const name = switch (value.object.get("type") orelse return error.MalformedMessage) {
@@ -325,19 +326,24 @@ pub fn Frame(comptime Body: type) type {
 
             const options: std.json.ParseOptions = .{ .ignore_unknown_fields = true };
             const id: ?u64 = if (value.object.get("id")) |id|
-                std.json.parseFromValueLeaky(u64, arena, id, options) catch return error.MalformedMessage
+                std.json.parseFromValueLeaky(u64, arena, id, options) catch |err| return malformed(err)
             else
                 null;
             switch (tag) {
                 inline else => |t| {
                     const Payload = @FieldType(Body, @tagName(t));
-                    const payload = std.json.parseFromValueLeaky(Payload, arena, value, options) catch
-                        return error.MalformedMessage;
+                    const payload = std.json.parseFromValueLeaky(Payload, arena, value, options) catch |err|
+                        return malformed(err);
                     return .{ .id = id, .body = @unionInit(Body, @tagName(t), payload) };
                 },
             }
         }
     };
+}
+
+/// Running out of memory is not the peer's fault, and is not reported as if it were.
+fn malformed(err: anyerror) error{ OutOfMemory, MalformedMessage } {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.MalformedMessage;
 }
 
 /// One frame as one line. The caller flushes.
@@ -367,8 +373,8 @@ pub fn encodeResult(w: *std.Io.Writer, id: ?u64, result: anytype) !void {
 /// A reply's result as the type its request is documented to return.
 pub fn parseResult(comptime T: type, arena: std.mem.Allocator, result: ?std.json.Value) !T {
     const value = result orelse return error.MalformedMessage;
-    return std.json.parseFromValueLeaky(T, arena, value, .{ .ignore_unknown_fields = true }) catch
-        error.MalformedMessage;
+    return std.json.parseFromValueLeaky(T, arena, value, .{ .ignore_unknown_fields = true }) catch |err|
+        malformed(err);
 }
 
 /// The next non-empty line, without its line ending. Null once the peer has

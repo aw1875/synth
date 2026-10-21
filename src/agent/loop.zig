@@ -153,6 +153,9 @@ message_ids: std.AutoHashMapUnmanaged(u64, i64) = .empty,
 
 state: State = .idle,
 request: ?*Request = null,
+/// Requests started so far, so a watcher can tell one stream from the next
+/// even when a request ends and another begins inside the same poll.
+requests_started: u64 = 0,
 tools: ?*ToolRun = null,
 /// How many of the running batch's results have been copied into the
 /// conversation. Advances while the batch runs, so cards settle one at a time.
@@ -424,6 +427,16 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
     if (std.mem.eql(u8, stored, self.provider.model)) return;
 
     const now = set(self.provider.userdata, stored) catch return;
+    try self.adoptModel(now);
+}
+
+/// Point the provider at another of its models and record it on the session.
+pub fn switchModel(self: *Loop, model: []const u8) !void {
+    const set = self.provider.set_model orelse return error.ModelFixed;
+    try self.adoptModel(try set(self.provider.userdata, model));
+}
+
+fn adoptModel(self: *Loop, now: Provider.Current) !void {
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
@@ -700,6 +713,7 @@ fn startCompaction(self: *Loop, resume_turn: bool) !void {
         self.conversation,
         request_turn,
     );
+    self.requests_started += 1;
     self.compacting = true;
     self.resume_after_compaction = resume_turn;
     self.state = .compacting;
@@ -942,6 +956,7 @@ fn ask(self: *Loop) !void {
         self.conversation,
         self.turn(""),
     );
+    self.requests_started += 1;
     self.state = .thinking;
 }
 
@@ -1883,7 +1898,7 @@ fn persistSubagent(
                 @tagName(call.status),
                 call.result,
                 @intCast(call.result_bytes),
-            if (call.elapsed_ms) |ms| @intCast(ms) else null,
+                if (call.elapsed_ms) |ms| @intCast(ms) else null,
             );
         }
     }
