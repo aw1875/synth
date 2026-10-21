@@ -11,6 +11,7 @@ const Conversation = @import("../core/conversation.zig");
 const Role = Conversation.Role;
 const AgentLoop = @import("../agent/loop.zig");
 const Mirror = @import("../remote/mirror.zig");
+const remote_client = @import("../remote/client.zig");
 const Session = @import("session.zig").Session;
 const Subagent = @import("../agent/subagent.zig");
 const mention = @import("../core/mention.zig");
@@ -1070,6 +1071,30 @@ pub fn clearSession(self: *Model) !bool {
     return true;
 }
 
+/// `path` with `home` written as `~`, the way a shell shows it. Caller owns
+/// the result.
+pub fn homeRelative(allocator: std.mem.Allocator, home: ?[]const u8, path: []const u8) ![]u8 {
+    const prefix = home orelse return allocator.dupe(u8, path);
+    if (prefix.len == 0 or !std.mem.startsWith(u8, path, prefix)) return allocator.dupe(u8, path);
+    const rest = path[prefix.len..];
+    if (rest.len > 0 and rest[0] != '/') return allocator.dupe(u8, path);
+    return std.fmt.allocPrint(allocator, "~{s}", .{rest});
+}
+
+test "a path under home is shown from ~" {
+    const cases = [_]struct { home: ?[]const u8, path: []const u8, want: []const u8 }{
+        .{ .home = "/home/me", .path = "/home/me/src/api", .want = "~/src/api" },
+        .{ .home = "/home/me", .path = "/home/me", .want = "~" },
+        .{ .home = "/home/me", .path = "/home/meadow", .want = "/home/meadow" },
+        .{ .home = null, .path = "/srv", .want = "/srv" },
+    };
+    for (cases) |case| {
+        const got = try homeRelative(std.testing.allocator, case.home, case.path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expectEqualStrings(case.want, got);
+    }
+}
+
 /// Forget what was drawn for the transcript just replaced, and recall the
 /// prompts of the one that replaced it.
 pub fn showReplacedTranscript(self: *Model) !void {
@@ -1086,7 +1111,10 @@ pub fn showReplacedTranscript(self: *Model) !void {
     self.scroll = 0;
     if (self.remote) |mirror| {
         self.slash.skills = mirror.skills;
-        const where = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ mirror.host, mirror.status.root });
+        const where = if (std.mem.eql(u8, mirror.host, remote_client.here))
+            try homeRelative(self.allocator, if (self.environ) |env| env.get("HOME") else null, mirror.status.root)
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ mirror.host, mirror.status.root });
         self.allocator.free(self.cwd_display);
         self.cwd_display = where;
     }

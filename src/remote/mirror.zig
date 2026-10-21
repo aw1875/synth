@@ -58,6 +58,8 @@ notices: std.ArrayList([]u8) = .empty,
 answers: std.ArrayList(Answer) = .empty,
 /// A snapshot replaced the transcript since the TUI last asked.
 switched: bool = false,
+/// The session attached has anything in it.
+spoken: bool = false,
 /// Requests sent and not yet answered, by id.
 waiting: std.AutoHashMapUnmanaged(u64, Awaited) = .empty,
 paging: bool = false,
@@ -329,6 +331,7 @@ fn applySnapshot(self: *Mirror, snapshot: wire.Snapshot) !void {
     self.switched = true;
     for (snapshot.messages) |message| try self.conversation.adoptMessage(try self.own(message));
     self.conversation.dropped += snapshot.dropped;
+    self.spoken = snapshot.messages.len > 0 or snapshot.dropped > 0;
     try self.keepStatus(snapshot.status);
     if (snapshot.stream) |stream| try self.applyStream(stream);
     try self.keepSkills(snapshot.skills);
@@ -359,6 +362,7 @@ fn applyMessage(self: *Mirror, message: wire.Message, changed: bool) !void {
         held.* = replacement;
     } else if (!changed) {
         try self.conversation.adoptMessage(try self.own(message));
+        self.spoken = true;
     }
 }
 

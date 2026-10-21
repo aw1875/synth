@@ -294,10 +294,12 @@ pub const Up = union(enum) {
     list: struct {
         stored: u32 = 0,
     },
-    /// Start a session in `root` on the server's machine. Replied with its
-    /// `Summary`.
+    /// Start a session in `root` on the server's machine, or with `latest`
+    /// take up the project's most recent one when it has any. Replied with
+    /// its `Summary`.
     open: struct {
         root: []const u8,
+        latest: bool = false,
     },
     /// Drive a session, live or stored, by handle. A `snapshot` arrives
     /// before the reply, and events follow it.

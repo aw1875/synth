@@ -354,7 +354,7 @@ fn sourceModel(self: *Server, allocator: std.mem.Allocator) ![]const u8 {
 
 /// Start a session in `root`: a row for it now, so it has a handle to attach
 /// by before anything is said in it, and a worker to host it.
-fn open(self: *Server, root: []const u8) !*Hosted {
+fn open(self: *Server, root: []const u8, latest: bool) !*Hosted {
     const wanted = try resolveRoot(self.allocator, root, self.options.home);
     defer self.allocator.free(wanted);
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(self.io, wanted, self.allocator);
@@ -362,16 +362,20 @@ fn open(self: *Server, root: []const u8) !*Hosted {
     var project = try Project.detect(self.allocator, self.io, cwd);
     defer project.deinit(self.allocator);
 
-    const id, const handle = blk: {
+    const id, const handle, const resumed = blk: {
         self.db_mutex.lockUncancelable(self.io);
         defer self.db_mutex.unlock(self.io);
         const project_id = try self.db.resolveProject(project.root, "git", project.name());
+        if (latest) {
+            if (try self.db.latestSession(project_id)) |id| break :blk .{ id, try self.db.sessionPublicId(id, self.allocator), true };
+        }
         const model = try self.sourceModel(self.allocator);
         defer self.allocator.free(model);
         const id = try self.db.createSession(project_id, cwd, model);
-        break :blk .{ id, try self.db.sessionPublicId(id, self.allocator) };
+        break :blk .{ id, try self.db.sessionPublicId(id, self.allocator), false };
     };
     defer self.allocator.free(handle);
+    if (resumed) return self.acquire(handle);
     return self.host(id, handle, cwd);
 }
 
@@ -1673,7 +1677,7 @@ const Client = struct {
                 self.reply(frame.id, sessions);
             },
             .open => |request| {
-                const hosted = self.server.open(request.root) catch |err| {
+                const hosted = self.server.open(request.root, request.latest) catch |err| {
                     const reason = std.fmt.allocPrint(arena, "{s}: {s}", .{ describe(err), request.root }) catch describe(err);
                     return self.replyError(frame.id, reason);
                 };

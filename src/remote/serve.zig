@@ -29,6 +29,9 @@ pub fn run(init: std.process.Init) !void {
     defer arena_state.deinit();
     var db = try Database.init(allocator, io, config.database_path);
     defer db.deinit();
+    if (db.prune(config.prune, db.nowMs())) |dropped| {
+        if (dropped.any()) db.vacuum() catch {};
+    } else |_| {}
     const active = try catalog.resolve(arena_state.allocator(), &db, &config, &auth);
 
     var backend: Backend = .init(active.entry.kind, .{

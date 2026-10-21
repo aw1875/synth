@@ -16,6 +16,7 @@ const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const tui_app = @import("../tui/app.zig");
 const tui_bell = @import("../tui/bell.zig");
+const tui_commands = @import("../tui/commands.zig");
 const Input = @import("../tui/input.zig");
 const Model = @import("../tui/model.zig");
 const themes = @import("../tui/themes.zig");
@@ -45,7 +46,8 @@ pub fn run(init: std.process.Init, host: []const u8, requested: ?[]const u8) !vo
 
     // Printed once the TUI has given the terminal back, or it would be drawn
     // on the screen it is about to leave.
-    if (try drive(init, connection, host, handle)) {
+    const left = try drive(init, connection, host, handle, .{}) orelse return;
+    if (left.live) {
         var farewell: [512]u8 = undefined;
         var out = std.Io.File.stdout().writer(io, &farewell);
         try out.interface.print(
@@ -53,19 +55,36 @@ pub fn run(init: std.process.Init, host: []const u8, requested: ?[]const u8) !vo
             \\Session {1s} carries on on {0s}
             \\  {2s} remote connect {0s} {1s}   come back to it
             \\
-        , .{ host, handle, pkg.name });
+        , .{ host, left.handle, pkg.name });
         try out.interface.flush();
     }
 }
 
-/// Run the TUI on `handle`, taking `connection` over. Whether the session is
-/// still running on the host when the TUI closes.
-fn drive(
+pub const Options = struct {
+    /// Switch the session to this model once attached.
+    model: ?[]const u8 = null,
+};
+
+/// How a TUI left its session.
+pub const Left = struct {
+    /// The session is still running on the host.
+    live: bool,
+    /// Its handle, in the process arena: `/sessions` may have moved the TUI
+    /// on from the one it started on.
+    handle: []const u8,
+    /// It has anything in it worth coming back to.
+    spoken: bool,
+};
+
+/// Run the TUI on `handle`, taking `connection` over. Null, having said why,
+/// when the session could not be attached.
+pub fn drive(
     init: std.process.Init,
     connection: *client.Connection,
     host: []const u8,
     handle: []const u8,
-) !bool {
+    options: Options,
+) !?Left {
     const io = init.io;
     const allocator = init.gpa;
     var attached = false;
@@ -93,6 +112,7 @@ fn drive(
         .cwd_display = try allocator.dupe(u8, host),
         .environ = init.environ_map,
         .bell = config.bell,
+        .prune_policy = config.prune,
         .db = if (db) |*settings| settings else null,
     };
 
@@ -104,11 +124,12 @@ fn drive(
         allocator.free(model.cwd_display);
         if (err != error.Refused) return err;
         try complain(io, "{s}", .{failure.message});
-        return false;
+        return null;
     };
     attached = true;
     model.remote = mirror;
     model.provider = mirror.provider;
+    if (options.model) |name| try mirror.switchModel(name, null, null);
 
     var buffer: [1024]u8 = undefined;
     var app: vxfw.App = try .init(io, allocator, init.environ_map, &buffer);
@@ -119,9 +140,14 @@ fn drive(
     defer model.deinit();
     tui_bell.askForFocusReports(&app);
     defer tui_bell.stopFocusReports(&app);
+    if (mirror.status.provider_missing) try tui_commands.showProviders(model);
 
     try app.run(tui_app.widget(model), .{});
-    return !mirror.ended;
+    return .{
+        .live = !mirror.ended,
+        .handle = try init.arena.allocator().dupe(u8, mirror.status.handle),
+        .spoken = mirror.spoken,
+    };
 }
 
 /// The session to attach when none was named: the one live session, or the

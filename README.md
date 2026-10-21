@@ -48,7 +48,7 @@ synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
 synth remote connect <host>    drive a session on a host in the TUI
-synth remote list <host>       live sessions on a host (. is this machine)
+synth remote list <host>       sessions on a host, live then stored (. is here)
 synth remote new <host> <dir>  start a session there
 synth remote stop <host> <id>  end one; its transcript stays
 synth remote serve|bridge      host sessions here, or reach them over stdio
@@ -256,14 +256,18 @@ servers on and off without leaving the TUI.
 
 ## Remote
 
-Sessions can run on another machine - a dev VM, a bigger box - with the agent,
-its tools, the database and the provider all over there. A session on a server
-keeps running whoever is attached, so a turn survives a closed laptop.
+Every session runs in a session server, one per user and machine, which
+`synth` starts the first time it is needed. The TUI is a client of it:
+quitting leaves the session where it is, mid-turn included, and any other
+terminal, or another machine, can pick it up. The agent, its tools, the
+database and the provider all live with the server.
+
+To drive from another machine a session you started on `devbox`:
 
 ```
-synth remote new devbox src/api         # start a session in ~/src/api there
-synth remote connect devbox             # drive it; ctrl+c leaves it running
+synth remote connect devbox             # the one live there, or pick from a list
 synth remote connect devbox ses_7k3f9a2b
+synth remote new devbox src/api         # or start one in ~/src/api there
 ```
 
 A directory that is not absolute is taken from your home directory on the
