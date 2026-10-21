@@ -5,6 +5,10 @@ const std = @import("std");
 
 const wire = @import("wire.zig");
 const client = @import("client.zig");
+const humanize = @import("../core/humanize.zig");
+
+/// Stored sessions offered beside the live ones.
+pub const stored_offered: u32 = 9;
 
 pub fn list(init: std.process.Init, host: []const u8) !void {
     var arena_state: std.heap.ArenaAllocator = .init(init.gpa);
@@ -14,13 +18,17 @@ pub fn list(init: std.process.Init, host: []const u8) !void {
     var failure: client.Diagnostic = .{};
     const connection = try connect(init, host, &failure) orelse return;
     defer connection.close();
-    const result = connection.call(arena, .{ .list = .{} }, &failure) catch |err| return refused(init.io, host, err, &failure);
+    const result = connection.call(arena, .{ .list = .{ .stored = stored_offered } }, &failure) catch |err| return refused(init.io, host, err, &failure);
     const sessions = try wire.parseResult([]const wire.Summary, arena, result);
 
     var buffer: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &buffer);
-    if (sessions.len == 0) try out.interface.print("no live sessions on {s}\n", .{host});
-    for (sessions) |session| try printSummary(&out.interface, session);
+    if (sessions.len == 0) try out.interface.print("no sessions on {s} yet\n", .{host});
+    const now = std.Io.Clock.now(.real, init.io).toMilliseconds();
+    for (sessions) |session| {
+        try printSummary(&out.interface, session, now);
+        try out.interface.writeByte('\n');
+    }
     try out.interface.flush();
 }
 
@@ -37,7 +45,8 @@ pub fn new(init: std.process.Init, host: []const u8, root: []const u8) !void {
 
     var buffer: [1024]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &buffer);
-    try printSummary(&out.interface, session);
+    try printSummary(&out.interface, session, std.Io.Clock.now(.real, init.io).toMilliseconds());
+    try out.interface.writeByte('\n');
     try out.interface.flush();
 }
 
@@ -83,9 +92,16 @@ fn complain(io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     try out.interface.flush();
 }
 
-fn printSummary(out: *std.Io.Writer, session: wire.Summary) !void {
-    const state = if (session.state == .idle) "idle" else session.state.label();
-    try out.print("{s}  {s}  {d} attached  {s}", .{ session.handle, state, session.clients, session.root });
+/// One session on one line: its handle, where it runs, what it is doing or
+/// when it last did anything, and its title. `now` in milliseconds.
+pub fn printSummary(out: *std.Io.Writer, session: wire.Summary, now: i64) !void {
+    try out.print("{s}  {s}  ", .{ session.handle, session.root });
+    if (session.live) {
+        const state = if (session.state == .idle) "idle" else session.state.label();
+        try out.print("live, {s}, {d} attached", .{ state, session.clients });
+    } else {
+        var buffer: [humanize.ago_bytes]u8 = undefined;
+        try out.print("stored, {s}", .{humanize.ago(&buffer, @intCast(@max(0, now - session.updated_at)))});
+    }
     if (session.title.len > 0) try out.print("  \"{s}\"", .{session.title});
-    try out.writeByte('\n');
 }

@@ -175,6 +175,57 @@ pub const SessionInfo = struct {
     }
 };
 
+/// A stored session anywhere on this machine, with where it ran.
+pub const RecentSession = struct {
+    public_id: []const u8,
+    title: []const u8,
+    cwd: []const u8,
+    updated_at: i64,
+    messages: u64,
+
+    pub fn deinit(self: *const RecentSession, allocator: std.mem.Allocator) void {
+        allocator.free(self.public_id);
+        allocator.free(self.title);
+        allocator.free(self.cwd);
+    }
+};
+
+/// Sessions with anything in them, across every project, most recently
+/// touched first.
+pub fn recentSessions(self: *Database, allocator: std.mem.Allocator, limit: usize) ![]RecentSession {
+    var rows = try self.conn.rows(
+        \\SELECT s.public_id, s.title, s.cwd, s.updated_at, COUNT(m.id) AS messages
+        \\FROM session s
+        \\JOIN message m ON m.session_id = s.id
+        \\WHERE s.parent_tool_call IS NULL
+        \\GROUP BY s.id
+        \\ORDER BY s.updated_at DESC
+        \\LIMIT ?
+    , .{@as(i64, @intCast(limit))});
+    defer rows.deinit();
+
+    var list: std.ArrayList(RecentSession) = .empty;
+    errdefer {
+        for (list.items) |info| info.deinit(allocator);
+        list.deinit(allocator);
+    }
+    while (rows.next()) |row| {
+        try list.ensureUnusedCapacity(allocator, 1);
+        const public_id = try allocator.dupe(u8, row.text(0));
+        errdefer allocator.free(public_id);
+        const title = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(title);
+        list.appendAssumeCapacity(.{
+            .public_id = public_id,
+            .title = title,
+            .cwd = try allocator.dupe(u8, row.text(2)),
+            .updated_at = row.int(3),
+            .messages = @intCast(row.int(4)),
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// Models this project has actually used, most recently first.
 pub fn recentModels(
     self: *Database,
@@ -2082,4 +2133,37 @@ test "a provider's replay record comes back whole on resume, and is shed with ol
     try db.conn.exec("UPDATE session SET updated_at = 0 WHERE id = ?", .{session_id});
     _ = try db.prune(.{ .shed_after_days = 1 }, db.nowMs());
     try std.testing.expectEqual(@as(i64, 0), try countOf(&db, "SELECT count(*) FROM blob WHERE kind = '" ++ provider_state_blob ++ "'"));
+}
+
+test "recent sessions come from every project, and only those with anything in them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/r.db", .{buf[0..n]});
+    defer std.testing.allocator.free(db_path);
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const api = try db.createSession(try db.resolveProject("/src/api", "git", "api"), "/src/api", "qwen3");
+    const web = try db.createSession(try db.resolveProject("/src/web", "git", "web"), "/src/web/app", "qwen3");
+    _ = try db.createSession(try db.resolveProject("/src/web", "git", "web"), "/src/web", "qwen3");
+    _ = try db.appendMessage(api, 0, "user", "hello", null, 0);
+    _ = try db.appendMessage(web, 0, "user", "hi", null, 0);
+    _ = try db.appendMessage(web, 1, "assistant", "hello", null, 0);
+
+    const recent = try db.recentSessions(std.testing.allocator, 10);
+    defer {
+        for (recent) |info| info.deinit(std.testing.allocator);
+        std.testing.allocator.free(recent);
+    }
+    try std.testing.expectEqual(@as(usize, 2), recent.len);
+    for (recent) |info| {
+        if (std.mem.eql(u8, info.cwd, "/src/web/app")) {
+            try std.testing.expectEqual(@as(u64, 2), info.messages);
+        } else {
+            try std.testing.expectEqualStrings("/src/api", info.cwd);
+            try std.testing.expectEqual(@as(u64, 1), info.messages);
+        }
+    }
 }

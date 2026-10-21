@@ -11,6 +11,7 @@ const vxfw = vaxis.vxfw;
 const client = @import("client.zig");
 const wire = @import("wire.zig");
 const Mirror = @import("mirror.zig");
+const verbs = @import("verbs.zig");
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const tui_app = @import("../tui/app.zig");
@@ -32,15 +33,15 @@ pub fn run(init: std.process.Init, host: []const u8, requested: ?[]const u8) !vo
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const listed = connection.call(arena, .{ .list = .{} }, &failure) catch |err| {
+    const listed = connection.call(arena, .{ .list = .{ .stored = verbs.stored_offered } }, &failure) catch |err| {
         connection.close();
         return err;
     };
-    const live = try wire.parseResult([]const wire.Summary, arena, listed);
-    const handle = requested orelse (onlyOne(io, host, live) catch {
+    const sessions = try wire.parseResult([]const wire.Summary, arena, listed);
+    const handle = requested orelse (try choose(io, host, sessions)) orelse {
         connection.close();
         return;
-    });
+    };
 
     // Printed once the TUI has given the terminal back, or it would be drawn
     // on the screen it is about to leave.
@@ -123,17 +124,47 @@ fn drive(
     return !mirror.ended;
 }
 
-/// The session to attach when none was named: the only one there is. Says
-/// what to do instead when there is not exactly one.
-fn onlyOne(io: std.Io, host: []const u8, live: []const wire.Summary) ![]const u8 {
-    if (live.len == 1) return live[0].handle;
-    if (live.len == 0) {
-        try complain(io, "no live sessions on {s}; start one with: {s} remote new {s} <dir>", .{ host, pkg.name, host });
-        return error.NoSession;
+/// The session to attach when none was named: the one live session, or the
+/// one picked from a list. Null, having said why, when there is nothing to
+/// pick or nobody to pick it.
+fn choose(io: std.Io, host: []const u8, sessions: []const wire.Summary) !?[]const u8 {
+    if (sessions.len == 0) {
+        try complain(io, "nothing on {s} yet; start a session with: {s} remote new {s} <dir>", .{ host, pkg.name, host });
+        return null;
     }
-    try complain(io, "{d} live sessions on {s}; name one:", .{ live.len, host });
-    for (live) |session| try complain(io, "  {s} remote connect {s} {s}   {s}", .{ pkg.name, host, session.handle, session.root });
-    return error.NoSession;
+    var live: usize = 0;
+    for (sessions) |session| live += @intFromBool(session.live);
+    if (live == 1) return sessions[0].handle;
+
+    var buffer: [4096]u8 = undefined;
+    var out = std.Io.File.stderr().writer(io, &buffer);
+    const now = std.Io.Clock.now(.real, io).toMilliseconds();
+    try out.interface.print("Sessions on {s}:\n", .{host});
+    for (sessions, 1..) |session, number| {
+        try out.interface.print("  {d}  ", .{number});
+        try verbs.printSummary(&out.interface, session, now);
+        try out.interface.writeByte('\n');
+    }
+    if (!try std.Io.File.stdin().isTty(io)) {
+        try out.interface.print("name one: {s} remote connect {s} <session>\n", .{ pkg.name, host });
+        try out.interface.flush();
+        return null;
+    }
+    try out.interface.print("Attach which? [1] ", .{});
+    try out.interface.flush();
+
+    var line_buffer: [64]u8 = undefined;
+    var in = std.Io.File.stdin().reader(io, &line_buffer);
+    const read = in.interface.takeDelimiter('\n') catch return null;
+    const line = read orelse return null;
+    const answer = std.mem.trim(u8, line, " \t\r");
+    if (answer.len == 0) return sessions[0].handle;
+    const number = std.fmt.parseInt(usize, answer, 10) catch 0;
+    if (number == 0 or number > sessions.len) {
+        try complain(io, "no session {s}", .{answer});
+        return null;
+    }
+    return sessions[number - 1].handle;
 }
 
 fn complain(io: std.Io, comptime fmt: []const u8, args: anytype) !void {

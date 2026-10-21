@@ -86,7 +86,8 @@ db_mutex: std.Io.Mutex = .init,
 /// Guards `sessions`, `retired` and `clients`.
 mutex: std.Io.Mutex = .init,
 sessions: std.ArrayList(*Hosted) = .empty,
-/// Sessions that unloaded themselves, waiting for their worker to be joined.
+/// Sessions taken out of the list, unloading or stopped, until their worker
+/// is joined. Loading one again waits for it to finish first.
 retired: std.ArrayList(*Hosted) = .empty,
 clients: std.ArrayList(*Client) = .empty,
 
@@ -246,7 +247,7 @@ fn reapSessions(self: *Server) void {
     var at: usize = 0;
     while (at < self.retired.items.len) {
         const hosted = self.retired.items[at];
-        if (!hosted.finished.load(.acquire)) {
+        if (!hosted.done.isSet()) {
             at += 1;
             continue;
         }
@@ -340,6 +341,8 @@ fn resolveRoot(allocator: std.mem.Allocator, root: []const u8, home: ?[]const u8
 /// live. The caller holds a reference and releases it.
 fn acquire(self: *Server, handle: []const u8) !*Hosted {
     if (self.findLive(handle)) |hosted| return hosted;
+    // What the database says about it is only settled once its last worker is done.
+    self.awaitLeft(handle);
 
     const id, const cwd = blk: {
         self.db_mutex.lockUncancelable(self.io);
@@ -370,22 +373,28 @@ fn findLive(self: *Server, handle: []const u8) ?*Hosted {
 /// Whoever takes a session out of the list owns its join and the list's
 /// reference, which is what `end` gives up.
 fn host(self: *Server, id: i64, handle: []const u8, cwd: []const u8) !*Hosted {
-    const hosted = blk: {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (self.sessions.items) |live| {
-            if (live.id == id) {
-                live.retain();
-                return live;
+    const hosted = spawned: while (true) {
+        const old = old: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            for (self.sessions.items) |live| {
+                if (live.id == id) {
+                    live.retain();
+                    return live;
+                }
             }
-        }
-        const hosted = try Hosted.create(self, id, handle, cwd);
-        errdefer hosted.release();
-        try self.sessions.ensureUnusedCapacity(self.allocator, 1);
-        hosted.thread = try std.Thread.spawn(.{}, Worker.run, .{hosted});
-        self.sessions.appendAssumeCapacity(hosted);
-        hosted.retain();
-        break :blk hosted;
+            if (self.leaving(id)) |old| break :old old;
+
+            const hosted = try Hosted.create(self, id, handle, cwd);
+            errdefer hosted.release();
+            try self.sessions.ensureUnusedCapacity(self.allocator, 1);
+            hosted.thread = try std.Thread.spawn(.{}, Worker.run, .{hosted});
+            self.sessions.appendAssumeCapacity(hosted);
+            hosted.retain();
+            break :spawned hosted;
+        };
+        old.done.waitUncancelable(self.io);
+        old.release();
     };
 
     hosted.ready.waitUncancelable(self.io);
@@ -393,6 +402,37 @@ fn host(self: *Server, id: i64, handle: []const u8, cwd: []const u8) !*Hosted {
     if (self.forget(hosted)) hosted.end();
     hosted.release();
     return failure;
+}
+
+/// Wait until no worker for `handle` is still on its way out.
+fn awaitLeft(self: *Server, handle: []const u8) void {
+    while (true) {
+        const old = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            for (self.retired.items) |old| {
+                if (std.mem.eql(u8, old.handle, handle) and !old.done.isSet()) {
+                    old.retain();
+                    break :blk old;
+                }
+            }
+            return;
+        };
+        old.done.waitUncancelable(self.io);
+        old.release();
+    }
+}
+
+/// A worker for session `id` that is still on its way out, retained. Called
+/// with the mutex held.
+fn leaving(self: *Server, id: i64) ?*Hosted {
+    for (self.retired.items) |old| {
+        if (old.id == id and !old.done.isSet()) {
+            old.retain();
+            return old;
+        }
+    }
+    return null;
 }
 
 /// Take a session out of the list, so nothing new can find it. False when
@@ -409,28 +449,72 @@ fn forget(self: *Server, hosted: *Hosted) bool {
     return false;
 }
 
-/// End a live session. Its transcript stays in the database.
+/// End a live session. Its transcript stays in the database, and loading it
+/// again waits for this worker to finish.
 fn stopSession(self: *Server, handle: []const u8) !void {
-    const hosted = blk: {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        for (self.sessions.items, 0..) |live, at| {
-            if (std.mem.eql(u8, live.handle, handle)) {
-                _ = self.sessions.swapRemove(at);
-                break :blk live;
-            }
-        }
-        return error.UnknownSession;
-    };
-    hosted.end();
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    for (self.sessions.items, 0..) |live, at| {
+        if (!std.mem.eql(u8, live.handle, handle)) continue;
+        try self.retired.ensureUnusedCapacity(self.allocator, 1);
+        _ = self.sessions.swapRemove(at);
+        self.retired.appendAssumeCapacity(live);
+        live.exiting.store(true, .release);
+        live.wake.set(self.io);
+        return;
+    }
+    return error.UnknownSession;
 }
 
-fn summaries(self: *Server, arena: std.mem.Allocator) ![]const wire.Summary {
+fn summaries(self: *Server, arena: std.mem.Allocator) ![]wire.Summary {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     const out = try arena.alloc(wire.Summary, self.sessions.items.len);
     for (self.sessions.items, out) |hosted, *summary| summary.* = try hosted.summary(arena);
     return out;
+}
+
+/// The live sessions, most recently touched first, then up to `stored` of
+/// the most recent ones that are not loaded.
+fn listing(self: *Server, arena: std.mem.Allocator, stored: u32) ![]const wire.Summary {
+    const live = try self.summaries(arena);
+    const recent = blk: {
+        self.db_mutex.lockUncancelable(self.io);
+        defer self.db_mutex.unlock(self.io);
+        break :blk try self.db.recentSessions(arena, live.len + stored);
+    };
+
+    var out: std.ArrayList(wire.Summary) = try .initCapacity(arena, live.len + stored);
+    for (live) |summary| {
+        var known = summary;
+        for (recent) |info| {
+            if (!std.mem.eql(u8, info.public_id, summary.handle)) continue;
+            known.updated_at = info.updated_at;
+            known.messages = info.messages;
+        }
+        out.appendAssumeCapacity(known);
+    }
+    std.mem.sort(wire.Summary, out.items, {}, newerFirst);
+
+    for (recent) |info| {
+        if (out.items.len == live.len + stored) break;
+        const loaded = for (live) |summary| {
+            if (std.mem.eql(u8, summary.handle, info.public_id)) break true;
+        } else false;
+        if (loaded) continue;
+        out.appendAssumeCapacity(.{
+            .handle = info.public_id,
+            .title = info.title,
+            .root = info.cwd,
+            .updated_at = info.updated_at,
+            .messages = info.messages,
+        });
+    }
+    return out.items;
+}
+
+fn newerFirst(_: void, a: wire.Summary, b: wire.Summary) bool {
+    return a.updated_at > b.updated_at;
 }
 
 /// A command for a session's worker. Owns its frame: the line it was decoded
@@ -494,8 +578,8 @@ const Hosted = struct {
     /// Raised for every command, and by `end`.
     wake: std.Io.Event = .unset,
     exiting: std.atomic.Value(bool) = .init(false),
-    /// The worker has returned, and only needs joining.
-    finished: std.atomic.Value(bool) = .init(false),
+    /// The worker is finished with the session, and only needs joining.
+    done: std.Io.Event = .unset,
     inbox_mutex: std.Io.Mutex = .init,
     inbox: std.DoublyLinkedList = .{},
     /// Once set, nothing more is queued: commands are refused on the spot.
@@ -608,6 +692,7 @@ const Hosted = struct {
             .root = self.cwd,
             .state = self.state,
             .clients = self.clients,
+            .live = true,
         };
     }
 };
@@ -640,6 +725,7 @@ const Worker = struct {
         self.build() catch |err| {
             hosted.failure = err;
             self.close("the session could not start");
+            hosted.done.set(self.io);
             hosted.ready.set(self.io);
             return;
         };
@@ -647,7 +733,7 @@ const Worker = struct {
         self.serve();
         self.close("the session has ended");
         self.teardown();
-        hosted.finished.store(true, .release);
+        hosted.done.set(self.io);
     }
 
     fn build(self: *Worker) !void {
@@ -800,11 +886,11 @@ const Worker = struct {
                 if (loop.isBusy()) return error.Busy;
                 try self.chooseEffort(set.effort);
             },
-            .models => |listing| return client.reply(id, try self.models(arena, listing.recent)),
+            .models => |asked| return client.reply(id, try self.models(arena, asked.recent)),
             .load_tool_result => |load| return client.reply(id, try self.loadToolResult(arena, load.seq, load.call)),
             .load_thinking => |load| return client.reply(id, try self.loadThinking(arena, load.seq)),
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
-            .sessions => |listing| return client.reply(id, try self.storedSessions(arena, listing.limit)),
+            .sessions => |asked| return client.reply(id, try self.storedSessions(arena, asked.limit)),
             .search => |query| return client.reply(id, try self.search(arena, query.query, query.limit)),
             .hello, .list, .open, .detach, .stop, .files => return error.NotASessionCommand,
         }
@@ -1331,8 +1417,8 @@ const Client = struct {
 
         switch (frame.body) {
             .hello => self.replyError(frame.id, "already said hello"),
-            .list => {
-                const sessions = self.server.summaries(arena) catch |err| return self.replyError(frame.id, describe(err));
+            .list => |request| {
+                const sessions = self.server.listing(arena, request.stored) catch |err| return self.replyError(frame.id, describe(err));
                 self.reply(frame.id, sessions);
             },
             .open => |request| {

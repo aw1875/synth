@@ -211,6 +211,11 @@ pub const Summary = struct {
     state: Loop.State = .idle,
     /// Clients attached right now.
     clients: u32 = 0,
+    /// Loaded on the server now, rather than only stored.
+    live: bool = false,
+    /// When it was last touched, in milliseconds since the epoch.
+    updated_at: i64 = 0,
+    messages: u64 = 0,
 };
 
 /// A stored session of the attached session's project.
@@ -249,8 +254,11 @@ pub const Up = union(enum) {
         protocol: u32,
         client: []const u8 = "",
     },
-    /// Live sessions. Replied with `[]Summary`.
-    list: struct {},
+    /// Live sessions, then up to `stored` of the most recent stored ones,
+    /// from every project. Replied with `[]Summary`.
+    list: struct {
+        stored: u32 = 0,
+    },
     /// Start a session in `root` on the server's machine. Replied with its
     /// `Summary`.
     open: struct {
