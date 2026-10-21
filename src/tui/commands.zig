@@ -223,6 +223,11 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             defer answer.deinit(self.allocator);
             try showHits(self, ctx, found.query, found.hits);
         },
+        .files => |paths| {
+            self.mentions.supply(self.io, paths);
+            try self.refreshMentions();
+            ctx.redraw = true;
+        },
         .models => |offer| {
             defer answer.deinit(self.allocator);
             const mirror = self.remote orelse return;

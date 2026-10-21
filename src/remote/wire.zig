@@ -285,6 +285,9 @@ pub const Up = union(enum) {
     set_effort: struct {
         effort: []const u8,
     },
+    /// The attached session's project files, root-relative, directories with
+    /// a trailing separator. Replied with `[][]const u8`.
+    files: struct {},
     /// Replied with `Models`, naming up to `recent` recently used.
     models: struct {
         recent: u32 = 5,

@@ -64,6 +64,11 @@ fn stopScan(self: *Popup) void {
     self.scan_result = &.{};
 }
 
+/// Whether the cursor sits in an `@` token, matches or not.
+pub fn isCompleting(self: *const Popup) bool {
+    return self.anchor != null;
+}
+
 pub fn isOpen(self: *const Popup) bool {
     if (self.anchor == null) return false;
     return self.matches.items.len > 0 or self.scanning;
@@ -82,10 +87,11 @@ pub fn close(self: *Popup) void {
 
 /// Recompute the popup state from the input buffer. Opens when the cursor sits
 /// inside an `@token`, closes otherwise.
+/// `root` is where to index from; null when the index is `supply`'d.
 pub fn update(
     self: *Popup,
     io: std.Io,
-    root: []const u8,
+    root: ?[]const u8,
     text: []const u8,
     cursor: usize,
 ) !void {
@@ -94,7 +100,7 @@ pub fn update(
         return;
     };
 
-    try self.startScan(io, root);
+    if (root) |dir| try self.startScan(io, dir);
 
     const query = std.mem.trimStart(u8, text[anchor + 1 .. cursor], "\"");
     self.anchor = anchor;
@@ -156,7 +162,7 @@ fn filter(self: *Popup, query: []const u8) !void {
 pub const stale_after_ms: i64 = 3000;
 
 /// Whether the index is old enough to be worth rebuilding.
-fn stale(self: *const Popup, io: std.Io) bool {
+pub fn stale(self: *const Popup, io: std.Io) bool {
     const built = self.indexed_at orelse return true;
     return nowMilliseconds(io) - built >= stale_after_ms;
 }
@@ -199,6 +205,15 @@ fn runScan(self: *Popup) void {
         self.scan_root,
         .{ .directories = true },
     ) catch &.{};
+}
+
+/// Take an index built elsewhere: a remote session's, listed on its server.
+/// The popup owns `paths` from here on.
+pub fn supply(self: *Popup, io: std.Io, paths: []const []const u8) void {
+    for (self.files.items) |path| self.allocator.free(path);
+    self.files.deinit(self.allocator);
+    self.files = .fromOwnedSlice(@constCast(paths));
+    self.indexed_at = nowMilliseconds(io);
 }
 
 /// Take delivery of a finished scan. Returns true when the index changed, so

@@ -1142,6 +1142,11 @@ pub fn afterDecision(self: *Model, ctx: *vxfw.EventContext) !void {
 /// every keystroke: the index is built once and the filter is a substring scan
 /// capped at the number of visible rows.
 pub fn refreshMentions(self: *Model) !void {
+    if (self.remote) |mirror| {
+        self.mentions.update(self.io, null, self.input.text.items, self.input.cursor) catch {};
+        if (self.mentions.isCompleting() and self.mentions.stale(self.io)) try mirror.listFiles();
+        return;
+    }
     const project = self.project orelse return;
     self.mentions.update(
         self.io,

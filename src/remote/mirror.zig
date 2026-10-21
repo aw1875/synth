@@ -69,6 +69,7 @@ const Awaited = union(enum) {
     /// A session opened to attach once it is up.
     fresh,
     models,
+    files,
 };
 
 /// What a request the TUI made came back with, for it to show.
@@ -76,6 +77,8 @@ pub const Answer = union(enum) {
     /// The project's stored sessions. Ids are the server's, so zero here.
     sessions: []Database.SessionInfo,
     search: struct { query: []u8, hits: []Database.Hit },
+    /// The project's files, for `@` mentions.
+    files: [][]const u8,
     /// The models the server's provider offers, in an arena of their own.
     models: struct { arena: std.heap.ArenaAllocator, models: wire.Models },
 
@@ -93,6 +96,10 @@ pub const Answer = union(enum) {
             .models => |offer| {
                 var arena = offer.arena;
                 arena.deinit();
+            },
+            .files => |paths| {
+                for (paths) |path| allocator.free(path);
+                allocator.free(paths);
             },
         }
     }
@@ -373,6 +380,7 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             .search => "searching",
             .fresh => "starting a session",
             .models => "listing the models",
+            .files => "listing the files",
         };
         return self.say("{s} failed on {s}: {s}", .{ what, self.host, reply.@"error" orelse "no reason given" });
     }
@@ -422,6 +430,11 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             errdefer self.allocator.free(copy);
             self.answers.appendAssumeCapacity(.{ .search = .{ .query = copy, .hits = try ownHits(self.allocator, hits) } });
         },
+        .files => {
+            const paths = try wire.parseResult([]const []const u8, arena, reply.result);
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            self.answers.appendAssumeCapacity(.{ .files = try dupeEach(self.allocator, paths) });
+        },
         .models => {
             try self.answers.ensureUnusedCapacity(self.allocator, 1);
             var kept: std.heap.ArenaAllocator = .init(self.allocator);
@@ -434,6 +447,20 @@ fn answered(self: *Mirror, id: u64, reply: @FieldType(wire.Down, "reply")) !void
             try self.switchTo(opened.handle);
         },
     }
+}
+
+fn dupeEach(allocator: std.mem.Allocator, texts: []const []const u8) ![][]const u8 {
+    const out = try allocator.alloc([]const u8, texts.len);
+    var copied: usize = 0;
+    errdefer {
+        for (out[0..copied]) |text| allocator.free(text);
+        allocator.free(out);
+    }
+    for (texts, out) |text, *copy| {
+        copy.* = try allocator.dupe(u8, text);
+        copied += 1;
+    }
+    return out;
 }
 
 fn ownSessions(allocator: std.mem.Allocator, stored: []const wire.Stored) ![]Database.SessionInfo {
@@ -613,6 +640,13 @@ pub fn setEffort(self: *Mirror, level: []const u8) !void {
     try self.send(.{ .set_effort = .{ .effort = level } }, .{ .command = "Setting the effort" });
 }
 
+/// Ask for the project's files, unless that is already on its way. They
+/// land on a later poll.
+pub fn listFiles(self: *Mirror) !void {
+    if (self.isWaitingFor(.files)) return;
+    try self.send(.{ .files = .{} }, .files);
+}
+
 /// Ask what models the server's provider offers. They land on a later poll.
 pub fn listModels(self: *Mirror, recent: usize) !void {
     try self.send(.{ .models = .{ .recent = @intCast(recent) } }, .models);
@@ -677,6 +711,7 @@ fn isWaitingFor(self: *const Mirror, wanted: Awaited) bool {
 }
 
 const Server = @import("server.zig");
+const project_files = @import("../core/files.zig");
 
 /// A mirror of a fresh session on `fixture`'s server, into `convo`.
 fn attachFresh(fixture: *Server.Fixture, convo: *Conversation) !*Mirror {
@@ -887,4 +922,30 @@ test "a mirror lists the server's models, and its provider answers for the effor
     defer listed.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), listed.models.models.offered.len);
     try testing.expectEqualStrings("high", listed.models.models.offered[0].effort);
+}
+
+test "a mirror lists its session's project files" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try fixture.tmp.dir.deleteTree(testing.io, "project/.git");
+    if (!try project_files.initRepo(fixture.project)) return error.SkipZigTest;
+    try fixture.tmp.dir.createDirPath(testing.io, "project/src");
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "project/src/notes.md", .data = "hi" });
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const here = try project_files.list(arena_state.allocator(), testing.io, fixture.project, .{ .directories = true });
+    try testing.expectEqualStrings("src/", here[0]);
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    try mirror.listFiles();
+    try mirror.listFiles();
+    const listed = try pollForAnswer(mirror);
+    defer listed.deinit(testing.allocator);
+    try testing.expectEqual(here.len, listed.files.len);
+    for (here, listed.files) |expected, got| try testing.expectEqualStrings(expected, got);
+    try testing.expect(mirror.takeAnswer() == null);
 }

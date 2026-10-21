@@ -23,6 +23,7 @@ const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const mention = @import("../core/mention.zig");
 const Project = @import("../core/project.zig");
+const project_files = @import("../core/files.zig");
 const Loop = @import("../agent/loop.zig");
 const Stack = @import("../agent/stack.zig");
 const Backend = @import("../provider/backend.zig");
@@ -686,7 +687,7 @@ const Worker = struct {
             .page_history => |page| return client.reply(id, try self.loadHistory(arena, page.before_seq, page.limit)),
             .sessions => |listing| return client.reply(id, try self.storedSessions(arena, listing.limit)),
             .search => |query| return client.reply(id, try self.search(arena, query.query, query.limit)),
-            .hello, .list, .open, .detach, .stop => return error.NotASessionCommand,
+            .hello, .list, .open, .detach, .stop, .files => return error.NotASessionCommand,
         }
         client.reply(id, {});
     }
@@ -972,6 +973,14 @@ const Worker = struct {
     }
 };
 
+/// Listed here rather than on the session's worker: a large tree takes a
+/// while, and a turn should not wait on it.
+fn projectFiles(server: *Server, arena: std.mem.Allocator, cwd: []const u8) ![]const []const u8 {
+    var project = try Project.detect(server.allocator, server.io, cwd);
+    defer project.deinit(server.allocator);
+    return project_files.list(arena, server.io, project.root, .{ .directories = true });
+}
+
 /// Why a request failed, for the person who made it.
 fn describe(err: anyerror) []const u8 {
     return switch (err) {
@@ -1209,6 +1218,11 @@ const Client = struct {
             .detach => {
                 self.detach();
                 self.reply(frame.id, {});
+            },
+            .files => {
+                const hosted = self.attached orelse return self.replyError(frame.id, "not attached to a session");
+                const files = projectFiles(self.server, arena, hosted.cwd) catch |err| return self.replyError(frame.id, describe(err));
+                self.reply(frame.id, files);
             },
             .attach => |request| {
                 self.detach();
