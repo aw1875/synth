@@ -110,6 +110,9 @@ think: bool = true,
 /// Let the preset list of read-only shell commands run without an approval
 /// prompt. Off makes every command a question, however harmless.
 auto_approve_safe_commands: bool = true,
+/// Run every tool call without an approval prompt, paths outside the project
+/// included. For a machine set aside for the agent; hooks still run.
+auto_approve_all: bool = false,
 /// How long one turn may run, and what it may spend, before the loop gives up
 /// on it. Zero turns either off. Null means the built-in default: what a
 /// runaway turn costs is the loop's business, not this file's.
@@ -152,6 +155,7 @@ const File = struct {
     system_prompt: ?[]const u8 = null,
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
+    auto_approve_all: ?bool = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -272,6 +276,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.system_prompt) |value| self.system_prompt = value;
     if (parsed.think) |value| self.think = value;
     if (parsed.auto_approve_safe_commands) |value| self.auto_approve_safe_commands = value;
+    if (parsed.auto_approve_all) |value| self.auto_approve_all = value;
     if (parsed.debug_log) |value| self.debug_log = value;
     if (parsed.max_turn_ms) |value| self.max_turn_ms = value;
     if (parsed.max_turn_tokens) |value| self.max_turn_tokens = value;

@@ -118,6 +118,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     };
     self.loop.hooks = &self.hooks;
     self.loop.auto_approve_safe = config.auto_approve_safe_commands;
+    self.loop.auto_approve_all = config.auto_approve_all;
     if (config.max_turn_ms) |ms| self.loop.max_turn_ms = ms;
     if (config.max_stall_ms) |ms| self.loop.max_stall_ms = ms;
     if (config.max_turn_tokens) |tokens| self.loop.max_turn_tokens = tokens;

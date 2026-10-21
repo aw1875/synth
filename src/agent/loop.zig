@@ -201,6 +201,9 @@ allowed: std.ArrayList(Allowance) = .empty,
 /// Whether the preset list of read-only shell commands runs without asking.
 /// Off makes every `bash` call a question, however harmless.
 auto_approve_safe: bool = true,
+/// Whether every call the agent allows runs without asking, paths outside the
+/// project included.
+auto_approve_all: bool = false,
 
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
@@ -1532,6 +1535,7 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
+    if (self.auto_approve_all) return true;
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
         defer self.allocator.free(path);
@@ -3350,6 +3354,33 @@ test "a standing allowance does not extend outside the project" {
 
     call.arguments = "{\"path\":\"/tmp/notes.md\"}";
     try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "approving everything covers commands and paths outside the project" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "bash",
+        .arguments = "{\"command\":\"rm -rf build\"}",
+    };
+    try testing.expect(!loop.needsNoDecision(&call));
+
+    loop.auto_approve_all = true;
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.name = "read";
+    call.arguments = "{\"path\":\"/etc/passwd\"}";
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.name = "write";
+    call.arguments = "{\"path\":\"/tmp/notes.md\"}";
+    try testing.expect(loop.needsNoDecision(&call));
+    try testing.expectEqual(@as(usize, 0), loop.allowed.items.len);
 }
 
 test "a question stops the turn and its answer becomes the result" {
