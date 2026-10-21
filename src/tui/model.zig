@@ -548,6 +548,31 @@ pub fn localLoop(self: *Model) ?*AgentLoop {
     };
 }
 
+/// The project's root, when its files can be read from here: a remote
+/// session's only when its server is this machine.
+pub fn readableRoot(self: *const Model) ?[]const u8 {
+    if (self.remote) |mirror| {
+        if (!std.mem.eql(u8, mirror.host, remote_client.here) or mirror.status.project.len == 0) return null;
+        return mirror.status.project;
+    }
+    const project = self.project orelse return null;
+    return project.root;
+}
+
+/// The project's name, or "" when the session is in none.
+pub fn projectLabel(self: *const Model) []const u8 {
+    if (self.remote) |mirror| return std.fs.path.basename(mirror.status.project);
+    const project = self.project orelse return "";
+    return project.name();
+}
+
+/// The branch the project has checked out, or "".
+pub fn projectBranch(self: *const Model) []const u8 {
+    if (self.remote) |mirror| return mirror.status.branch;
+    const project = self.project orelse return "";
+    return project.branch orelse "";
+}
+
 /// The skills this machine offers, for `/help` and running one by name.
 pub fn skillsOffered(self: *const Model) []const skill.Skill {
     if (self.remote) |mirror| return mirror.skills;
@@ -1854,6 +1879,8 @@ test "a model drives a session on a server the way it drives one here" {
     try testing.expect(model.localLoop() == null);
     try testing.expect(model.session.database() == null);
     try testing.expect(model.session.takeSwitched());
+    try testing.expectEqualStrings("project", model.projectLabel());
+    try testing.expect(model.readableRoot() == null);
 
     try model.session.submit("make a note", .{});
     for (0..500) |_| {

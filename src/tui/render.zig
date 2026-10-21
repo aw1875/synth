@@ -870,7 +870,7 @@ pub fn drawApproval(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surfa
         .name = call.name,
         .description = if (definition) |found| found.description else "",
         .arguments = call.arguments,
-        .project = if (self.project) |project| project.name() else "",
+        .project = self.projectLabel(),
         .patterns = AgentLoop.approvalPatterns(ctx.arena, call.name, call.arguments) catch &.{},
         .width = width,
     });
@@ -1017,7 +1017,7 @@ pub fn drawTitleBar(self: *Model, ctx: vxfw.DrawContext, root: vxfw.Surface, wid
 
     var col = w.writeText(root, Model.gutter, 0, fitRight(projectName(self), left_room), theme.on_bg(theme.fg).bold().cell);
 
-    const branch = if (self.project) |project| project.branch orelse "" else "";
+    const branch = self.projectBranch();
     const on_branch = if (branch.len > 0)
         std.fmt.allocPrint(ctx.arena, "on {s}", .{branch}) catch ""
     else
@@ -1291,6 +1291,7 @@ pub fn compact(arena: std.mem.Allocator, value: anytype) ![]const u8 {
 
 pub fn projectName(self: *Model) []const u8 {
     if (self.session.title().len > 0) return self.session.title();
+    if (self.projectLabel().len > 0) return self.projectLabel();
     if (self.cwd.len == 0) return pkg.name;
     return std.fs.path.basename(self.cwd);
 }

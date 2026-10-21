@@ -31,8 +31,8 @@ pub fn resolveDiffStart(self: *Model, call: *Conversation.ToolCall) ?usize {
     const change = (diff.change(arena, call.name, call.arguments) catch return null) orelse return null;
     if (change.old.len == 0) return 1;
 
-    const project = self.project orelse return null;
-    const path = std.fs.path.join(arena, &.{ project.root, change.path }) catch return null;
+    const root = self.readableRoot() orelse return null;
+    const path = std.fs.path.join(arena, &.{ root, change.path }) catch return null;
     const source = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, Model.max_diff_file_bytes) catch return null;
 
     const at = std.mem.indexOf(u8, source, change.old) orelse

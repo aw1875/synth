@@ -142,6 +142,9 @@ pub const Status = struct {
     handle: []const u8 = "",
     /// The directory the session runs in, on the server's machine.
     root: []const u8 = "",
+    /// The repository holding it, and its checked-out branch.
+    project: []const u8 = "",
+    branch: []const u8 = "",
     agent: []const u8 = "",
     model: []const u8 = "",
     provider: []const u8 = "",

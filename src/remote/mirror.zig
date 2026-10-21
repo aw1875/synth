@@ -391,6 +391,8 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
     kept.root = try arena.dupe(u8, status.root);
+    kept.project = try arena.dupe(u8, status.project);
+    kept.branch = try arena.dupe(u8, status.branch);
     kept.agent = try arena.dupe(u8, status.agent);
     kept.model = try arena.dupe(u8, status.model);
     kept.provider = try arena.dupe(u8, status.provider);
