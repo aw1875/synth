@@ -958,6 +958,7 @@ const Worker = struct {
                     try self.useProvider(catalog.find(set.provider_id.?) orelse return error.UnknownProvider, null, null);
                 }
                 try loop.switchModel(set.model);
+                self.rememberModel();
                 if (set.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
                 if (switching) self.announceProvider();
             },
@@ -1337,6 +1338,18 @@ const Worker = struct {
             self.broadcastNotice("Could not offer the new tools: {s}", .{@errorName(err)});
         };
         for (mcp_host.failures.items) |failure| self.broadcastNotice("MCP server {s} failed: {s}", .{ failure.server, failure.reason });
+    }
+
+    /// Have sessions to come start on the model this one switched to, which
+    /// is what the next launch did when each TUI ran its own session.
+    fn rememberModel(self: *Worker) void {
+        const model = self.stack.loop.provider.model;
+        if (model.len == 0) return;
+        const key = std.fmt.allocPrint(self.allocator, "model:{s}", .{self.provider_id}) catch return;
+        defer self.allocator.free(key);
+        self.db.setSetting(key, model) catch |err| self.broadcastNotice("Could not remember the model: {s}", .{@errorName(err)});
+        const providers = self.providerSource() catch return;
+        providers.useModel(self.provider_id, model) catch |err| self.broadcastNotice("New sessions stay on the old model: {s}", .{@errorName(err)});
     }
 
     /// Put the model back on the effort last chosen for it, or its default.
@@ -2206,6 +2219,10 @@ test "a model is listed with its efforts, and the effort chosen for it comes bac
     try client.awaitModel("scripted", "high");
     _ = try client.expectOk(try client.send(.{ .set_model = .{ .model = "bigger", .effort = "high" } }));
     try client.awaitModel("bigger", "high");
+    var db = try Database.init(std.testing.allocator, std.testing.io, fixture.server.options.database_path);
+    defer db.deinit();
+    const remembered = try db.setting(client.arena.allocator(), "model:");
+    try std.testing.expectEqualStrings("bigger", remembered);
 
     const result = try client.expectOk(try client.send(.{ .models = .{} }));
     const models = try wire.parseResult(wire.Models, client.arena.allocator(), result);

@@ -117,6 +117,16 @@ pub fn connect(self: *Providers, session: *Backend, entry: catalog.Entry, host: 
     return provider;
 }
 
+/// Start new sessions on model `name`, when they would start on provider `id`.
+pub fn useModel(self: *Providers, id: []const u8, name: []const u8) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (!std.mem.eql(u8, id, self.active_id)) return;
+    const provider = self.template.provider();
+    const set = provider.set_model orelse return;
+    _ = try set(provider.userdata, name);
+}
+
 /// ChatGPT was signed out of: sessions on it have nothing to answer them.
 pub fn signedOut(self: *Providers) void {
     self.mutex.lockUncancelable(self.io);
