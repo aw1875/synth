@@ -295,6 +295,7 @@ fn resumeTarget(db: *Database, project_id: ?i64, options: cli.Command.Tui) !?i64
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("remote/wire.zig");
 }
 
 /// A provider someone chose, and that has what it needs; or, with nothing
