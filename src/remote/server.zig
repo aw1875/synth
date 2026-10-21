@@ -67,6 +67,9 @@ pub const Options = struct {
     provider_id: []const u8 = "",
     home: ?[]const u8 = null,
     mcp_auth: ?*mcp.Auth = null,
+    /// How long a session with nothing to do and nobody attached stays
+    /// loaded. It stays stored after, and attaching loads it again.
+    idle_unload: std.Io.Duration = .fromSeconds(5 * 60),
 };
 
 allocator: std.mem.Allocator,
@@ -80,9 +83,11 @@ accept_thread: std.Thread = undefined,
 /// connection is single-threaded and client threads share this one.
 db: Database,
 db_mutex: std.Io.Mutex = .init,
-/// Guards `sessions` and `clients`.
+/// Guards `sessions`, `retired` and `clients`.
 mutex: std.Io.Mutex = .init,
 sessions: std.ArrayList(*Hosted) = .empty,
+/// Sessions that unloaded themselves, waiting for their worker to be joined.
+retired: std.ArrayList(*Hosted) = .empty,
 clients: std.ArrayList(*Client) = .empty,
 
 /// `$XDG_RUNTIME_DIR/<name>/server.sock` where the machine has a runtime
@@ -172,6 +177,13 @@ pub fn stop(self: *Server) void {
     for (sessions.items) |hosted| hosted.end();
     sessions.deinit(self.allocator);
 
+    self.mutex.lockUncancelable(self.io);
+    var retired = self.retired;
+    self.retired = .empty;
+    self.mutex.unlock(self.io);
+    for (retired.items) |hosted| hosted.reap();
+    retired.deinit(self.allocator);
+
     self.db.deinit();
     self.allocator.free(self.path);
     self.allocator.destroy(self);
@@ -185,6 +197,7 @@ fn acceptLoop(self: *Server) void {
             else => return,
         };
         self.reapClients();
+        self.reapSessions();
         if (!peerIsUs(stream)) {
             stream.close(self.io);
             continue;
@@ -222,6 +235,41 @@ fn reapClients(self: *Server) void {
     self.mutex.unlock(self.io);
 
     for (finished.items) |client| client.destroy();
+}
+
+/// Join and free the sessions that have unloaded themselves.
+fn reapSessions(self: *Server) void {
+    var finished: std.ArrayList(*Hosted) = .empty;
+    defer finished.deinit(self.allocator);
+
+    self.mutex.lockUncancelable(self.io);
+    var at: usize = 0;
+    while (at < self.retired.items.len) {
+        const hosted = self.retired.items[at];
+        if (!hosted.finished.load(.acquire)) {
+            at += 1;
+            continue;
+        }
+        finished.append(self.allocator, hosted) catch break;
+        _ = self.retired.swapRemove(at);
+    }
+    self.mutex.unlock(self.io);
+
+    for (finished.items) |hosted| hosted.reap();
+}
+
+/// Move a session from the list to `retired`, if the list's reference is the
+/// only one and nothing is queued for it. Under the mutex every new reference
+/// is taken under, so no client can be on its way in.
+fn retire(self: *Server, hosted: *Hosted) bool {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    if (hosted.refs.load(.acquire) != 1 or !hosted.inboxEmpty()) return false;
+    self.retired.ensureUnusedCapacity(self.allocator, 1) catch return false;
+    const at = std.mem.indexOfScalar(*Hosted, self.sessions.items, hosted) orelse return false;
+    _ = self.sessions.swapRemove(at);
+    self.retired.appendAssumeCapacity(hosted);
+    return true;
 }
 
 /// Refuse a peer whose uid is not ours. `SO_PEERCRED` is Linux; elsewhere the
@@ -446,6 +494,8 @@ const Hosted = struct {
     /// Raised for every command, and by `end`.
     wake: std.Io.Event = .unset,
     exiting: std.atomic.Value(bool) = .init(false),
+    /// The worker has returned, and only needs joining.
+    finished: std.atomic.Value(bool) = .init(false),
     inbox_mutex: std.Io.Mutex = .init,
     inbox: std.DoublyLinkedList = .{},
     /// Once set, nothing more is queued: commands are refused on the spot.
@@ -477,7 +527,10 @@ const Hosted = struct {
     }
 
     fn release(self: *Hosted) void {
-        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const held = self.refs.fetchSub(1, .acq_rel);
+        // Down to the list's: the worker starts counting toward unloading.
+        if (held == 2) self.wake.set(self.server.io);
+        if (held != 1) return;
         const allocator = self.server.allocator;
         std.debug.assert(self.inbox.first == null);
         allocator.free(self.title);
@@ -491,8 +544,20 @@ const Hosted = struct {
     fn end(self: *Hosted) void {
         self.exiting.store(true, .release);
         self.wake.set(self.server.io);
+        self.reap();
+    }
+
+    /// Join the worker, which has finished or been told to, and drop the
+    /// list's reference.
+    fn reap(self: *Hosted) void {
         self.thread.join();
         self.release();
+    }
+
+    fn inboxEmpty(self: *Hosted) bool {
+        self.inbox_mutex.lockUncancelable(self.server.io);
+        defer self.inbox_mutex.unlock(self.server.io);
+        return self.inbox.first == null;
     }
 
     /// Queue a command, or refuse it at once when the worker has gone.
@@ -567,6 +632,8 @@ const Worker = struct {
     stream_thinking: usize = 0,
     stream_text: usize = 0,
     stream_closed: bool = false,
+    /// Since when the session has had nothing to do and nobody attached.
+    alone_since: ?std.Io.Timestamp = null,
 
     fn run(hosted: *Hosted) void {
         var self: Worker = .{ .hosted = hosted, .allocator = hosted.server.allocator, .io = hosted.server.io };
@@ -580,6 +647,7 @@ const Worker = struct {
         self.serve();
         self.close("the session has ended");
         self.teardown();
+        hosted.finished.store(true, .release);
     }
 
     fn build(self: *Worker) !void {
@@ -612,6 +680,8 @@ const Worker = struct {
     }
 
     fn teardown(self: *Worker) void {
+        // Opening a session makes its row up front; one never spoken in is not worth keeping.
+        if (self.stack.convo.totalCount() == 0) self.db.deleteSession(self.hosted.id) catch {};
         self.stack.loop.requestStop();
         self.stack.destroy();
         if (self.spawned) |spawned| spawned.deinit();
@@ -633,9 +703,34 @@ const Worker = struct {
             _ = arena_state.reset(.retain_capacity);
 
             const busy = self.stack.loop.isBusy() or self.stack.runner.busy();
-            const timeout: std.Io.Timeout = if (busy) .{ .duration = .{ .raw = poll_interval, .clock = .awake } } else .none;
-            self.hosted.wake.waitTimeout(self.io, timeout) catch {};
+            if (busy) {
+                self.alone_since = null;
+                self.hosted.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
+                continue;
+            }
+            const left = self.idleLeft() orelse {
+                if (self.hosted.server.retire(self.hosted)) return;
+                self.alone_since = null;
+                continue;
+            };
+            self.hosted.wake.waitTimeout(self.io, .{ .duration = .{ .raw = left, .clock = .awake } }) catch {};
         }
+    }
+
+    /// How much longer an idle session stays loaded, or null when its time
+    /// is up. Nobody attached is the list's reference being the only one.
+    fn idleLeft(self: *Worker) ?std.Io.Duration {
+        const grace = self.hosted.server.options.idle_unload;
+        if (self.stack.loop.state != .idle or self.hosted.refs.load(.acquire) != 1) {
+            self.alone_since = null;
+            return grace;
+        }
+        const now = std.Io.Clock.now(.awake, self.io);
+        const since = self.alone_since orelse now;
+        self.alone_since = since;
+        const waited = since.durationTo(now);
+        if (waited.nanoseconds >= grace.nanoseconds) return null;
+        return .fromNanoseconds(grace.nanoseconds - waited.nanoseconds);
     }
 
     /// Tell the subscribers they are on their own, then stop taking commands.
@@ -1778,4 +1873,46 @@ test "a session's directory is found from home unless it is absolute" {
         defer allocator.free(got);
         try std.testing.expectEqualStrings(case.want, got);
     }
+}
+
+/// Wait for the list of live sessions to reach `count`, or fail after a few seconds.
+fn awaitLive(client: *TestClient, count: usize) !void {
+    for (0..300) |_| {
+        if ((try client.list()).len == count) return;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    return error.TimedOut;
+}
+
+test "an idle session nobody watches unloads, and attaching loads it again" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    fixture.server.options.idle_unload = .fromMilliseconds(50);
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+
+    const handle = (try client.open(fixture.project)).handle;
+    _ = try client.attach(handle);
+    _ = try client.expectOk(try client.send(.{ .submit = .{ .text = "make a note" } }));
+    _ = try client.awaitState(.awaiting_approval);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(150), .awake);
+    _ = try client.expectOk(try client.send(.{ .detach = .{} }));
+    try std.testing.expectEqual(@as(usize, 1), (try client.list()).len);
+
+    _ = try client.attach(handle);
+    _ = try client.expectOk(try client.send(.{ .decide = .{ .decision = .once } }));
+    _ = try client.awaitState(.idle);
+    _ = try client.expectOk(try client.send(.{ .detach = .{} }));
+    try awaitLive(client, 0);
+
+    const snapshot = try client.attach(handle);
+    try std.testing.expect(snapshot.messages.len >= 4);
+    try std.testing.expectEqual(@as(usize, 1), (try client.list()).len);
+    _ = try client.expectOk(try client.send(.{ .detach = .{} }));
+    try awaitLive(client, 0);
+
+    const empty = (try client.open(fixture.project)).handle;
+    try awaitLive(client, 0);
+    try std.testing.expectEqualStrings("no such session", try client.expectError(try client.send(.{ .attach = .{ .handle = empty } })));
 }
