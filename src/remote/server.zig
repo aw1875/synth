@@ -63,6 +63,10 @@ pub const Source = union(enum) {
 
 pub const Options = struct {
     config: *const Config,
+    /// When set, each session reads `config.path` again as it starts, against
+    /// its own directory when relative, so an edit takes effect from the next
+    /// session rather than the next server. Left null, sessions share `config`.
+    environ_map: ?*std.process.Environ.Map = null,
     /// Where to listen. The lock file sits next to it.
     socket_path: []const u8,
     /// The database sessions persist to. Each worker opens its own connection.
@@ -782,6 +786,8 @@ const Worker = struct {
     sign_in: ?*SignInTask = null,
     mcp_auth: ?mcp.Auth = null,
     sign_out: ?*SignOutTask = null,
+    /// The config read for this session, which `stack` borrows from.
+    config: ?Config = null,
     stack: *Stack = undefined,
     subscribers: std.ArrayList(*Client) = .empty,
     /// Every message sent, by seq, with a signature of the parts of it that
@@ -831,8 +837,11 @@ const Worker = struct {
         };
         errdefer if (self.spawned) |spawned| spawned.deinit();
 
+        if (server.options.environ_map) |env| self.config = try self.readConfig(env);
+        errdefer if (self.config) |*config| config.deinit();
+
         self.stack = try Stack.create(self.allocator, self.io, .{
-            .config = server.options.config,
+            .config = if (self.config) |*config| config else server.options.config,
             .provider = provider,
             .backend = backend,
             .cwd = self.hosted.cwd,
@@ -846,6 +855,13 @@ const Worker = struct {
         self.restoreEffort();
     }
 
+    fn readConfig(self: *Worker, env: *std.process.Environ.Map) !Config {
+        const shared = self.hosted.server.options.config;
+        const path = try std.fs.path.resolve(self.allocator, &.{ self.hosted.cwd, shared.path });
+        defer self.allocator.free(path);
+        return Config.load(self.allocator, self.io, env, path, shared.database_path);
+    }
+
     fn teardown(self: *Worker) void {
         if (self.sign_in) |task| task.abandon();
         if (self.sign_out) |task| task.abandon();
@@ -854,6 +870,7 @@ const Worker = struct {
         self.stack.loop.requestStop();
         self.stack.destroy();
         if (self.spawned) |spawned| spawned.deinit();
+        if (self.config) |*config| config.deinit();
         if (self.mcp_auth) |*store| store.deinit();
         self.db.deinit();
         self.subscribers.deinit(self.allocator);
@@ -2464,6 +2481,32 @@ test "a session's MCP servers are reported, and one turned off stays off" {
     _ = try client.expectOk(try client.send(.{ .toggle_mcp = .{ .name = "broken" } }));
     _ = try awaitMcp(client, .failed);
     try std.testing.expectEqualStrings("no such MCP server", try client.expectError(try client.send(.{ .toggle_mcp = .{ .name = "missing" } })));
+}
+
+test "a config edited while the server runs applies to the next session" {
+    const io = std.testing.io;
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    fixture.config.path = "config.json";
+    fixture.server.options.environ_map = &env;
+
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+    const before = try client.attach((try client.open(fixture.project)).handle);
+    try std.testing.expectEqual(@as(usize, 0), before.status.mcp.len);
+
+    try fixture.tmp.dir.writeFile(io, .{
+        .sub_path = "project/config.json",
+        .data =
+        \\{"mcp":{"servers":{"broken":{"command":"/nonexistent/synth-test-mcp"}}}}
+        ,
+    });
+    const after = try client.attach((try client.open(fixture.project)).handle);
+    try std.testing.expectEqual(@as(usize, 1), after.status.mcp.len);
+    try std.testing.expectEqualStrings("broken", after.status.mcp[0].name);
 }
 
 test "a request this server does not know is answered, not left hanging" {

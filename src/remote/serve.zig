@@ -64,6 +64,7 @@ pub fn run(init: std.process.Init) !void {
 
     const server = Server.start(allocator, io, .{
         .config = &config,
+        .environ_map = init.environ_map,
         .socket_path = socket_path,
         .database_path = config.database_path,
         .source = .{ .providers = &providers },
