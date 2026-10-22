@@ -117,17 +117,21 @@ pub fn startLike(self: *OpenAIProvider, other: *const OpenAIProvider) !void {
     self.send_stream_options = other.send_stream_options;
 }
 
-/// Read the context window for the current model. Failures leave the table's
-/// guess in place: a server that will not answer `/v1/models` is a problem the
-/// first request reports better than startup can.
+/// Read the context window for the current model.
 fn probe(self: *OpenAIProvider) void {
-    self.context_limit = knownWindow(self.model);
-
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = self.get(arena, "/models") catch return;
+    const listing = self.get(arena, "/models") catch null;
+    self.learnWindow(arena, listing);
+}
+
+/// No listing leaves the table's guess in place: a server that will not answer
+/// `/v1/models` is a problem the first request reports better than this can.
+fn learnWindow(self: *OpenAIProvider, arena: std.mem.Allocator, listing: ?[]const u8) void {
+    self.context_limit = knownWindow(self.model);
+    const body = listing orelse return;
     const reported = listedWindow(arena, body, self.model);
     if (reported > 0) self.context_limit = reported;
 }
@@ -290,9 +294,29 @@ pub fn reconnect(self: *OpenAIProvider, connection: Provider.Connection) !void {
 /// Point this provider at another model, re-reading the context window since
 /// that is per-model and the sidebar's "how full is the context" figure is
 /// meaningless against the wrong number.
+/// Refused only when OpenAI's own API does not list the name, since it lists
+/// every model a key can use. A gateway is under no obligation to list
+/// everything it will route, so a name sent elsewhere is taken at its word. The
+/// listing is the one the context window is read from, so judging costs no
+/// extra request.
 pub fn setModel(self: *OpenAIProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
+    if (!self.started) return self.adoptModel(name);
 
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const listing = self.get(arena, "/models") catch null;
+    if (listing) |body| {
+        const is_refused = isOfficialHost(self.host) and isUnlisted(arena, body, name);
+        if (is_refused) return error.UnknownModel;
+    }
+    try self.adoptModel(name);
+    self.learnWindow(arena, listing);
+}
+
+fn adoptModel(self: *OpenAIProvider, name: []const u8) !void {
     const owned = try self.allocator.dupe(u8, name);
     if (self.model_owned) |previous| self.allocator.free(previous);
     self.model_owned = owned;
@@ -300,8 +324,30 @@ pub fn setModel(self: *OpenAIProvider, name: []const u8) !void {
     self.supports_tools = true;
     self.supports_vision = true;
     self.send_stream_options = true;
+}
 
-    if (self.started) self.probe();
+const official_domain = "api.openai.com";
+
+fn isOfficialHost(host: []const u8) bool {
+    const uri = std.Uri.parse(host) catch return false;
+    const domain = uri.host orelse return false;
+    return switch (domain) {
+        inline else => |text| std.ascii.eqlIgnoreCase(text, official_domain),
+    };
+}
+
+/// A listing that cannot be read judges nothing.
+fn isUnlisted(arena: std.mem.Allocator, body: []const u8, name: []const u8) bool {
+    const Listing = struct {
+        data: []const struct { id: []const u8 = "" } = &.{},
+    };
+    const parsed = std.json.parseFromSliceLeaky(Listing, arena, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    for (parsed.data) |entry| {
+        if (std.mem.eql(u8, entry.id, name)) return false;
+    }
+    return true;
 }
 
 /// Settle on a model when the config named none. Unlike ollama, a named model
@@ -1157,6 +1203,22 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
     }
     return false;
+}
+
+test "only OpenAI's own API judges a name by its listing" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const listing = "{\"data\":[{\"id\":\"gpt-5\"}]}";
+
+    try std.testing.expect(!isUnlisted(arena, listing, "gpt-5"));
+    try std.testing.expect(isUnlisted(arena, listing, "asdf"));
+    try std.testing.expect(!isUnlisted(arena, "not json", "asdf"));
+
+    try std.testing.expect(isOfficialHost("https://api.openai.com/v1"));
+    try std.testing.expect(isOfficialHost("https://api.openai.com/v1/"));
+    try std.testing.expect(!isOfficialHost("https://openrouter.ai/api/v1"));
+    try std.testing.expect(!isOfficialHost("http://localhost:8080/v1"));
 }
 
 /// The context window a listing reports for `model`. Not part of the OpenAI
