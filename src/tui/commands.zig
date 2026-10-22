@@ -541,9 +541,10 @@ pub fn offerProvidersInstead(self: *Model) !bool {
     return true;
 }
 
-/// Open the model switcher at once and ask every connected provider what it
-/// offers in the background. Models join the list as each provider answers, so
-/// a slow or hung one never holds the picker shut.
+/// Open the model switcher at once on what each connected provider last
+/// offered, and ask them all again in the background. Each answer replaces that
+/// provider's models as it lands, so a slow or hung one never holds the picker
+/// shut.
 pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (try offerProvidersInstead(self)) return;
     if (!self.provider.switchable()) return;
@@ -553,7 +554,8 @@ pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     const arena = arena_state.allocator();
 
     const recent = try recentModels(self, arena);
-    try self.models.show(&.{}, recent, self.provider.model);
+    const offered = try lastOffered(self, arena);
+    try self.models.show(offered, recent, self.provider.model);
 
     const active_id = try activeProviderId(self, arena);
     for (catalog.all) |entry| {
@@ -614,21 +616,53 @@ pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
             continue;
         }
         _ = listings.orderedRemove(index);
-        defer listing.finish();
-        try addListedModels(self, listing);
+        listing.join();
+        try takeListing(self, listing);
         ctx.redraw = true;
     }
     if (listings.items.len > 0) try self.scheduleTick(ctx);
 }
 
-fn addListedModels(self: *Model, listing: *ModelListing) !void {
+/// A provider that could not be asked leaves what it offered last in place.
+fn takeListing(self: *Model, listing: *ModelListing) !void {
+    const models = listing.models orelse return listing.destroy();
+    errdefer listing.destroy();
+
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const entries = try modelEntries(self, arena, listing.entry, listing.models);
+    const entries = try modelEntries(self, arena, listing.entry, models);
     const recent = try recentModels(self, arena);
-    try self.models.append(entries, recent);
+    try self.models.replaceProvider(listing.entry.id, entries, recent);
+    try keepOffered(self, listing);
+}
+
+fn keepOffered(self: *Model, listing: *ModelListing) !void {
+    for (self.offered_models.items) |*kept| {
+        if (!std.mem.eql(u8, kept.*.entry.id, listing.entry.id)) continue;
+        kept.*.destroy();
+        kept.* = listing;
+        return;
+    }
+    try self.offered_models.append(self.allocator, listing);
+}
+
+fn lastOffered(self: *Model, arena: std.mem.Allocator) ![]const ModelPicker.Entry {
+    var entries: std.ArrayList(ModelPicker.Entry) = .empty;
+    for (catalog.all) |entry| {
+        if (!isConnected(self, entry)) continue;
+        const models = offeredBy(self, entry.id) orelse continue;
+        try entries.appendSlice(arena, try modelEntries(self, arena, entry, models));
+    }
+    return entries.items;
+}
+
+fn offeredBy(self: *Model, provider_id: []const u8) ?[]const ModelListing.Offered {
+    for (self.offered_models.items) |kept| {
+        if (std.mem.eql(u8, kept.entry.id, provider_id)) return kept.models;
+    }
+    return null;
 }
 
 fn recentModels(self: *Model, arena: std.mem.Allocator) ![]const []const u8 {

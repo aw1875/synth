@@ -172,30 +172,59 @@ pub fn show(
     self.open = true;
 }
 
-/// Add models that arrived after the list was shown, in their provider's place,
-/// keeping the highlight on the row it was on. Borrowed like `show`.
-pub fn append(self: *Picker, models: []const Entry, recent: []const []const u8) !void {
+/// Put what a provider answered in place of what it offered before, in its
+/// provider's place, keeping the highlight on the row it was on. Borrowed like
+/// `show`.
+pub fn replaceProvider(self: *Picker, provider_id: []const u8, models: []const Entry, recent: []const []const u8) !void {
     const place = self.highlightedPlace();
     const scroll = self.scroll;
-    try self.addEntries(models, recent);
+    const previous = self.entries;
+    self.entries = try self.mergedEntries(provider_id, models, recent);
+    defer releaseReplaced(self.allocator, previous, provider_id);
+
     std.mem.sort(Entry, self.entries, {}, isEarlierProvider);
     try self.filter();
     if (place) |kept| self.restore(kept, scroll);
 }
 
-fn addEntries(self: *Picker, models: []const Entry, recent: []const []const u8) !void {
-    const added = try self.allocator.alloc(Entry, models.len);
-    defer self.allocator.free(added);
+/// Every other provider's entries, shared with `self.entries`, then copies of
+/// `models`.
+fn mergedEntries(self: *Picker, provider_id: []const u8, models: []const Entry, recent: []const []const u8) ![]Entry {
+    var kept_count: usize = 0;
+    for (self.entries) |entry| {
+        if (!isFrom(entry, provider_id)) kept_count += 1;
+    }
+
+    const merged = try self.allocator.alloc(Entry, kept_count + models.len);
+    errdefer self.allocator.free(merged);
+    var at: usize = 0;
+    for (self.entries) |entry| {
+        if (isFrom(entry, provider_id)) continue;
+        merged[at] = entry;
+        at += 1;
+    }
+
+    const added = merged[kept_count..];
     var filled: usize = 0;
     errdefer for (added[0..filled]) |entry| freeEntry(self.allocator, entry);
     for (models, added) |src, *dst| {
         dst.* = try dupeEntry(self.allocator, src, recent);
         filled += 1;
     }
+    return merged;
+}
 
-    const merged = try std.mem.concat(self.allocator, Entry, &.{ self.entries, added });
-    self.allocator.free(self.entries);
-    self.entries = merged;
+/// Frees the replaced provider's entries and the array that held them; the
+/// rest moved to the new array.
+fn releaseReplaced(allocator: std.mem.Allocator, previous: []Entry, provider_id: []const u8) void {
+    for (previous) |entry| {
+        if (isFrom(entry, provider_id)) freeEntry(allocator, entry);
+    }
+    allocator.free(previous);
+}
+
+fn isFrom(entry: Entry, provider_id: []const u8) bool {
+    return std.mem.eql(u8, entry.provider_id, provider_id);
 }
 
 fn isEarlierProvider(_: void, a: Entry, b: Entry) bool {
@@ -238,7 +267,7 @@ fn isRowFor(self: *const Picker, row: Row, entry: Entry) bool {
         .entry => |index| index,
     };
     const listed = self.entries[index];
-    return std.mem.eql(u8, listed.provider_id, entry.provider_id) and std.mem.eql(u8, listed.name, entry.name);
+    return isFrom(listed, entry.provider_id) and std.mem.eql(u8, listed.name, entry.name);
 }
 
 fn isRecent(name: []const u8, recent: []const []const u8) bool {
@@ -533,13 +562,31 @@ test "late models join in catalog order, and the highlight keeps its row" {
     picker.move(1);
     const provider_row = picker.cursor;
 
-    try picker.append(&.{
+    try picker.replaceProvider("ollama", &.{
         .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama", .order = 0 },
     }, &.{"gpt-oss"});
 
     try std.testing.expectEqualStrings("Ollama", picker.rows.items[2].heading);
     try std.testing.expectEqualStrings("gpt-oss", picker.selected().?.name);
     try std.testing.expect(picker.cursor > provider_row);
+}
+
+test "a provider's fresh answer replaces what it offered before" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    try picker.show(&.{
+        .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama" },
+        .{ .name = "llama3:70b", .provider = "Ollama", .provider_id = "ollama" },
+        .{ .name = "gpt-oss", .provider = "Ollama Cloud", .provider_id = "ollama-cloud", .order = 1 },
+    }, &.{}, "");
+
+    try picker.replaceProvider("ollama", &.{
+        .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama" },
+    }, &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), picker.entries.len);
+    try std.testing.expectEqualStrings("qwen3:8b", picker.selected().?.name);
 }
 
 test "a model remembers which provider offers it" {

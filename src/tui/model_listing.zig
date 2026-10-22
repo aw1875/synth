@@ -32,8 +32,9 @@ entry: catalog.Entry,
 reach: Reach,
 future: std.Io.Future(void) = undefined,
 done: std.atomic.Value(bool) = .init(false),
-/// Empty when the provider could not be reached. Only read once `isFinished`.
-models: []const Offered = &.{},
+/// Null when the provider could not be asked, which is not the same as
+/// offering nothing. Only read once `isFinished`.
+models: ?[]const Offered = null,
 
 pub fn start(allocator: std.mem.Allocator, io: std.Io, entry: catalog.Entry, reach: Reach) !*ModelListing {
     const self = try allocator.create(ModelListing);
@@ -53,7 +54,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, entry: catalog.Entry, rea
 
 fn run(self: *ModelListing) void {
     defer self.done.store(true, .release);
-    self.models = self.list() catch &.{};
+    self.models = self.list() catch null;
 }
 
 fn list(self: *ModelListing) ![]const Offered {
@@ -91,10 +92,9 @@ pub fn isFinished(self: *ModelListing) bool {
     return self.done.load(.acquire);
 }
 
-/// Only call once `isFinished`; `models` dies with this.
-pub fn finish(self: *ModelListing) void {
+/// Only call once `isFinished`. `models` then lives until `destroy`.
+pub fn join(self: *ModelListing) void {
     self.future.await(self.io);
-    self.destroy();
 }
 
 /// For a picker closing before the provider answered: stop at the next
@@ -104,7 +104,7 @@ pub fn abandon(self: *ModelListing) void {
     self.destroy();
 }
 
-fn destroy(self: *ModelListing) void {
+pub fn destroy(self: *ModelListing) void {
     self.arena.deinit();
     self.allocator.destroy(self);
 }
@@ -118,6 +118,7 @@ test "a provider that cannot be reached lists nothing" {
     });
     while (!listing.isFinished()) try std.Io.sleep(testing.io, .fromMilliseconds(5), .awake);
 
-    try testing.expectEqual(@as(usize, 0), listing.models.len);
-    listing.finish();
+    listing.join();
+    defer listing.destroy();
+    try testing.expect(listing.models == null);
 }
