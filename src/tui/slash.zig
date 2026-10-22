@@ -29,6 +29,9 @@ pub const Command = struct {
     is_skill: bool = false,
     /// Only offered while signed in to ChatGPT.
     needs_chatgpt: bool = false,
+    /// Throws away what cannot be had back, so Enter runs it only once its
+    /// whole name is typed: `/c` must not clear a session.
+    is_destructive: bool = false,
 };
 
 /// What a command takes after its name, and what to call it in a hint.
@@ -51,20 +54,20 @@ const unlabelled_skill = "run this skill";
 /// Everything `/` offers. Kept in the order it should be read, not
 /// alphabetically: the ones that change what the model sees come first.
 pub const commands: []const Command = &.{
-    .{ .name = "clear", .description = "clear the transcript and start a fresh session" },
-    .{ .name = "compact", .description = "summarise the conversation so far, freeing context" },
+    .{ .name = "clear", .description = "clear the transcript and start a fresh session", .is_destructive = true },
+    .{ .name = "compact", .description = "summarise the conversation so far, freeing context", .is_destructive = true },
     .{ .name = "model", .description = "switch the model this session runs on", .argument = .{ .optional = "name" } },
     .{ .name = "effort", .description = "set how hard the model thinks, where it has levels", .argument = .{ .optional = "level" } },
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
-    .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true },
+    .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true, .is_destructive = true },
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = .{ .optional = "name" } },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = .{ .optional = "name" } },
     .{ .name = "rename", .description = "name this session", .argument = .{ .optional = "name" } },
-    .{ .name = "prune", .description = "shrink the database, dropping old stored tool output" },
+    .{ .name = "prune", .description = "shrink the database, dropping old stored tool output", .is_destructive = true },
     .{ .name = "search", .description = "find text in this project's transcripts", .argument = .{ .required = "text" } },
     .{ .name = "help", .description = "list these commands" },
 };
@@ -197,12 +200,16 @@ pub fn selectedCommand(self: *const Slash) ?Command {
 /// As in codex, only a command picked by its name runs, never a fuzzy guess or
 /// whatever a bare `/` lists first. A skill waits for what to work on, the way
 /// codex inserts a `$skill` mention, and so does a command whose argument is
-/// required and not yet typed.
+/// required and not yet typed. A destructive command runs only by its full
+/// name.
 pub fn runsOnEnter(self: *const Slash, draft: []const u8) bool {
     const command = self.selectedCommand() orelse return false;
     const is_named = self.selected < self.named;
     const is_missing_argument = command.argument == .required and typedArgument(draft).len == 0;
-    return is_named and !command.is_skill and !is_missing_argument;
+    const typed_name = draft[1..commandWordEnd(draft)];
+    const is_full_name = std.ascii.eqlIgnoreCase(typed_name, command.name);
+    const is_unconfirmed = command.is_destructive and !is_full_name;
+    return is_named and !command.is_skill and !is_missing_argument and !is_unconfirmed;
 }
 
 /// What the draft becomes when the highlighted command is accepted: the word
@@ -214,13 +221,6 @@ pub fn completion(self: *const Slash, arena: std.mem.Allocator, draft: []const u
     const typed_argument = typedArgument(draft);
     if (typed_argument.len > 0) return try std.fmt.allocPrint(arena, "/{s}{s}", .{ command.name, typed_argument });
     return try std.fmt.allocPrint(arena, "/{s} ", .{command.name});
-}
-
-pub fn isBuiltIn(name: []const u8) bool {
-    for (commands) |command| {
-        if (std.mem.eql(u8, command.name, name)) return true;
-    }
-    return false;
 }
 
 /// Where a command's name ends in a line typed after `/`.
@@ -431,6 +431,18 @@ test "enter runs a command picked by name, unless it is waiting for input" {
     try std.testing.expect(!slash.runsOnEnter("/opt"));
     try slash.update("/", 1);
     try std.testing.expect(!slash.runsOnEnter("/"));
+}
+
+test "a destructive command runs on enter only by its full name" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
+    try slash.update("/c", 2);
+    try std.testing.expectEqualStrings("clear", slash.selectedCommand().?.name);
+    try std.testing.expect(!slash.runsOnEnter("/c"));
+
+    try slash.update("/clear", 6);
+    try std.testing.expect(slash.runsOnEnter("/clear"));
 }
 
 test "an exact name is offered before the longer names it starts" {
