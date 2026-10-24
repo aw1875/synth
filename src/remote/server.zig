@@ -1556,7 +1556,8 @@ const Client = struct {
     stream: std.Io.net.Stream,
     reader_thread: std.Thread = undefined,
     writer_thread: std.Thread = undefined,
-    read_buffer: []u8,
+    read_buffer: [64 * 1024]u8 = undefined,
+    lines: wire.LineReader,
     /// Raised once the reader is done with everything but being freed.
     finished: std.atomic.Value(bool) = .init(false),
     /// The session this connection drives, and the command that will leave
@@ -1580,9 +1581,9 @@ const Client = struct {
         self.* = .{
             .server = server,
             .stream = stream,
-            .read_buffer = try allocator.alloc(u8, wire.max_line),
+            .lines = .init(allocator),
         };
-        errdefer allocator.free(self.read_buffer);
+        errdefer self.lines.deinit();
 
         self.writer_thread = try std.Thread.spawn(.{}, writeLoop, .{self});
         errdefer {
@@ -1602,7 +1603,7 @@ const Client = struct {
         self.stream.close(self.server.io);
         for (self.outbox.items) |line| allocator.free(line);
         self.outbox.deinit(allocator);
-        allocator.free(self.read_buffer);
+        self.lines.deinit();
         allocator.destroy(self);
     }
 
@@ -1702,10 +1703,10 @@ const Client = struct {
         defer self.close();
         defer self.detach();
 
-        var reader = self.stream.reader(self.server.io, self.read_buffer);
+        var reader = self.stream.reader(self.server.io, &self.read_buffer);
         if (!(self.handshake(&reader.interface) catch false)) return;
         while (true) {
-            const line = (wire.readLine(&reader.interface) catch return) orelse return;
+            const line = (self.lines.next(&reader.interface) catch return) orelse return;
             self.handle(line) catch |err| switch (err) {
                 error.OutOfMemory => return,
             };
@@ -1716,7 +1717,7 @@ const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(self.server.allocator);
         defer arena_state.deinit();
 
-        const line = try wire.readLine(reader) orelse return false;
+        const line = try self.lines.next(reader) orelse return false;
         const frame = try wire.Frame(wire.Up).decode(arena_state.allocator(), line) orelse return false;
         if (frame.body != .hello) return false;
         self.send(.{ .body = .{ .hello = .{
@@ -1950,8 +1951,9 @@ const TestClient = struct {
     stream: std.Io.net.Stream,
     reader: std.Io.net.Stream.Reader,
     writer: std.Io.net.Stream.Writer,
-    read_buffer: [256 * 1024]u8 = undefined,
+    read_buffer: [64 * 1024]u8 = undefined,
     write_buffer: [4096]u8 = undefined,
+    lines: wire.LineReader,
     arena: std.heap.ArenaAllocator,
     next_id: u64 = 1,
 
@@ -1962,7 +1964,7 @@ const TestClient = struct {
         const self = try std.testing.allocator.create(TestClient);
         errdefer std.testing.allocator.destroy(self);
         const address = try std.Io.net.UnixAddress.init(path);
-        self.* = .{ .stream = try address.connect(io), .reader = undefined, .writer = undefined, .arena = .init(std.testing.allocator) };
+        self.* = .{ .stream = try address.connect(io), .reader = undefined, .writer = undefined, .lines = .init(std.testing.allocator), .arena = .init(std.testing.allocator) };
 
         // A missing event fails the test rather than hanging it.
         const timeout: linux.timeval = .{ .sec = 10, .usec = 0 };
@@ -1975,6 +1977,7 @@ const TestClient = struct {
 
     fn close(self: *TestClient) void {
         self.stream.close(std.testing.io);
+        self.lines.deinit();
         self.arena.deinit();
         std.testing.allocator.destroy(self);
     }
@@ -2001,7 +2004,7 @@ const TestClient = struct {
 
     /// The next frame, or `error.Closed` once the server hangs up.
     fn next(self: *TestClient) !Down {
-        const line = try wire.readLine(&self.reader.interface) orelse return error.Closed;
+        const line = try self.lines.next(&self.reader.interface) orelse return error.Closed;
         return (try Down.decode(self.arena.allocator(), try self.arena.allocator().dupe(u8, line))) orelse self.next();
     }
 

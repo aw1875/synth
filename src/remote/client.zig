@@ -83,8 +83,9 @@ pub const Connection = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     transport: Transport,
-    read_buffer: []u8,
+    read_buffer: [64 * 1024]u8 = undefined,
     write_buffer: [64 * 1024]u8 = undefined,
+    lines: wire.LineReader,
     next_id: u64 = 1,
     /// What the server said it is, from its hello.
     server: []const u8 = "",
@@ -123,7 +124,7 @@ pub const Connection = struct {
         });
         self.transport = .{ .child = .{ .process = process, .reader = undefined, .writer = undefined } };
         const child = &self.transport.child;
-        child.reader = child.process.stdout.?.reader(io, self.read_buffer);
+        child.reader = child.process.stdout.?.reader(io, &self.read_buffer);
         child.writer = child.process.stdin.?.writer(io, &self.write_buffer);
 
         try self.handshake(host, diagnostic);
@@ -136,7 +137,7 @@ pub const Connection = struct {
         errdefer self.destroy();
         self.transport = .{ .socket = .{ .stream = stream, .reader = undefined, .writer = undefined } };
         const socket = &self.transport.socket;
-        socket.reader = stream.reader(io, self.read_buffer);
+        socket.reader = stream.reader(io, &self.read_buffer);
         socket.writer = stream.writer(io, &self.write_buffer);
 
         try self.handshake(here, diagnostic);
@@ -150,7 +151,7 @@ pub const Connection = struct {
             .allocator = allocator,
             .io = io,
             .transport = undefined,
-            .read_buffer = try allocator.alloc(u8, wire.max_line),
+            .lines = .init(allocator),
             .hello_arena = .init(allocator),
         };
         return self;
@@ -171,7 +172,7 @@ pub const Connection = struct {
 
     fn destroy(self: *Connection) void {
         self.hello_arena.deinit();
-        self.allocator.free(self.read_buffer);
+        self.lines.deinit();
         self.allocator.destroy(self);
     }
 
@@ -241,7 +242,7 @@ pub const Connection = struct {
     /// Frames of types this build does not know are skipped.
     pub fn next(self: *Connection, arena: std.mem.Allocator) !?wire.Frame(wire.Down) {
         while (true) {
-            const line = try wire.readLine(self.reader()) orelse return null;
+            const line = try self.lines.next(self.reader()) orelse return null;
             const copy = try arena.dupe(u8, line);
             if (try wire.Frame(wire.Down).decode(arena, copy)) |frame| return frame;
         }

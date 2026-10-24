@@ -563,18 +563,51 @@ pub fn parseResult(comptime T: type, arena: std.mem.Allocator, result: ?std.json
         malformed(err);
 }
 
-/// The next non-empty line, without its line ending. Null once the peer has
-/// closed its side.
-pub fn readLine(reader: *std.Io.Reader) !?[]const u8 {
-    while (true) {
-        const line = reader.takeDelimiter('\n') catch |err| switch (err) {
-            error.StreamTooLong => return error.LineTooLong,
-            error.ReadFailed => return error.ReadFailed,
-        } orelse return null;
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (trimmed.len > 0) return trimmed;
+/// Lines read off a connection, each held in memory sized to it. A read
+/// buffer of `max_line` would be resident from the start, since safe builds
+/// fill every allocation.
+pub const LineReader = struct {
+    line: std.Io.Writer.Allocating,
+
+    /// Past this, the line's memory is given back before the next read, so
+    /// one pasted image does not stay resident for the whole connection.
+    const retained: usize = 64 * 1024;
+
+    pub fn init(allocator: std.mem.Allocator) LineReader {
+        return .{ .line = .init(allocator) };
     }
-}
+
+    pub fn deinit(self: *LineReader) void {
+        self.line.deinit();
+    }
+
+    /// The next non-empty line, without its line ending, valid until the
+    /// next call. Null once the peer has closed its side.
+    pub fn next(self: *LineReader, reader: *std.Io.Reader) !?[]const u8 {
+        while (true) {
+            self.reset();
+            _ = reader.streamDelimiterLimit(&self.line.writer, '\n', .limited(max_line)) catch |err| switch (err) {
+                error.StreamTooLong => return error.LineTooLong,
+                error.ReadFailed => return error.ReadFailed,
+                error.WriteFailed => return error.OutOfMemory,
+            };
+            const ended = if (reader.takeByte()) |_| true else |err| switch (err) {
+                error.EndOfStream => false,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            const trimmed = std.mem.trimEnd(u8, self.line.written(), "\r");
+            if (trimmed.len > 0) return trimmed;
+            if (!ended) return null;
+        }
+    }
+
+    fn reset(self: *LineReader) void {
+        if (self.line.writer.buffer.len <= retained) return self.line.clearRetainingCapacity();
+        const allocator = self.line.allocator;
+        self.line.deinit();
+        self.line = .init(allocator);
+    }
+};
 
 fn roundTrip(comptime Body: type, arena: std.mem.Allocator, frame: Frame(Body)) !Frame(Body) {
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -610,6 +643,22 @@ test "malformed lines are refused" {
     try testing.expectError(error.MalformedMessage, Frame(Up).decode(arena, "{\"type\":7}"));
     try testing.expectError(error.MalformedMessage, Frame(Up).decode(arena, "{\"type\":\"decide\",\"decision\":\"maybe\"}"));
     try testing.expectError(error.MalformedMessage, Frame(Up).decode(arena, "{\"type\":\"cancel\",\"id\":-1}"));
+}
+
+test "lines longer than the read buffer come whole, and their memory is given back" {
+    const long = "x" ** (LineReader.retained * 2);
+    var source: std.Io.Reader = .fixed("one\r\n\n" ++ long ++ "\ntwo\nlast");
+    var limited_buffer: [16]u8 = undefined;
+    var limited = source.limited(.unlimited, &limited_buffer);
+    var lines: LineReader = .init(testing.allocator);
+    defer lines.deinit();
+
+    try testing.expectEqualStrings("one", (try lines.next(&limited.interface)).?);
+    try testing.expectEqualStrings(long, (try lines.next(&limited.interface)).?);
+    try testing.expectEqualStrings("two", (try lines.next(&limited.interface)).?);
+    try testing.expect(lines.line.writer.buffer.len <= LineReader.retained);
+    try testing.expectEqualStrings("last", (try lines.next(&limited.interface)).?);
+    try testing.expectEqual(null, try lines.next(&limited.interface));
 }
 
 test "a snapshot round-trips" {
