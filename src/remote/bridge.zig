@@ -44,8 +44,10 @@ fn startServer(init: std.process.Init, path: []const u8) !void {
     try Config.ensureDir(io, path);
     const log = try std.Io.Dir.cwd().createFile(io, log_path, .{});
     defer log.close(io);
+    var arena_state: std.heap.ArenaAllocator = .init(init.gpa);
+    defer arena_state.deinit();
     _ = try std.process.spawn(io, .{
-        .argv = &.{ exe, "remote", "serve" },
+        .argv = try serveCommand(arena_state.allocator(), init.environ_map, exe),
         .stdin = .ignore,
         .stdout = .{ .file = log },
         .stderr = .{ .file = log },
@@ -63,6 +65,56 @@ fn startServer(init: std.process.Init, path: []const u8) !void {
     try stderr.interface.print("the session server did not start; see {s}\n", .{log_path});
     try stderr.interface.flush();
     return error.ServerDidNotStart;
+}
+
+/// What starts the server. ssh runs a command with a bare environment, without
+/// the `PATH` a login sets up, and the server passes its own on to every MCP
+/// server and tool it runs; so a bridge ssh ran starts it under a login shell.
+/// Started from a terminal, it keeps that terminal's environment, a nix shell
+/// say, as a session run there always has.
+fn serveCommand(arena: std.mem.Allocator, env: *const std.process.Environ.Map, exe: []const u8) ![]const []const u8 {
+    const shell = env.get("SHELL") orelse "";
+    const over_ssh = env.get("SSH_CONNECTION") != null and env.get("SSH_TTY") == null;
+    if (!over_ssh or !std.fs.path.isAbsolute(shell)) return arena.dupe([]const u8, &.{ exe, "remote", "serve" });
+
+    var script: std.Io.Writer.Allocating = .init(arena);
+    try script.writer.writeAll("exec ");
+    try quote(&script.writer, exe);
+    try script.writer.writeAll(" remote serve");
+    return arena.dupe([]const u8, &.{ shell, "-l", "-c", script.written() });
+}
+
+/// Single quotes, each one inside closed, escaped and reopened: read the same
+/// by sh, bash, zsh and fish.
+fn quote(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('\'');
+    for (text) |c| {
+        if (c == '\'') try writer.writeAll("'\\''") else try writer.writeByte(c);
+    }
+    try writer.writeByte('\'');
+}
+
+test "a server ssh asked for starts under a login shell, one from a terminal as it is" {
+    const testing = std.testing;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("SHELL", "/bin/zsh");
+
+    const local = try serveCommand(arena, &env, "/opt/it's/synth");
+    try testing.expectEqualStrings("/opt/it's/synth", local[0]);
+
+    try env.put("SSH_CONNECTION", "10.0.0.2 51000 10.0.0.1 22");
+    const remote = try serveCommand(arena, &env, "/opt/it's/synth");
+    const expected = [_][]const u8{ "/bin/zsh", "-l", "-c", "exec '/opt/it'\\''s/synth' remote serve" };
+    try testing.expectEqual(expected.len, remote.len);
+    for (expected, remote) |want, got| try testing.expectEqualStrings(want, got);
+
+    try env.put("SSH_TTY", "/dev/pts/3");
+    const interactive = try serveCommand(arena, &env, "/opt/synth");
+    try testing.expectEqual(@as(usize, 3), interactive.len);
 }
 
 /// This bridge is the newest program on the machine: whatever ssh or a
