@@ -47,6 +47,11 @@ synth session search <text>    find text in this project's transcripts
 synth mcp list|auth|logout     MCP servers, and signing in to one
 synth mcp enable|disable|debug turn one on or off, or see what discovery finds
 synth db status|prune|vacuum   what the database holds, and shrinking it
+synth remote connect <host>    drive a session on a host in the TUI
+synth remote list <host>       sessions on a host, live then stored (. is here)
+synth remote new <host> <dir>  start a session there
+synth remote stop <host> <id>  end one; its transcript stays
+synth remote serve|bridge      host sessions here, or reach them over stdio
 synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
@@ -249,6 +254,52 @@ A `command` runs a child process; a `url` is a remote server over Streamable
 HTTP, signed in with `synth mcp auth <name>` where it needs OAuth. `/mcp` turns
 servers on and off without leaving the TUI.
 
+## Remote
+
+Every session runs in a session server, one per user and machine, which
+`synth` starts the first time it is needed. The TUI is a client of it:
+quitting leaves the session where it is, mid-turn included, and any other
+terminal, or another machine, can pick it up. The agent, its tools, the
+database and the provider all live with the server.
+
+To drive from another machine a session you started on `devbox`:
+
+```
+synth remote connect devbox             # the one live there, or pick from a list
+synth remote connect devbox ses_7k3f9a2b
+synth remote new devbox src/api         # or start one in ~/src/api there
+```
+
+A directory that is not absolute is taken from your home directory on the
+host; quote a `~`, or your own shell expands it first. `connect` with no
+session attaches the only one live on the host. Any number
+of TUIs can drive one session: each can type, and the first to answer an
+approval settles it for all of them.
+
+`<host>` is anything `ssh` accepts: a `Host` alias, `user@host`, an address.
+synth runs `ssh <host> synth remote bridge`, so keys, agents, `ProxyJump` and
+the rest of `~/.ssh/config` apply, and the far end needs only `synth` on its
+`PATH` and plain exec - no port forwarding. `.` is this machine.
+
+The bridge starts the host's server if none is running. It listens on
+`$XDG_RUNTIME_DIR/synth/server.sock`, owner-only, and refuses peers with
+another uid; what it says on starting goes to `server.log` beside it.
+`synth remote serve` runs one in the foreground, until SIGINT or SIGTERM.
+When synth is upgraded, the next connection replaces a server still running
+the old build, as soon as no session is busy or attached. A session nobody
+is attached to unloads after five idle minutes; it stays stored, and
+attaching loads it again.
+
+The theme stays local to this machine. On a remote session providers are
+the server's: ctrl+p connects one there, keys are stored there, and the model
+picker, `/model` and `/effort` choose among its models. A ChatGPT sign-in
+listens on the server, so from another machine its callback port has to be
+forwarded, as the dialog says. `/sessions`, `/search` and `/clear` work on the
+server's stored sessions; switching away leaves a running turn running.
+Skills, MCP servers (`/mcp`) and `@` mentions are the server's too. A running
+subagent's transcript shows what it has finished saying, refreshed twice a
+second, rather than streaming.
+
 ## Hooks
 
 Hooks run commands from the project root at selected lifecycle events. Each
@@ -388,6 +439,7 @@ src/
   agent/      the turn state machine: ask -> approve -> run -> repeat
   tools/      read, list, glob, grep, write, edit, bash, task, ask_user, skill, todo
   tui/        the vxfw widget tree: transcript, composer, pickers, sidebar
+  remote/     the session server, its protocol, and the ssh bridge to it
 packages/
   mcp/        the MCP client, its own package, importing nothing from synth
 ```

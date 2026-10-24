@@ -113,6 +113,14 @@ pub const Efforts = struct {
     /// Mildest first.
     levels: []const []const u8 = &.{},
     default: []const u8 = "",
+
+    /// `wanted` when it is on offer, else the default.
+    pub fn pick(self: Efforts, wanted: []const u8) []const u8 {
+        for (self.levels) |level| {
+            if (std.mem.eql(u8, level, wanted)) return level;
+        }
+        return self.default;
+    }
 };
 
 pub fn effortsFor(self: Provider, model: []const u8) Efforts {

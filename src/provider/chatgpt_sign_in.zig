@@ -1,12 +1,12 @@
-//! A ChatGPT browser sign-in running off the UI thread.
+//! A ChatGPT browser sign-in running off the thread that asked for it.
 //!
-//! The wait is minutes of a person reading a consent screen. Done on the
-//! thread that draws, it would freeze the screen and swallow ctrl+c, so it
-//! runs here and the tick loop polls it.
+//! The wait is minutes of a person reading a consent screen. Done on a TUI's
+//! thread it would freeze the screen and swallow ctrl+c, and on a session's
+//! worker it would stall the session, so it runs here and the asker polls it.
 
 const std = @import("std");
 
-const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
+const chatgpt_auth = @import("chatgpt_auth.zig");
 
 const SignInTask = @This();
 

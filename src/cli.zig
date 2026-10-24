@@ -11,6 +11,7 @@ pub const Command = union(enum) {
     tui: Tui,
     run: Run,
     session: Session,
+    remote: Remote,
     mcp: Mcp,
     db: Db,
     skills,
@@ -56,6 +57,17 @@ pub const Command = union(enum) {
         search: []const u8,
     };
 
+    /// Sessions hosted on a machine, this one or another reached over ssh.
+    pub const Remote = union(enum) {
+        serve,
+        bridge,
+        list: []const u8,
+        /// Drive a session there in the TUI: the one named, or the only one.
+        connect: struct { host: []const u8, session: ?[]const u8 },
+        new: struct { host: []const u8, root: []const u8 },
+        stop: struct { host: []const u8, session: []const u8 },
+    };
+
     /// Looking after the database the transcripts live in.
     pub const Db = union(enum) {
         status,
@@ -97,6 +109,14 @@ const session_params = clap.parseParamsComptime(
     \\
 );
 
+const remote_params = clap.parseParamsComptime(
+    \\-h, --help    show this help and exit
+    \\<str>         connect, list, new, stop, serve, or bridge
+    \\<str>         the host: anything ssh reaches, or . for this machine
+    \\<str>         for new, the directory; for connect and stop, the session handle
+    \\
+);
+
 const run_params = clap.parseParamsComptime(
     \\-h, --help     show this help and exit
     \\--allow        approve tool calls that would otherwise be denied
@@ -112,7 +132,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"},
+    .{"session"}, .{"remote"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -140,6 +160,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
     if (first) |word| {
         if (known.has(word)) {
             if (std.mem.eql(u8, word, "session")) return parseSession(init, allocator, &iter);
+            if (std.mem.eql(u8, word, "remote")) return parseRemote(init, allocator, &iter);
             if (std.mem.eql(u8, word, "mcp")) return parseMcp(init, allocator, &iter);
             if (std.mem.eql(u8, word, "db")) return parseDb(init, &iter);
             if (std.mem.eql(u8, word, "run")) return parseRun(init, allocator, &iter);
@@ -246,6 +267,40 @@ fn parseSession(
     return error.UnknownSessionCommand;
 }
 
+fn parseRemote(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    iter: *std.process.Args.Iterator,
+) !Command {
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parseEx(clap.Help, &remote_params, clap.parsers.default, iter, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0) return .{ .help = .remote };
+
+    const verb = res.positionals[0] orelse return .{ .help = .remote };
+    if (std.mem.eql(u8, verb, "serve")) return .{ .remote = .serve };
+    if (std.mem.eql(u8, verb, "bridge")) return .{ .remote = .bridge };
+
+    const host = try allocator.dupe(u8, res.positionals[1] orelse return error.MissingHost);
+    if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .remote = .{ .list = host } };
+    if (std.mem.eql(u8, verb, "connect")) {
+        const session = if (res.positionals[2]) |handle| try allocator.dupe(u8, handle) else null;
+        return .{ .remote = .{ .connect = .{ .host = host, .session = session } } };
+    }
+
+    const target = try allocator.dupe(u8, res.positionals[2] orelse return error.MissingArgument);
+    if (std.mem.eql(u8, verb, "new")) return .{ .remote = .{ .new = .{ .host = host, .root = target } } };
+    if (std.mem.eql(u8, verb, "stop")) return .{ .remote = .{ .stop = .{ .host = host, .session = target } } };
+    return error.UnknownRemoteCommand;
+}
+
 fn parseDb(init: std.process.Init, iter: *std.process.Args.Iterator) !Command {
     var diag: clap.Diagnostic = .{};
     var res = clap.parseEx(clap.Help, &db_params, clap.parsers.default, iter, .{
@@ -308,6 +363,7 @@ fn dupeOptional(allocator: std.mem.Allocator, text: ?[]const u8) !?[]const u8 {
 pub const Topic = enum {
     run,
     session,
+    remote,
     mcp,
     db,
 
@@ -342,6 +398,12 @@ const help_sections: []const Section = &.{
             .{ .left = "session show <id>", .right = "print a session's transcript" },
             .{ .left = "session rm <id>", .right = "delete a session" },
             .{ .left = "session search <text>", .right = "find messages in this project's transcripts" },
+            .{ .left = "remote connect <host> [session]", .right = "drive a session on a host in the TUI" },
+            .{ .left = "remote list <host>", .right = "live sessions on a host (. is this machine)" },
+            .{ .left = "remote new <host> <dir>", .right = "start a session there" },
+            .{ .left = "remote stop <host> <session>", .right = "end a session there; its transcript stays" },
+            .{ .left = "remote serve", .right = "host sessions on this machine until stopped" },
+            .{ .left = "remote bridge", .right = "this machine's server on stdin/stdout (what ssh runs)" },
             .{ .left = "mcp list", .right = "configured MCP servers and their state" },
             .{ .left = "mcp auth <name>", .right = "sign in to a remote MCP server" },
             .{ .left = "mcp logout <name>", .right = "forget a server's credentials" },
