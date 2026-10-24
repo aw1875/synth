@@ -959,19 +959,16 @@ const Worker = struct {
         switch (request) {
             .attach => |attach| return self.subscribe(client, id, attach.history, arena),
             .submit => |submit| {
-                if (loop.isBusy()) {
-                    _ = try loop.steer(submit.text);
-                } else {
-                    const attachments = try arena.alloc(mention.Attachment, submit.attachments.len);
-                    for (submit.attachments, attachments) |attachment, *out| out.* = .{
-                        .path = attachment.path,
-                        .content = attachment.content,
-                        .content_bytes = attachment.content_bytes,
-                    };
-                    try loop.submit(submit.text, .{ .attachments = attachments, .images = submit.images });
-                }
+                const attachments = try arena.alloc(mention.Attachment, submit.attachments.len);
+                for (submit.attachments, attachments) |attachment, *out| out.* = .{
+                    .path = attachment.path,
+                    .content = attachment.content,
+                    .content_bytes = attachment.content_bytes,
+                };
+                const extras: Loop.Extras = .{ .attachments = attachments, .images = submit.images };
+                if (!try loop.steer(submit.text, extras)) try loop.submit(submit.text, extras);
             },
-            .steer => |steer| _ = try loop.steer(steer.text),
+            .steer => |steer| _ = try loop.steer(steer.text, .{}),
             .cancel => try loop.cancel(),
             .decide => |decide| try loop.decide(decide.decision),
             .answer => |answer| try loop.answer(answer.text),
@@ -1095,9 +1092,10 @@ const Worker = struct {
             loop.compact() catch |err| self.broadcastNotice("Could not compact: {s}", .{@errorName(err)});
             return;
         }
-        if (loop.takeSteering()) |prompt| {
-            defer self.allocator.free(prompt);
-            loop.submit(prompt, .{}) catch |err| self.broadcastNotice("Could not start the next turn: {s}", .{@errorName(err)});
+        if (loop.takeSteering()) |taken| {
+            var prompt = taken;
+            defer prompt.deinit(loop.allocator);
+            loop.submit(prompt.prompt, prompt.asExtras()) catch |err| self.broadcastNotice("Could not start the next turn: {s}", .{@errorName(err)});
         }
     }
 
@@ -1203,11 +1201,17 @@ const Worker = struct {
             .pending_call = if (pending_call) |index| @intCast(index) else null,
             .pending_description = self.pendingDescription(),
             .notes = notes,
-            .steering = loop.pendingSteering(),
+            .steering = try steeringTexts(arena, loop.pendingSteering()),
             .outcome = loop.outcome,
             .request = if (loop.request != null) loop.requests_started else null,
             .finished = loop.finished,
         };
+    }
+
+    fn steeringTexts(arena: std.mem.Allocator, pending: []const Loop.Submission) ![]const []const u8 {
+        const texts = try arena.alloc([]const u8, pending.len);
+        for (pending, texts) |submission, *text| text.* = submission.prompt;
+        return texts;
     }
 
     fn chatgptSignedIn(self: *Worker) bool {
@@ -2180,6 +2184,35 @@ test "a turn runs over the socket, its approval included" {
 
     const result = try client.expectOk(try client.send(.{ .load_tool_result = .{ .seq = asked.seq, .call = 0 } }));
     try std.testing.expect((try wire.parseResult([]const u8, arena, result)).len > 0);
+}
+
+test "a prompt sent to a session already busy steers it, keeping what came with it" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+    _ = try client.attach((try client.open(fixture.project)).handle);
+
+    fixture.script.gate.reset();
+    _ = try client.expectOk(try client.send(.{ .submit = .{ .text = "make a note" } }));
+    _ = try client.expectOk(try client.send(.{ .submit = .{
+        .text = "and this",
+        .attachments = &.{.{ .path = "pasted", .content = "a long paste" }},
+    } }));
+    while (true) {
+        const frame = try client.next();
+        if (frame.body == .status and frame.body.status.steering.len == 1) break;
+    }
+    fixture.script.gate.set(std.testing.io);
+    _ = try client.awaitState(.awaiting_approval);
+    _ = try client.expectOk(try client.send(.{ .decide = .{ .decision = .once } }));
+
+    const steered = while (true) {
+        const frame = try client.next();
+        if (frame.body == .appended and std.mem.eql(u8, frame.body.appended.message.text, "and this")) break frame.body.appended.message;
+    };
+    try std.testing.expectEqualStrings("a long paste", steered.attachments[0].content);
 }
 
 test "a client that leaves mid-turn finds it waiting, and another can answer it" {
