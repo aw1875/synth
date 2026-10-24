@@ -802,6 +802,9 @@ const Worker = struct {
     stream_closed: bool = false,
     /// Since when the session has had nothing to do and nobody attached.
     alone_since: ?std.Io.Timestamp = null,
+    /// Someone has attached. Until then an empty session is one just opened,
+    /// its opener on the way to attaching.
+    visited: bool = false,
 
     fn run(hosted: *Hosted) void {
         var self: Worker = .{ .hosted = hosted, .allocator = hosted.server.allocator, .io = hosted.server.io };
@@ -907,13 +910,16 @@ const Worker = struct {
     }
 
     /// How much longer an idle session stays loaded, or null when its time
-    /// is up. Nobody attached is the list's reference being the only one.
+    /// is up: at once for one left without a word said in it, which there is
+    /// nothing to come back to. Nobody attached is the list's reference being
+    /// the only one.
     fn idleLeft(self: *Worker) ?std.Io.Duration {
         const grace = self.hosted.server.options.idle_unload;
         if (self.stack.loop.state != .idle or self.hosted.refs.load(.acquire) != 1) {
             self.alone_since = null;
             return grace;
         }
+        if (self.visited and self.stack.convo.totalCount() == 0) return null;
         const now = std.Io.Clock.now(.awake, self.io);
         const since = self.alone_since orelse now;
         self.alone_since = since;
@@ -1016,6 +1022,7 @@ const Worker = struct {
 
     fn subscribe(self: *Worker, client: *Client, id: ?u64, history: u32, arena: std.mem.Allocator) !void {
         try self.subscribers.ensureUnusedCapacity(self.allocator, 1);
+        self.visited = true;
         // What older subscribers are owed goes first, so the snapshot starts where events resume.
         try self.publish(arena);
 
@@ -2357,6 +2364,24 @@ var shutdown_asked: std.atomic.Value(bool) = .init(false);
 
 fn noteShutdown() void {
     shutdown_asked.store(true, .release);
+}
+
+test "a session left without a word said in it unloads at once, one not yet attached waits" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.hello();
+
+    const left = (try client.open(fixture.project)).handle;
+    _ = try client.attach(left);
+    _ = try client.expectOk(try client.send(.{ .detach = .{} }));
+    try awaitLive(client, 0);
+
+    const opened = (try client.open(fixture.project)).handle;
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+    _ = try client.attach(opened);
+    try std.testing.expectEqual(@as(usize, 1), (try client.list()).len);
 }
 
 test "a server whose program was replaced says so, and steps aside once nobody is using it" {
