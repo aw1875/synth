@@ -848,6 +848,7 @@ const Worker = struct {
             .home = server.options.home,
             .db = &self.db,
             .mcp_auth = if (self.mcp_auth) |*store| store else null,
+            .mcp_connect = .background,
         });
         errdefer self.stack.destroy();
         self.stack.convo.max_messages = max_messages;

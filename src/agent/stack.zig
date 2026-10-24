@@ -56,10 +56,13 @@ pub const Options = struct {
     db: ?*Database = null,
     mcp_auth: ?*mcp.Auth = null,
     mcp_stderr: mcp.Transport.Stderr = .ignore,
+    /// Wait for the MCP servers, so their tools are offered from the first
+    /// turn, or leave them connecting for the owner to `install` once
+    /// `mcp_host` has settled.
+    mcp_connect: enum { wait, background } = .wait,
 };
 
-/// Build a session, connecting its MCP servers before the first schema is
-/// built, so their tools are advertised from the first turn.
+/// Build a session, reaching its MCP servers as `options.mcp_connect` says.
 pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stack {
     const config = options.config;
 
@@ -87,7 +90,11 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.mcp_host.stderr = options.mcp_stderr;
     if (config.mcp) |block| {
         const servers = try mcp_tools.serversFromJson(self.arena.allocator(), block);
-        try self.mcp_host.connectAll(&self.registry, servers, .{ .name = pkg.name, .version = pkg.version });
+        const client: mcp.Implementation = .{ .name = pkg.name, .version = pkg.version };
+        switch (options.mcp_connect) {
+            .wait => try self.mcp_host.connectAll(&self.registry, servers, client),
+            .background => try self.mcp_host.beginConnectAll(servers, client),
+        }
     }
 
     self.reads = .init(allocator);
