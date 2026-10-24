@@ -1192,6 +1192,7 @@ const Worker = struct {
             .sign_in = if (self.sign_in) |task| .{ .url = task.sign_in.url, .port = task.sign_in.callbackPort() } else null,
             .chatgpt_signed_in = self.chatgptSignedIn(),
             .context_limit = loop.provider.context_limit,
+            .vision = loop.provider.vision,
             .switchable = loop.provider.switchable(),
             .effort = loop.provider.effort,
             .efforts = loop.provider.effortsFor(loop.provider.model).levels,
@@ -1831,7 +1832,7 @@ test "socketPath sits under XDG_RUNTIME_DIR when there is one" {
 /// Answers the first turn by thinking aloud and asking to write a note, and
 /// the second, once the note is written, with "done". Each answer waits on
 /// `gate` after the thinking, so a test can catch a request mid-stream. Offers
-/// two models, each at two efforts.
+/// two models, each at two efforts; only the first can be shown images.
 pub const Script = struct {
     gate: std.Io.Event = .is_set,
     model: []const u8 = offered[0],
@@ -1870,7 +1871,12 @@ pub const Script = struct {
 
     fn refresh(ptr: *anyopaque) Provider.Current {
         const self: *Script = @ptrCast(@alignCast(ptr));
-        return .{ .model = self.model, .name = "script", .effort = efforts(ptr, self.model).pick(self.effort) };
+        return .{
+            .model = self.model,
+            .name = "script",
+            .vision = std.mem.eql(u8, self.model, offered[0]),
+            .effort = efforts(ptr, self.model).pick(self.effort),
+        };
     }
 
     fn efforts(_: *anyopaque, _: []const u8) Provider.Efforts {

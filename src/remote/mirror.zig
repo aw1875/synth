@@ -441,6 +441,7 @@ fn keepStatus(self: *Mirror, status: wire.Status) !void {
     self.provider.name = kept.provider;
     self.provider.model = kept.model;
     self.provider.context_limit = kept.context_limit;
+    self.provider.vision = kept.vision;
     self.provider.effort = kept.effort;
 }
 
@@ -1100,6 +1101,25 @@ test "a server number survives the trip here and back, and a note maps to the me
     try testing.expectEqual(@as(u64, 0), serverSeq(0));
     try testing.expectEqual(@as(u64, 0), serverSeq(3));
     try testing.expectEqual(@as(u64, 8), serverSeq(localSeq(7) + 1));
+}
+
+fn textOnly(mirror: *Mirror) bool {
+    return !mirror.provider.vision;
+}
+
+test "a mirror hears whether its session's model can be shown images" {
+    const testing = std.testing;
+    const fixture = try Server.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try attachFresh(fixture, &convo);
+    defer mirror.detach();
+    try testing.expect(mirror.provider.vision);
+
+    try mirror.switchModel("bigger", null, null);
+    try pollUntil(mirror, textOnly);
 }
 
 fn runsHigh(mirror: *Mirror) bool {

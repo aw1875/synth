@@ -157,6 +157,8 @@ pub const Status = struct {
     /// The server holds a ChatGPT sign-in, which `/logout` would end.
     chatgpt_signed_in: bool = false,
     context_limit: u32 = 0,
+    /// Whether the model can be shown images.
+    vision: bool = true,
     /// Whether the provider offers other models to switch to.
     switchable: bool = false,
     /// The reasoning effort in force, and the levels the model offers.
