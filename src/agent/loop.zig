@@ -1548,6 +1548,13 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     return self.isAllowed(call);
 }
 
+/// Whether a call cleared to run may resolve paths outside the project: one
+/// the user was asked about, one naming such a path, which running means was
+/// cleared, or any call once everything is approved.
+fn mayReachOutside(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    return self.auto_approve_all or self.escapesProject(call) or !self.needsNoDecision(call);
+}
+
 /// Whether a call names a path outside the project.
 ///
 /// Such a call never skips the gate, whatever the tool says about being
@@ -1990,7 +1997,7 @@ fn runApproved(self: *Loop) !void {
             .index = i,
             .name = call.name,
             .arguments = call.arguments,
-            .allow_outside = !self.needsNoDecision(&call),
+            .allow_outside = self.mayReachOutside(&call),
         });
     }
 
@@ -3385,6 +3392,62 @@ test "approving everything covers commands and paths outside the project" {
     call.arguments = "{\"path\":\"/tmp/notes.md\"}";
     try testing.expect(loop.needsNoDecision(&call));
     try testing.expectEqual(@as(usize, 0), loop.allowed.items.len);
+}
+
+/// A file outside `fixture`'s project, and a `read` of it for the fake to ask for.
+fn readOutside(fixture: *Fixture, outside: *testing.TmpDir) ![]u8 {
+    try outside.dir.writeFile(testing.io, .{ .sub_path = "notes.md", .data = "outside" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try outside.dir.realPath(testing.io, &buf)];
+    const arguments = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}/notes.md\"}}", .{dir});
+    fixture.fake.tool_name = "read";
+    fixture.fake.tool_arguments = arguments;
+    return arguments;
+}
+
+fn firstCall(loop: *const Loop) Conversation.ToolCall {
+    for (loop.conversation.messages.items) |msg| {
+        if (msg.tool_calls.len > 0) return msg.tool_calls[0];
+    }
+    unreachable;
+}
+
+test "approving everything runs a call outside the project, not just its prompt" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    const arguments = try readOutside(fixture, &outside);
+    defer testing.allocator.free(arguments);
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.auto_approve_all = true;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, firstCall(&loop).status);
+}
+
+test "saying always to a path outside the project runs the call" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    const arguments = try readOutside(fixture, &outside);
+    defer testing.allocator.free(arguments);
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try loop.decide(.always);
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, firstCall(&loop).status);
 }
 
 test "a question stops the turn and its answer becomes the result" {
