@@ -115,11 +115,11 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
-| `auto_approve_all` | bool | `false` | Run every tool call without a prompt, including reads and writes outside the project. Meant for a machine set aside for the agent. `PreToolUse` hooks still run and can still refuse a call. |
+| `auto_approve_all` | bool | `false` | Run every tool call without a prompt, including reads and writes outside the project. Meant for a machine set aside for the agent. `PreToolUse` hooks still run and can still refuse a call. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
-| `max_stall_ms` | number | `120000` | How long the provider may send nothing before the turn is given up on. `0` disables it. |
+| `max_stall_ms` | number | `120000` | How long the provider may send nothing before the turn is given up on. `0` disables it. With all three of these at `0`, the agent's cap on model calls per turn is lifted too. |
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See below. |
