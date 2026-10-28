@@ -3,16 +3,40 @@
 A terminal coding agent, written in Zig. Runs on local or hosted models, with
 MCP servers and skills.
 
-> Early. It works and it is used daily, but there is no release yet and things
-> move.
+> Early. It works and it is used daily, but there is no stable release yet and
+> things move.
 
-## Requirements
+## Install with Homebrew
+
+```sh
+brew tap misraishan/synth https://github.com/misraishan/synth.git
+brew install misraishan/synth/synth
+```
+
+The tap lives in this repository. The explicit Git URL is required because its
+name does not start with `homebrew-`. The formula downloads the published binary
+for macOS arm64 or Linux x86-64; Zig is not required. It currently tracks the
+upstream rolling [`dev` prerelease](https://github.com/aw1875/synth/releases/tag/dev).
+The release workflows update its version, URLs, and checksums to this
+repository's binaries after publishing.
+A model server with tool-call support is still required.
+
+To update to the latest published build:
+
+```sh
+brew update
+brew upgrade misraishan/synth/synth
+```
+
+## Build from source
+
+### Requirements
 
 - Zig 0.16
 - A model server: [ollama](https://ollama.com), or anything speaking the OpenAI
   chat API. The model has to support tool calls.
 
-## Build
+### Build
 
 ```sh
 zig build              # build synth

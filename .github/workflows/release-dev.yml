@@ -78,3 +78,8 @@ jobs:
 
             **Build ${{ steps.vars.outputs.build }}** from ${{ steps.vars.outputs.short }}
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/update-homebrew.py "${{ steps.vars.outputs.version }}" dev --publish

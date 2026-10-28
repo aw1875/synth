@@ -97,3 +97,8 @@ jobs:
             install -m755 synth /usr/local/bin/synth
             ```
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/update-homebrew.py "${{ steps.vars.outputs.version }}" "$GITHUB_REF_NAME" --publish
