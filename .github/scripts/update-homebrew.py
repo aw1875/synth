@@ -22,11 +22,10 @@ def main():
         archive = root / "release" / f"synth-{asset_version}-{target}.tar.gz"
         checksums[target] = hashlib.sha256(archive.read_bytes()).hexdigest()
 
-    repository = os.environ.get("GITHUB_REPOSITORY", "aw1875/synth")
-    base_url = f"https://github.com/{repository}/releases/download/{args.tag}"
+    base_url = f"https://github.com/aw1875/synth/releases/download/{args.tag}"
     updated = f'''class Synth < Formula
   desc "Terminal coding agent for local and hosted models"
-  homepage "https://github.com/{repository}"
+  homepage "https://github.com/aw1875/synth"
   version "{args.version}"
   license "MIT"
 

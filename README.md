@@ -9,23 +9,22 @@ MCP servers and skills.
 ## Install with Homebrew
 
 ```sh
-brew tap misraishan/synth https://github.com/misraishan/synth.git
-brew install misraishan/synth/synth
+brew tap aw1875/synth https://github.com/aw1875/synth.git
+brew install aw1875/synth/synth
 ```
 
 The tap lives in this repository. The explicit Git URL is required because its
 name does not start with `homebrew-`. The formula downloads the published binary
 for macOS arm64 or Linux x86-64; Zig is not required. It currently tracks the
-upstream rolling [`dev` prerelease](https://github.com/aw1875/synth/releases/tag/dev).
-The release workflows update its version, URLs, and checksums to this
-repository's binaries after publishing.
+rolling [`dev` prerelease](https://github.com/aw1875/synth/releases/tag/dev),
+and the release workflows update its version, URLs, and checksums after publishing.
 A model server with tool-call support is still required.
 
 To update to the latest published build:
 
 ```sh
 brew update
-brew upgrade misraishan/synth/synth
+brew upgrade aw1875/synth/synth
 ```
 
 ## Build from source
