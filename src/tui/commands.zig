@@ -166,6 +166,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
 /// Turn a command down and hand the draft back, so nothing typed is lost.
 fn refuseCommand(self: *Model, ctx: *vxfw.EventContext, line: []const u8, said: []const u8) !bool {
     try self.input.insertText(line);
+    try self.followDraft(ctx);
     try self.notification.show(ctx, .info, said);
     ctx.redraw = true;
     return true;
@@ -1046,6 +1047,21 @@ test "the model is not switched under a running turn" {
     try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
     try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
     try testing.expectEqualStrings("/model glm-5.3-flash", model.input.text.items);
+}
+
+test "clearing the draft closes the slash menu over it" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try model.input.insertText("/mo");
+    try model.followDraft(&ctx);
+    try testing.expect(model.slash.isOpen());
+
+    try model.handleInterrupt(&ctx);
+    try testing.expect(!model.slash.isOpen());
 }
 
 test "a tab separates a command from its argument" {

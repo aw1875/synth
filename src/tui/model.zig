@@ -1057,6 +1057,7 @@ pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.input.text.items.len > 0) {
         self.input.clear();
         self.mentions.close();
+        self.slash.close();
         self.endRecall();
         if (self.loop.pendingSteering().len == 0) self.held.clear();
         return ctx.consumeAndRedraw();
@@ -1109,9 +1110,17 @@ pub fn awaitMentions(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.mentions.isScanning()) try self.scheduleTick(ctx);
 }
 
-/// Recompute the `/` picker from the draft, after typing or a paste.
-pub fn refreshSlash(self: *Model) !void {
-    self.slash.chatgpt_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
+/// Recompute the `@` and `/` pickers from the draft. Every path that changes
+/// the draft ends here, or a picker goes on offering what is no longer typed.
+pub fn followDraft(self: *Model, ctx: *vxfw.EventContext) !void {
+    try self.refreshMentions();
+    try self.awaitMentions(ctx);
+    try self.refreshSlash();
+}
+
+fn refreshSlash(self: *Model) !void {
+    const is_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
+    self.slash.chatgpt_signed_in = is_signed_in;
     try self.slash.update(self.input.text.items, self.input.cursor);
 }
 

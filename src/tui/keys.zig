@@ -192,13 +192,13 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             self.normalizePaste();
             try self.handlePaste(self.paste_buffer.items);
             self.paste_buffer.clearRetainingCapacity();
-            try self.refreshSlash();
+            try self.followDraft(ctx);
             return ctx.consumeAndRedraw();
         },
         .paste => |text| {
             defer self.allocator.free(text);
             try self.handlePaste(text);
-            try self.refreshSlash();
+            try self.followDraft(ctx);
             return ctx.consumeAndRedraw();
         },
         .mouse => |mouse| {
@@ -544,10 +544,16 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches(vaxis.Key.up, .{})) {
-                if (try self.recall(.back)) return ctx.consumeAndRedraw();
+                if (try self.recall(.back)) {
+                    try self.followDraft(ctx);
+                    return ctx.consumeAndRedraw();
+                }
             }
             if (key.matches(vaxis.Key.down, .{})) {
-                if (try self.recall(.forward)) return ctx.consumeAndRedraw();
+                if (try self.recall(.forward)) {
+                    try self.followDraft(ctx);
+                    return ctx.consumeAndRedraw();
+                }
             }
 
             if (self.selection.isActive() and key.text != null) {
@@ -556,9 +562,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             _ = try self.input.handleEvent(ctx, event);
-            try self.refreshMentions();
-            try self.awaitMentions(ctx);
-            try self.refreshSlash();
+            try self.followDraft(ctx);
             if (ctx.consume_event) return;
         },
         else => {},
@@ -596,6 +600,7 @@ fn openEditor(self: *Model, ctx: *vxfw.EventContext) !void {
 
     self.input.clear();
     try self.input.insertText(edited);
+    try self.followDraft(ctx);
 }
 
 /// Hand the terminal back and stop the process, the way ctrl+z does for any
