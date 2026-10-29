@@ -42,6 +42,8 @@ pub const Argument = union(enum) {
     required: []const u8,
 };
 
+const optional_name: Argument = .{ .optional = "name" };
+
 /// What a skill offers when it has no description of its own.
 const unlabelled_skill = "run this skill";
 
@@ -50,17 +52,17 @@ const unlabelled_skill = "run this skill";
 pub const commands: []const Command = &.{
     .{ .name = "clear", .description = "clear the transcript and start a fresh session", .is_destructive = true },
     .{ .name = "compact", .description = "summarise the conversation so far, freeing context", .is_destructive = true },
-    .{ .name = "model", .description = "switch the model this session runs on", .argument = .{ .optional = "name" } },
+    .{ .name = "model", .description = "switch the model this session runs on", .argument = optional_name },
     .{ .name = "effort", .description = "set how hard the model thinks, where it has levels", .argument = .{ .optional = "level" } },
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
     .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true, .is_destructive = true },
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
-    .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = .{ .optional = "name" } },
+    .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = optional_name },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
-    .{ .name = "theme", .description = "change the color theme", .argument = .{ .optional = "name" } },
-    .{ .name = "rename", .description = "name this session", .argument = .{ .optional = "name" } },
+    .{ .name = "theme", .description = "change the color theme", .argument = optional_name },
+    .{ .name = "rename", .description = "name this session", .argument = optional_name },
     .{ .name = "prune", .description = "shrink the database, dropping old stored tool output", .is_destructive = true },
     .{ .name = "search", .description = "find text in this project's transcripts", .argument = .{ .required = "text" } },
     .{ .name = "help", .description = "list these commands" },
