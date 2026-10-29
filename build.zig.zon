@@ -1,6 +1,6 @@
 .{
     .name = .synth,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0x241431a6bf4a78b3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

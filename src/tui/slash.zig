@@ -47,6 +47,7 @@ pub const commands: []const Command = &.{
     .{ .name = "model", .description = "switch the model this session runs on", .argument = "[name]" },
     .{ .name = "effort", .description = "set how hard the model thinks, where it has levels" },
     .{ .name = "sessions", .description = "switch to another session" },
+    .{ .name = "detach", .description = "leave this session running, to come back to later" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
     .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true },
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },

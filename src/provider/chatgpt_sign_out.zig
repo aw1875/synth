@@ -1,9 +1,9 @@
-//! Signing out of ChatGPT off the UI thread: revoking the session is a
-//! network round trip, and the screen must keep drawing while it runs.
+//! Signing out of ChatGPT off the thread that asked: revoking the session is
+//! a network round trip, and a TUI or a session must not stall on it.
 
 const std = @import("std");
 
-const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
+const chatgpt_auth = @import("chatgpt_auth.zig");
 
 const SignOutTask = @This();
 

@@ -58,9 +58,8 @@ pub fn privateDataPath(allocator: std.mem.Allocator, env: *std.process.Environ.M
 /// `$XDG_DATA_HOME/<name>/mcp-auth.json`, or `~/.local/share/<name>/...`. A
 /// debug build keeps it in the working directory. Owned by the caller.
 ///
-/// Beside the database rather than the config: this is state the program
-/// writes - OAuth tokens and client registrations - not anything a person
-/// edits.
+/// Where MCP sign-ins were kept before the database, read once to bring them
+/// in.
 pub fn defaultMcpAuthPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
     return dataPath(allocator, env, mcp_auth_file);
 }
@@ -68,7 +67,7 @@ pub fn defaultMcpAuthPath(allocator: std.mem.Allocator, env: *std.process.Enviro
 /// What the database is called, wherever it ends up living.
 const database_file = pkg.name ++ ".db";
 
-/// Where per-server OAuth state is kept.
+/// Where per-server OAuth state was kept.
 const mcp_auth_file = "mcp-auth.json";
 
 /// Largest config file we will read.

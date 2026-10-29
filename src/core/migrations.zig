@@ -32,6 +32,8 @@ pub const all = [_]Migration{
     .{ .version = 4, .sql = @embedFile("migrations/004_todo.sql") },
     .{ .version = 5, .sql = @embedFile("migrations/005_subagent_session.sql") },
     .{ .version = 6, .sql = @embedFile("migrations/006_tool_call_elapsed.sql") },
+    .{ .version = 7, .sql = @embedFile("migrations/007_lease.sql") },
+    .{ .version = 8, .sql = @embedFile("migrations/008_mcp_auth.sql") },
 };
 
 /// The version this build writes. Derived, so adding a migration is one edit.
@@ -40,21 +42,25 @@ pub const current: i32 = all[all.len - 1].version;
 /// Bring the schema up to `current`. Each migration runs in its own
 /// transaction; a failure rolls that one back and leaves the version where it
 /// was, so the next start retries it rather than skipping it.
+/// Each step takes the write lock before it reads the version, so a second
+/// process opening the database at the same moment waits for the first and
+/// then finds the step done. A deferred `begin` would let both read the old
+/// version, and fail the second as busy when it went to write.
 pub fn run(conn: *zqlite.Conn) !void {
-    var version = try userVersion(conn);
-    while (version < current) {
+    if (try userVersion(conn) >= current) return;
+    while (true) {
+        try conn.execNoArgs("begin immediate");
+        errdefer conn.rollback();
+
+        const version = try userVersion(conn);
+        if (version >= current) return conn.commit();
         const migration = for (all) |m| {
             if (m.version == version + 1) break m;
         } else return error.UnknownMigration;
 
-        try conn.transaction();
-        errdefer conn.rollback();
-
         try conn.execNoArgs(migration.sql);
         try setUserVersion(conn, migration.version);
-
         try conn.commit();
-        version = migration.version;
     }
 }
 

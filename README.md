@@ -73,6 +73,10 @@ synth db status|prune|vacuum   what the database holds, and shrinking it
 synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
+synth acp                      speak the Agent Client Protocol on stdio
+synth remote list <host>       sessions on a host over ssh (. is this machine)
+synth remote connect <host>    drive one in the TUI: name its id, or pick
+synth remote new <host> [dir]  start one there, in your home by default
 
   -c, --continue               resume the most recent session here
   -s, --session <id>           resume a session by handle (ses_7k3f9a2b)
@@ -83,6 +87,28 @@ synth prompt                   print the system prompt
 `synth run` is the fastest way to answer "does this model actually emit tool
 calls" - it drives the real loop and provider and prints each step, denying
 anything that would change the project unless `--allow` is given.
+
+`synth acp` is synth as an [ACP](https://agentclientprotocol.com) agent, for an
+editor to spawn: each session it opens runs in a process of its own, and
+approvals are asked as permission requests. Loading a session that is running
+elsewhere attaches to it there. An editor that offers its own view of files
+gets reads and edits through it, unsaved changes included, and one that keeps
+terminals runs commands in them, shown in the call as they run. MCP servers
+the editor brings connect beside those in `config.json`, which wins a clash of
+names; skills and `/compact` are offered as its slash commands.
+
+Quitting stops the session, a turn in progress included. `/detach` leaves it
+running instead: `synth --session <id>`, `--continue` or `/sessions` attach to
+it again from any terminal, and quitting from there stops it. Each session
+listens on a socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`.
+
+`synth remote` reaches the sessions on another machine the same way, over
+ssh: your ssh config, keys and jump hosts apply, and synth must be on the far
+end's `PATH`. There `synth remote bridge` attaches to a running session or
+starts `synth acp` under your login shell, so tools see the environment a
+login there would. `/detach` keeps a remote session running after you
+disconnect, and `synth remote connect <host>` with no id offers the sessions
+there to pick from.
 
 ## Keys
 
@@ -169,7 +195,7 @@ own business: `/api/ps` is the last word on what the runner actually got, and
 that is what the sidebar plans against.
 
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
-`SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
+`SYNTH_DB`, `SYNTH_SOCKET_DIR`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
 `OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
 `SYNTH_SEARCH_API_KEY`. `VISUAL` and `EDITOR` decide what `ctrl+e` opens. Which host-and-key pair applies depends on the protocol
 the chosen provider speaks, so having both sets exported does not hand one
@@ -409,6 +435,7 @@ src/
   core/       config, auth, sqlite, sessions, @path mentions, search primitives
   provider/   the ollama and OpenAI backends, and what fits in a context window
   agent/      the turn state machine: ask -> approve -> run -> repeat
+  acp/        the ACP agent, and synth's own extension to it
   tools/      read, list, glob, grep, write, edit, bash, task, ask_user, skill, todo
   tui/        the vxfw widget tree: transcript, composer, pickers, sidebar
 packages/

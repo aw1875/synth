@@ -181,6 +181,7 @@ pub fn refresh(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    store.reload(options.name) catch {};
     const entry = store.getForUrl(options.name, options.server_url) orelse return Error.NoRefreshToken;
     const tokens = entry.tokens orelse return Error.NoRefreshToken;
     const refresh_token = tokens.refresh_token orelse return Error.NoRefreshToken;
@@ -231,6 +232,7 @@ pub fn accessToken(
     store: *Auth,
     options: Options,
 ) !?[]const u8 {
+    store.reload(options.name) catch {};
     const entry = store.getForUrl(options.name, options.server_url) orelse return null;
     const tokens = entry.tokens orelse return null;
 
@@ -294,7 +296,7 @@ fn clientId(
 
     // Saved before the flow finishes: an attempt abandoned at the consent
     // screen would otherwise register a fresh client on every try.
-    store.save(io, null) catch {};
+    store.save(options.name) catch {};
 
     return registered.client_id;
 }

@@ -29,6 +29,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
     defer allocator.free(path);
 
     try Config.ensureDir(io, db_path);
+    if (!std.mem.eql(u8, db_path, ":memory:")) try keepPrivate(io, db_path);
 
     // NoMutex: this connection is the UI thread's. A worker opens its own.
     var conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.NoMutex);
@@ -37,9 +38,10 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
     var db = Database{ .conn = conn, .io = io };
     errdefer db.deinit();
 
+    // First, so that switching a new database to WAL waits out another process creating it.
+    conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
     conn.execNoArgs("PRAGMA journal_mode = WAL") catch {};
     conn.execNoArgs("PRAGMA synchronous = NORMAL") catch {};
-    conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
     conn.execNoArgs("PRAGMA foreign_keys = ON") catch {};
 
     try db.migrate();
@@ -49,6 +51,26 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
 
 pub fn deinit(self: *Database) void {
     self.conn.close();
+}
+
+const owner_only: std.Io.File.Permissions = .fromMode(0o600);
+
+/// Let only the owner read the database and its WAL files: transcripts hold
+/// whatever a tool printed, and sign-ins are kept here. Created here when
+/// missing, empty, which SQLite takes for a new database, because SQLite
+/// gives the WAL files it creates the database file's mode.
+fn keepPrivate(io: std.Io, db_path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.createFile(io, db_path, .{ .permissions = owner_only, .truncate = false });
+    file.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+        const path = try std.fmt.bufPrint(&buffer, "{s}{s}", .{ db_path, suffix });
+        cwd.setFilePermissions(io, path, owner_only, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn migrate(self: *Database) !void {
@@ -97,10 +119,19 @@ pub fn createSession(
     cwd: []const u8,
     model: []const u8,
 ) !i64 {
-    const now = self.nowMs();
-    var buffer: [public_id_chars + 4]u8 = undefined;
-    const public_id = self.newPublicId(&buffer);
+    var buffer: [public_id_bytes]u8 = undefined;
+    return self.createSessionAs(project_id, cwd, model, self.newPublicId(&buffer));
+}
 
+/// A session row under a handle given out before it existed.
+pub fn createSessionAs(
+    self: *Database,
+    project_id: i64,
+    cwd: []const u8,
+    model: []const u8,
+    public_id: []const u8,
+) !i64 {
+    const now = self.nowMs();
     try self.conn.exec(
         \\INSERT INTO session (project_id, created_at, updated_at, cwd, model, public_id)
         \\VALUES (?, ?, ?, ?, ?, ?)
@@ -143,7 +174,10 @@ pub fn subagentSession(self: *Database, tool_call_id: i64) !?i64 {
 
 /// A fresh `ses_xxxxxxxx` handle, written into `buffer`. Randomness comes from
 /// `Io` in 0.16, which is also what makes it testable.
-fn newPublicId(self: *Database, buffer: []u8) []const u8 {
+pub const public_id_bytes = public_id_chars + 4;
+
+/// A fresh session handle, in `buffer`.
+pub fn newPublicId(self: *Database, buffer: []u8) []const u8 {
     @memcpy(buffer[0..4], "ses_");
 
     const body = buffer[4 .. 4 + public_id_chars];
@@ -168,12 +202,65 @@ pub const SessionInfo = struct {
     title: []const u8,
     updated_at: i64,
     messages: u64,
+    /// Hosted by a process right now: see `heldSessions`.
+    live: bool = false,
 
     pub fn deinit(self: *const SessionInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.public_id);
         allocator.free(self.title);
     }
 };
+
+/// A stored session anywhere on this machine, with where it ran.
+pub const RecentSession = struct {
+    public_id: []const u8,
+    title: []const u8,
+    cwd: []const u8,
+    updated_at: i64,
+    messages: u64,
+
+    pub fn deinit(self: *const RecentSession, allocator: std.mem.Allocator) void {
+        allocator.free(self.public_id);
+        allocator.free(self.title);
+        allocator.free(self.cwd);
+    }
+};
+
+/// Sessions with anything in them, across every project, most recently
+/// touched first.
+pub fn recentSessions(self: *Database, allocator: std.mem.Allocator, limit: usize) ![]RecentSession {
+    var rows = try self.conn.rows(
+        \\SELECT s.public_id, s.title, s.cwd, s.updated_at, COUNT(m.id) AS messages
+        \\FROM session s
+        \\JOIN message m ON m.session_id = s.id
+        \\WHERE s.parent_tool_call IS NULL
+        \\GROUP BY s.id
+        \\ORDER BY s.updated_at DESC
+        \\LIMIT ?
+    , .{@as(i64, @intCast(limit))});
+    defer rows.deinit();
+
+    var list: std.ArrayList(RecentSession) = .empty;
+    errdefer {
+        for (list.items) |info| info.deinit(allocator);
+        list.deinit(allocator);
+    }
+    while (rows.next()) |row| {
+        try list.ensureUnusedCapacity(allocator, 1);
+        const public_id = try allocator.dupe(u8, row.text(0));
+        errdefer allocator.free(public_id);
+        const title = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(title);
+        list.appendAssumeCapacity(.{
+            .public_id = public_id,
+            .title = title,
+            .cwd = try allocator.dupe(u8, row.text(2)),
+            .updated_at = row.int(3),
+            .messages = @intCast(row.int(4)),
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
 
 /// Models this project has actually used, most recently first.
 pub fn recentModels(
@@ -384,6 +471,24 @@ pub fn findSession(self: *Database, project_id: i64, public_id: []const u8) !?i6
     return row.int(0);
 }
 
+/// The top-level session a handle names, in any project.
+pub fn sessionByHandle(self: *Database, public_id: []const u8) !?i64 {
+    const row = try self.conn.row(
+        "SELECT id FROM session WHERE public_id = ? AND parent_tool_call IS NULL",
+        .{public_id},
+    ) orelse return null;
+    defer row.deinit();
+    return row.int(0);
+}
+
+/// Where a session ran. Caller owns the result.
+pub fn sessionCwd(self: *Database, session_id: i64, allocator: std.mem.Allocator) ![]const u8 {
+    const row = try self.conn.row("SELECT cwd FROM session WHERE id = ?", .{session_id}) orelse
+        return error.UnknownSession;
+    defer row.deinit();
+    return allocator.dupe(u8, row.text(0));
+}
+
 /// The most recently touched session with anything in it, for `--continue`.
 pub fn latestSession(self: *Database, project_id: i64) !?i64 {
     const row = try self.conn.row(
@@ -410,6 +515,93 @@ pub fn countMessages(self: *Database, session_id: i64) !u64 {
 /// Delete a session and everything hanging off it.
 pub fn deleteSession(self: *Database, session_id: i64) !void {
     try self.conn.exec("DELETE FROM session WHERE id = ?", .{session_id});
+}
+
+/// How long a lease outlives its holder's last renewal.
+pub const lease_ttl_ms: i64 = 30 * std.time.ms_per_s;
+
+/// Make process `pid` the host of session `public_id`, or renew its lease.
+/// `error.SessionHeld` when another process holds it.
+pub fn takeLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
+    try self.conn.execNoArgs("begin immediate");
+    errdefer self.conn.rollback();
+    const now = self.nowMs();
+    if (try self.conn.row("SELECT pid, heartbeat_at FROM lease WHERE public_id = ?", .{public_id})) |row| {
+        defer row.deinit();
+        const holder: std.posix.pid_t = @intCast(row.int(0));
+        if (holder != pid and isLive(holder, row.int(1), now)) return error.SessionHeld;
+    }
+    try self.conn.exec(
+        \\INSERT INTO lease (public_id, pid, heartbeat_at) VALUES (?, ?, ?)
+        \\ON CONFLICT(public_id) DO UPDATE SET pid = excluded.pid, heartbeat_at = excluded.heartbeat_at
+    , .{ public_id, @as(i64, pid), now });
+    try self.conn.commit();
+}
+
+/// Keep `pid`'s lease on `public_id` from going stale.
+pub fn renewLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
+    try self.conn.exec("UPDATE lease SET heartbeat_at = ? WHERE public_id = ? AND pid = ?", .{ self.nowMs(), public_id, @as(i64, pid) });
+}
+
+pub fn releaseLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
+    try self.conn.exec("DELETE FROM lease WHERE public_id = ? AND pid = ?", .{ public_id, @as(i64, pid) });
+}
+
+/// The handles of the sessions some process is hosting right now. Caller
+/// owns the result.
+pub fn heldSessions(self: *Database, allocator: std.mem.Allocator) ![][]const u8 {
+    var rows = try self.conn.rows("SELECT public_id, pid, heartbeat_at FROM lease", .{});
+    defer rows.deinit();
+    const now = self.nowMs();
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |handle| allocator.free(handle);
+        list.deinit(allocator);
+    }
+    while (rows.next()) |row| {
+        if (!isLive(@intCast(row.int(1)), row.int(2), now)) continue;
+        try list.append(allocator, try allocator.dupe(u8, row.text(0)));
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// A lease is held while it is renewed and its process is still there. The
+/// process check frees a crashed holder's sessions at once rather than after
+/// the time to live; the renewal frees them once its pid has gone to another.
+fn isLive(pid: std.posix.pid_t, heartbeat_at: i64, now: i64) bool {
+    if (now - heartbeat_at > lease_ttl_ms) return false;
+    const probe: std.posix.SIG = @enumFromInt(0);
+    return std.posix.errno(std.posix.system.kill(pid, probe)) != .SRCH;
+}
+
+/// One MCP server's stored entry, as the `mcp` package encodes it.
+pub const McpAuthEntry = struct { name: []const u8, entry: []const u8 };
+
+/// Every MCP server's stored entry, in `arena`.
+pub fn mcpAuthEntries(self: *Database, arena: std.mem.Allocator) ![]McpAuthEntry {
+    var rows = try self.conn.rows("SELECT name, entry FROM mcp_auth", .{});
+    defer rows.deinit();
+    var list: std.ArrayList(McpAuthEntry) = .empty;
+    while (rows.next()) |row| {
+        try list.append(arena, .{ .name = try arena.dupe(u8, row.text(0)), .entry = try arena.dupe(u8, row.text(1)) });
+    }
+    return list.items;
+}
+
+/// One MCP server's stored entry, in `arena`, or null when there is none.
+pub fn mcpAuthEntry(self: *Database, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    const row = try self.conn.row("SELECT entry FROM mcp_auth WHERE name = ?", .{name}) orelse return null;
+    defer row.deinit();
+    return try arena.dupe(u8, row.text(0));
+}
+
+/// Replace one MCP server's entry, or remove it when `entry` is null.
+pub fn setMcpAuthEntry(self: *Database, name: []const u8, entry: ?[]const u8) !void {
+    const kept = entry orelse return self.conn.exec("DELETE FROM mcp_auth WHERE name = ?", .{name});
+    try self.conn.exec(
+        \\INSERT INTO mcp_auth (name, entry) VALUES (?, ?)
+        \\ON CONFLICT(name) DO UPDATE SET entry = excluded.entry
+    , .{ name, kept });
 }
 
 /// Append a message row and return its id. Heavy bodies (reasoning, tool
@@ -596,6 +788,24 @@ pub fn setSetting(self: *Database, key: []const u8, value: []const u8) !void {
     ,
         .{ key, value },
     );
+}
+
+fn effortKey(allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "effort:{s}:{s}", .{ provider_id, model });
+}
+
+/// The reasoning effort last chosen for a provider's model, or "" when none
+/// was. Caller owns the result.
+pub fn rememberedEffort(self: *Database, allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
+    const key = try effortKey(allocator, provider_id, model);
+    defer allocator.free(key);
+    return self.setting(allocator, key);
+}
+
+pub fn rememberEffort(self: *Database, allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8, level: []const u8) !void {
+    const key = try effortKey(allocator, provider_id, model);
+    defer allocator.free(key);
+    try self.setSetting(key, level);
 }
 
 pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
@@ -1198,6 +1408,111 @@ fn searchFixture(dir: *std.testing.TmpDir) !struct { db: Database, project_id: i
     return .{ .db = db, .project_id = project_id };
 }
 
+test "the database and its WAL files are the owner's alone, even once others could read them" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], "private.db" });
+    defer testing.allocator.free(db_path);
+
+    const modeOf = struct {
+        fn run(path: []const u8) !std.posix.mode_t {
+            const stat = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
+            return stat.permissions.toMode() & 0o777;
+        }
+    }.run;
+    const wal = try std.fmt.allocPrint(testing.allocator, "{s}-wal", .{db_path});
+    defer testing.allocator.free(wal);
+    {
+        var db = try init(testing.allocator, testing.io, db_path);
+        defer db.deinit();
+        _ = try db.resolveProject("/repo", "git", "repo");
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(db_path));
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(wal));
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, db_path, .fromMode(0o644), .{});
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, wal, .fromMode(0o644), .{});
+    }
+    var reopened = try init(testing.allocator, testing.io, db_path);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(db_path));
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(wal));
+}
+
+test "two processes opening a new database at once both get it, migrated once" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+
+    for (0..10) |round| {
+        var name: [16]u8 = undefined;
+        const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], try std.fmt.bufPrint(&name, "{d}.db", .{round}) });
+        defer testing.allocator.free(db_path);
+
+        const Opener = struct {
+            path: []const u8,
+            failed: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                var db = init(testing.allocator, testing.io, self.path) catch |err| {
+                    self.failed = err;
+                    return;
+                };
+                db.deinit();
+            }
+        };
+        var openers = [_]Opener{ .{ .path = db_path }, .{ .path = db_path } };
+        var threads: [openers.len]std.Thread = undefined;
+        for (&openers, &threads) |*opener, *thread| thread.* = try std.Thread.spawn(.{}, Opener.run, .{opener});
+        for (threads) |thread| thread.join();
+        for (openers) |opener| try testing.expectEqual(null, opener.failed);
+    }
+}
+
+test "a session is hosted by one live process at a time" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], "lease.db" });
+    defer testing.allocator.free(db_path);
+    var db = try init(testing.allocator, testing.io, db_path);
+    defer db.deinit();
+
+    const us = std.posix.system.getpid();
+    const init_pid: std.posix.pid_t = 1;
+    try db.takeLease("ses_ours", us);
+    try db.takeLease("ses_ours", us);
+    try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
+
+    try db.takeLease("ses_theirs", init_pid);
+    try testing.expectError(error.SessionHeld, db.takeLease("ses_theirs", us));
+    const held = try db.heldSessions(testing.allocator);
+    defer {
+        for (held) |handle| testing.allocator.free(handle);
+        testing.allocator.free(held);
+    }
+    try testing.expectEqual(2, held.len);
+
+    try db.conn.exec("UPDATE lease SET heartbeat_at = ? WHERE public_id = 'ses_theirs'", .{db.nowMs() - lease_ttl_ms - 1});
+    try db.takeLease("ses_theirs", us);
+
+    try db.releaseLease("ses_ours", init_pid);
+    try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
+    try db.releaseLease("ses_ours", us);
+    try db.takeLease("ses_ours", init_pid);
+
+    var gone = try std.process.spawn(testing.io, .{ .argv = &.{"true"} });
+    const dead = gone.id.?;
+    _ = try gone.wait(testing.io);
+    try db.takeLease("ses_crashed", dead);
+    try db.takeLease("ses_crashed", us);
+}
+
 test "a search finds messages whatever their case, within the project" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
@@ -1722,6 +2037,11 @@ test "sessions get a handle, and are found by it" {
 
     try std.testing.expectEqual(session_id, (try db.findSession(project_id, handle)).?);
     try std.testing.expect(try db.findSession(project_id, "ses_00000000") == null);
+    try std.testing.expectEqual(session_id, (try db.sessionByHandle(handle)).?);
+    try std.testing.expect(try db.sessionByHandle("ses_00000000") == null);
+    const cwd = try db.sessionCwd(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectEqualStrings("/tmp/project", cwd);
 
     try std.testing.expectEqual(@as(usize, 0), (try db.listSessions(std.testing.allocator, project_id, 10)).len);
     try std.testing.expect(try db.latestSession(project_id) == null);
@@ -2041,4 +2361,37 @@ test "a provider's replay record comes back whole on resume, and is shed with ol
     try db.conn.exec("UPDATE session SET updated_at = 0 WHERE id = ?", .{session_id});
     _ = try db.prune(.{ .shed_after_days = 1 }, db.nowMs());
     try std.testing.expectEqual(@as(i64, 0), try countOf(&db, "SELECT count(*) FROM blob WHERE kind = '" ++ provider_state_blob ++ "'"));
+}
+
+test "recent sessions come from every project, and only those with anything in them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/r.db", .{buf[0..n]});
+    defer std.testing.allocator.free(db_path);
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const api = try db.createSession(try db.resolveProject("/src/api", "git", "api"), "/src/api", "qwen3");
+    const web = try db.createSession(try db.resolveProject("/src/web", "git", "web"), "/src/web/app", "qwen3");
+    _ = try db.createSession(try db.resolveProject("/src/web", "git", "web"), "/src/web", "qwen3");
+    _ = try db.appendMessage(api, 0, "user", "hello", null, 0);
+    _ = try db.appendMessage(web, 0, "user", "hi", null, 0);
+    _ = try db.appendMessage(web, 1, "assistant", "hello", null, 0);
+
+    const recent = try db.recentSessions(std.testing.allocator, 10);
+    defer {
+        for (recent) |info| info.deinit(std.testing.allocator);
+        std.testing.allocator.free(recent);
+    }
+    try std.testing.expectEqual(@as(usize, 2), recent.len);
+    for (recent) |info| {
+        if (std.mem.eql(u8, info.cwd, "/src/web/app")) {
+            try std.testing.expectEqual(@as(u64, 2), info.messages);
+        } else {
+            try std.testing.expectEqualStrings("/src/api", info.cwd);
+            try std.testing.expectEqual(@as(u64, 1), info.messages);
+        }
+    }
 }
