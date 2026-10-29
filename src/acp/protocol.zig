@@ -32,6 +32,11 @@ pub const method = struct {
     pub const elicitation_create = "elicitation/create";
     pub const fs_read_text_file = "fs/read_text_file";
     pub const fs_write_text_file = "fs/write_text_file";
+    pub const terminal_create = "terminal/create";
+    pub const terminal_output = "terminal/output";
+    pub const terminal_wait_for_exit = "terminal/wait_for_exit";
+    pub const terminal_kill = "terminal/kill";
+    pub const terminal_release = "terminal/release";
     /// Either way: the request with this id no longer needs an answer.
     pub const cancel_request = "$/cancel_request";
 };
@@ -58,6 +63,8 @@ pub const ClientCapabilities = struct {
         readTextFile: bool = false,
         writeTextFile: bool = false,
     } = null,
+    /// Runs commands in terminals of its own, shown as they run.
+    terminal: bool = false,
     elicitation: ?struct {
         /// Present, even empty, when the client draws forms.
         form: ?struct {} = null,
@@ -158,6 +165,34 @@ pub const WriteTextFile = struct {
     sessionId: []const u8,
     path: []const u8,
     content: []const u8,
+};
+
+pub const CreateTerminal = struct {
+    sessionId: []const u8,
+    command: []const u8,
+    args: []const []const u8 = &.{},
+    cwd: ?[]const u8 = null,
+    outputByteLimit: ?u64 = null,
+};
+
+pub const TerminalCreated = struct {
+    terminalId: []const u8,
+};
+
+pub const TerminalRef = struct {
+    sessionId: []const u8,
+    terminalId: []const u8,
+};
+
+pub const ExitStatus = struct {
+    exitCode: ?u32 = null,
+    signal: ?[]const u8 = null,
+};
+
+pub const TerminalOutput = struct {
+    output: []const u8,
+    truncated: bool = false,
+    exitStatus: ?ExitStatus = null,
 };
 
 pub const Prompt = struct {
@@ -291,9 +326,12 @@ pub const ToolCall = struct {
     rawInput: ?std.json.Value = null,
 };
 
+/// A call's content: text, or a terminal the client keeps (`type`
+/// "terminal").
 pub const ToolContent = struct {
     type: []const u8 = "content",
-    content: Text,
+    content: ?Text = null,
+    terminalId: ?[]const u8 = null,
 };
 
 pub const Location = struct {

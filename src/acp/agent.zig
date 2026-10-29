@@ -36,6 +36,7 @@ const SignInTask = @import("../provider/chatgpt_sign_in.zig");
 const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const skill_tool = @import("../tools/skill.zig");
+const shell = @import("../tools/shell.zig");
 const tool = @import("../tools/tool.zig");
 
 const Agent = @This();
@@ -411,6 +412,7 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
         connection.reads_files = fs.readTextFile;
         connection.writes_files = fs.writeTextFile;
     }
+    connection.terminals = request.clientCapabilities.terminal;
     connection.reply(id, protocol.Initialized{
         .agentInfo = .{ .name = pkg.name, .version = pkg.version },
         ._meta = if (asked != null) .{ .synth = .{ .protocol = synth.version } } else null,
@@ -876,13 +878,15 @@ fn releaseCalls(self: *Agent, connection: *Connection) void {
     }
 }
 
-/// The first client offering its view of files for `writing` or reading.
-fn fileClient(self: *Agent, writing: bool) ?*Connection {
+const Offer = enum { reads_files, writes_files, terminals };
+
+/// The first client that offers to do `offer` for the session.
+fn offering(self: *Agent, comptime offer: Offer) ?*Connection {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     for (self.connections.items) |connection| {
         if (connection.finished.load(.acquire)) continue;
-        if (if (writing) connection.writes_files else connection.reads_files) return connection;
+        if (@field(connection, @tagName(offer))) return connection;
     }
     return null;
 }
@@ -910,7 +914,7 @@ fn callClient(self: *Agent, ctx: tool.Context, connection: *Connection, method: 
         defer self.mutex.unlock(self.io);
         if (!self.calls.remove(id)) continue;
         connection.notify(protocol.method.cancel_request, protocol.CancelRequest{ .requestId = .{ .integer = id } });
-        return error.Cancelled;
+        return error.Canceled;
     }
     const reply = call.reply orelse return error.ClientGone;
     if (reply.message.err != null) {
@@ -920,9 +924,29 @@ fn callClient(self: *Agent, ctx: tool.Context, connection: *Connection, method: 
     return reply;
 }
 
+/// Put `method` to `connection` and wait out the reply, whatever it says:
+/// tidying up, which nothing waits on the outcome of.
+fn settleWith(self: *Agent, ctx: tool.Context, connection: *Connection, method: []const u8, params: anytype) void {
+    const reply = self.callClient(ctx, connection, method, params) catch return;
+    reply.destroy();
+}
+
 /// How long a tool waiting on a client sleeps before asking whether it has
 /// been given up on.
 const client_call_slice_ms: u64 = 100;
+
+/// How long a client gets to tidy up after a call given up on: to kill and
+/// let go of a terminal.
+const settle_ms: i64 = 5 * std.time.ms_per_s;
+
+/// `ctx` for tidying up once it is given up on: not to be given up on in
+/// turn, but not to wait forever.
+fn settle(ctx: tool.Context) tool.Context {
+    var settling = ctx;
+    settling.cancelled = null;
+    settling.deadline_ms = tool.monotonicMilliseconds(ctx.io) + settle_ms;
+    return settling;
+}
 
 /// The call a permission request is out for, and the request each client
 /// was sent.
@@ -1000,6 +1024,7 @@ const Connection = struct {
     /// Offers its own view of files, unsaved changes and all.
     reads_files: bool = false,
     writes_files: bool = false,
+    terminals: bool = false,
 
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
@@ -1215,6 +1240,9 @@ const Session = struct {
     /// Each call as clients without synth's extension were last told it, by
     /// a signature of what can change about it.
     told_calls: std.AutoHashMapUnmanaged(Place, u64) = .empty,
+    /// The terminal each call ran in, for those a client ran. Guarded by the
+    /// agent's `mutex`: tools note them from their own threads.
+    terminals: std.AutoHashMapUnmanaged(Place, []u8) = .empty,
     /// The reply they have been streamed so far, which the message it lands
     /// as is told after.
     told_text: std.ArrayList(u8) = .empty,
@@ -1279,7 +1307,7 @@ const Session = struct {
             self.stack.loop.session_public_id = self.handle;
         }
         self.restoreEffort();
-        self.stack.loop.files = self.files();
+        self.stack.loop.handoff = .{ .files = self.files(), .terminal = self.terminal() };
         return self;
     }
 
@@ -1292,7 +1320,7 @@ const Session = struct {
     fn readThroughClient(context: *anyopaque, ctx: tool.Context, path: []const u8) anyerror!?[]u8 {
         const self: *Session = @ptrCast(@alignCast(context));
         const agent = self.agent;
-        const connection = agent.fileClient(false) orelse return null;
+        const connection = agent.offering(.reads_files) orelse return null;
         const reply = try agent.callClient(ctx, connection, protocol.method.fs_read_text_file, protocol.ReadTextFile{ .sessionId = self.handle, .path = path });
         defer reply.destroy();
         const file = try rpc.parse(protocol.TextFile, reply.arena.allocator(), reply.message.result);
@@ -1302,10 +1330,84 @@ const Session = struct {
     fn writeThroughClient(context: *anyopaque, ctx: tool.Context, path: []const u8, content: []const u8) anyerror!bool {
         const self: *Session = @ptrCast(@alignCast(context));
         const agent = self.agent;
-        const connection = agent.fileClient(true) orelse return false;
+        const connection = agent.offering(.writes_files) orelse return false;
         const reply = try agent.callClient(ctx, connection, protocol.method.fs_write_text_file, protocol.WriteTextFile{ .sessionId = self.handle, .path = path, .content = content });
         reply.destroy();
         return true;
+    }
+
+    /// `bash` in a terminal a client keeps, shown in the call's card as it
+    /// runs, else a shell of its own.
+    fn terminal(self: *Session) tool.Terminal {
+        return .{ .context = self, .run = runInTerminal };
+    }
+
+    fn runInTerminal(context: *anyopaque, ctx: tool.Context, command: []const u8) anyerror!?tool.Terminal.Ran {
+        const self: *Session = @ptrCast(@alignCast(context));
+        const agent = self.agent;
+        const connection = agent.offering(.terminals) orelse return null;
+        const created = try agent.callClient(ctx, connection, protocol.method.terminal_create, protocol.CreateTerminal{
+            .sessionId = self.handle,
+            .command = "bash",
+            .args = &.{ "-lc", command },
+            .cwd = ctx.project_root,
+            .outputByteLimit = shell.output_limit.toInt().?,
+        });
+        defer created.destroy();
+        const ref: protocol.TerminalRef = .{
+            .sessionId = self.handle,
+            .terminalId = (try rpc.parse(protocol.TerminalCreated, created.arena.allocator(), created.message.result)).terminalId,
+        };
+        const settling = settle(ctx);
+        defer agent.settleWith(settling, connection, protocol.method.terminal_release, ref);
+        try self.showTerminal(ctx, ref.terminalId);
+
+        const exited = agent.callClient(ctx, connection, protocol.method.terminal_wait_for_exit, ref) catch |err| {
+            agent.settleWith(settling, connection, protocol.method.terminal_kill, ref);
+            return if (err == error.Canceled and ctx.outOfTime()) error.Timeout else err;
+        };
+        defer exited.destroy();
+        const status = try rpc.parse(protocol.ExitStatus, exited.arena.allocator(), exited.message.result);
+
+        const read = try agent.callClient(settling, connection, protocol.method.terminal_output, ref);
+        defer read.destroy();
+        const output = try rpc.parse(protocol.TerminalOutput, read.arena.allocator(), read.message.result);
+        return .{
+            .output = try ctx.allocator.dupe(u8, output.output),
+            .exit_code = status.exitCode,
+            .truncated = output.truncated,
+        };
+    }
+
+    /// Note the terminal the call `ctx` runs in, and show it in its card.
+    fn showTerminal(self: *Session, ctx: tool.Context, id: []const u8) !void {
+        const agent = self.agent;
+        const place: Place = .{ .seq = ctx.message_seq, .call = ctx.call_index };
+        {
+            const owned = try self.allocator.dupe(u8, id);
+            errdefer self.allocator.free(owned);
+            agent.mutex.lockUncancelable(agent.io);
+            defer agent.mutex.unlock(agent.io);
+            const slot = try self.terminals.getOrPut(self.allocator, place);
+            if (slot.found_existing) self.allocator.free(slot.value_ptr.*);
+            slot.value_ptr.* = owned;
+        }
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        self.tell(.{ .tool_call_update = .{
+            .toolCallId = try updates.toolCallId(arena, place.seq, place.call),
+            .content = try updates.terminalContent(arena, id),
+        } });
+    }
+
+    /// The terminal call `place` ran in, copied into `arena`.
+    fn terminalOf(self: *Session, arena: std.mem.Allocator, place: Place) !?[]const u8 {
+        const agent = self.agent;
+        agent.mutex.lockUncancelable(agent.io);
+        defer agent.mutex.unlock(agent.io);
+        const id = self.terminals.get(place) orelse return null;
+        return try arena.dupe(u8, id);
     }
 
     fn destroy(self: *Session) void {
@@ -1317,6 +1419,9 @@ const Session = struct {
         self.sent.deinit(self.allocator);
         self.sent_status.deinit(self.allocator);
         self.told_calls.deinit(self.allocator);
+        var terminals = self.terminals.valueIterator();
+        while (terminals.next()) |id| self.allocator.free(id.*);
+        self.terminals.deinit(self.allocator);
         self.told_text.deinit(self.allocator);
         self.told.deinit(self.allocator);
         self.allocator.free(self.handle);
@@ -1606,7 +1711,8 @@ const Session = struct {
             if (entry.found_existing and entry.value_ptr.* == mark) continue;
             entry.value_ptr.* = mark;
             if (!send) continue;
-            const told = try updates.toolCall(arena, self.stack.project.root, msg.seq, index, call);
+            var told = try updates.toolCall(arena, self.stack.project.root, msg.seq, index, call);
+            if (try self.terminalOf(arena, .{ .seq = msg.seq, .call = index })) |id| told.content = try updates.terminalContent(arena, id);
             self.tell(if (entry.found_existing) .{ .tool_call_update = told } else .{ .tool_call = told });
         }
     }
@@ -2109,6 +2215,14 @@ pub const Script = struct {
             };
             return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
         }
+        if (last != null and std.mem.eql(u8, last.?.text, "run it")) {
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call-1"),
+                .name = try allocator.dupe(u8, "bash"),
+                .arguments = try allocator.dupe(u8, "{\"command\":\"touch made\"}"),
+            };
+            return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
+        }
         if (last != null and std.mem.eql(u8, last.?.text, "read the note")) {
             calls[0] = .{
                 .id = try allocator.dupe(u8, "call-1"),
@@ -2560,6 +2674,63 @@ test "a resumed session is not replayed, and a deleted one is gone" {
     for (listed.sessions) |info| try testing.expect(!std.mem.eql(u8, info.sessionId, session));
     const again = try client.request(protocol.method.session_delete, protocol.SessionId{ .sessionId = session });
     try testing.expectEqualStrings("no such session", (try client.expectError(again)).message);
+}
+
+test "a client that keeps terminals runs commands in one, shown in the call's card" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const arena = client.arena.allocator();
+    _ = try client.expectResult(try client.request(protocol.method.initialize, protocol.Initialize{
+        .protocolVersion = protocol.version,
+        .clientCapabilities = .{ .terminal = true },
+    }));
+    const opened = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project }));
+    const session = (try rpc.parse(protocol.SessionSetup, arena, opened)).sessionId;
+
+    const ran = try client.prompt(session, "run it");
+    try client.choose((try client.awaitPermission()).id, "once");
+    const create = try client.awaitMethod(protocol.method.terminal_create);
+    const asked = try rpc.parse(protocol.CreateTerminal, arena, create.params);
+    try testing.expectEqualStrings("bash", asked.command);
+    try testing.expectEqualStrings("touch made", asked.args[1]);
+    try client.answer(create.id.?, protocol.TerminalCreated{ .terminalId = "term-1" });
+    const exit = try client.awaitMethod(protocol.method.terminal_wait_for_exit);
+    try client.answer(exit.id.?, protocol.ExitStatus{ .exitCode = 0 });
+    const output = try client.awaitMethod(protocol.method.terminal_output);
+    try client.answer(output.id.?, protocol.TerminalOutput{ .output = "hi\n" });
+    const release = try client.awaitMethod(protocol.method.terminal_release);
+    try client.answer(release.id.?, protocol.Empty{});
+
+    var shown = false;
+    while (true) {
+        const message = try client.next();
+        if (message.method == null and message.id != null and message.id.?.eql(ran)) break;
+        if (!std.mem.eql(u8, message.method orelse "", protocol.method.session_update)) continue;
+        const update = message.params.?.object.get("update").?.object;
+        if (!std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call_update")) continue;
+        const status = update.get("status") orelse continue;
+        if (!std.mem.eql(u8, status.string, "completed")) continue;
+        const content = update.get("content").?.array.items[0].object;
+        try testing.expectEqualStrings("terminal", content.get("type").?.string);
+        try testing.expectEqualStrings("term-1", content.get("terminalId").?.string);
+        shown = true;
+    }
+    try testing.expect(shown);
+
+    const abandoned = try client.prompt(session, "run it");
+    try client.choose((try client.awaitPermission()).id, "once");
+    const again = try client.awaitMethod(protocol.method.terminal_create);
+    try client.answer(again.id.?, protocol.TerminalCreated{ .terminalId = "term-2" });
+    _ = try client.awaitMethod(protocol.method.terminal_wait_for_exit);
+    try client.notify(protocol.method.session_cancel, protocol.SessionId{ .sessionId = session });
+    const kill = try client.awaitMethod(protocol.method.terminal_kill);
+    try testing.expectEqualStrings("term-2", (try rpc.parse(protocol.TerminalRef, arena, kill.params)).terminalId);
+    try client.answer(kill.id.?, protocol.Empty{});
+    const let_go = try client.awaitMethod(protocol.method.terminal_release);
+    try client.answer(let_go.id.?, protocol.Empty{});
+    try testing.expectEqual(protocol.StopReason.cancelled, try client.stopReason(abandoned));
 }
 
 test "the first answer to a permission request wins, and the rest are taken back" {

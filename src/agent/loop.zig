@@ -208,8 +208,8 @@ auto_approve_safe: bool = true,
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
 delegate: ?tool.Delegate = null,
-/// Where file tools read and write, when not the disk. See `tool.Files`.
-files: ?tool.Files = null,
+/// What the session's client does in place of the disk and a shell.
+handoff: tool.Handoff = .{},
 /// What the model may do this turn. The tool schema sent with every request is
 /// this agent's list, and the gate refuses anything outside it.
 agent: agents.Agent = agents.all[0],
@@ -1991,6 +1991,7 @@ fn runApproved(self: *Loop) !void {
         if (call.status != .running) continue;
         if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
         try batch.append(self.allocator, .{
+            .seq = self.conversation.messages.items[message_index].seq,
             .index = i,
             .name = call.name,
             .arguments = call.arguments,
@@ -2017,7 +2018,7 @@ fn runApproved(self: *Loop) !void {
         self.project_root,
         self.reads,
         self.delegate,
-        self.files,
+        self.handoff,
         self.hooks,
         batch.items,
     );

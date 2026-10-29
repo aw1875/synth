@@ -40,6 +40,14 @@ pub fn toolCall(arena: std.mem.Allocator, root: []const u8, seq: u64, index: usi
     };
 }
 
+/// A call's content as the terminal its command ran in, which the client
+/// keeps showing once the command is done.
+pub fn terminalContent(arena: std.mem.Allocator, terminal: []const u8) ![]const protocol.ToolContent {
+    const out = try arena.alloc(protocol.ToolContent, 1);
+    out[0] = .{ .type = "terminal", .terminalId = terminal };
+    return out;
+}
+
 /// The tool, and what it acts on.
 fn title(arena: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) ![]const u8 {
     for ([_][]const u8{ "path", "command", "pattern", "url", "query", "prompt", "question" }) |key| {
@@ -177,7 +185,7 @@ test "a call reads as what it acts on, where, and how it went" {
     try testing.expectEqual(protocol.ToolKind.read, told.kind.?);
     try testing.expectEqual(protocol.ToolStatus.completed, told.status.?);
     try testing.expectEqualStrings("/project/src/a.zig", told.locations.?[0].path);
-    try testing.expectEqualStrings("const a = 1;", told.content.?[0].content.text);
+    try testing.expectEqualStrings("const a = 1;", told.content.?[0].content.?.text);
 
     const command: Conversation.ToolCall = .{ .id = "", .name = "bash", .arguments = "{\"command\":\"zig build\\nzig build test\"}", .status = .rejected };
     const refused = try toolCall(arena, "/project", 7, 2, &command);

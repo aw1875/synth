@@ -91,7 +91,9 @@ anything that would change the project unless `--allow` is given.
 `synth acp` is synth as an [ACP](https://agentclientprotocol.com) agent, for an
 editor to spawn: each session it opens runs in a process of its own, and
 approvals are asked as permission requests. Loading a session that is running
-elsewhere attaches to it there.
+elsewhere attaches to it there. An editor that offers its own view of files
+gets reads and edits through it, unsaved changes included, and one that keeps
+terminals runs commands in them, shown in the call as they run.
 
 Quitting stops the session, a turn in progress included. `/detach` leaves it
 running instead: `synth --session <id>`, `--continue` or `/sessions` attach to

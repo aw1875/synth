@@ -36,6 +36,11 @@ pub const Context = struct {
     /// Where `read`, `write` and `edit` take a file's text from and give it
     /// to, when not the disk: an editor's buffers, unsaved changes and all.
     files: ?Files = null,
+    /// Where `bash` runs a command, when not a shell of its own.
+    terminal: ?Terminal = null,
+    /// The message that asked for this call, by seq; with `call_index`, the
+    /// call as a client knows it.
+    message_seq: u64 = 0,
     /// Whether this call may touch paths outside the project.
     ///
     /// True only for a call a person approved by hand. A call that skipped the
@@ -91,6 +96,30 @@ pub const Files = struct {
     context: *anyopaque,
     read: *const fn (context: *anyopaque, ctx: Context, path: []const u8) anyerror!?[]u8,
     write: *const fn (context: *anyopaque, ctx: Context, path: []const u8, content: []const u8) anyerror!bool,
+};
+
+/// Commands run in a terminal something else keeps, an editor's say, so that
+/// whoever is watching sees them as they run. `run` answers null to leave
+/// the command to a shell of the tool's own after all.
+pub const Terminal = struct {
+    context: *anyopaque,
+    run: *const fn (context: *anyopaque, ctx: Context, command: []const u8) anyerror!?Ran,
+
+    pub const Ran = struct {
+        /// Owned by `ctx.allocator`.
+        output: []u8,
+        /// Null when a signal ended it.
+        exit_code: ?u32,
+        /// The start of the output was dropped to keep within the limit.
+        truncated: bool,
+    };
+};
+
+/// What a session's client does in place of the disk and a shell, when it
+/// offers to.
+pub const Handoff = struct {
+    files: ?Files = null,
+    terminal: ?Terminal = null,
 };
 
 /// Cap on one progress line. Fixed so a worker can publish it without

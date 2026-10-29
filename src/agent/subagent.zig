@@ -230,7 +230,8 @@ pub const Runner = struct {
         child.loop.skills = parent.skills;
         child.loop.system_prompt = parent.system_prompt;
         child.loop.delegate = null;
-        child.loop.files = parent.files;
+        // Its calls are not the session's, so they have no card for a terminal to show in.
+        child.loop.handoff = .{ .files = parent.handoff.files };
         // A standing allowance is the person's, not something to inherit.
         child.loop.auto_approve_safe = false;
         child.loop.max_turn_ms = parent.max_turn_ms;
