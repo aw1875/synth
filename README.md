@@ -93,7 +93,9 @@ editor to spawn: each session it opens runs in a process of its own, and
 approvals are asked as permission requests. Loading a session that is running
 elsewhere attaches to it there. An editor that offers its own view of files
 gets reads and edits through it, unsaved changes included, and one that keeps
-terminals runs commands in them, shown in the call as they run.
+terminals runs commands in them, shown in the call as they run. MCP servers
+the editor brings connect beside those in `config.json`, which wins a clash of
+names; skills and `/compact` are offered as its slash commands.
 
 Quitting stops the session, a turn in progress included. `/detach` leaves it
 running instead: `synth --session <id>`, `--continue` or `/sessions` attach to
