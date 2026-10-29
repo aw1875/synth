@@ -37,7 +37,6 @@ pub const method = struct {
     pub const notice = "_synth/notice";
 
     /// Client to agent.
-    pub const answer = "_synth/answer";
     pub const compact = "_synth/compact";
     pub const rename = "_synth/rename";
     pub const providers = "_synth/providers";
@@ -318,7 +317,6 @@ pub const StatusUpdate = struct { sessionId: []const u8, status: Status };
 pub const Notice = struct { sessionId: []const u8, text: []const u8 };
 
 /// Request params.
-pub const Answer = struct { sessionId: []const u8, text: []const u8 };
 pub const Rename = struct { sessionId: []const u8, title: []const u8 };
 pub const ConnectProvider = struct {
     sessionId: []const u8,

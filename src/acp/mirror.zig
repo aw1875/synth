@@ -10,6 +10,7 @@ const std = @import("std");
 const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
 const synth = @import("synth.zig");
+const updates = @import("updates.zig");
 const Connection = @import("connection.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
@@ -65,14 +66,30 @@ switched: bool = false,
 spoken: bool = false,
 /// Requests sent and not yet answered, by id.
 waiting: std.AutoHashMapUnmanaged(i64, Awaited) = .empty,
-/// The permission request out for the call waiting on a decision. Owned.
-asked: ?struct { id: rpc.Id, call: []u8 } = null,
-/// A decision made before the request it answers arrived.
-early: ?Loop.Decision = null,
+/// The request out for the call waiting on a person. Owned.
+asked: ?Asked = null,
+/// A decision or an answer given before the request it settles arrived.
+/// Owned.
+early: ?Early = null,
 paging: bool = false,
 /// The agent has gone; requests go nowhere now.
 ended: bool = false,
 lost_heard: bool = false,
+
+const Asked = struct {
+    id: rpc.Id,
+    call: []u8,
+    on: union(enum) {
+        decision,
+        /// The answers the question's form offers to pick from.
+        answer: [][]u8,
+    },
+};
+
+const Early = union(enum) {
+    decision: Loop.Decision,
+    answer: []u8,
+};
 
 const Awaited = union(enum) {
     /// A request, named for the notice should it fail.
@@ -276,6 +293,7 @@ fn destroy(self: *Mirror) void {
     }
     self.lost.destroy();
     self.forgetAsked();
+    self.forgetEarly();
     for (self.notices.items) |notice| self.allocator.free(notice);
     self.notices.deinit(self.allocator);
     for (self.answers.items) |unshown| unshown.deinit(self.allocator);
@@ -366,7 +384,8 @@ fn apply(self: *Mirror, message: rpc.Message) !void {
     const m = synth.method;
 
     if (eql(u8, method, m.snapshot)) return self.applySnapshot(try rpc.parse(synth.Snapshot, arena, message.params));
-    if (eql(u8, method, protocol.method.session_request_permission)) return self.keepAsked(message, arena);
+    if (eql(u8, method, protocol.method.session_request_permission)) return self.keepPermission(message, arena);
+    if (eql(u8, method, protocol.method.elicitation_create)) return self.keepQuestion(message, arena);
     if (eql(u8, method, protocol.method.cancel_request)) {
         const withdrawn = try rpc.parse(protocol.CancelRequest, arena, message.params);
         const asked = self.asked orelse return;
@@ -393,20 +412,50 @@ fn isCurrent(self: *const Mirror, params: ?std.json.Value) bool {
     return session == .string and std.mem.eql(u8, session.string, self.status.handle);
 }
 
-fn keepAsked(self: *Mirror, message: rpc.Message, arena: std.mem.Allocator) !void {
+fn keepPermission(self: *Mirror, message: rpc.Message, arena: std.mem.Allocator) !void {
     const id = message.id orelse return;
     const asked = try rpc.parse(protocol.RequestPermission, arena, message.params);
-    const call = try self.allocator.dupe(u8, asked.toolCall.toolCallId);
-    errdefer self.allocator.free(call);
+    try self.hold(id, asked.toolCall.toolCallId, .decision);
+}
+
+fn keepQuestion(self: *Mirror, message: rpc.Message, arena: std.mem.Allocator) !void {
+    const id = message.id orelse return;
+    const asked = try rpc.parse(protocol.FormElicitation(updates.Question), arena, message.params);
+    const offered = asked.requestedSchema.properties.answer.oneOf orelse &.{};
+    const choices = try self.allocator.alloc([]u8, offered.len);
+    var kept: usize = 0;
+    errdefer {
+        for (choices[0..kept]) |choice| self.allocator.free(choice);
+        self.allocator.free(choices);
+    }
+    for (offered, choices) |option, *choice| {
+        choice.* = try self.allocator.dupe(u8, option.@"const");
+        kept += 1;
+    }
+    try self.hold(id, asked.toolCallId orelse "", .{ .answer = choices });
+}
+
+/// Keep the request out for the waiting call, taking `on` over, and settle
+/// it at once if the person got there first.
+fn hold(self: *Mirror, id: rpc.Id, call: []const u8, on: @FieldType(Asked, "on")) !void {
+    errdefer if (on == .answer) freeAll(self.allocator, on.answer);
+    const owned_call = try self.allocator.dupe(u8, call);
+    errdefer self.allocator.free(owned_call);
     const owned: rpc.Id = switch (id) {
         .number => id,
         .string => |text| .{ .string = try self.allocator.dupe(u8, text) },
     };
     self.forgetAsked();
-    self.asked = .{ .id = owned, .call = call };
-    if (self.early) |decision| {
-        self.early = null;
-        try self.decide(decision);
+    self.asked = .{ .id = owned, .call = owned_call, .on = on };
+
+    const early = self.early orelse return;
+    self.early = null;
+    switch (early) {
+        .decision => |decision| if (on == .decision) try self.decide(decision),
+        .answer => |text| {
+            defer self.allocator.free(text);
+            if (on == .answer) try self.answer(text);
+        },
     }
 }
 
@@ -414,7 +463,19 @@ fn forgetAsked(self: *Mirror) void {
     const asked = self.asked orelse return;
     if (asked.id == .string) self.allocator.free(asked.id.string);
     self.allocator.free(asked.call);
+    if (asked.on == .answer) freeAll(self.allocator, asked.on.answer);
     self.asked = null;
+}
+
+fn forgetEarly(self: *Mirror) void {
+    const early = self.early orelse return;
+    if (early == .answer) self.allocator.free(early.answer);
+    self.early = null;
+}
+
+fn freeAll(allocator: std.mem.Allocator, texts: [][]u8) void {
+    for (texts) |text| allocator.free(text);
+    allocator.free(texts);
 }
 
 /// Agent message `seq` is numbered `(seq + 1) << note_bits` here, leaving
@@ -444,7 +505,7 @@ fn applySnapshot(self: *Mirror, snapshot: synth.Snapshot) !void {
     self.conversation.clear();
     self.resetStreams(null);
     self.forgetAsked();
-    self.early = null;
+    self.forgetEarly();
     self.switched = true;
     for (snapshot.messages) |message| try self.conversation.adoptMessage(try self.own(message));
     self.conversation.dropped += snapshot.dropped;
@@ -530,7 +591,13 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     kept.notes = try dupeAll(arena, status.notes);
     kept.steering = try dupeAll(arena, status.steering);
     self.status = kept;
-    if (kept.state != .awaiting_approval) self.early = null;
+    if (self.early) |early| {
+        const still = switch (early) {
+            .decision => kept.state == .awaiting_approval,
+            .answer => kept.state == .awaiting_answer,
+        };
+        if (!still) self.forgetEarly();
+    }
 
     try self.todos.replace(status.todos);
     self.provider.name = kept.provider;
@@ -871,8 +938,28 @@ pub fn steer(self: *Mirror, text: []const u8) !bool {
     return true;
 }
 
+/// Answer the question out for the call waiting on an answer, or the one
+/// on its way when the status already says a question is waiting. An
+/// answer that is not one the form offers goes in its field for the
+/// person's own.
 pub fn answer(self: *Mirror, text: []const u8) !void {
-    try self.send(synth.method.answer, synth.Answer{ .sessionId = self.status.handle, .text = text }, .{ .command = "Answering" });
+    const connection = try self.live();
+    const asked = self.asked orelse {
+        if (self.status.state != .awaiting_answer) return error.NothingToAnswer;
+        self.forgetEarly();
+        self.early = .{ .answer = try self.allocator.dupe(u8, text) };
+        return;
+    };
+    const choices = switch (asked.on) {
+        .answer => |choices| choices,
+        .decision => return error.NothingToAnswer,
+    };
+    const offered = choices.len == 0 or for (choices) |choice| {
+        if (std.mem.eql(u8, choice, text)) break true;
+    } else false;
+    const filled: updates.Question.Filled = if (offered) .{ .answer = text } else .{ .other = text };
+    try connection.reply(asked.id, protocol.Elicited(updates.Question.Filled){ .action = "accept", .content = filled });
+    self.forgetAsked();
 }
 
 pub fn cancel(self: *Mirror) !void {
@@ -885,9 +972,11 @@ pub fn decide(self: *Mirror, decision: Loop.Decision) !void {
     const connection = try self.live();
     const asked = self.asked orelse {
         if (self.status.state != .awaiting_approval) return error.NothingToDecide;
-        self.early = decision;
+        self.forgetEarly();
+        self.early = .{ .decision = decision };
         return;
     };
+    if (asked.on != .decision) return error.NothingToDecide;
     try connection.reply(asked.id, .{ .outcome = .{ .outcome = "selected", .optionId = @tagName(decision) } });
     self.forgetAsked();
 }
@@ -1068,6 +1157,30 @@ fn awaitingApproval(mirror: *Mirror) bool {
 
 fn finishedOne(mirror: *Mirror) bool {
     return mirror.status.state == .idle and mirror.status.finished == 1;
+}
+
+fn awaitingAnswer(mirror: *Mirror) bool {
+    return mirror.status.state == .awaiting_answer;
+}
+
+test "a question is answered from here, whether or not its request has arrived yet" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+    try testing.expectError(error.NothingToAnswer, mirror.answer("too soon"));
+
+    try mirror.submit("ask me", .{});
+    try pollUntil(mirror, awaitingAnswer);
+    try testing.expectError(error.NothingToDecide, mirror.decide(.once));
+    try mirror.answer("green");
+    try pollUntil(mirror, finishedOne);
+    try testing.expectEqual(@as(?Loop.Outcome, .done), mirror.status.outcome);
+    try testing.expectEqualStrings("green", convo.messages.items[1].tool_calls[0].result.?);
+    try testing.expect(mirror.asked == null and mirror.early == null);
 }
 
 test "a mirror follows a turn, and its approval is answered from here" {

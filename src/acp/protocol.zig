@@ -27,6 +27,7 @@ pub const method = struct {
     /// Agent to client.
     pub const session_update = "session/update";
     pub const session_request_permission = "session/request_permission";
+    pub const elicitation_create = "elicitation/create";
     /// Either way: the request with this id no longer needs an answer.
     pub const cancel_request = "$/cancel_request";
 };
@@ -42,8 +43,21 @@ pub const Meta = struct {
 
 pub const Initialize = struct {
     protocolVersion: u32,
+    clientCapabilities: ClientCapabilities = .{},
     clientInfo: ?Implementation = null,
     _meta: ?Meta = null,
+};
+
+pub const ClientCapabilities = struct {
+    elicitation: ?struct {
+        /// Present, even empty, when the client draws forms.
+        form: ?struct {} = null,
+    } = null,
+
+    pub fn drawsForms(self: ClientCapabilities) bool {
+        const elicitation = self.elicitation orelse return false;
+        return elicitation.form != null;
+    }
 };
 
 pub const Initialized = struct {
@@ -193,6 +207,43 @@ pub fn chosenOption(value: ?std.json.Value) ?[]const u8 {
     const chosen = field(field(value, "outcome"), "optionId") orelse return null;
     return if (chosen == .string) chosen.string else null;
 }
+
+/// `elicitation/create` for a form, put to the person on behalf of a call.
+/// `Fields` is the form's properties, one field each.
+pub fn FormElicitation(comptime Fields: type) type {
+    return struct {
+        sessionId: []const u8,
+        toolCallId: ?[]const u8 = null,
+        mode: []const u8 = "form",
+        message: []const u8,
+        requestedSchema: struct {
+            type: []const u8 = "object",
+            properties: Fields,
+            required: []const []const u8 = &.{},
+        },
+    };
+}
+
+/// The answer to `elicitation/create`: `accept` with what was filled in, or
+/// `decline` or `cancel`.
+pub fn Elicited(comptime Filled: type) type {
+    return struct {
+        action: []const u8,
+        content: ?Filled = null,
+    };
+}
+
+pub const StringProperty = struct {
+    type: []const u8 = "string",
+    title: ?[]const u8 = null,
+    /// The values to pick from, when it is a choice.
+    oneOf: ?[]const EnumOption = null,
+};
+
+pub const EnumOption = struct {
+    @"const": []const u8,
+    title: []const u8,
+};
 
 pub const CancelRequest = struct {
     requestId: std.json.Value,

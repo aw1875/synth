@@ -130,7 +130,7 @@ pub fn serve(self: *Agent) void {
         if (self.session) |session| {
             session.step();
             session.publish(arena, true) catch |err| self.noticeFmt("Could not report progress: {s}", .{@errorName(err)});
-            self.settleApproval(arena);
+            self.settleAsked(arena);
             self.settlePrompts();
         }
         _ = arena_state.reset(.retain_capacity);
@@ -299,9 +299,7 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     const session = try self.sessionFor((try rpc.parse(protocol.SessionId, arena, params)).sessionId);
     const loop = &session.stack.loop;
 
-    if (eql(u8, method, m.answer)) {
-        try loop.answer((try rpc.parse(synth.Answer, arena, params)).text);
-    } else if (eql(u8, method, m.compact)) {
+    if (eql(u8, method, m.compact)) {
         try loop.compact();
     } else if (eql(u8, method, m.rename)) {
         try loop.rename((try rpc.parse(synth.Rename, arena, params)).title);
@@ -354,6 +352,7 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
         }
     }
     connection.dialect = if (asked != null) .synth else .standard;
+    connection.forms = request.clientCapabilities.drawsForms();
     connection.reply(id, protocol.Initialized{
         .agentInfo = .{ .name = pkg.name, .version = pkg.version },
         ._meta = if (asked != null) .{ .synth = .{ .protocol = synth.version } } else null,
@@ -530,41 +529,63 @@ fn cancelPrompt(self: *Agent, connection: *Connection, request: std.json.Value) 
     }
 }
 
-/// Ask every client about the call waiting on a decision, once; and take the
-/// question back from all of them once it is no longer waiting.
-fn settleApproval(self: *Agent, arena: std.mem.Allocator) void {
+/// Ask every client about the call waiting on a person, once; and take the
+/// request back from all of them once it is no longer waiting.
+fn settleAsked(self: *Agent, arena: std.mem.Allocator) void {
     const session = self.session orelse return self.withdraw();
     const waiting = session.waitingCall();
     if (self.asked) |asked| {
-        if (waiting != null and asked.seq == waiting.?.seq and asked.call == waiting.?.call) return;
+        if (waiting) |call| {
+            if (asked.for_answer == call.for_answer and asked.seq == call.seq and asked.call == call.call) return;
+        }
         self.withdraw();
     }
     const call = waiting orelse return;
-    self.ask(arena, session, call) catch |err| self.noticeFmt("Could not ask for approval: {s}", .{@errorName(err)});
+    self.ask(arena, session, call) catch |err| self.noticeFmt("Could not ask: {s}", .{@errorName(err)});
 }
 
+/// A question goes only to clients that draw forms. With clients connected
+/// and none of them able to answer, the model is told so rather than left
+/// waiting on someone who cannot.
 fn ask(self: *Agent, arena: std.mem.Allocator, session: *Session, waiting: Session.Waiting) !void {
-    const params: protocol.RequestPermission = .{
-        .sessionId = session.handle,
-        .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
-        .options = &permission_options,
-    };
-
-    var asked: Asked = .{ .seq = waiting.seq, .call = waiting.call };
+    var asked: Asked = .{ .for_answer = waiting.for_answer, .seq = waiting.seq, .call = waiting.call };
     errdefer asked.deinit(self.allocator);
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    for (self.connections.items) |connection| {
-        if (connection.dialect == null) continue;
-        const id = self.next_id;
-        self.next_id += 1;
-        try asked.requests.append(self.allocator, .{ .connection = connection, .id = id });
-        connection.request(.{ .number = id }, protocol.method.session_request_permission, params);
+    if (!waiting.for_answer) {
+        _ = try self.put(&asked, protocol.method.session_request_permission, protocol.RequestPermission{
+            .sessionId = session.handle,
+            .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
+            .options = &permission_options,
+        });
+        self.asked = asked;
+        return;
+    }
+    const greeted = try self.put(&asked, protocol.method.elicitation_create, try updates.question(arena, session.handle, waiting.seq, waiting.call, waiting.tool));
+    if (asked.requests.items.len == 0 and greeted > 0) {
+        asked.deinit(self.allocator);
+        return session.stack.loop.answer(unanswerable);
     }
     self.asked = asked;
 }
 
-/// Take back every permission request still out.
+/// Send `method` to every client that can take it, noting each request in
+/// `asked`. Returns how many clients have said hello, able to take it or not.
+fn put(self: *Agent, asked: *Asked, method: []const u8, params: anytype) !usize {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    var greeted: usize = 0;
+    for (self.connections.items) |connection| {
+        if (connection.dialect == null) continue;
+        greeted += 1;
+        if (asked.for_answer and !connection.forms) continue;
+        const id = self.next_id;
+        self.next_id += 1;
+        try asked.requests.append(self.allocator, .{ .connection = connection, .id = id });
+        connection.request(.{ .number = id }, method, params);
+    }
+    return greeted;
+}
+
+/// Take back every request still out.
 fn withdraw(self: *Agent) void {
     var asked = self.asked orelse return;
     self.asked = null;
@@ -580,20 +601,34 @@ const permission_options = [_]protocol.PermissionOption{
     .{ .optionId = "deny", .name = "Deny", .kind = .reject_once },
 };
 
-/// A reply from a client: the only requests the agent makes are permission
-/// requests, and only the one still out for the waiting call counts.
+const declined = "The user chose not to answer.";
+const unanswerable = "No one connected can answer questions. Decide for yourself, and say what you assumed.";
+
+/// A reply from a client: the only requests the agent makes are for a
+/// decision or an answer, and only the one still out for the waiting call
+/// counts.
 fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
     const id = message.id orelse return;
     const asked = if (self.asked) |*asked| asked else return;
     const index = asked.find(connection, id) orelse return;
     if (message.err != null) return;
+    const session = self.session orelse return;
+    const loop = &session.stack.loop;
+
+    if (asked.for_answer) {
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const text = updates.answerOf(arena_state.allocator(), message.result) catch null;
+        _ = asked.requests.swapRemove(index);
+        self.withdraw();
+        loop.answer(text orelse declined) catch |err| self.noticeFmt("Could not answer: {s}", .{@errorName(err)});
+        return;
+    }
     const chosen = protocol.chosenOption(message.result) orelse return;
     const decision = std.meta.stringToEnum(Loop.Decision, chosen) orelse return;
-    const session = self.session orelse return;
-
     _ = asked.requests.swapRemove(index);
     self.withdraw();
-    session.stack.loop.decide(decision) catch |err| self.noticeFmt("Could not decide: {s}", .{@errorName(err)});
+    loop.decide(decision) catch |err| self.noticeFmt("Could not decide: {s}", .{@errorName(err)});
 }
 
 /// What `session/list` returns: the sessions stored for the project holding
@@ -689,6 +724,8 @@ const Prompting = struct {
 /// The call a permission request is out for, and the request each client
 /// was sent.
 const Asked = struct {
+    /// A question, rather than a call to approve.
+    for_answer: bool,
     seq: u64,
     call: usize,
     requests: std.ArrayList(struct { connection: *Connection, id: i64 }) = .empty,
@@ -752,6 +789,8 @@ const Connection = struct {
     finished: std.atomic.Value(bool) = .init(false),
     /// Set by `initialize`. Session's thread only.
     dialect: ?Dialect = null,
+    /// Draws forms, so a question can be put to it.
+    forms: bool = false,
 
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
@@ -1107,17 +1146,28 @@ const Session = struct {
         if (!try loop.steer(text.items, extras)) try loop.submit(text.items, extras);
     }
 
-    const Waiting = struct { seq: u64, call: usize, tool: *const Conversation.ToolCall };
+    const Waiting = struct { for_answer: bool, seq: u64, call: usize, tool: *const Conversation.ToolCall };
 
-    /// The call waiting on a decision, if one is.
+    /// The call waiting on a decision, or the question waiting on an answer.
     fn waitingCall(self: *Session) ?Waiting {
         const loop = &self.stack.loop;
-        if (loop.state != .awaiting_approval) return null;
         const seq = loop.pending_seq orelse return null;
-        const call = loop.firstPending() orelse return null;
         const msg = self.held(seq) orelse return null;
-        if (call >= msg.tool_calls.len) return null;
-        return .{ .seq = seq, .call = call, .tool = &msg.tool_calls[call] };
+        switch (loop.state) {
+            .awaiting_approval => {
+                const call = loop.firstPending() orelse return null;
+                if (call >= msg.tool_calls.len) return null;
+                return .{ .for_answer = false, .seq = seq, .call = call, .tool = &msg.tool_calls[call] };
+            },
+            .awaiting_answer => {
+                const asking = loop.pendingQuestion() orelse return null;
+                for (msg.tool_calls, 0..) |*call, index| {
+                    if (call == asking) return .{ .for_answer = true, .seq = seq, .call = index, .tool = call };
+                }
+                return null;
+            },
+            else => return null,
+        }
     }
 
     fn modes(self: *Session) protocol.Modes {
@@ -1709,8 +1759,9 @@ fn signature(msg: *const Conversation.Message) u64 {
 const testing = std.testing;
 const linux = std.os.linux;
 
-/// Answers the first turn by thinking aloud and asking to write a note, and
-/// the second, once the note is written, with "done". Each answer waits on
+/// Answers the first turn by thinking aloud and asking to write a note, or,
+/// for a prompt of "ask me", asking which colour; and the second, once the
+/// call is settled, with "done". Each answer waits on
 /// `gate` after the thinking, so a test can catch a request mid-stream. Offers
 /// two models, each at two efforts; only the first can be shown images.
 pub const Script = struct {
@@ -1779,6 +1830,14 @@ pub const Script = struct {
         if (last != null and last.?.role == .tool) return .{ .text = try allocator.dupe(u8, "done") };
 
         const calls = try allocator.alloc(Conversation.ToolCall, 1);
+        if (last != null and std.mem.eql(u8, last.?.text, "ask me")) {
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call-1"),
+                .name = try allocator.dupe(u8, "ask_user"),
+                .arguments = try allocator.dupe(u8, "{\"question\":\"Which colour?\",\"options\":[\"red\",\"blue\"]}"),
+            };
+            return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
+        }
         calls[0] = .{
             .id = try allocator.dupe(u8, "call-1"),
             .name = try allocator.dupe(u8, "write"),
@@ -1962,9 +2021,16 @@ pub const Client = struct {
         }
     }
 
+    /// Say hello as the TUI does when `speaks_synth`, drawing forms; and
+    /// otherwise as an editor that does not.
     pub fn initialize(self: *Client, speaks_synth: bool) !void {
+        return self.hello(speaks_synth, speaks_synth);
+    }
+
+    pub fn hello(self: *Client, speaks_synth: bool, draws_forms: bool) !void {
         const id = try self.request(protocol.method.initialize, protocol.Initialize{
             .protocolVersion = protocol.version,
+            .clientCapabilities = if (draws_forms) .{ .elicitation = .{ .form = .{} } } else .{},
             .clientInfo = .{ .name = "test" },
             ._meta = if (speaks_synth) .{ .synth = .{ .protocol = synth.version } } else null,
         });
@@ -2235,6 +2301,79 @@ test "a client without synth's extension is told the turn as session updates, an
     try testing.expectEqualStrings("Let me write that down.done", replayed.text.items);
     try testing.expectEqual(@as(usize, 1), replayed.calls.items.len);
     try testing.expectEqualStrings("completed", replayed.calls.items[0].get("status").?.string);
+}
+
+/// The result a standard client is told the call `id` settled with,
+/// checking that it was never put a question on the way.
+fn settledWith(client: *Client, id: []const u8) ![]const u8 {
+    while (true) {
+        const message = try client.next();
+        try testing.expect(!std.mem.eql(u8, message.method orelse "", protocol.method.elicitation_create));
+        if (!std.mem.eql(u8, message.method orelse "", protocol.method.session_update)) continue;
+        const update = message.params.?.object.get("update").?.object;
+        if (!std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call_update")) continue;
+        if (!std.mem.eql(u8, update.get("toolCallId").?.string, id)) continue;
+        if (!std.mem.eql(u8, update.get("status").?.string, "completed")) continue;
+        return update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string;
+    }
+}
+
+test "a question is put as a form to the clients that draw them, and the answer given goes in" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.initialize(true);
+    const session = (try client.open(fixture.project)).sessionId;
+    const editor = try fixture.connect();
+    defer editor.close();
+    try editor.hello(false, false);
+
+    const prompted = try client.prompt(session, "ask me");
+    const message = try client.awaitMethod(protocol.method.elicitation_create);
+    const asked = try rpc.parse(protocol.FormElicitation(updates.Question), client.arena.allocator(), message.params);
+    try testing.expectEqualStrings("Which colour?", asked.message);
+    try testing.expectEqualStrings("blue", asked.requestedSchema.properties.answer.oneOf.?[1].@"const");
+    try client.answer(message.id.?, .{ .action = "accept", .content = .{ .other = "green" } });
+
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(prompted));
+    try testing.expectEqualStrings("green", try settledWith(editor, asked.toolCallId.?));
+}
+
+test "a question no one connected can answer is answered so, and the turn goes on" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const editor = try fixture.connect();
+    defer editor.close();
+    try editor.hello(false, false);
+    const opened = try editor.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project });
+    const session = (try rpc.parse(protocol.SessionSetup, editor.arena.allocator(), try editor.expectResult(opened))).sessionId;
+
+    _ = try editor.prompt(session, "ask me");
+    var seq: ?[]const u8 = null;
+    while (seq == null) {
+        const message = try editor.next();
+        if (!std.mem.eql(u8, message.method orelse "", protocol.method.session_update)) continue;
+        const update = message.params.?.object.get("update").?.object;
+        if (std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call")) seq = update.get("toolCallId").?.string;
+    }
+    try testing.expectEqualStrings(unanswerable, try settledWith(editor, seq.?));
+}
+
+test "a declined question tells the model so" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const editor = try fixture.connect();
+    defer editor.close();
+    try editor.hello(false, true);
+    const opened = try editor.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project });
+    const session = (try rpc.parse(protocol.SessionSetup, editor.arena.allocator(), try editor.expectResult(opened))).sessionId;
+
+    _ = try editor.prompt(session, "ask me");
+    const message = try editor.awaitMethod(protocol.method.elicitation_create);
+    const asked = try rpc.parse(protocol.FormElicitation(updates.Question), editor.arena.allocator(), message.params);
+    try editor.answer(message.id.?, .{ .action = "decline" });
+    try testing.expectEqualStrings(declined, try settledWith(editor, asked.toolCallId.?));
 }
 
 test "a model and its effort are chosen through config options, and remembered" {

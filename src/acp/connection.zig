@@ -96,10 +96,12 @@ pub fn interrupt(self: *Connection) void {
     }
 }
 
-/// Say hello, asking for synth's extension.
+/// Say hello, asking for synth's extension, and saying questions can be
+/// put to us as forms.
 pub fn initialize(self: *Connection, arena: std.mem.Allocator, diagnostic: ?*Diagnostic) !void {
     _ = self.call(arena, protocol.method.initialize, protocol.Initialize{
         .protocolVersion = protocol.version,
+        .clientCapabilities = .{ .elicitation = .{ .form = .{} } },
         .clientInfo = .{ .name = pkg.name, .version = pkg.version },
         ._meta = .{ .synth = .{ .protocol = synth.version } },
     }, diagnostic) catch |err| {
