@@ -27,6 +27,7 @@ project_root: []const u8,
 reads: *tool.ReadLog,
 /// Passed through to every call's context, so a tool that delegates can.
 delegate: ?tool.Delegate,
+files: ?tool.Files,
 hooks: ?*const Hooks.Runner,
 
 /// Calls to run: name, arguments, and their index in the requesting message.
@@ -94,6 +95,7 @@ pub fn start(
     project_root: []const u8,
     reads: *tool.ReadLog,
     delegate: ?tool.Delegate,
+    files: ?tool.Files,
     hook_runner: ?*const Hooks.Runner,
     approved: []const Call,
 ) !*ToolRun {
@@ -140,6 +142,7 @@ pub fn start(
         .project_root = project_root,
         .reads = reads,
         .delegate = delegate,
+        .files = files,
         .hooks = hook_runner,
         .calls = calls,
         .results = results,
@@ -291,6 +294,7 @@ fn runOne(self: *ToolRun, index: usize) void {
         .project_root = self.project_root,
         .reads = self.reads,
         .delegate = self.delegate,
+        .files = self.files,
         .cancelled = &self.stop,
         .allow_outside = call.allow_outside,
         .progress = .{ .userdata = &self.reporters[index], .report = Reporter.report },
@@ -448,7 +452,7 @@ fn drain(
     reads: *tool.ReadLog,
     calls: []const Call,
 ) !*ToolRun {
-    const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, null, calls);
+    const run_state = try ToolRun.start(allocator, io, registry, ".", reads, null, null, null, calls);
     run_state.join();
     return run_state;
 }
@@ -545,7 +549,7 @@ test "a batch wider than the cap runs in several groups" {
     var reads: tool.ReadLog = .init(allocator);
     defer reads.deinit();
 
-    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, &many);
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, null, &many);
     defer run_state.destroy();
     run_state.join();
 
@@ -571,7 +575,7 @@ test "giving up inside a group stops the calls after it" {
         .{ .index = 2, .name = "alone", .arguments = "{}" },
     };
 
-    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, calls);
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, null, calls);
     defer run_state.destroy();
     probe.run.store(run_state, .release);
     run_state.join();
@@ -593,7 +597,7 @@ test "a running call's progress reaches the owner while it is still running" {
 
     const calls: []const Call = &.{.{ .index = 0, .name = "talkative", .arguments = "{}" }};
 
-    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, calls);
+    const run_state = try ToolRun.start(allocator, testing.io, &registry, ".", &reads, null, null, null, calls);
     defer run_state.destroy();
 
     var seen: Note = .{};
@@ -640,6 +644,7 @@ test "post-tool hooks run for ordinary tool errors" {
         &registry,
         root,
         &reads,
+        null,
         null,
         &runner,
         &calls,

@@ -33,6 +33,9 @@ pub const Context = struct {
     /// Where this call sits in the message that asked for it, so what a tool
     /// leaves behind can be matched back to the call that produced it.
     call_index: usize = 0,
+    /// Where `read`, `write` and `edit` take a file's text from and give it
+    /// to, when not the disk: an editor's buffers, unsaved changes and all.
+    files: ?Files = null,
     /// Whether this call may touch paths outside the project.
     ///
     /// True only for a call a person approved by hand. A call that skipped the
@@ -79,6 +82,15 @@ pub const Context = struct {
         if (left <= 0) return 0;
         return @min(cap_ms, @as(u64, @intCast(left)));
     }
+};
+
+/// A file's text by way of something other than the disk. Either call
+/// answers null, or false, to leave it to the disk after all: whoever
+/// offered it may since have gone.
+pub const Files = struct {
+    context: *anyopaque,
+    read: *const fn (context: *anyopaque, ctx: Context, path: []const u8) anyerror!?[]u8,
+    write: *const fn (context: *anyopaque, ctx: Context, path: []const u8, content: []const u8) anyerror!bool,
 };
 
 /// Cap on one progress line. Fixed so a worker can publish it without

@@ -230,6 +230,7 @@ pub const Runner = struct {
         child.loop.skills = parent.skills;
         child.loop.system_prompt = parent.system_prompt;
         child.loop.delegate = null;
+        child.loop.files = parent.files;
         // A standing allowance is the person's, not something to inherit.
         child.loop.auto_approve_safe = false;
         child.loop.max_turn_ms = parent.max_turn_ms;

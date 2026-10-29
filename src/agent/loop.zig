@@ -208,6 +208,8 @@ auto_approve_safe: bool = true,
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
 delegate: ?tool.Delegate = null,
+/// Where file tools read and write, when not the disk. See `tool.Files`.
+files: ?tool.Files = null,
 /// What the model may do this turn. The tool schema sent with every request is
 /// this agent's list, and the gate refuses anything outside it.
 agent: agents.Agent = agents.all[0],
@@ -2015,6 +2017,7 @@ fn runApproved(self: *Loop) !void {
         self.project_root,
         self.reads,
         self.delegate,
+        self.files,
         self.hooks,
         batch.items,
     );

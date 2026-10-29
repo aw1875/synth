@@ -28,6 +28,8 @@ pub const method = struct {
     pub const session_update = "session/update";
     pub const session_request_permission = "session/request_permission";
     pub const elicitation_create = "elicitation/create";
+    pub const fs_read_text_file = "fs/read_text_file";
+    pub const fs_write_text_file = "fs/write_text_file";
     /// Either way: the request with this id no longer needs an answer.
     pub const cancel_request = "$/cancel_request";
 };
@@ -49,6 +51,11 @@ pub const Initialize = struct {
 };
 
 pub const ClientCapabilities = struct {
+    /// Files read and written through the client: an editor's buffers.
+    fs: ?struct {
+        readTextFile: bool = false,
+        writeTextFile: bool = false,
+    } = null,
     elicitation: ?struct {
         /// Present, even empty, when the client draws forms.
         form: ?struct {} = null,
@@ -133,6 +140,21 @@ pub const ConfigValue = struct {
 
 pub const config_model = "model";
 pub const config_effort = "effort";
+
+pub const ReadTextFile = struct {
+    sessionId: []const u8,
+    path: []const u8,
+};
+
+pub const TextFile = struct {
+    content: []const u8,
+};
+
+pub const WriteTextFile = struct {
+    sessionId: []const u8,
+    path: []const u8,
+    content: []const u8,
+};
 
 pub const Prompt = struct {
     sessionId: []const u8,

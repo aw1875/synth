@@ -36,6 +36,7 @@ const SignInTask = @import("../provider/chatgpt_sign_in.zig");
 const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const skill_tool = @import("../tools/skill.zig");
+const tool = @import("../tools/tool.zig");
 
 const Agent = @This();
 
@@ -98,6 +99,9 @@ listener: ?*sockets.Listener = null,
 detached: bool = false,
 /// The permission request out for the call waiting on a decision.
 asked: ?Asked = null,
+/// Requests a tool put to a client and is waiting on, by id. Guarded by
+/// `mutex`, as `next_id` is.
+calls: std.AutoHashMapUnmanaged(i64, *ClientCall) = .empty,
 /// Prompts answered when the turn they started or steered ends.
 prompts: std.ArrayList(Prompting) = .empty,
 next_id: i64 = 1,
@@ -121,6 +125,7 @@ pub fn deinit(self: *Agent) void {
     var leftover = self.inbox;
     while (leftover.popFirst()) |node| Inbound.of(node).destroy();
     self.prompts.deinit(self.allocator);
+    self.calls.deinit(self.allocator);
 }
 
 /// Speak ACP over a pair of files, until `input` ends. Both are closed with
@@ -212,6 +217,7 @@ fn drop(self: *Agent, connection: *Connection) void {
         defer self.mutex.unlock(self.io);
         const index = std.mem.indexOfScalar(*Connection, self.connections.items, connection).?;
         _ = self.connections.swapRemove(index);
+        self.releaseCalls(connection);
     }
     connection.destroy();
 }
@@ -395,6 +401,10 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
     }
     connection.dialect = if (asked != null) .synth else .standard;
     connection.forms = request.clientCapabilities.drawsForms();
+    if (request.clientCapabilities.fs) |fs| {
+        connection.reads_files = fs.readTextFile;
+        connection.writes_files = fs.writeTextFile;
+    }
     connection.reply(id, protocol.Initialized{
         .agentInfo = .{ .name = pkg.name, .version = pkg.version },
         ._meta = if (asked != null) .{ .synth = .{ .protocol = synth.version } } else null,
@@ -810,6 +820,89 @@ const Prompting = struct {
     }
 };
 
+/// A request a tool put to a client, and the reply once it comes. The tool's
+/// thread waits on it; the client's reader settles it.
+const ClientCall = struct {
+    connection: *Connection,
+    done: std.Io.Event = .unset,
+    /// Null when the client went away first.
+    reply: ?*Inbound = null,
+};
+
+/// Hand `inbound` to the tool waiting on it, if it answers one. Called from
+/// a connection's reader.
+fn settleCall(self: *Agent, inbound: *Inbound) bool {
+    const id = inbound.message.id orelse return false;
+    if (id != .number) return false;
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const entry = self.calls.fetchRemove(id.number) orelse return false;
+    entry.value.reply = inbound;
+    entry.value.done.set(self.io);
+    return true;
+}
+
+/// Let go of the tools waiting on `connection`, which has gone. Called under
+/// `mutex`.
+fn releaseCalls(self: *Agent, connection: *Connection) void {
+    var calls = self.calls.iterator();
+    while (calls.next()) |entry| {
+        const call = entry.value_ptr.*;
+        if (call.connection != connection) continue;
+        self.calls.removeByPtr(entry.key_ptr);
+        call.done.set(self.io);
+        calls = self.calls.iterator();
+    }
+}
+
+/// The first client offering its view of files for `writing` or reading.
+fn fileClient(self: *Agent, writing: bool) ?*Connection {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    for (self.connections.items) |connection| {
+        if (connection.finished.load(.acquire)) continue;
+        if (if (writing) connection.writes_files else connection.reads_files) return connection;
+    }
+    return null;
+}
+
+/// Put `method` to `connection` from a tool's thread and wait for the reply,
+/// which the caller destroys. A call given up on is taken back.
+fn callClient(self: *Agent, ctx: tool.Context, connection: *Connection, method: []const u8, params: anytype) !*Inbound {
+    var call: ClientCall = .{ .connection = connection };
+    const id = blk: {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (std.mem.indexOfScalar(*Connection, self.connections.items, connection) == null) return error.ClientGone;
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.calls.put(self.allocator, id, &call);
+        connection.request(.{ .number = id }, method, params);
+        break :blk id;
+    };
+    while (true) {
+        const slice: std.Io.Duration = .fromMilliseconds(@intCast(ctx.waitSliceMs(client_call_slice_ms)));
+        call.done.waitTimeout(self.io, .{ .duration = .{ .raw = slice, .clock = .awake } }) catch {};
+        if (call.done.isSet()) break;
+        if (!ctx.shouldStop()) continue;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.calls.remove(id)) continue;
+        connection.notify(protocol.method.cancel_request, protocol.CancelRequest{ .requestId = .{ .integer = id } });
+        return error.Cancelled;
+    }
+    const reply = call.reply orelse return error.ClientGone;
+    if (reply.message.err != null) {
+        reply.destroy();
+        return error.ClientRefused;
+    }
+    return reply;
+}
+
+/// How long a tool waiting on a client sleeps before asking whether it has
+/// been given up on.
+const client_call_slice_ms: u64 = 100;
+
 /// The call a permission request is out for, and the request each client
 /// was sent.
 const Asked = struct {
@@ -883,6 +976,9 @@ const Connection = struct {
     dialect: ?Dialect = null,
     /// Draws forms, so a question can be put to it.
     forms: bool = false,
+    /// Offers its own view of files, unsaved changes and all.
+    reads_files: bool = false,
+    writes_files: bool = false,
 
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
@@ -1046,6 +1142,7 @@ const Connection = struct {
         const method = inbound.message.method orelse "";
         if (std.mem.eql(u8, method, synth.method.files)) return self.listFiles(inbound.message, arena);
         posted = true;
+        if (inbound.message.method == null and self.agent.settleCall(inbound)) return;
         self.agent.post(inbound);
     }
 
@@ -1161,7 +1258,33 @@ const Session = struct {
             self.stack.loop.session_public_id = self.handle;
         }
         self.restoreEffort();
+        self.stack.loop.files = self.files();
         return self;
+    }
+
+    /// File tools by way of a client that offers its view of files, else the
+    /// disk.
+    fn files(self: *Session) tool.Files {
+        return .{ .context = self, .read = readThroughClient, .write = writeThroughClient };
+    }
+
+    fn readThroughClient(context: *anyopaque, ctx: tool.Context, path: []const u8) anyerror!?[]u8 {
+        const self: *Session = @ptrCast(@alignCast(context));
+        const agent = self.agent;
+        const connection = agent.fileClient(false) orelse return null;
+        const reply = try agent.callClient(ctx, connection, protocol.method.fs_read_text_file, protocol.ReadTextFile{ .sessionId = self.handle, .path = path });
+        defer reply.destroy();
+        const file = try rpc.parse(protocol.TextFile, reply.arena.allocator(), reply.message.result);
+        return try ctx.allocator.dupe(u8, file.content);
+    }
+
+    fn writeThroughClient(context: *anyopaque, ctx: tool.Context, path: []const u8, content: []const u8) anyerror!bool {
+        const self: *Session = @ptrCast(@alignCast(context));
+        const agent = self.agent;
+        const connection = agent.fileClient(true) orelse return false;
+        const reply = try agent.callClient(ctx, connection, protocol.method.fs_write_text_file, protocol.WriteTextFile{ .sessionId = self.handle, .path = path, .content = content });
+        reply.destroy();
+        return true;
     }
 
     fn destroy(self: *Session) void {
@@ -1965,6 +2088,14 @@ pub const Script = struct {
             };
             return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
         }
+        if (last != null and std.mem.eql(u8, last.?.text, "read the note")) {
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call-1"),
+                .name = try allocator.dupe(u8, "read"),
+                .arguments = try allocator.dupe(u8, "{\"path\":\"note.txt\"}"),
+            };
+            return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
+        }
         calls[0] = .{
             .id = try allocator.dupe(u8, "call-1"),
             .name = try allocator.dupe(u8, "write"),
@@ -2327,6 +2458,52 @@ test "a linked file in the project is attached, and any other link named in the 
 
     try client.choose((try client.awaitPermission()).id, "deny");
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(prompted));
+}
+
+test "a client that offers its view of files is where file tools read and write" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const arena = client.arena.allocator();
+    _ = try client.expectResult(try client.request(protocol.method.initialize, protocol.Initialize{
+        .protocolVersion = protocol.version,
+        .clientCapabilities = .{ .fs = .{ .readTextFile = true, .writeTextFile = true } },
+        ._meta = .{ .synth = .{ .protocol = synth.version } },
+    }));
+    const session = (try client.open(fixture.project)).sessionId;
+    const note = try std.fs.path.join(arena, &.{ fixture.project, "note.txt" });
+
+    const writing = try client.prompt(session, "make a note");
+    try client.choose((try client.awaitPermission()).id, "once");
+    const write = try client.awaitMethod(protocol.method.fs_write_text_file);
+    const written = try rpc.parse(protocol.WriteTextFile, arena, write.params);
+    try testing.expectEqualStrings(note, written.path);
+    try testing.expectEqualStrings("acp", written.content);
+    try client.answer(write.id.?, protocol.Empty{});
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(writing));
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, note, .{}));
+
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = note, .data = "saved" });
+    const reading = try client.prompt(session, "read the note");
+    const read = try client.awaitMethod(protocol.method.fs_read_text_file);
+    try testing.expectEqualStrings(note, (try rpc.parse(protocol.ReadTextFile, arena, read.params)).path);
+    try client.answer(read.id.?, protocol.TextFile{ .content = "unsaved" });
+    const result = while (true) {
+        const message = try client.awaitMethod(synth.method.appended);
+        const appended = try rpc.parse(synth.Appended, arena, message.params);
+        if (appended.message.role == .tool) break appended.message.text;
+    };
+    try testing.expect(std.mem.indexOf(u8, result, "unsaved") != null);
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(reading));
+
+    const abandoned = try client.prompt(session, "read the note");
+    const unanswered = try client.awaitMethod(protocol.method.fs_read_text_file);
+    try client.notify(protocol.method.session_cancel, protocol.SessionId{ .sessionId = session });
+    const withdrawn = try client.awaitMethod(protocol.method.cancel_request);
+    const cancel = try rpc.parse(protocol.CancelRequest, arena, withdrawn.params);
+    try testing.expect(unanswered.id.?.eql(rpc.Id.from(cancel.requestId).?));
+    try testing.expectEqual(protocol.StopReason.cancelled, try client.stopReason(abandoned));
 }
 
 test "the first answer to a permission request wins, and the rest are taken back" {
