@@ -31,8 +31,8 @@ pub fn resolveDiffStart(self: *Model, call: *Conversation.ToolCall) ?usize {
     const change = (diff.change(arena, call.name, call.arguments) catch return null) orelse return null;
     if (change.old.len == 0) return 1;
 
-    const project = self.project orelse return null;
-    const path = std.fs.path.join(arena, &.{ project.root, change.path }) catch return null;
+    const root = self.readableRoot() orelse return null;
+    const path = std.fs.path.join(arena, &.{ root, change.path }) catch return null;
     const source = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, Model.max_diff_file_bytes) catch return null;
 
     const at = std.mem.indexOf(u8, source, change.old) orelse
@@ -111,7 +111,7 @@ pub fn attachmentCard(
     card.body = attachment.content;
 
     if (card.expanded and attachment.shortened()) {
-        if (!self.inSubagent()) self.loop.loadAttachment(msg, index) catch {};
+        if (!self.inSubagent()) self.mirror.loadAttachment(msg, index) catch {};
         card.body = attachment.content;
     }
 
@@ -141,10 +141,10 @@ pub fn toolCard(
     card.arguments = call.arguments;
     card.start_line = diffStart(self, key, call);
     card.result = call.result;
-    card.note = self.loop.toolNote(msg.seq, call_index);
+    card.note = self.mirror.toolNote(msg.seq, call_index);
     card.status = call.status;
     card.elapsed_ms = call.elapsed_ms;
-    card.open = if (self.hasSubagent(key, msg, call_index))
+    card.open = if (self.hasSubagent(msg, call_index))
         .{ .userdata = self, .key = key, .seq = msg.seq, .index = call_index, .call = Model.openFromCard }
     else
         null;
@@ -152,7 +152,7 @@ pub fn toolCard(
     if (card.expanded and call.result_bytes > Conversation.preview_bytes) {
         if (call.result) |r| {
             if (r.len < call.result_bytes) {
-                if (!self.inSubagent()) self.loop.loadToolResult(msg, call_index) catch {};
+                if (!self.inSubagent()) self.mirror.loadToolResult(msg, call_index) catch {};
                 card.result = call.result;
             }
         }
@@ -182,7 +182,7 @@ pub fn thoughtRow(self: *Model, msg: *Conversation.Message) !?*ThoughtView.View 
     if (row.expanded and msg.thinking_bytes > Conversation.preview_bytes) {
         if (msg.thinking) |t| {
             if (t.len < msg.thinking_bytes) {
-                if (!self.inSubagent()) self.loop.loadThinking(msg) catch {};
+                if (!self.inSubagent()) self.mirror.loadThinking(msg) catch {};
                 row.text = msg.thinking.?;
             }
         }
