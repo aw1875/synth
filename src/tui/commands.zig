@@ -50,7 +50,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/search")) {
-        try searchTranscripts(self, ctx, commandArgument(line, "/search"));
+        try searchTranscripts(self, ctx, commandArgument(line));
         return true;
     }
     if (std.mem.eql(u8, line, "/prune")) {
@@ -78,7 +78,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/agent")) {
-        const name = commandArgument(line, "/agent");
+        const name = commandArgument(line);
         if (name.len > 0) {
             try switchAgent(self, ctx, agents.findOrDefault(name).id);
         } else {
@@ -87,7 +87,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/theme")) {
-        const name = commandArgument(line, "/theme");
+        const name = commandArgument(line);
         if (name.len > 0) {
             keepTheme(self, themes.findOrDefault(name).id);
         } else {
@@ -124,7 +124,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/effort")) {
-        try chooseEffort(self, ctx, commandArgument(line, "/effort"));
+        try chooseEffort(self, ctx, commandArgument(line));
         ctx.redraw = true;
         return true;
     }
@@ -141,17 +141,18 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     if (isCommand(line, "/model")) {
         if (try offerProvidersInstead(self)) return true;
         if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
-        const name = commandArgument(line, "/model");
-        if (name.len > 0) {
-            try switchModelNamed(self, ctx, name);
-        } else {
+        const name = commandArgument(line);
+        if (name.len == 0) {
             try showModels(self, ctx);
+        } else if (switchModel(self, name)) |_| {} else |err| {
+            if (err == error.UnknownModel) return refuseUnknownModel(self, ctx, line, name);
+            try reportSwitchFailure(self, ctx, name, err);
         }
         ctx.redraw = true;
         return true;
     }
     if (isCommand(line, "/rename")) {
-        const name = commandArgument(line, "/rename");
+        const name = commandArgument(line);
         if (name.len > 0) {
             self.loop.rename(name) catch {};
         } else {
@@ -183,8 +184,8 @@ fn commandName(line: []const u8) []const u8 {
     return line[1..Slash.commandWordEnd(line)];
 }
 
-fn commandArgument(line: []const u8, command: []const u8) []const u8 {
-    return std.mem.trim(u8, line[command.len..], " \t\r\n");
+fn commandArgument(line: []const u8) []const u8 {
+    return std.mem.trim(u8, line[Slash.commandWordEnd(line)..], " \t\r\n");
 }
 
 /// Invoke a skill by name: `/release 2.1`.
@@ -898,23 +899,27 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     return self.provider.model;
 }
 
-fn switchModelNamed(self: *Model, ctx: *vxfw.EventContext, name: []const u8) !void {
-    _ = switchModel(self, name) catch |err| return reportSwitchFailure(self, ctx, name, err);
-}
-
 /// In the backend's words where it has some. A switch that went through before
 /// a later step failed, such as remembering the choice, is said to have.
 pub fn reportSwitchFailure(self: *Model, ctx: *vxfw.EventContext, name: []const u8, err: anyerror) !void {
     if (err == error.UnknownModel) {
-        return self.notification.showFmt(ctx, .warn, "{s} has no model called {s}. Ctrl+o lists what it has", .{ self.provider.name, name });
+        return self.notification.showFmt(ctx, .warn, unknown_model_format, .{ self.provider.name, name });
     }
     const is_switched = std.mem.eql(u8, self.provider.model, name);
     if (is_switched) {
-        return self.notification.showFmt(ctx, .warn, "Switched to {s}, but could not save it: {s}", .{ name, @errorName(err) });
+        return self.notification.showFmt(ctx, .warn, "Switched to {s}, but could not remember it for next time: {s}", .{ name, @errorName(err) });
     }
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     try self.notification.show(ctx, .err, try self.provider.explain(err, arena_state.allocator()));
+}
+
+const unknown_model_format = "{s} has no model called {s}. ctrl+o lists what it has.";
+
+fn refuseUnknownModel(self: *Model, ctx: *vxfw.EventContext, line: []const u8, name: []const u8) !bool {
+    const said = try std.fmt.allocPrint(self.allocator, unknown_model_format, .{ self.provider.name, name });
+    defer self.allocator.free(said);
+    return refuseCommand(self, ctx, line, said);
 }
 
 /// Remember the model per provider so the next launch reopens on it.
@@ -1130,9 +1135,12 @@ test "a model the provider does not serve is refused, and the one in use stays" 
     var ctx = testContext();
     defer ctx.cmds.deinit(testing.allocator);
 
-    try testing.expect(try runCommand(&model, &ctx, "/model " ++ unserved_model));
+    const refused = "/model " ++ unserved_model;
+    try testing.expect(try runCommand(&model, &ctx, refused));
     try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+    try testing.expectEqualStrings(refused, model.input.text.items);
 
+    model.input.clear();
     try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
     try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
 }
@@ -1147,9 +1155,21 @@ test "the model is not switched under a running turn" {
     model.loop.state = .awaiting_approval;
     defer model.loop.state = .idle;
 
-    try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
+    const line = "/model glm-5.3-flash";
+    try testing.expect(try runCommand(&model, &ctx, line));
     try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
-    try testing.expectEqualStrings("/model glm-5.3-flash", model.input.text.items);
+    try testing.expectEqualStrings(line, model.input.text.items);
+}
+
+test "a word that names no command goes to the model as written" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try testing.expect(!try runCommand(&model, &ctx, "/models"));
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
 }
 
 test "clearing the draft closes the slash menu over it" {
