@@ -20,6 +20,7 @@ const Database = @import("core/database.zig");
 const Timing = @import("core/timing.zig");
 const Project = @import("core/project.zig");
 const skill = @import("core/skill.zig");
+const acp = @import("acp/run.zig");
 const headless = @import("headless.zig");
 const prompt_dump = @import("prompt_dump.zig");
 const catalog = @import("provider/catalog.zig");
@@ -69,6 +70,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
+        .acp => try acp.run(init),
         .models => try commands.models(init),
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),

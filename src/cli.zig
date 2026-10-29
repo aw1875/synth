@@ -16,6 +16,8 @@ pub const Command = union(enum) {
     skills,
     models,
     prompt,
+    /// Speak ACP on stdio, for an editor or the TUI.
+    acp,
     /// Null for the whole menu, or the subcommand whose `-h` asked.
     help: ?Topic,
     version,
@@ -112,7 +114,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"},
+    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"}, .{"acp"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -145,6 +147,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
             if (std.mem.eql(u8, word, "run")) return parseRun(init, allocator, &iter);
             if (std.mem.eql(u8, word, "models")) return .models;
             if (std.mem.eql(u8, word, "skills")) return .skills;
+            if (std.mem.eql(u8, word, "acp")) return .acp;
             return .prompt;
         }
     }
@@ -354,6 +357,7 @@ const help_sections: []const Section = &.{
             .{ .left = "skills", .right = "skills on offer, and where they came from" },
             .{ .left = "models", .right = "models the provider offers" },
             .{ .left = "prompt", .right = "print the system prompt" },
+            .{ .left = "acp", .right = "speak the Agent Client Protocol on stdio" },
         },
     },
     .{

@@ -73,6 +73,7 @@ synth db status|prune|vacuum   what the database holds, and shrinking it
 synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
+synth acp                      speak the Agent Client Protocol on stdio
 
   -c, --continue               resume the most recent session here
   -s, --session <id>           resume a session by handle (ses_7k3f9a2b)
@@ -83,6 +84,9 @@ synth prompt                   print the system prompt
 `synth run` is the fastest way to answer "does this model actually emit tool
 calls" - it drives the real loop and provider and prints each step, denying
 anything that would change the project unless `--allow` is given.
+
+`synth acp` is synth as an [ACP](https://agentclientprotocol.com) agent, for an
+editor to spawn: one session at a time, approvals asked as permission requests.
 
 ## Keys
 
@@ -409,6 +413,7 @@ src/
   core/       config, auth, sqlite, sessions, @path mentions, search primitives
   provider/   the ollama and OpenAI backends, and what fits in a context window
   agent/      the turn state machine: ask -> approve -> run -> repeat
+  acp/        the ACP agent, and synth's own extension to it
   tools/      read, list, glob, grep, write, edit, bash, task, ask_user, skill, todo
   tui/        the vxfw widget tree: transcript, composer, pickers, sidebar
 packages/
