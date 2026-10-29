@@ -289,7 +289,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
-        return session.tellCommands(arena, connection);
+        return session.welcome(arena, connection);
     }
     const loads = eql(u8, method, protocol.method.session_load);
     if (loads or eql(u8, method, protocol.method.session_resume)) {
@@ -304,7 +304,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
-        return session.tellCommands(arena, connection);
+        return session.welcome(arena, connection);
     }
     if (eql(u8, method, protocol.method.session_delete)) {
         if (connection.guest) return error.HostsOneSession;
@@ -393,6 +393,13 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
     } else return error.MethodNotFound;
     connection.reply(id, protocol.Empty{});
+}
+
+fn contains(names: []const []const u8, wanted: []const u8) bool {
+    for (names) |name| {
+        if (std.mem.eql(u8, name, wanted)) return true;
+    }
+    return false;
 }
 
 fn need(id: ?rpc.Id) !rpc.Id {
@@ -1305,6 +1312,10 @@ const Session = struct {
     /// been, which names the next.
     compaction: ?u64 = null,
     compactions: u64 = 0,
+    /// The provider's models when last asked, for the model option a client
+    /// without synth's extension picks from. Empty until one opens the
+    /// session, and again once the provider changes.
+    offered_models: [][]const u8 = &.{},
 
     const Place = struct { seq: u64, call: usize };
 
@@ -1481,6 +1492,7 @@ const Session = struct {
         self.terminals.deinit(self.allocator);
         self.told_text.deinit(self.allocator);
         self.told.deinit(self.allocator);
+        self.forgetModels();
         self.allocator.free(self.handle);
         self.allocator.free(self.cwd);
         self.allocator.destroy(self);
@@ -1617,14 +1629,16 @@ const Session = struct {
         break :blk out;
     };
 
-    /// The model, and its reasoning effort where it offers a choice. Only the
-    /// model in use is listed: asking the provider for the rest is a round
-    /// trip, which `_synth/models` makes on request.
+    /// The model, and its reasoning effort where it offers a choice. The other
+    /// models are listed once `welcome` has asked the provider for them.
     fn configOptions(self: *Session, arena: std.mem.Allocator) ![]const protocol.ConfigOption {
         const provider = self.stack.loop.provider;
         var out: std.ArrayList(protocol.ConfigOption) = .empty;
-        const model = try arena.alloc(protocol.ConfigValue, 1);
-        model[0] = .{ .value = provider.model, .name = provider.model };
+        var names: std.ArrayList([]const u8) = .empty;
+        if (!contains(self.offered_models, provider.model)) try names.append(arena, provider.model);
+        try names.appendSlice(arena, self.offered_models);
+        const model = try arena.alloc(protocol.ConfigValue, names.items.len);
+        for (names.items, model) |name, *value| value.* = .{ .value = name, .name = name };
         try out.append(arena, .{ .id = protocol.config_model, .name = "Model", .category = "model", .currentValue = provider.model, .options = model });
 
         const levels = provider.effortsFor(provider.model).levels;
@@ -1763,10 +1777,27 @@ const Session = struct {
         self.agent.notifyAll(audience, protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = update });
     }
 
+    /// What a client without synth's extension is told once it has the
+    /// session: its commands, and the models it can pick from. Asking the
+    /// provider is a round trip, made after the reply rather than before.
+    fn welcome(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
+        if (connection.dialect != .standard) return;
+        try self.tellCommands(arena, connection);
+        if (self.offered_models.len == 0) {
+            self.offered_models = self.stack.loop.provider.models(self.allocator) catch return;
+        }
+        try self.tellState(arena, true);
+    }
+
+    fn forgetModels(self: *Session) void {
+        for (self.offered_models) |name| self.allocator.free(name);
+        self.allocator.free(self.offered_models);
+        self.offered_models = &.{};
+    }
+
     /// What a client without synth's extension can type as `/name`: the
     /// skills, and compacting.
     fn tellCommands(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
-        if (connection.dialect != .standard) return;
         const skills = self.stack.skills.skills;
         const commands = try arena.alloc(protocol.Command, skills.len + 1);
         commands[0] = .{ .name = "compact", .description = "Summarise the conversation so far to free up context" };
@@ -2039,6 +2070,7 @@ const Session = struct {
 
         const loop = &self.stack.loop;
         loop.provider = try providers.connect(entry, where, key);
+        self.forgetModels();
         try loop.setModel(loop.provider.model);
         db.setProviderHost(entry.id, where) catch |err| self.notice(.warning, "Could not remember the host: {s}", .{@errorName(err)});
         db.setActiveProvider(entry.id) catch |err| self.notice(.warning, "Could not remember the provider: {s}", .{@errorName(err)});
@@ -3156,6 +3188,27 @@ test "a model and its effort are chosen through config options, and remembered" 
 
     const missing = try client.request(protocol.method.session_set_config_option, protocol.SetConfigOption{ .sessionId = session, .configId = protocol.config_model, .value = "missing" });
     try testing.expectEqualStrings("UnknownModel", (try client.expectError(missing)).message);
+}
+
+test "a client without synth's extension is offered every model once the session opens" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const arena = client.arena.allocator();
+    try client.initialize(false);
+
+    const opened = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project }));
+    const session = (try rpc.parse(protocol.SessionSetup, arena, opened)).sessionId;
+    const update = try client.awaitUpdate("config_option_update");
+    const options = try rpc.parse(protocol.ConfigOptions, arena, .{ .object = update });
+    try testing.expectEqual(@as(usize, 2), options.configOptions[0].options.len);
+    try testing.expectEqualStrings("bigger", options.configOptions[0].options[1].value);
+
+    const chosen = try client.request(protocol.method.session_set_config_option, protocol.SetConfigOption{ .sessionId = session, .configId = protocol.config_model, .value = "bigger" });
+    const after = try rpc.parse(protocol.ConfigOptions, arena, try client.expectResult(chosen));
+    try testing.expectEqualStrings("bigger", after.configOptions[0].currentValue);
+    try testing.expectEqual(@as(usize, 2), after.configOptions[0].options.len);
 }
 
 test "a session is listed once spoken in, loads back with its transcript, and an empty one is not kept" {
