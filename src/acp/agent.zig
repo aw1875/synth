@@ -395,9 +395,33 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     connection.reply(id, protocol.Empty{});
 }
 
-fn contains(names: []const []const u8, wanted: []const u8) bool {
-    for (names) |name| {
-        if (std.mem.eql(u8, name, wanted)) return true;
+/// A model as a client without synth's extension picks it, when it may come
+/// from any provider: `<catalog id>/<model>`. Model names can hold `/`
+/// themselves; catalog ids never do. Plain when there is no provider to name.
+fn modelValue(arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
+    if (provider_id.len == 0) return model;
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ provider_id, model });
+}
+
+const Chosen = struct { provider: ?[]const u8, model: []const u8 };
+
+fn chosenModel(value: []const u8) Chosen {
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return .{ .provider = null, .model = value };
+    const id = value[0..slash];
+    if (catalog.find(id) == null) return .{ .provider = null, .model = value };
+    return .{ .provider = id, .model = value[slash + 1 ..] };
+}
+
+fn offers(offered: []const synth.Offered, provider_id: []const u8, model: []const u8) bool {
+    for (offered) |entry| {
+        if (std.mem.eql(u8, entry.provider_id, provider_id) and std.mem.eql(u8, entry.name, model)) return true;
+    }
+    return false;
+}
+
+fn seen(earlier: []const synth.Offered, provider_id: []const u8) bool {
+    for (earlier) |entry| {
+        if (std.mem.eql(u8, entry.provider_id, provider_id)) return true;
     }
     return false;
 }
@@ -1312,10 +1336,11 @@ const Session = struct {
     /// been, which names the next.
     compaction: ?u64 = null,
     compactions: u64 = 0,
-    /// The provider's models when last asked, for the model option a client
-    /// without synth's extension picks from. Empty until one opens the
-    /// session, and again once the provider changes.
-    offered_models: [][]const u8 = &.{},
+    /// Every connected provider's models when last asked, for the model
+    /// option a client without synth's extension picks from. Asked once one
+    /// opens the session.
+    offered_store: ?std.heap.ArenaAllocator = null,
+    offered: []const synth.Offered = &.{},
 
     const Place = struct { seq: u64, call: usize };
 
@@ -1630,16 +1655,11 @@ const Session = struct {
     };
 
     /// The model, and its reasoning effort where it offers a choice. The other
-    /// models are listed once `welcome` has asked the provider for them.
+    /// models are listed once `welcome` has asked the providers for them.
     fn configOptions(self: *Session, arena: std.mem.Allocator) ![]const protocol.ConfigOption {
         const provider = self.stack.loop.provider;
         var out: std.ArrayList(protocol.ConfigOption) = .empty;
-        var names: std.ArrayList([]const u8) = .empty;
-        if (!contains(self.offered_models, provider.model)) try names.append(arena, provider.model);
-        try names.appendSlice(arena, self.offered_models);
-        const model = try arena.alloc(protocol.ConfigValue, names.items.len);
-        for (names.items, model) |name, *value| value.* = .{ .value = name, .name = name };
-        try out.append(arena, .{ .id = protocol.config_model, .name = "Model", .category = "model", .currentValue = provider.model, .options = model });
+        try out.append(arena, try self.modelOption(arena));
 
         const levels = provider.effortsFor(provider.model).levels;
         if (levels.len > 0) {
@@ -1648,6 +1668,38 @@ const Session = struct {
             try out.append(arena, .{ .id = protocol.config_effort, .name = "Effort", .category = "thought_level", .currentValue = provider.effort, .options = efforts });
         }
         return out.items;
+    }
+
+    /// The models to pick from: under a header per provider, valued as
+    /// `modelValue` names them, when the session can change provider; else
+    /// a plain list. The model in use is always among them.
+    fn modelOption(self: *Session, arena: std.mem.Allocator) !protocol.ConfigOption {
+        const model = self.stack.loop.provider.model;
+        const provider_id = self.providerId();
+        var offered: std.ArrayList(synth.Offered) = .empty;
+        if (model.len > 0 and !offers(self.offered, provider_id, model)) {
+            try offered.append(arena, .{ .name = model, .provider = catalog.findOrDefault(provider_id).label, .provider_id = provider_id });
+        }
+        try offered.appendSlice(arena, self.offered);
+        const current = try modelValue(arena, provider_id, model);
+
+        if (self.agent.options.source != .providers) {
+            const values = try arena.alloc(protocol.ConfigValue, offered.items.len);
+            for (offered.items, values) |entry, *value| value.* = .{ .value = entry.name, .name = entry.name };
+            return .{ .id = protocol.config_model, .name = "Model", .category = "model", .currentValue = current, .options = values };
+        }
+
+        var groups: std.ArrayList(protocol.ConfigValue) = .empty;
+        for (offered.items, 0..) |entry, at| {
+            if (seen(offered.items[0..at], entry.provider_id)) continue;
+            var values: std.ArrayList(protocol.ConfigValue) = .empty;
+            for (offered.items[at..]) |same| {
+                if (!std.mem.eql(u8, same.provider_id, entry.provider_id)) continue;
+                try values.append(arena, .{ .value = try modelValue(arena, same.provider_id, same.name), .name = same.name });
+            }
+            try groups.append(arena, .{ .group = entry.provider_id, .name = entry.provider, .options = values.items });
+        }
+        return .{ .id = protocol.config_model, .name = "Model", .category = "model", .currentValue = current, .options = groups.items };
     }
 
     fn setConfigOption(self: *Session, request: protocol.SetConfigOption) !void {
@@ -1659,13 +1711,15 @@ const Session = struct {
         if (!std.mem.eql(u8, request.configId, protocol.config_model)) return error.UnknownConfigOption;
 
         const extra: synth.SetModel = if (request._meta) |meta| meta.synth orelse .{} else .{};
+        const by_editor = request._meta == null and self.agent.options.source == .providers;
+        const chosen: Chosen = if (by_editor) chosenModel(request.value) else .{ .provider = extra.provider, .model = request.value };
         const provider_id = self.providerId();
-        const switching = if (extra.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
+        const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
         if (switching) {
             if (loop.isBusy()) return error.Busy;
-            try self.useProvider(catalog.find(extra.provider.?) orelse return error.UnknownProvider, null, null);
+            try self.useProvider(catalog.find(chosen.provider.?) orelse return error.UnknownProvider, null, null);
         }
-        try loop.switchModel(request.value);
+        try loop.switchModel(chosen.model);
         self.rememberModel();
         if (extra.effort) |level| try self.chooseEffort(level) else self.restoreEffort();
         if (switching) self.announceProvider();
@@ -1783,16 +1837,20 @@ const Session = struct {
     fn welcome(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
         if (connection.dialect != .standard) return;
         try self.tellCommands(arena, connection);
-        if (self.offered_models.len == 0) {
-            self.offered_models = self.stack.loop.provider.models(self.allocator) catch return;
+        if (self.offered_store == null) {
+            self.offered_store = .init(self.allocator);
+            self.offered = self.offeredModels(self.offered_store.?.allocator()) catch {
+                self.forgetModels();
+                return;
+            };
         }
         try self.tellState(arena, true);
     }
 
     fn forgetModels(self: *Session) void {
-        for (self.offered_models) |name| self.allocator.free(name);
-        self.allocator.free(self.offered_models);
-        self.offered_models = &.{};
+        if (self.offered_store) |*store| store.deinit();
+        self.offered_store = null;
+        self.offered = &.{};
     }
 
     /// What a client without synth's extension can type as `/name`: the
@@ -2070,7 +2128,6 @@ const Session = struct {
 
         const loop = &self.stack.loop;
         loop.provider = try providers.connect(entry, where, key);
-        self.forgetModels();
         try loop.setModel(loop.provider.model);
         db.setProviderHost(entry.id, where) catch |err| self.notice(.warning, "Could not remember the host: {s}", .{@errorName(err)});
         db.setActiveProvider(entry.id) catch |err| self.notice(.warning, "Could not remember the provider: {s}", .{@errorName(err)});
@@ -2199,14 +2256,19 @@ const Session = struct {
     }
 
     fn models(self: *Session, arena: std.mem.Allocator, recent: u32) !synth.Models {
+        const offered = try self.offeredModels(arena);
+        const project_id = self.stack.loop.project_id orelse return .{ .offered = offered };
+        return .{ .offered = offered, .recent = try self.agent.options.db.recentModels(arena, project_id, recent) };
+    }
+
+    /// Every connected provider's models, each provider asked in turn.
+    fn offeredModels(self: *Session, arena: std.mem.Allocator) ![]const synth.Offered {
         const provider = self.stack.loop.provider;
         const db = self.agent.options.db;
-        const offered = switch (self.agent.options.source) {
-            .providers => |providers| try providers.offered(arena, db, provider),
-            .provider => try Providers.offeredBy(arena, db, "", provider.name, provider),
+        return switch (self.agent.options.source) {
+            .providers => |providers| providers.offered(arena, db, provider),
+            .provider => Providers.offeredBy(arena, db, "", provider.name, provider),
         };
-        const project_id = self.stack.loop.project_id orelse return .{ .offered = offered };
-        return .{ .offered = offered, .recent = try db.recentModels(arena, project_id, recent) };
     }
 
     fn search(self: *Session, arena: std.mem.Allocator, query: []const u8, limit: u32) ![]const synth.Hit {
@@ -3203,12 +3265,28 @@ test "a client without synth's extension is offered every model once the session
     const update = try client.awaitUpdate("config_option_update");
     const options = try rpc.parse(protocol.ConfigOptions, arena, .{ .object = update });
     try testing.expectEqual(@as(usize, 2), options.configOptions[0].options.len);
-    try testing.expectEqualStrings("bigger", options.configOptions[0].options[1].value);
+    try testing.expectEqualStrings("bigger", options.configOptions[0].options[1].value.?);
 
     const chosen = try client.request(protocol.method.session_set_config_option, protocol.SetConfigOption{ .sessionId = session, .configId = protocol.config_model, .value = "bigger" });
     const after = try rpc.parse(protocol.ConfigOptions, arena, try client.expectResult(chosen));
     try testing.expectEqualStrings("bigger", after.configOptions[0].currentValue);
     try testing.expectEqual(@as(usize, 2), after.configOptions[0].options.len);
+}
+
+test "a model picked from any provider names its provider, and only a catalog id counts as one" {
+    const arena = testing.allocator;
+    const value = try modelValue(arena, "ollama-cloud", "gpt-oss:120b");
+    defer arena.free(value);
+    try testing.expectEqualStrings("ollama-cloud/gpt-oss:120b", value);
+    try testing.expectEqualStrings("gpt-oss:120b", try modelValue(arena, "", "gpt-oss:120b"));
+
+    const routed = chosenModel("openai-compat/meta-llama/llama-3-70b");
+    try testing.expectEqualStrings("openai-compat", routed.provider.?);
+    try testing.expectEqualStrings("meta-llama/llama-3-70b", routed.model);
+
+    const plain = chosenModel("meta-llama/llama-3-70b");
+    try testing.expect(plain.provider == null);
+    try testing.expectEqualStrings("meta-llama/llama-3-70b", plain.model);
 }
 
 test "a session is listed once spoken in, loads back with its transcript, and an empty one is not kept" {

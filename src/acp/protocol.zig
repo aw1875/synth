@@ -165,9 +165,13 @@ pub const ConfigOption = struct {
     options: []const ConfigValue,
 };
 
+/// A value to pick or, with `group` set, a header over the `options` under it.
+/// One list holds only values or only groups.
 pub const ConfigValue = struct {
-    value: []const u8,
+    value: ?[]const u8 = null,
     name: []const u8,
+    group: ?[]const u8 = null,
+    options: ?[]const ConfigValue = null,
 };
 
 pub const config_model = "model";
