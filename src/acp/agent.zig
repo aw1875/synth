@@ -168,7 +168,7 @@ pub fn serve(self: *Agent) void {
         if (self.session) |session| {
             self.renewLease(session);
             session.step();
-            session.publish(arena, true) catch |err| self.noticeFmt("Could not report progress: {s}", .{@errorName(err)});
+            session.publish(arena, true) catch |err| self.noticeFmt(.warning, "Could not report progress: {s}", .{@errorName(err)});
             self.settleAsked(arena);
             self.settlePrompts();
         }
@@ -252,7 +252,7 @@ fn dispatch(self: *Agent, inbound: *Inbound) void {
     const arena = inbound.arena.allocator();
     const method = message.method orelse return self.answered(connection, message);
     self.perform(connection, message.id, method, message.params, arena) catch |err| {
-        const id = message.id orelse return self.noticeFmt("{s} failed: {s}", .{ method, describe(err) });
+        const id = message.id orelse return self.noticeFmt(.@"error", "{s} failed: {s}", .{ method, describe(err) });
         switch (err) {
             error.InvalidParams => connection.fail(id, rpc.code.invalid_params, "invalid params"),
             error.MethodNotFound => connection.fail(id, rpc.code.method_not_found, "unknown method"),
@@ -284,11 +284,12 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
         const request = try rpc.parse(protocol.NewSession, arena, params);
         if (!std.fs.path.isAbsolute(request.cwd)) return error.RelativeCwd;
         const session = try self.open(request.cwd, null, try mcpServers(arena, request.mcpServers));
-        return connection.reply(asked, protocol.SessionSetup{
+        connection.reply(asked, protocol.SessionSetup{
             .sessionId = session.handle,
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
+        return session.tellCommands(arena, connection);
     }
     const loads = eql(u8, method, protocol.method.session_load);
     if (loads or eql(u8, method, protocol.method.session_resume)) {
@@ -299,10 +300,11 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
         }
         const session = try self.open(request.cwd, request.sessionId, try mcpServers(arena, request.mcpServers));
         if (loads and connection.dialect == .standard) try session.replay(arena, connection);
-        return connection.reply(asked, protocol.Loaded{
+        connection.reply(asked, protocol.Loaded{
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
+        return session.tellCommands(arena, connection);
     }
     if (eql(u8, method, protocol.method.session_delete)) {
         if (connection.guest) return error.HostsOneSession;
@@ -414,6 +416,8 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
         connection.writes_files = fs.writeTextFile;
     }
     connection.terminals = request.clientCapabilities.terminal;
+    connection.notices = request.clientCapabilities.session.notices != null;
+    connection.compactions = request.clientCapabilities.session.compaction != null;
     connection.reply(id, protocol.Initialized{
         .agentInfo = .{ .name = pkg.name, .version = pkg.version },
         ._meta = if (asked != null) .{ .synth = .{ .protocol = synth.version } } else null,
@@ -522,7 +526,7 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8, servers: []const mcp
 fn listen(self: *Agent, session: *Session) void {
     const socket_dir = self.options.socket_dir orelse return;
     self.startListening(socket_dir, session.handle) catch |err| {
-        self.noticeFmt("Other terminals cannot reach this session: {s}", .{describe(err)});
+        self.noticeFmt(.warning, "Other terminals cannot reach this session: {s}", .{describe(err)});
     };
 }
 
@@ -604,31 +608,45 @@ fn sendSnapshots(self: *Agent, session: *Session) !void {
 /// synth's extension in its place.
 const Dialect = enum { standard, synth };
 
-/// Send a line to every client speaking `dialect`.
-fn broadcast(self: *Agent, dialect: Dialect, line: []const u8) void {
+/// Who a line is for: the clients speaking a dialect, or those without
+/// synth's extension that asked for a kind of update.
+const Audience = enum { synth, standard, notices, compactions };
+
+fn hears(connection: *const Connection, audience: Audience) bool {
+    return switch (audience) {
+        .synth => connection.dialect == .synth,
+        .standard => connection.dialect == .standard,
+        .notices => connection.dialect == .standard and connection.notices,
+        .compactions => connection.dialect == .standard and connection.compactions,
+    };
+}
+
+fn broadcast(self: *Agent, audience: Audience, line: []const u8) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     for (self.connections.items) |connection| {
-        if (connection.dialect == dialect) connection.push(line);
+        if (hears(connection, audience)) connection.push(line);
     }
 }
 
-fn notifyAll(self: *Agent, dialect: Dialect, method: []const u8, params: anytype) void {
+fn notifyAll(self: *Agent, audience: Audience, method: []const u8, params: anytype) void {
     var encoded: std.Io.Writer.Allocating = .init(self.allocator);
     defer encoded.deinit();
     rpc.notify(&encoded.writer, method, params) catch return;
-    self.broadcast(dialect, encoded.written());
+    self.broadcast(audience, encoded.written());
 }
 
-fn noticeFmt(self: *Agent, comptime fmt: []const u8, args: anytype) void {
+fn noticeFmt(self: *Agent, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
     var buffer: [512]u8 = undefined;
     const text = std.fmt.bufPrint(&buffer, fmt, args) catch fmt;
-    self.notice(text);
+    self.notice(severity, text);
 }
 
-fn notice(self: *Agent, text: []const u8) void {
+fn notice(self: *Agent, severity: protocol.Severity, text: []const u8) void {
     const session = self.session orelse return;
+    if (text.len == 0) return;
     self.notifyAll(.synth, synth.method.notice, synth.Notice{ .sessionId = session.handle, .text = text });
+    session.tellTo(.notices, .{ .notice = .{ .severity = severity, .title = text } });
 }
 
 /// Answer the prompts waiting on the session once it has nothing left to do
@@ -677,7 +695,7 @@ fn settleAsked(self: *Agent, arena: std.mem.Allocator) void {
         self.withdraw();
     }
     const call = waiting orelse return;
-    self.ask(arena, session, call) catch |err| self.noticeFmt("Could not ask: {s}", .{@errorName(err)});
+    self.ask(arena, session, call) catch |err| self.noticeFmt(.warning, "Could not ask: {s}", .{@errorName(err)});
 }
 
 /// A question goes only to clients that draw forms. With clients connected
@@ -757,14 +775,14 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
         const text = updates.answerOf(arena_state.allocator(), message.result) catch null;
         _ = asked.requests.swapRemove(index);
         self.withdraw();
-        loop.answer(text orelse declined) catch |err| self.noticeFmt("Could not answer: {s}", .{@errorName(err)});
+        loop.answer(text orelse declined) catch |err| self.noticeFmt(.warning, "Could not answer: {s}", .{@errorName(err)});
         return;
     }
     const chosen = protocol.chosenOption(message.result) orelse return;
     const decision = std.meta.stringToEnum(Loop.Decision, chosen) orelse return;
     _ = asked.requests.swapRemove(index);
     self.withdraw();
-    loop.decide(decision) catch |err| self.noticeFmt("Could not decide: {s}", .{@errorName(err)});
+    loop.decide(decision) catch |err| self.noticeFmt(.warning, "Could not decide: {s}", .{@errorName(err)});
 }
 
 /// What `session/list` returns: the sessions stored for the project holding
@@ -1055,6 +1073,10 @@ const Connection = struct {
     reads_files: bool = false,
     writes_files: bool = false,
     terminals: bool = false,
+    /// Shows `notice` updates.
+    notices: bool = false,
+    /// Follows compactions through `compaction_update`.
+    compactions: bool = false,
 
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
@@ -1279,6 +1301,10 @@ const Session = struct {
     told_thinking: usize = 0,
     /// The rest of what they were last told, encoded.
     told: Told = .{},
+    /// The compaction clients were told is running, and how many there have
+    /// been, which names the next.
+    compaction: ?u64 = null,
+    compactions: u64 = 0,
 
     const Place = struct { seq: u64, call: usize };
 
@@ -1465,8 +1491,8 @@ const Session = struct {
             self.sign_out != null or self.stack.mcp_host.connecting();
     }
 
-    fn notice(self: *Session, comptime fmt: []const u8, args: anytype) void {
-        self.agent.noticeFmt(fmt, args);
+    fn notice(self: *Session, severity: protocol.Severity, comptime fmt: []const u8, args: anytype) void {
+        self.agent.noticeFmt(severity, fmt, args);
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
@@ -1478,30 +1504,30 @@ const Session = struct {
         if (self.providerSource()) |providers| {
             if (providers.checkModel()) loop.syncProvider();
         } else |_| {}
-        _ = self.stack.runner.poll() catch |err| self.notice("Subagent failed: {s}", .{@errorName(err)});
-        _ = loop.poll() catch |err| self.notice("The turn failed: {s}", .{@errorName(err)});
+        _ = self.stack.runner.poll() catch |err| self.notice(.@"error", "Subagent failed: {s}", .{@errorName(err)});
+        _ = loop.poll() catch |err| self.notice(.@"error", "The turn failed: {s}", .{@errorName(err)});
 
         if (loop.takeHookNotice()) |text| {
             defer self.allocator.free(text);
-            self.agent.notice(text);
+            self.agent.notice(.info, text);
         }
         self.settleSignOut();
         self.settleMcp();
         if (loop.isBusy()) return;
         self.settleSignIn();
         if (loop.shouldCompact()) {
-            loop.compact() catch |err| self.notice("Could not compact: {s}", .{@errorName(err)});
+            loop.compact() catch |err| self.notice(.warning, "Could not compact: {s}", .{@errorName(err)});
             return;
         }
         if (loop.takeSteering()) |taken| {
             var next = taken;
             defer next.deinit(loop.allocator);
-            loop.submit(next.prompt, next.asExtras()) catch |err| self.notice("Could not start the next turn: {s}", .{@errorName(err)});
+            loop.submit(next.prompt, next.asExtras()) catch |err| self.notice(.warning, "Could not start the next turn: {s}", .{@errorName(err)});
         }
     }
 
     /// Start a turn on `blocks`, or steer the one running. A prompt of
-    /// `/skill args` runs that skill.
+    /// `/skill args` runs that skill, and `/compact` compacts.
     fn prompt(self: *Session, arena: std.mem.Allocator, blocks: []const std.json.Value) !void {
         var text: std.ArrayList(u8) = .empty;
         var attachments: std.ArrayList(mention.Attachment) = .empty;
@@ -1526,6 +1552,10 @@ const Session = struct {
                     .content = try skill_tool.render(arena, found),
                 });
                 return loop.submit(text.items, .{ .attachments = attachments.items, .images = images.items });
+            }
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, text.items, " \t\n"), "/compact")) {
+                if (loop.isBusy()) return error.Busy;
+                return loop.compact();
             }
         }
         const extras: Loop.Extras = .{ .attachments = attachments.items, .images = images.items };
@@ -1661,6 +1691,7 @@ const Session = struct {
         }
         if (self.sent.count() > convo.messages.items.len) try self.forgetTrimmed(arena);
 
+        self.tellCompaction(arena, send);
         try self.publishStream(arena, send);
         try self.tellState(arena, send);
 
@@ -1725,12 +1756,64 @@ const Session = struct {
     }
 
     fn tell(self: *Session, update: protocol.Update) void {
-        self.agent.notifyAll(.standard, protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = update });
+        self.tellTo(.standard, update);
+    }
+
+    fn tellTo(self: *Session, audience: Audience, update: protocol.Update) void {
+        self.agent.notifyAll(audience, protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = update });
+    }
+
+    /// What a client without synth's extension can type as `/name`: the
+    /// skills, and compacting.
+    fn tellCommands(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
+        if (connection.dialect != .standard) return;
+        const skills = self.stack.skills.skills;
+        const commands = try arena.alloc(protocol.Command, skills.len + 1);
+        commands[0] = .{ .name = "compact", .description = "Summarise the conversation so far to free up context" };
+        for (skills, commands[1..]) |found, *command| command.* = .{
+            .name = found.id,
+            .description = if (found.description.len > 0) found.description else found.name,
+            .input = .{ .hint = "what to do, if anything" },
+        };
+        connection.notify(protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = .{
+            .available_commands_update = .{ .availableCommands = commands },
+        } });
+    }
+
+    /// A compaction as it starts and as it ends. One that finishes between
+    /// two looks is told only finished.
+    fn tellCompaction(self: *Session, arena: std.mem.Allocator, send: bool) void {
+        const loop = &self.stack.loop;
+        if (loop.compacting) {
+            if (self.compaction != null) return;
+            self.compactions += 1;
+            self.compaction = self.compactions;
+            if (send) self.tellCompactionStatus(arena, self.compactions, .in_progress, null);
+            return;
+        }
+        const running = self.compaction orelse return;
+        self.compaction = null;
+        if (send) self.tellCompactionStatus(arena, running, if (loop.outcome == .cancelled) .cancelled else .failed, null);
+    }
+
+    fn tellCompacted(self: *Session, arena: std.mem.Allocator, summary: []const u8) void {
+        const id = self.compaction orelse blk: {
+            self.compactions += 1;
+            break :blk self.compactions;
+        };
+        self.compaction = null;
+        self.tellCompactionStatus(arena, id, .completed, &.{.{ .text = summary }});
+    }
+
+    fn tellCompactionStatus(self: *Session, arena: std.mem.Allocator, id: u64, status: protocol.CompactionStatus, summary: ?[]const protocol.Text) void {
+        const name = std.fmt.allocPrint(arena, "compaction-{d}", .{id}) catch return;
+        self.tellTo(.compactions, .{ .compaction_update = .{ .compactionId = name, .status = status, .summary = summary } });
     }
 
     /// Tell clients without synth's extension what changed in `msg`: the
     /// part of a reply its stream did not carry, and its calls.
     fn tellMessage(self: *Session, arena: std.mem.Allocator, msg: *const Conversation.Message, appended: bool, send: bool) !void {
+        if (appended and msg.role == .system and send) self.tellCompacted(arena, msg.text);
         if (appended and msg.role == .assistant) {
             if (send) self.tellRest(msg);
             self.told_text.clearRetainingCapacity();
@@ -1957,8 +2040,8 @@ const Session = struct {
         const loop = &self.stack.loop;
         loop.provider = try providers.connect(entry, where, key);
         try loop.setModel(loop.provider.model);
-        db.setProviderHost(entry.id, where) catch |err| self.notice("Could not remember the host: {s}", .{@errorName(err)});
-        db.setActiveProvider(entry.id) catch |err| self.notice("Could not remember the provider: {s}", .{@errorName(err)});
+        db.setProviderHost(entry.id, where) catch |err| self.notice(.warning, "Could not remember the host: {s}", .{@errorName(err)});
+        db.setActiveProvider(entry.id) catch |err| self.notice(.warning, "Could not remember the provider: {s}", .{@errorName(err)});
         self.restoreEffort();
     }
 
@@ -1966,15 +2049,15 @@ const Session = struct {
         const providers = self.providerSource() catch return;
         const entry = catalog.findOrDefault(providers.active_id);
         const model = self.stack.loop.provider.model;
-        if (entry.key == .oauth) return self.notice("Connected to your {s}, running {s}.", .{ entry.label, model });
-        self.notice("Connected {s} at {s}, running {s}.", .{ entry.label, providers.backend.currentHost(), model });
+        if (entry.key == .oauth) return self.notice(.info, "Connected to your {s}, running {s}.", .{ entry.label, model });
+        self.notice(.info, "Connected {s} at {s}, running {s}.", .{ entry.label, providers.backend.currentHost(), model });
     }
 
     fn beginSignIn(self: *Session, providers: *Providers) !void {
         if (self.sign_in != null) return;
         const store = providers.chatgpt orelse return error.NoCredentialStore;
         self.sign_in = SignInTask.start(self.allocator, self.io, store) catch |err| {
-            return self.notice("{s}", .{SignInTask.explain(err)});
+            return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
         };
     }
 
@@ -1983,11 +2066,11 @@ const Session = struct {
         const task = self.sign_in orelse return;
         if (!task.isFinished()) return;
         self.sign_in = null;
-        task.finish() catch |err| return self.notice("{s}", .{SignInTask.explain(err)});
+        task.finish() catch |err| return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
 
         const entry = catalog.find(catalog.chatgpt_id).?;
         self.useProvider(entry, entry.host, null) catch |err| {
-            return self.notice("Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
+            return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
         self.announceProvider();
         self.welcomeToPlanUsage();
@@ -2001,7 +2084,7 @@ const Session = struct {
         var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
         const welcomed = db.setting(fixed.allocator(), welcomed_key) catch "";
         if (welcomed.len > 0) return;
-        self.notice("You're using your ChatGPT plan. Requests in synth count toward its usage. Manage usage with /usage or at {s}", .{chatgpt_auth.usage_url});
+        self.notice(.info, "You're using your ChatGPT plan. Requests in synth count toward its usage. Manage usage with /usage or at {s}", .{chatgpt_auth.usage_url});
         db.setSetting(welcomed_key, "1") catch {};
     }
 
@@ -2009,7 +2092,7 @@ const Session = struct {
         const providers = try self.providerSource();
         const store = providers.chatgpt orelse return error.NoCredentialStore;
         if (self.sign_out != null) return;
-        if (!store.isSignedIn()) return self.notice("Not signed in to ChatGPT.", .{});
+        if (!store.isSignedIn()) return self.notice(.info, "Not signed in to ChatGPT.", .{});
         self.sign_out = try SignOutTask.start(self.allocator, self.io, store);
     }
 
@@ -2017,8 +2100,8 @@ const Session = struct {
         const task = self.sign_out orelse return;
         if (!task.isFinished()) return;
         self.sign_out = null;
-        const confirmed = task.finish() catch |err| return self.notice("Could not sign out of ChatGPT: {s}", .{@errorName(err)});
-        self.notice("{s}", .{if (confirmed)
+        const confirmed = task.finish() catch |err| return self.notice(.warning, "Could not sign out of ChatGPT: {s}", .{@errorName(err)});
+        self.notice(if (confirmed) .info else .warning, "{s}", .{if (confirmed)
             "Signed out of ChatGPT."
         else
             "Signed out of ChatGPT here, but OpenAI did not confirm it. You can disconnect synth in ChatGPT settings."});
@@ -2026,7 +2109,7 @@ const Session = struct {
         const providers = self.providerSource() catch return;
         providers.signedOut();
         if (std.mem.eql(u8, providers.active_id, catalog.chatgpt_id)) {
-            self.agent.options.db.setActiveProvider("") catch |err| self.notice("Could not clear the provider: {s}", .{@errorName(err)});
+            self.agent.options.db.setActiveProvider("") catch |err| self.notice(.warning, "Could not clear the provider: {s}", .{@errorName(err)});
         }
     }
 
@@ -2040,7 +2123,7 @@ const Session = struct {
 
         const wanted = mcp_host.wants(server);
         try store.setEnabled(server.name, !wanted);
-        store.save(server.name) catch |err| self.notice("Could not remember that: {s}", .{@errorName(err)});
+        store.save(server.name) catch |err| self.notice(.warning, "Could not remember that: {s}", .{@errorName(err)});
         if (wanted) {
             if (mcp_host.disconnect(&self.stack.registry, server.name)) try self.stack.loop.useAgent(self.stack.loop.agent.id);
         } else {
@@ -2055,9 +2138,9 @@ const Session = struct {
         if (!mcp_host.settled()) return;
         const added = mcp_host.install(&self.stack.registry) catch 0;
         if (added > 0) self.stack.loop.useAgent(self.stack.loop.agent.id) catch |err| {
-            self.notice("Could not offer the new tools: {s}", .{@errorName(err)});
+            self.notice(.warning, "Could not offer the new tools: {s}", .{@errorName(err)});
         };
-        for (mcp_host.failures.items) |failure| self.notice("MCP server {s} failed: {s}", .{ failure.server, failure.reason });
+        for (mcp_host.failures.items) |failure| self.notice(.warning, "MCP server {s} failed: {s}", .{ failure.server, failure.reason });
     }
 
     /// Have sessions to come start on the model this one switched to.
@@ -2066,7 +2149,7 @@ const Session = struct {
         if (model.len == 0) return;
         const key = std.fmt.allocPrint(self.allocator, "model:{s}", .{self.providerId()}) catch return;
         defer self.allocator.free(key);
-        self.agent.options.db.setSetting(key, model) catch |err| self.notice("Could not remember the model: {s}", .{@errorName(err)});
+        self.agent.options.db.setSetting(key, model) catch |err| self.notice(.warning, "Could not remember the model: {s}", .{@errorName(err)});
     }
 
     /// Put the model back on the effort last chosen for it, or its default.
@@ -2227,13 +2310,14 @@ pub const Script = struct {
         self.effort = efforts(ptr, self.model).pick(level);
     }
 
-    fn respond(ptr: *anyopaque, convo: *Conversation, _: Provider.Turn, allocator: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
+    fn respond(ptr: *anyopaque, convo: *Conversation, turn: Provider.Turn, allocator: std.mem.Allocator, sink: ?Provider.Sink) !Provider.Reply {
         const self: *Script = @ptrCast(@alignCast(ptr));
         if (sink) |s| {
             s.onThinking(s.userdata, "weighing it up");
             s.onThinkingDone(s.userdata);
         }
         self.gate.waitUncancelable(testing.io);
+        if (turn.compacting) return .{ .text = try allocator.dupe(u8, "The story so far.") };
         const last = convo.last();
         if (last != null and last.?.role == .tool) return .{ .text = try allocator.dupe(u8, "done") };
 
@@ -2433,6 +2517,15 @@ pub const Client = struct {
         while (true) {
             const message = try self.next();
             if (std.mem.eql(u8, message.method orelse "", method)) return message;
+        }
+    }
+
+    /// Read until a `session/update` of `kind`, returning the update.
+    pub fn awaitUpdate(self: *Client, kind: []const u8) !std.json.ObjectMap {
+        while (true) {
+            const message = try self.awaitMethod(protocol.method.session_update);
+            const update = message.params.?.object.get("update").?.object;
+            if (std.mem.eql(u8, update.get("sessionUpdate").?.string, kind)) return update;
         }
     }
 
@@ -2730,6 +2823,42 @@ test "the MCP servers a client brings join the session's, but for those synth ca
     try testing.expectEqualStrings("TOKEN", servers[0].transport.stdio.env[0].name);
     try testing.expectEqualStrings("docs", servers[1].name);
     try testing.expectEqualStrings("Bearer k", servers[1].transport.http.headers[0].value);
+}
+
+test "a client without synth's extension is offered commands, and told notices and compactions when it asks" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const arena = client.arena.allocator();
+    _ = try client.expectResult(try client.request(protocol.method.initialize, protocol.Initialize{
+        .protocolVersion = protocol.version,
+        .clientCapabilities = .{ .session = .{ .notices = .{}, .compaction = .{} } },
+    }));
+
+    const opened = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project, .mcpServers = &.{
+        .{ .name = "editor", .command = "definitely-not-a-real-program-xyz" },
+    } }));
+    const session = (try rpc.parse(protocol.SessionSetup, arena, opened)).sessionId;
+    const commands = (try client.awaitUpdate("available_commands_update")).get("availableCommands").?.array.items;
+    try testing.expectEqualStrings("compact", commands[0].object.get("name").?.string);
+
+    const told = try client.awaitUpdate("notice");
+    try testing.expectEqualStrings("warning", told.get("severity").?.string);
+    try testing.expect(std.mem.startsWith(u8, told.get("title").?.string, "MCP server editor failed"));
+
+    const prompted = try client.prompt(session, "make a note");
+    try client.choose((try client.awaitPermission()).id, "deny");
+    _ = try client.stopReason(prompted);
+
+    const compacting = try client.prompt(session, "/compact");
+    while (true) {
+        const update = try client.awaitUpdate("compaction_update");
+        if (!std.mem.eql(u8, update.get("status").?.string, "completed")) continue;
+        try testing.expectEqualStrings("The story so far.", update.get("summary").?.array.items[0].object.get("text").?.string);
+        break;
+    }
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(compacting));
 }
 
 test "a client that keeps terminals runs commands in one, shown in the call's card" {

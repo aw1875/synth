@@ -773,7 +773,8 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     self.usage.context_tokens = 0;
-    if (resume_turn) try self.ask();
+    if (resume_turn) return self.ask();
+    self.outcome = .done;
 }
 
 /// Start a turn. Attachments come from `@path` mentions in the prompt, plus
@@ -3059,6 +3060,23 @@ test "compaction summarises the transcript into a system message" {
 
     // The fake echoes its input, so this is the only proof the instruction arrived.
     try testing.expect(std.mem.indexOf(u8, summary.text, "Summarise this conversation") != null);
+}
+
+test "a compaction after a cancelled turn ends done" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try loop.cancel();
+    try loop.settle();
+    try testing.expectEqual(@as(?Outcome, .cancelled), loop.outcome);
+
+    try loop.compact();
+    try settle(&loop);
+    try testing.expectEqual(@as(?Outcome, .done), loop.outcome);
 }
 
 test "a turn carries the agent's prompt and tools, not the provider's" {

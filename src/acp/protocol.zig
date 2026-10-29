@@ -65,6 +65,12 @@ pub const ClientCapabilities = struct {
     } = null,
     /// Runs commands in terminals of its own, shown as they run.
     terminal: bool = false,
+    session: struct {
+        /// Present, even empty, when the client shows `notice` updates.
+        notices: ?struct {} = null,
+        /// Present, even empty, when the client tracks compactions.
+        compaction: ?struct {} = null,
+    } = .{},
     elicitation: ?struct {
         /// Present, even empty, when the client draws forms.
         form: ?struct {} = null,
@@ -363,6 +369,16 @@ pub const Chunk = struct {
     messageId: ?[]const u8 = null,
 };
 
+pub const Command = struct {
+    name: []const u8,
+    description: []const u8,
+    input: ?struct { hint: []const u8 } = null,
+};
+
+pub const Severity = enum { info, warning, @"error" };
+
+pub const CompactionStatus = enum { in_progress, completed, failed, cancelled };
+
 pub const PlanEntry = struct {
     content: []const u8,
     priority: []const u8 = "medium",
@@ -382,6 +398,13 @@ pub const Update = union(enum) {
     config_option_update: struct { configOptions: []const ConfigOption },
     session_info_update: struct { title: ?[]const u8 = null },
     usage_update: struct { used: u64, size: u64 },
+    available_commands_update: struct { availableCommands: []const Command },
+    notice: struct { severity: Severity, title: []const u8 },
+    compaction_update: struct {
+        compactionId: []const u8,
+        status: CompactionStatus,
+        summary: ?[]const Text = null,
+    },
 
     pub fn jsonStringify(self: Update, jws: anytype) !void {
         try jws.beginObject();
