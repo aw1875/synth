@@ -25,6 +25,8 @@ active_id: []const u8,
 missing: bool = false,
 /// What `backend` was built from, until `start` has reached it.
 unstarted: ?struct { config: *const Config, active: catalog.Active },
+/// The configured model is yet to be checked against what the provider has.
+model_unchecked: bool = false,
 
 /// `backend` is built from `active` but not yet reached: an agent answers
 /// `initialize` first, and reaches it when the first session opens.
@@ -44,8 +46,18 @@ pub fn start(self: *Providers, arena: std.mem.Allocator, db: *Database) !void {
     const unstarted = self.unstarted orelse return;
     self.unstarted = null;
     try self.backend.start();
-    self.backend.ensureModel() catch {};
+    self.model_unchecked = true;
     self.missing = !try usable(arena, db, unstarted.config, unstarted.active, self.auth, self.chatgpt, self.backend);
+}
+
+/// Check the configured model against what the provider has, once, and say
+/// whether it did. Kept out of `start`, which a session waits on to open: the
+/// check is a round trip to the provider, as on master's first frame.
+pub fn checkModel(self: *Providers) bool {
+    if (!self.model_unchecked) return false;
+    self.model_unchecked = false;
+    self.backend.ensureModel() catch {};
+    return true;
 }
 
 /// Whether the session has nothing to answer it: none was chosen, or the

@@ -98,10 +98,19 @@ pub fn createSession(
     cwd: []const u8,
     model: []const u8,
 ) !i64 {
-    const now = self.nowMs();
-    var buffer: [public_id_chars + 4]u8 = undefined;
-    const public_id = self.newPublicId(&buffer);
+    var buffer: [public_id_bytes]u8 = undefined;
+    return self.createSessionAs(project_id, cwd, model, self.newPublicId(&buffer));
+}
 
+/// A session row under a handle given out before it existed.
+pub fn createSessionAs(
+    self: *Database,
+    project_id: i64,
+    cwd: []const u8,
+    model: []const u8,
+    public_id: []const u8,
+) !i64 {
+    const now = self.nowMs();
     try self.conn.exec(
         \\INSERT INTO session (project_id, created_at, updated_at, cwd, model, public_id)
         \\VALUES (?, ?, ?, ?, ?, ?)
@@ -144,7 +153,10 @@ pub fn subagentSession(self: *Database, tool_call_id: i64) !?i64 {
 
 /// A fresh `ses_xxxxxxxx` handle, written into `buffer`. Randomness comes from
 /// `Io` in 0.16, which is also what makes it testable.
-fn newPublicId(self: *Database, buffer: []u8) []const u8 {
+pub const public_id_bytes = public_id_chars + 4;
+
+/// A fresh session handle, in `buffer`.
+pub fn newPublicId(self: *Database, buffer: []u8) []const u8 {
     @memcpy(buffer[0..4], "ses_");
 
     const body = buffer[4 .. 4 + public_id_chars];

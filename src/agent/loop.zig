@@ -145,6 +145,9 @@ session_cwd: []const u8 = "",
 /// provider frees its own copy on the *next* switch, so keeping that slice
 /// would leave this dangling.
 session_model: []const u8 = "",
+/// The handle the session row is created under, when one was given out before
+/// the row existed. Borrowed.
+session_public_id: ?[]const u8 = null,
 session_model_owned: ?[]u8 = null,
 /// Database message id for each conversation message, keyed by the message's
 /// stable `seq`. Keyed by seq rather than index so trimming older messages from
@@ -522,7 +525,10 @@ fn ensureSession(self: *Loop) !i64 {
     if (self.session_id) |id| return id;
     const db = self.db orelse return error.NoDatabase;
     const project_id = self.project_id orelse return error.NoProject;
-    const id = try db.createSession(project_id, self.session_cwd, self.session_model);
+    const id = if (self.session_public_id) |handle|
+        try db.createSessionAs(project_id, self.session_cwd, self.session_model, handle)
+    else
+        try db.createSession(project_id, self.session_cwd, self.session_model);
     self.session_id = id;
     try db.setSessionAgent(id, self.agent.id);
     return id;

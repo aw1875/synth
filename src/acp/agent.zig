@@ -385,26 +385,18 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8) !*Session {
     }
 
     const db = self.options.db;
-    const id: i64, const where: []const u8 = if (handle) |wanted| blk: {
+    const id: ?i64, const where: []const u8 = if (handle) |wanted| blk: {
         const id = try db.sessionByHandle(wanted) orelse return error.UnknownSession;
         break :blk .{ id, try db.sessionCwd(id, self.allocator) };
     } else blk: {
         const resolved = try std.Io.Dir.cwd().realPathFileAlloc(self.io, cwd, self.allocator);
         defer self.allocator.free(resolved);
-        const real = try self.allocator.dupe(u8, resolved);
-        errdefer self.allocator.free(real);
-        var project = try Project.detect(self.allocator, self.io, real);
-        defer project.deinit(self.allocator);
-        const project_id = try db.resolveProject(project.root, "git", project.name());
-        break :blk .{ try db.createSession(project_id, real, self.sourceModel()), real };
+        break :blk .{ null, try self.allocator.dupe(u8, resolved) };
     };
     defer self.allocator.free(where);
 
     self.closeSession();
-    const session = Session.create(self, id, where) catch |err| {
-        if (handle == null) db.deleteSession(id) catch {};
-        return err;
-    };
+    const session = try Session.create(self, id, where);
     self.session = session;
     try self.share(session);
 
@@ -413,14 +405,6 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8) !*Session {
     try session.publish(arena_state.allocator(), false);
     try self.sendSnapshots(session);
     return session;
-}
-
-/// The model a new session starts on.
-fn sourceModel(self: *Agent) []const u8 {
-    return switch (self.options.source) {
-        .providers => |providers| providers.backend.model(),
-        .provider => |provider| provider.model,
-    };
 }
 
 fn share(self: *Agent, session: *Session) !void {
@@ -980,7 +964,6 @@ const Session = struct {
     agent: *Agent,
     allocator: std.mem.Allocator,
     io: std.Io,
-    id: i64,
     handle: []const u8,
     cwd: []const u8,
     mcp_auth: ?mcp.Auth = null,
@@ -1021,17 +1004,20 @@ const Session = struct {
         }
     };
 
-    fn create(agent: *Agent, id: i64, cwd: []const u8) !*Session {
+    /// The stored session `id`, or a new one, whose row is made once there is
+    /// anything to keep in it, as on master.
+    fn create(agent: *Agent, id: ?i64, cwd: []const u8) !*Session {
         const allocator = agent.allocator;
         const io = agent.io;
         const options = agent.options;
         const self = try allocator.create(Session);
         errdefer allocator.destroy(self);
-        const handle = try options.db.sessionPublicId(id, allocator);
+        var fresh: [Database.public_id_bytes]u8 = undefined;
+        const handle = if (id) |stored| try options.db.sessionPublicId(stored, allocator) else try allocator.dupe(u8, options.db.newPublicId(&fresh));
         errdefer allocator.free(handle);
         const owned_cwd = try allocator.dupe(u8, cwd);
         errdefer allocator.free(owned_cwd);
-        self.* = .{ .agent = agent, .allocator = allocator, .io = io, .id = id, .handle = handle, .cwd = owned_cwd, .stack = undefined };
+        self.* = .{ .agent = agent, .allocator = allocator, .io = io, .handle = handle, .cwd = owned_cwd, .stack = undefined };
 
         if (options.mcp_auth_path) |path| {
             self.mcp_auth = mcp.Auth.load(allocator, io, path) catch mcp.Auth.init(allocator);
@@ -1056,7 +1042,11 @@ const Session = struct {
         });
         errdefer self.stack.destroy();
         self.stack.convo.max_messages = max_messages;
-        try self.stack.loop.resumeSession(id, max_messages);
+        if (id) |stored| {
+            try self.stack.loop.resumeSession(stored, max_messages);
+        } else {
+            self.stack.loop.session_public_id = self.handle;
+        }
         self.restoreEffort();
         return self;
     }
@@ -1064,8 +1054,6 @@ const Session = struct {
     fn destroy(self: *Session) void {
         if (self.sign_in) |task| task.abandon();
         if (self.sign_out) |task| task.abandon();
-        // Opening a session makes its row up front; one never spoken in is not worth keeping.
-        if (self.stack.convo.totalCount() == 0) self.agent.options.db.deleteSession(self.id) catch {};
         self.stack.loop.requestStop();
         self.stack.destroy();
         if (self.mcp_auth) |*store| store.deinit();
@@ -1089,10 +1077,14 @@ const Session = struct {
     }
 
     /// Advance the session, and do what a TUI's tick does for a local one:
-    /// compact when the context is filling, and start the next turn from
-    /// whatever was typed while the last one ran.
+    /// check the model once the session is open, compact when the context is
+    /// filling, and start the next turn from whatever was typed while the
+    /// last one ran.
     fn step(self: *Session) void {
         const loop = &self.stack.loop;
+        if (self.providerSource()) |providers| {
+            if (providers.checkModel()) loop.syncProvider();
+        } else |_| {}
         _ = self.stack.runner.poll() catch |err| self.notice("Subagent failed: {s}", .{@errorName(err)});
         _ = loop.poll() catch |err| self.notice("The turn failed: {s}", .{@errorName(err)});
 
