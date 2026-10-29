@@ -24,6 +24,8 @@ pub const method = struct {
     pub const session_set_config_option = "session/set_config_option";
     pub const session_list = "session/list";
     pub const session_close = "session/close";
+    pub const session_resume = "session/resume";
+    pub const session_delete = "session/delete";
     /// Agent to client.
     pub const session_update = "session/update";
     pub const session_request_permission = "session/request_permission";
@@ -85,6 +87,8 @@ pub const AgentCapabilities = struct {
     sessionCapabilities: struct {
         list: struct {} = .{},
         close: struct {} = .{},
+        @"resume": struct {} = .{},
+        delete: struct {} = .{},
     } = .{},
 };
 

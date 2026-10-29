@@ -194,8 +194,12 @@ fn endFor(self: *Router, arena: std.mem.Allocator, method: []const u8, params: ?
         return end;
     }
     if (eql(u8, method, protocol.method.session_new)) return self.forNew();
-    if (eql(u8, method, protocol.method.session_load)) {
+    if (eql(u8, method, protocol.method.session_load) or eql(u8, method, protocol.method.session_resume)) {
         return self.forLoad((try rpc.parse(protocol.LoadSession, arena, params)).sessionId);
+    }
+    if (eql(u8, method, protocol.method.session_delete)) {
+        const handle = (try rpc.parse(protocol.SessionId, arena, params)).sessionId;
+        return self.hosting(handle) orelse self.anyEnd();
     }
     if (stringOf(fieldOf(params, "sessionId"))) |handle| {
         return self.hosting(handle) orelse error.UnknownSession;
@@ -406,9 +410,12 @@ fn expect(self: *Router, arena: std.mem.Allocator, id: std.json.Value, end: *End
     const key = try self.allocator.dupe(u8, try std.json.Stringify.valueAlloc(arena, id, .{}));
     errdefer self.allocator.free(key);
     const eql = std.mem.eql;
-    const kind: @FieldType(Pending, "kind") = if (eql(u8, method, protocol.method.session_new) or eql(u8, method, protocol.method.session_load))
+    const opens = eql(u8, method, protocol.method.session_new) or eql(u8, method, protocol.method.session_load) or
+        eql(u8, method, protocol.method.session_resume);
+    const closes = eql(u8, method, protocol.method.session_close) or eql(u8, method, protocol.method.session_delete);
+    const kind: @FieldType(Pending, "kind") = if (opens)
         .opens
-    else if (eql(u8, method, protocol.method.session_close))
+    else if (closes)
         .closes
     else
         .other;

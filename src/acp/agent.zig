@@ -288,18 +288,24 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
             .configOptions = try session.configOptions(arena),
         });
     }
-    if (eql(u8, method, protocol.method.session_load)) {
+    const loads = eql(u8, method, protocol.method.session_load);
+    if (loads or eql(u8, method, protocol.method.session_resume)) {
         const request = try rpc.parse(protocol.LoadSession, arena, params);
         if (connection.guest) {
             _ = try self.sessionFor(request.sessionId);
             self.detached = false;
         }
         const session = try self.open(request.cwd, request.sessionId);
-        if (connection.dialect == .standard) try session.replay(arena, connection);
+        if (loads and connection.dialect == .standard) try session.replay(arena, connection);
         return connection.reply(asked, protocol.Loaded{
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
+    }
+    if (eql(u8, method, protocol.method.session_delete)) {
+        if (connection.guest) return error.HostsOneSession;
+        try self.deleteSession((try rpc.parse(protocol.SessionId, arena, params)).sessionId);
+        return connection.reply(asked, protocol.Empty{});
     }
     if (eql(u8, method, protocol.method.session_list)) {
         return connection.reply(asked, try self.listSessions(arena, try rpc.parse(protocol.ListSessions, arena, params)));
@@ -412,6 +418,21 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
 }
 
 /// The live session, when `id` names it.
+/// Delete stored session `handle`, closing it first if it is live here. One
+/// another process hosts is refused: its lease cannot be taken.
+fn deleteSession(self: *Agent, handle: []const u8) !void {
+    const db = self.options.db;
+    const live_here = if (self.session) |session| std.mem.eql(u8, session.handle, handle) else false;
+    if (live_here) self.closeSession();
+    const id = try db.sessionByHandle(handle) orelse {
+        if (live_here) return;
+        return error.UnknownSession;
+    };
+    try db.takeLease(handle, self.pid);
+    defer db.releaseLease(handle, self.pid) catch {};
+    try db.deleteSession(id);
+}
+
 fn sessionFor(self: *Agent, id: []const u8) !*Session {
     const session = self.session orelse return error.UnknownSession;
     if (!std.mem.eql(u8, session.handle, id)) return error.UnknownSession;
@@ -2504,6 +2525,41 @@ test "a client that offers its view of files is where file tools read and write"
     const cancel = try rpc.parse(protocol.CancelRequest, arena, withdrawn.params);
     try testing.expect(unanswered.id.?.eql(rpc.Id.from(cancel.requestId).?));
     try testing.expectEqual(protocol.StopReason.cancelled, try client.stopReason(abandoned));
+}
+
+test "a resumed session is not replayed, and a deleted one is gone" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const arena = client.arena.allocator();
+    try client.initialize(false);
+
+    const opened = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project }));
+    const session = (try rpc.parse(protocol.SessionSetup, arena, opened)).sessionId;
+    const prompted = try client.prompt(session, "make a note");
+    try client.choose((try client.awaitPermission()).id, "deny");
+    _ = try client.stopReason(prompted);
+    _ = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project }));
+
+    const resumed = try client.request(protocol.method.session_resume, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
+    while (true) {
+        const message = try client.next();
+        if (message.method == null and message.id != null and message.id.?.eql(resumed)) {
+            try testing.expect(message.err == null);
+            break;
+        }
+        if (message.method) |method| if (std.mem.eql(u8, method, protocol.method.session_update)) {
+            const update = message.params.?.object.get("update").?.object.get("sessionUpdate").?.string;
+            try testing.expect(!std.mem.eql(u8, update, "user_message_chunk"));
+        };
+    }
+
+    _ = try client.expectResult(try client.request(protocol.method.session_delete, protocol.SessionId{ .sessionId = session }));
+    const listed = try rpc.parse(protocol.SessionList, arena, try client.expectResult(try client.request(protocol.method.session_list, protocol.ListSessions{ .cwd = fixture.project })));
+    for (listed.sessions) |info| try testing.expect(!std.mem.eql(u8, info.sessionId, session));
+    const again = try client.request(protocol.method.session_delete, protocol.SessionId{ .sessionId = session });
+    try testing.expectEqualStrings("no such session", (try client.expectError(again)).message);
 }
 
 test "the first answer to a permission request wins, and the rest are taken back" {
