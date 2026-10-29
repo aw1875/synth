@@ -94,7 +94,9 @@ pub const Listener = struct {
     accepted: *const fn (context: *anyopaque, client: std.Io.File) void,
 
     /// Bind `path`, replacing a socket no one answers on. A live one is
-    /// `error.AlreadyListening`: that session is hosted elsewhere.
+    /// `error.AlreadyListening`: that session is hosted elsewhere. The probe
+    /// and the unlink race another host binding the same path; callers hold
+    /// the session's lease in `synth.db`, which rules that host out.
     pub fn start(
         allocator: std.mem.Allocator,
         io: std.Io,
