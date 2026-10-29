@@ -29,6 +29,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
     defer allocator.free(path);
 
     try Config.ensureDir(io, db_path);
+    if (!std.mem.eql(u8, db_path, ":memory:")) try keepPrivate(io, db_path);
 
     // NoMutex: this connection is the UI thread's. A worker opens its own.
     var conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.NoMutex);
@@ -50,6 +51,26 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
 
 pub fn deinit(self: *Database) void {
     self.conn.close();
+}
+
+const owner_only: std.Io.File.Permissions = .fromMode(0o600);
+
+/// Let only the owner read the database and its WAL files: transcripts hold
+/// whatever a tool printed, and sign-ins are kept here. Created here when
+/// missing, empty, which SQLite takes for a new database, because SQLite
+/// gives the WAL files it creates the database file's mode.
+fn keepPrivate(io: std.Io, db_path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.createFile(io, db_path, .{ .permissions = owner_only, .truncate = false });
+    file.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+        const path = try std.fmt.bufPrint(&buffer, "{s}{s}", .{ db_path, suffix });
+        cwd.setFilePermissions(io, path, owner_only, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn migrate(self: *Database) !void {
@@ -1355,6 +1376,38 @@ fn searchFixture(dir: *std.testing.TmpDir) !struct { db: Database, project_id: i
     _ = try db.appendMessage(other_session, 0, "user", "cancel this too", null, 0);
 
     return .{ .db = db, .project_id = project_id };
+}
+
+test "the database and its WAL files are the owner's alone, even once others could read them" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], "private.db" });
+    defer testing.allocator.free(db_path);
+
+    const modeOf = struct {
+        fn run(path: []const u8) !std.posix.mode_t {
+            const stat = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
+            return stat.permissions.toMode() & 0o777;
+        }
+    }.run;
+    const wal = try std.fmt.allocPrint(testing.allocator, "{s}-wal", .{db_path});
+    defer testing.allocator.free(wal);
+    {
+        var db = try init(testing.allocator, testing.io, db_path);
+        defer db.deinit();
+        _ = try db.resolveProject("/repo", "git", "repo");
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(db_path));
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(wal));
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, db_path, .fromMode(0o644), .{});
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, wal, .fromMode(0o644), .{});
+    }
+    var reopened = try init(testing.allocator, testing.io, db_path);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(db_path));
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(wal));
 }
 
 test "two processes opening a new database at once both get it, migrated once" {
