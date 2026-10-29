@@ -1159,6 +1159,11 @@ fn finishedOne(mirror: *Mirror) bool {
     return mirror.status.state == .idle and mirror.status.finished == 1;
 }
 
+/// The agent reports a turn over a moment before it answers the prompt.
+fn finishedAndAnswered(mirror: *Mirror) bool {
+    return finishedOne(mirror) and mirror.waiting.count() == 0;
+}
+
 fn awaitingAnswer(mirror: *Mirror) bool {
     return mirror.status.state == .awaiting_answer;
 }
@@ -1203,11 +1208,10 @@ test "a mirror follows a turn, and its approval is answered from here" {
     try testing.expectEqualStrings("make a note", convo.messages.items[0].text);
 
     try mirror.decide(.once);
-    try pollUntil(mirror, finishedOne);
+    try pollUntil(mirror, finishedAndAnswered);
     try testing.expectEqual(@as(?Loop.Outcome, .done), mirror.status.outcome);
     try testing.expect(mirror.pendingCall() == null);
     try testing.expect(mirror.thoughts() == null);
-    try testing.expect(mirror.waiting.count() == 0);
 
     const replied = for (convo.messages.items) |msg| {
         if (std.mem.eql(u8, msg.text, "done")) break true;
