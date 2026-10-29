@@ -8,7 +8,6 @@ const vxfw = vaxis.vxfw;
 
 const fuzzy = @import("../core/fuzzy.zig");
 const Input = @import("input.zig");
-const ModelListing = @import("model_listing.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
 
@@ -22,7 +21,6 @@ pub const max_recent: usize = 5;
 const box_width: u16 = 76;
 /// Left and right padding inside the box.
 const pad: u16 = 2;
-/// Columns kept clear between the key hints and what is still loading.
 const hint_gap: u16 = 2;
 
 /// One model on offer.
@@ -43,9 +41,6 @@ pub const Entry = struct {
     /// Whether the level was stepped here, and so is a choice worth keeping
     /// rather than the default it was shown with.
     effort_changed: bool = false,
-    /// Its provider's place in the catalog. Groups keep this order whichever
-    /// provider answers first.
-    order: usize = 0,
 };
 
 /// A row of the drawn list: either a group heading or a model.
@@ -70,32 +65,28 @@ scroll: usize = 0,
 search: Input,
 /// The model in use, marked in the list.
 current: []const u8 = "",
-/// Providers still being asked what they offer. Abandoned when the picker
-/// closes, so an answer never lands in a list that is gone.
-listings: std.ArrayList(*ModelListing) = .empty,
+/// Providers still being asked that have nothing listed yet.
+asking: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) Picker {
     return .{ .allocator = allocator, .search = .init(allocator) };
 }
 
 pub fn deinit(self: *Picker) void {
-    self.abandonListings();
-    self.listings.deinit(self.allocator);
     self.release();
     self.matches.deinit(self.allocator);
     self.rows.deinit(self.allocator);
     self.search.deinit();
 }
 
-fn abandonListings(self: *Picker) void {
-    for (self.listings.items) |listing| listing.abandon();
-    self.listings.clearRetainingCapacity();
+fn release(self: *Picker) void {
+    freeEntries(self.allocator, self.entries);
+    self.entries = &.{};
 }
 
-fn release(self: *Picker) void {
-    for (self.entries) |entry| freeEntry(self.allocator, entry);
-    self.allocator.free(self.entries);
-    self.entries = &.{};
+fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
+    for (entries) |entry| freeEntry(allocator, entry);
+    allocator.free(entries);
 }
 
 fn freeEntry(allocator: std.mem.Allocator, entry: Entry) void {
@@ -112,7 +103,6 @@ fn dupeEntry(allocator: std.mem.Allocator, source: Entry, recent: []const []cons
         .provider = "",
         .provider_id = "",
         .recent = isRecent(source.name, recent),
-        .order = source.order,
     };
     errdefer freeEntry(allocator, copy);
     copy.provider = try allocator.dupe(u8, source.provider);
@@ -151,18 +141,7 @@ pub fn show(
     current: []const u8,
 ) !void {
     self.release();
-
-    const entries = try self.allocator.alloc(Entry, models.len);
-    var filled: usize = 0;
-    errdefer {
-        for (entries[0..filled]) |entry| freeEntry(self.allocator, entry);
-        self.allocator.free(entries);
-    }
-    for (models, entries) |src, *dst| {
-        dst.* = try dupeEntry(self.allocator, src, recent);
-        filled += 1;
-    }
-    self.entries = entries;
+    self.entries = try copyEntries(self.allocator, models, recent, &.{});
 
     self.current = current;
     self.search.clear();
@@ -172,63 +151,50 @@ pub fn show(
     self.open = true;
 }
 
-/// Put what a provider answered in place of what it offered before, in its
-/// provider's place, keeping the highlight on the row it was on. Borrowed like
+/// Show `models` in place of the list, as a provider answers again, keeping the
+/// highlight on its row and any effort level stepped here. Borrowed like
 /// `show`.
-pub fn replaceProvider(self: *Picker, provider_id: []const u8, models: []const Entry, recent: []const []const u8) !void {
+pub fn refill(self: *Picker, models: []const Entry, recent: []const []const u8) !void {
     const place = self.highlightedPlace();
     const scroll = self.scroll;
     const previous = self.entries;
-    self.entries = try self.mergedEntries(provider_id, models, recent);
-    defer releaseReplaced(self.allocator, previous, provider_id);
+    self.entries = try copyEntries(self.allocator, models, recent, previous);
+    defer freeEntries(self.allocator, previous);
 
-    std.mem.sort(Entry, self.entries, {}, isEarlierProvider);
     try self.filter();
     if (place) |kept| self.restore(kept, scroll);
 }
 
-/// Every other provider's entries, shared with `self.entries`, then copies of
-/// `models`.
-fn mergedEntries(self: *Picker, provider_id: []const u8, models: []const Entry, recent: []const []const u8) ![]Entry {
-    var kept_count: usize = 0;
-    for (self.entries) |entry| {
-        if (!isFrom(entry, provider_id)) kept_count += 1;
-    }
-
-    const merged = try self.allocator.alloc(Entry, kept_count + models.len);
-    errdefer self.allocator.free(merged);
-    var at: usize = 0;
-    for (self.entries) |entry| {
-        if (isFrom(entry, provider_id)) continue;
-        merged[at] = entry;
-        at += 1;
-    }
-
-    const added = merged[kept_count..];
+fn copyEntries(allocator: std.mem.Allocator, models: []const Entry, recent: []const []const u8, previous: []const Entry) ![]Entry {
+    const entries = try allocator.alloc(Entry, models.len);
     var filled: usize = 0;
-    errdefer for (added[0..filled]) |entry| freeEntry(self.allocator, entry);
-    for (models, added) |src, *dst| {
-        dst.* = try dupeEntry(self.allocator, src, recent);
+    errdefer {
+        for (entries[0..filled]) |entry| freeEntry(allocator, entry);
+        allocator.free(entries);
+    }
+    for (models, entries) |source, *copy| {
+        copy.* = try dupeEntry(allocator, source, recent);
         filled += 1;
+        keepSteppedEffort(copy, previous);
     }
-    return merged;
+    return entries;
 }
 
-/// Frees the replaced provider's entries and the array that held them; the
-/// rest moved to the new array.
-fn releaseReplaced(allocator: std.mem.Allocator, previous: []Entry, provider_id: []const u8) void {
-    for (previous) |entry| {
-        if (isFrom(entry, provider_id)) freeEntry(allocator, entry);
+/// A level stepped before the provider answered again outlasts the answer,
+/// while the model still offers it.
+fn keepSteppedEffort(entry: *Entry, previous: []const Entry) void {
+    for (previous) |old| {
+        if (!old.effort_changed or !isSameModel(old, entry.*)) continue;
+        const level = matchingLevel(entry.efforts, old.effort);
+        if (level.len == 0) return;
+        entry.effort = level;
+        entry.effort_changed = true;
+        return;
     }
-    allocator.free(previous);
 }
 
-fn isFrom(entry: Entry, provider_id: []const u8) bool {
-    return std.mem.eql(u8, entry.provider_id, provider_id);
-}
-
-fn isEarlierProvider(_: void, a: Entry, b: Entry) bool {
-    return a.order < b.order;
+fn isSameModel(a: Entry, b: Entry) bool {
+    return std.mem.eql(u8, a.provider_id, b.provider_id) and std.mem.eql(u8, a.name, b.name);
 }
 
 /// A highlighted model and which of its rows: a recent model is listed twice,
@@ -247,18 +213,20 @@ fn highlightedPlace(self: *const Picker) ?Place {
     return .{ .entry = entry, .occurrence = occurrence };
 }
 
+/// Back to the same row of the same model, or its last row when the answer
+/// left fewer of them.
 fn restore(self: *Picker, place: Place, scroll: usize) void {
     var occurrence: usize = 0;
+    var found: ?usize = null;
     for (self.rows.items, 0..) |row, at| {
         if (!self.isRowFor(row, place.entry)) continue;
-        if (occurrence == place.occurrence) {
-            self.cursor = at;
-            self.scroll = scroll;
-            self.keepCursorVisible();
-            return;
-        }
+        found = at;
+        if (occurrence == place.occurrence) break;
         occurrence += 1;
     }
+    self.cursor = found orelse return;
+    self.scroll = scroll;
+    self.keepCursorVisible();
 }
 
 fn isRowFor(self: *const Picker, row: Row, entry: Entry) bool {
@@ -266,8 +234,7 @@ fn isRowFor(self: *const Picker, row: Row, entry: Entry) bool {
         .heading => return false,
         .entry => |index| index,
     };
-    const listed = self.entries[index];
-    return isFrom(listed, entry.provider_id) and std.mem.eql(u8, listed.name, entry.name);
+    return isSameModel(self.entries[index], entry);
 }
 
 fn isRecent(name: []const u8, recent: []const []const u8) bool {
@@ -279,7 +246,6 @@ fn isRecent(name: []const u8, recent: []const []const u8) bool {
 
 pub fn close(self: *Picker) void {
     self.open = false;
-    self.abandonListings();
     self.search.clear();
     self.release();
     self.matches.clearRetainingCapacity();
@@ -473,7 +439,7 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
     const first_row: u16 = field_row + 2;
     if (self.rows.items.len == 0) {
-        const is_waiting = self.listings.items.len > 0;
+        const is_waiting = self.asking > 0;
         const empty = if (is_waiting) "asking providers…" else "no models";
         _ = w.writeText(surface, pad, first_row, empty, theme.on_card(theme.fg_dim).cell);
     }
@@ -520,9 +486,9 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
         hint = w.writeText(surface, hint, hint_row, "   ←→", theme.on_card(theme.fg_muted).bold().cell);
         hint = w.writeText(surface, hint, hint_row, " effort", theme.on_card(theme.fg_dim).cell);
     }
-    const is_still_asking = self.listings.items.len > 0 and self.rows.items.len > 0;
+    const is_still_asking = self.asking > 0 and self.rows.items.len > 0;
     if (is_still_asking) {
-        const asking = try std.fmt.allocPrint(ctx.arena, "asking {d} more…", .{self.listings.items.len});
+        const asking = try std.fmt.allocPrint(ctx.arena, "asking {d} more…", .{self.asking});
         const has_room = hint + hint_gap + w.textWidth(asking) + pad <= width;
         if (has_room) w.writeTextRight(surface, hint_row, pad, asking, theme.on_card(theme.fg_dim).cell);
     }
@@ -552,41 +518,37 @@ test "the list groups by provider and lifts what was used before" {
     try std.testing.expectEqualStrings("llama3:70b", picker.selected().?.name);
 }
 
-test "late models join in catalog order, and the highlight keeps its row" {
+test "a fresh answer keeps the highlight on its row" {
     var picker: Picker = .init(std.testing.allocator);
     defer picker.deinit();
 
-    try picker.show(&.{
-        .{ .name = "gpt-oss", .provider = "Ollama Cloud", .provider_id = "ollama-cloud", .order = 1 },
-    }, &.{"gpt-oss"}, "");
+    const cloud: Entry = .{ .name = "gpt-oss", .provider = "Ollama Cloud", .provider_id = "ollama-cloud" };
+    const local: Entry = .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama" };
+    const recent: []const []const u8 = &.{cloud.name};
+
+    try picker.show(&.{cloud}, recent, "");
     picker.move(1);
-    const provider_row = picker.cursor;
+    const row_under_provider = picker.cursor;
 
-    try picker.replaceProvider("ollama", &.{
-        .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama", .order = 0 },
-    }, &.{"gpt-oss"});
+    try picker.refill(&.{ local, cloud }, recent);
 
-    try std.testing.expectEqualStrings("Ollama", picker.rows.items[2].heading);
-    try std.testing.expectEqualStrings("gpt-oss", picker.selected().?.name);
-    try std.testing.expect(picker.cursor > provider_row);
+    try std.testing.expectEqualStrings(cloud.name, picker.selected().?.name);
+    try std.testing.expect(picker.cursor > row_under_provider);
 }
 
-test "a provider's fresh answer replaces what it offered before" {
+test "a fresh answer keeps an effort level stepped before it" {
     var picker: Picker = .init(std.testing.allocator);
     defer picker.deinit();
 
-    try picker.show(&.{
-        .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama" },
-        .{ .name = "llama3:70b", .provider = "Ollama", .provider_id = "ollama" },
-        .{ .name = "gpt-oss", .provider = "Ollama Cloud", .provider_id = "ollama-cloud", .order = 1 },
-    }, &.{}, "");
+    const levels: []const []const u8 = &.{ "low", "medium", "high" };
+    const model: Entry = .{ .name = "gpt-5", .provider = "OpenAI", .provider_id = "openai", .efforts = levels, .effort = "medium" };
 
-    try picker.replaceProvider("ollama", &.{
-        .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama" },
-    }, &.{});
+    try picker.show(&.{model}, &.{}, "");
+    picker.stepEffort(1);
+    try picker.refill(&.{model}, &.{});
 
-    try std.testing.expectEqual(@as(usize, 2), picker.entries.len);
-    try std.testing.expectEqualStrings("qwen3:8b", picker.selected().?.name);
+    try std.testing.expectEqualStrings("high", picker.selected().?.effort);
+    try std.testing.expect(picker.selected().?.effort_changed);
 }
 
 test "a model remembers which provider offers it" {

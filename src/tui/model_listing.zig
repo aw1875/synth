@@ -1,6 +1,6 @@
-//! Asking a provider that is not in use what it offers, off the UI thread. Each
-//! one is a client of its own and a network round trip, and the model picker
-//! should be up before the slowest of them answers.
+//! Asking a provider what it offers, off the UI thread and through a client of
+//! its own. Each is a network round trip, and the model picker should be up
+//! before the slowest of them answers.
 
 const std = @import("std");
 
@@ -97,8 +97,8 @@ pub fn join(self: *ModelListing) void {
     self.future.await(self.io);
 }
 
-/// For a picker closing before the provider answered: stop at the next
-/// cancelation point rather than wait on the network.
+/// For quitting before the provider answered. Waits for the worker to reach a
+/// cancelation point, so only for when blocking no longer matters.
 pub fn abandon(self: *ModelListing) void {
     self.future.cancel(self.io);
     self.destroy();

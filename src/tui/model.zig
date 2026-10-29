@@ -249,9 +249,12 @@ provider_missing: bool = false,
 chatgpt_sign_in: ?*SignInTask = null,
 /// A sign-out waiting on OpenAI to confirm the revocation.
 chatgpt_sign_out: ?*SignOutTask = null,
+/// Providers being asked what they offer, at most one listing apiece. Left
+/// to finish when the model picker closes: cancelling one waits on the
+/// network, and on macOS a name lookup cannot be interrupted at all.
+model_listings: std.ArrayList(*ModelListing) = .empty,
 /// What each provider last said it offers, one finished listing apiece. The
-/// model picker opens on these while every provider is asked again, the way
-/// codex opens on its cached catalog.
+/// model picker opens on these while every provider is asked again.
 offered_models: std.ArrayList(*ModelListing) = .empty,
 /// The client behind `provider`. Borrowed; it outlives the model. Needed
 /// because connecting a provider of another protocol replaces the client, which
@@ -631,6 +634,8 @@ pub fn deinit(self: *Model) void {
         task.abandon();
         self.chatgpt_sign_out = null;
     }
+    for (self.model_listings.items) |listing| listing.abandon();
+    self.model_listings.deinit(self.allocator);
     for (self.offered_models.items) |listing| listing.destroy();
     self.offered_models.deinit(self.allocator);
     self.closeSubagent();

@@ -177,6 +177,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
     switch (event) {
         .init => {
             try commands.applyMcp(self, ctx);
+            commands.askProviders(self, ctx) catch {};
             if (self.pending_model_check) try self.scheduleTick(ctx);
             if (self.mcp) |host| {
                 if (host.connecting()) try self.scheduleTick(ctx);

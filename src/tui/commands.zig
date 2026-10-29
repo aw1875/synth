@@ -554,16 +554,27 @@ pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const recent = try recentModels(self, arena);
-    const offered = try lastOffered(self, arena);
-    try self.models.show(offered, recent, self.provider.model);
+    try self.models.show(try lastOffered(self, arena), try recentModels(self, arena), self.provider.model);
+    try askProviders(self, ctx);
+    self.models.asking = try countUnlisted(self, arena);
+}
+
+/// Ask every connected provider what it offers, unless it is being asked
+/// already. Done once at launch too, so the first picker opens with rows.
+pub fn askProviders(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (needsProvider(self)) return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     const active_id = try activeProviderId(self, arena);
     for (catalog.all) |entry| {
         if (!isConnected(self, entry)) continue;
+        if (isBeingAsked(self, entry.id)) continue;
         try startModelListing(self, arena, entry, active_id);
     }
-    if (self.models.listings.items.len > 0) try self.scheduleTick(ctx);
+    if (self.model_listings.items.len > 0) try self.scheduleTick(ctx);
 }
 
 /// Whether a provider has what it needs to be asked what it offers.
@@ -573,8 +584,7 @@ pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
 }
 
 /// Each provider is asked through a client of its own, never the one a turn
-/// uses. Nothing is reconnected to list a model; that only happens when one is
-/// picked. A provider that cannot be given a thread is left out.
+/// uses. A provider that cannot be given a thread is left out.
 fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !void {
     const reach = try reachOf(self, arena, entry, active_id);
     const listing = ModelListing.start(self.allocator, self.io, entry, reach) catch |err| switch (err) {
@@ -582,7 +592,14 @@ fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entr
         else => return err,
     };
     errdefer listing.abandon();
-    try self.models.listings.append(self.allocator, listing);
+    try self.model_listings.append(self.allocator, listing);
+}
+
+fn isBeingAsked(self: *Model, provider_id: []const u8) bool {
+    for (self.model_listings.items) |listing| {
+        if (std.mem.eql(u8, listing.entry.id, provider_id)) return true;
+    }
+    return false;
 }
 
 /// The provider in use is reached where it is pointed now, which a runtime
@@ -608,7 +625,8 @@ fn reachOf(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_
 }
 
 pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
-    const listings = &self.models.listings;
+    const listings = &self.model_listings;
+    var is_any_finished = false;
     var index: usize = 0;
     while (index < listings.items.len) {
         const listing = listings.items[index];
@@ -618,65 +636,78 @@ pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
         }
         _ = listings.orderedRemove(index);
         listing.join();
-        try takeListing(self, listing);
+        try keepOffered(self, listing);
+        is_any_finished = true;
+    }
+    if (is_any_finished and self.models.open) {
+        try refillModels(self);
         ctx.redraw = true;
     }
     if (listings.items.len > 0) try self.scheduleTick(ctx);
 }
 
 /// A provider that could not be asked leaves what it offered last in place.
-fn takeListing(self: *Model, listing: *ModelListing) !void {
-    const models = listing.models orelse return listing.destroy();
-    errdefer listing.destroy();
-
-    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const entries = try modelEntries(self, arena, listing.entry, models);
-    const recent = try recentModels(self, arena);
-    try self.models.replaceProvider(listing.entry.id, entries, recent);
-    try keepOffered(self, listing);
-}
-
 fn keepOffered(self: *Model, listing: *ModelListing) !void {
+    if (listing.models == null) return listing.destroy();
     for (self.offered_models.items) |*kept| {
         if (!std.mem.eql(u8, kept.*.entry.id, listing.entry.id)) continue;
         kept.*.destroy();
         kept.* = listing;
         return;
     }
+    errdefer listing.destroy();
     try self.offered_models.append(self.allocator, listing);
 }
 
+fn refillModels(self: *Model) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try self.models.refill(try lastOffered(self, arena), try recentModels(self, arena));
+    self.models.asking = try countUnlisted(self, arena);
+}
+
+/// Every connected provider's models, in catalog order.
 fn lastOffered(self: *Model, arena: std.mem.Allocator) ![]const ModelPicker.Entry {
+    const active_id = try activeProviderId(self, arena);
     var entries: std.ArrayList(ModelPicker.Entry) = .empty;
     for (catalog.all) |entry| {
         if (!isConnected(self, entry)) continue;
-        const models = offeredBy(self, entry.id) orelse continue;
+        const models = try offeredBy(self, arena, entry, active_id) orelse continue;
         try entries.appendSlice(arena, try modelEntries(self, arena, entry, models));
     }
     return entries.items;
 }
 
-fn offeredBy(self: *Model, provider_id: []const u8) ?[]const ModelListing.Offered {
+/// What a provider last offered from where it is reached now. A list from a
+/// host it has since moved off is no answer: an OpenAI-compatible server takes
+/// any name, so its rows would set a model the new host does not have.
+fn offeredBy(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !?[]const ModelListing.Offered {
+    const reach = try reachOf(self, arena, entry, active_id);
     for (self.offered_models.items) |kept| {
-        if (std.mem.eql(u8, kept.entry.id, provider_id)) return kept.models;
+        if (!std.mem.eql(u8, kept.entry.id, entry.id)) continue;
+        if (!std.mem.eql(u8, kept.reach.host, reach.host)) return null;
+        return kept.models;
     }
     return null;
+}
+
+/// Providers still being asked that have no rows to show yet.
+fn countUnlisted(self: *Model, arena: std.mem.Allocator) !usize {
+    const active_id = try activeProviderId(self, arena);
+    var count: usize = 0;
+    for (self.model_listings.items) |listing| {
+        const offered = try offeredBy(self, arena, listing.entry, active_id);
+        if (offered == null) count += 1;
+    }
+    return count;
 }
 
 fn recentModels(self: *Model, arena: std.mem.Allocator) ![]const []const u8 {
     const db = self.loop.database() orelse return &.{};
     const project_id = self.loop.project_id orelse return &.{};
     return db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
-}
-
-fn catalogOrder(id: []const u8) usize {
-    for (catalog.all, 0..) |entry, order| {
-        if (std.mem.eql(u8, entry.id, id)) return order;
-    }
-    return catalog.all.len;
 }
 
 /// Each model a provider offers, with the effort level last chosen for it.
@@ -699,7 +730,6 @@ fn modelEntries(
             .provider_id = entry.id,
             .efforts = model.efforts.levels,
             .effort = if (is_remembered_offered) remembered else model.efforts.default,
-            .order = catalogOrder(entry.id),
         };
     }
     return entries;
