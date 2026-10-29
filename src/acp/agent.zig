@@ -17,6 +17,7 @@ const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
 const synth = @import("synth.zig");
 const Providers = @import("providers.zig");
+const sockets = @import("sockets.zig");
 const updates = @import("updates.zig");
 const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
@@ -67,6 +68,9 @@ pub const Options = struct {
     home: ?[]const u8 = null,
     /// Where MCP tokens and on/off choices are kept.
     mcp_auth_path: ?[]const u8 = null,
+    /// Where the session listens for clients besides the one that started
+    /// the agent. Null for none.
+    socket_dir: ?[]const u8 = null,
 };
 
 allocator: std.mem.Allocator,
@@ -84,6 +88,8 @@ wake: std.Io.Event = .unset,
 live: ?struct { handle: []u8, root: []u8 } = null,
 
 session: ?*Session = null,
+/// The live session's socket, while it has one.
+listener: ?*sockets.Listener = null,
 /// The permission request out for the call waiting on a decision.
 asked: ?Asked = null,
 /// Prompts answered when the turn they started or steered ends.
@@ -97,7 +103,10 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) Agent {
 /// Join every connection and end the session. Called once `serve` returns.
 pub fn deinit(self: *Agent) void {
     self.closeSession();
-    for (self.connections.items) |connection| connection.destroy();
+    for (self.connections.items) |connection| {
+        connection.hangUp();
+        connection.destroy();
+    }
     self.connections.deinit(self.allocator);
     var leftover = self.inbox;
     while (leftover.popFirst()) |node| Inbound.of(node).destroy();
@@ -107,10 +116,22 @@ pub fn deinit(self: *Agent) void {
 /// Speak ACP over a pair of files, until `input` ends. Both are closed with
 /// the connection, once if they are the same.
 pub fn connect(self: *Agent, input: std.Io.File, output: std.Io.File) !void {
+    return self.add(input, output, false);
+}
+
+fn add(self: *Agent, input: std.Io.File, output: std.Io.File, guest: bool) !void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     try self.connections.ensureUnusedCapacity(self.allocator, 1);
-    self.connections.appendAssumeCapacity(try Connection.create(self, input, output));
+    const connection = try Connection.create(self, input, output);
+    connection.guest = guest;
+    self.connections.appendAssumeCapacity(connection);
+}
+
+/// A client on the session's socket. From the listener's thread.
+fn accepted(context: *anyopaque, client: std.Io.File) void {
+    const self: *Agent = @ptrCast(@alignCast(context));
+    self.add(client, client, true) catch client.close(self.io);
 }
 
 /// Answer the connections until the last of them has gone.
@@ -238,6 +259,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     }
     const asked = try need(id);
     if (eql(u8, method, protocol.method.session_new)) {
+        if (connection.guest) return error.HostsOneSession;
         const request = try rpc.parse(protocol.NewSession, arena, params);
         if (!std.fs.path.isAbsolute(request.cwd)) return error.RelativeCwd;
         const session = try self.open(request.cwd, null);
@@ -249,6 +271,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     }
     if (eql(u8, method, protocol.method.session_load)) {
         const request = try rpc.parse(protocol.LoadSession, arena, params);
+        if (connection.guest) _ = try self.sessionFor(request.sessionId);
         const session = try self.open(request.cwd, request.sessionId);
         if (connection.dialect == .standard) try session.replay(arena, connection);
         return connection.reply(asked, protocol.Loaded{
@@ -404,7 +427,37 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8) !*Session {
     defer arena_state.deinit();
     try session.publish(arena_state.allocator(), false);
     try self.sendSnapshots(session);
+    self.listen(session);
     return session;
+}
+
+/// Listen for other clients on the session's socket. A session no other
+/// client can reach still runs, and its clients are told why.
+fn listen(self: *Agent, session: *Session) void {
+    const socket_dir = self.options.socket_dir orelse return;
+    self.startListening(socket_dir, session.handle) catch |err| {
+        self.noticeFmt("Other terminals cannot reach this session: {s}", .{describe(err)});
+    };
+}
+
+fn startListening(self: *Agent, socket_dir: []const u8, handle: []const u8) !void {
+    try sockets.ensureDir(self.io, socket_dir);
+    const path = try sockets.pathFor(self.allocator, socket_dir, handle);
+    defer self.allocator.free(path);
+    self.listener = try sockets.Listener.start(self.allocator, self.io, path, self, accepted);
+}
+
+/// Stop listening, and hang up on the clients that came in that way: the
+/// session they came for is over.
+fn stopListening(self: *Agent) void {
+    const listener = self.listener orelse return;
+    self.listener = null;
+    listener.stop();
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    for (self.connections.items) |connection| {
+        if (connection.guest) connection.hangUp();
+    }
 }
 
 fn share(self: *Agent, session: *Session) !void {
@@ -428,6 +481,7 @@ fn unshare(self: *Agent) void {
 /// End the live session, answering whatever was waiting on it.
 fn closeSession(self: *Agent) void {
     const session = self.session orelse return;
+    self.stopListening();
     self.withdraw();
     for (self.prompts.items) |*waiting| {
         waiting.connection.reply(waiting.id, protocol.Prompted{ .stopReason = .cancelled });
@@ -683,6 +737,7 @@ fn describe(err: anyerror) []const u8 {
         error.StillConnecting => "still connecting - try again in a moment",
         error.NoMcpState => "no MCP state file, so this cannot be remembered",
         error.InvalidRequest => "a request needs an id",
+        error.HostsOneSession => "this process hosts one session; attach to it with session/load",
         else => @errorName(err),
     };
 }
@@ -771,6 +826,9 @@ const Connection = struct {
     lines: rpc.LineReader,
     /// Raised once the reader is done with everything but being freed.
     finished: std.atomic.Value(bool) = .init(false),
+    /// Came in on the session's socket, rather than being the client that
+    /// started the agent.
+    guest: bool = false,
     /// Set by `initialize`. Session's thread only.
     dialect: ?Dialect = null,
     /// Draws forms, so a question can be put to it.
@@ -812,6 +870,12 @@ const Connection = struct {
         self.outbox.deinit(allocator);
         self.lines.deinit();
         allocator.destroy(self);
+    }
+
+    /// End a socket client's connection from this side: its reader sees the
+    /// end of input. Does nothing to a pipe.
+    fn hangUp(self: *Connection) void {
+        _ = std.posix.system.shutdown(self.input.handle, std.posix.SHUT.RD);
     }
 
     fn close(self: *Connection) void {
@@ -2436,4 +2500,32 @@ test "a session is listed once spoken in, loads back with its transcript, and an
     const gone = try client.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = empty, .cwd = fixture.project });
     try testing.expectEqualStrings("no such session", (try client.expectError(gone)).message);
     try testing.expectEqual(@as(usize, 1), (try list(client, null)).sessions.len);
+}
+
+test "a session listens on its socket, where a client can attach to it and nothing else" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const socket_dir = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "sockets" });
+    fixture.agent.options.socket_dir = socket_dir;
+    const host = try fixture.connect();
+    defer host.close();
+    try host.initialize(true);
+    const session = (try host.open(fixture.project)).sessionId;
+
+    const path = try sockets.pathFor(fixture.arena.allocator(), socket_dir, session);
+    const guest = try Client.create(try sockets.connect(path));
+    defer guest.close();
+    try guest.initialize(false);
+
+    const new = try guest.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project });
+    try testing.expect(std.mem.startsWith(u8, (try guest.expectError(new)).message, "this process hosts one session"));
+    const other = try guest.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = "ses_elsewhere", .cwd = fixture.project });
+    try testing.expectEqualStrings("no such session", (try guest.expectError(other)).message);
+    const attach = try guest.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
+    _ = try guest.expectResult(attach);
+
+    const close = try host.request(protocol.method.session_close, protocol.SessionId{ .sessionId = session });
+    try testing.expect(try host.expectResult(close) == .object);
+    while (guest.next()) |_| {} else |err| try testing.expectEqual(error.Closed, err);
+    try testing.expectError(error.NotListening, sockets.connect(path));
 }

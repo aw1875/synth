@@ -4,6 +4,7 @@ const std = @import("std");
 
 const Agent = @import("agent.zig");
 const Providers = @import("providers.zig");
+const sockets = @import("sockets.zig");
 const Auth = @import("../core/auth.zig");
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
@@ -43,6 +44,8 @@ pub fn run(init: std.process.Init) !void {
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
+    const socket_dir = try sockets.dir(allocator, init.environ_map);
+    defer allocator.free(socket_dir);
 
     var agent: Agent = .init(allocator, io, .{
         .config = &config,
@@ -50,6 +53,7 @@ pub fn run(init: std.process.Init) !void {
         .source = .{ .providers = &providers },
         .home = init.environ_map.get("HOME"),
         .mcp_auth_path = mcp_auth_path,
+        .socket_dir = socket_dir,
     });
     defer agent.deinit();
     try agent.connect(.stdin(), .stdout());
