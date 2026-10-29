@@ -333,6 +333,8 @@ pub const Content = union(enum) {
     image: []const u8,
     /// A file the client attached, by path, with its text.
     resource: struct { path: []const u8, text: []const u8 },
+    /// A file or other resource the client only named.
+    link: []const u8,
     /// Anything else, which is skipped.
     other,
 
@@ -357,6 +359,13 @@ pub const Content = union(enum) {
                 try jws.objectField("resource");
                 try jws.write(.{ .uri = resource.path, .text = resource.text });
             },
+            .link => |uri| {
+                try jws.write("resource_link");
+                try jws.objectField("uri");
+                try jws.write(uri);
+                try jws.objectField("name");
+                try jws.write(std.fs.path.basename(uri));
+            },
             .other => return error.WriteFailed,
         }
         try jws.endObject();
@@ -373,6 +382,7 @@ pub const Content = union(enum) {
             const text = string(field(resource, "text")) orelse return .other;
             return .{ .resource = .{ .path = pathOf(uri), .text = text } };
         }
+        if (std.mem.eql(u8, kind.string, "resource_link")) return .{ .link = string(field(block, "uri")) orelse return .other };
         return .other;
     }
 };
@@ -381,6 +391,18 @@ pub const Content = union(enum) {
 pub fn pathOf(uri: []const u8) []const u8 {
     const scheme = "file://";
     return if (std.mem.startsWith(u8, uri, scheme)) uri[scheme.len..] else uri;
+}
+
+/// The local path a `file:` URI names, percent-escapes decoded. Null for any
+/// other scheme, or a file on another host.
+pub fn filePath(arena: std.mem.Allocator, uri: []const u8) !?[]const u8 {
+    const parsed = std.Uri.parse(uri) catch return null;
+    if (!std.mem.eql(u8, parsed.scheme, "file")) return null;
+    if (parsed.host) |host| {
+        const name = try host.toRawMaybeAlloc(arena);
+        if (name.len > 0 and !std.mem.eql(u8, name, "localhost")) return null;
+    }
+    return try parsed.path.toRawMaybeAlloc(arena);
 }
 
 fn field(value: ?std.json.Value, name: []const u8) ?std.json.Value {
@@ -396,6 +418,21 @@ fn string(value: ?std.json.Value) ?[]const u8 {
         .string => |text| text,
         else => null,
     };
+}
+
+test "a file link names a local path, escapes decoded; other links name none" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("/src/my file.zig", (try filePath(arena, "file:///src/my%20file.zig")).?);
+    try testing.expectEqualStrings("/src/a.zig", (try filePath(arena, "file://localhost/src/a.zig")).?);
+    try testing.expectEqual(null, try filePath(arena, "file://elsewhere/src/a.zig"));
+    try testing.expectEqual(null, try filePath(arena, "https://example.com/a.zig"));
+
+    const block = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"resource_link","name":"a.zig","uri":"file:///src/a.zig"}
+    , .{});
+    try testing.expectEqualStrings("file:///src/a.zig", Content.of(block).link);
 }
 
 test "an update flattens under its tag" {

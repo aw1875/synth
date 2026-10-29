@@ -737,6 +737,11 @@ fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSe
     return .{ .sessions = out };
 }
 
+fn projectRelative(root: []const u8, path: []const u8) []const u8 {
+    if (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == std.fs.path.sep) return path[root.len + 1 ..];
+    return path;
+}
+
 fn isHeld(held: []const []const u8, handle: []const u8) bool {
     for (held) |live| {
         if (std.mem.eql(u8, live, handle)) return true;
@@ -1228,6 +1233,7 @@ const Session = struct {
             },
             .image => |data| try images.append(arena, data),
             .resource => |resource| try attachments.append(arena, .{ .path = resource.path, .content = resource.text }),
+            .link => |uri| try self.follow(arena, uri, &text, &attachments, &images),
             .other => {},
         };
 
@@ -1244,6 +1250,27 @@ const Session = struct {
         }
         const extras: Loop.Extras = .{ .attachments = attachments.items, .images = images.items };
         if (!try loop.steer(text.items, extras)) try loop.submit(text.items, extras);
+    }
+
+    /// A linked file in the project, attached as a mention of it would be.
+    /// Anything else is named in the text, for the model to see.
+    fn follow(
+        self: *Session,
+        arena: std.mem.Allocator,
+        uri: []const u8,
+        text: *std.ArrayList(u8),
+        attachments: *std.ArrayList(mention.Attachment),
+        images: *std.ArrayList([]const u8),
+    ) !void {
+        const root = self.stack.project.root;
+        if (try protocol.filePath(arena, uri)) |path| {
+            if (try mention.readPath(arena, self.agent.io, root, path)) |entry| return switch (entry) {
+                .image => |data| images.append(arena, data),
+                .text => |content| attachments.append(arena, .{ .path = projectRelative(root, path), .content = content }),
+            };
+        }
+        if (text.items.len > 0) try text.append(arena, '\n');
+        try text.appendSlice(arena, uri);
     }
 
     const Waiting = struct { for_answer: bool, seq: u64, call: usize, tool: *const Conversation.ToolCall };
@@ -2267,6 +2294,39 @@ test "a prompt sent while busy steers the turn, and both are answered when it en
     try client.choose((try client.awaitPermission()).id, "deny");
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(first));
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(second));
+}
+
+test "a linked file in the project is attached, and any other link named in the text" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.initialize(true);
+    const session = (try client.open(fixture.project)).sessionId;
+    const arena = client.arena.allocator();
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = try std.fs.path.join(arena, &.{ fixture.project, "linked file.txt" }), .data = "linked text" });
+
+    const prompted = try client.request(protocol.method.session_prompt, .{
+        .sessionId = session,
+        .prompt = .{
+            .{ .type = "text", .text = "read these" },
+            .{ .type = "resource_link", .name = "linked file.txt", .uri = try std.fmt.allocPrint(arena, "file://{s}/linked%20file.txt", .{fixture.project}) },
+            .{ .type = "resource_link", .name = "passwd", .uri = "file:///etc/passwd" },
+            .{ .type = "resource_link", .name = "docs", .uri = "https://example.com/docs" },
+        },
+    });
+    const sent = while (true) {
+        const message = try client.awaitMethod(synth.method.appended);
+        const appended = try rpc.parse(synth.Appended, arena, message.params);
+        if (appended.message.role == .user) break appended.message;
+    };
+    try testing.expectEqualStrings("read these\nfile:///etc/passwd\nhttps://example.com/docs", sent.text);
+    try testing.expectEqual(1, sent.attachments.len);
+    try testing.expectEqualStrings("linked file.txt", sent.attachments[0].path);
+    try testing.expectEqualStrings("linked text", sent.attachments[0].content);
+
+    try client.choose((try client.awaitPermission()).id, "deny");
+    try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(prompted));
 }
 
 test "the first answer to a permission request wins, and the rest are taken back" {
