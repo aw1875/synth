@@ -988,19 +988,18 @@ pub fn checkModel(self: *Model, ctx: *vxfw.EventContext) void {
     const remembered = self.allocator.dupe(u8, backend.model()) catch return;
     defer self.allocator.free(remembered);
     backend.ensureModel() catch {};
-    syncProvider(self);
     ctx.redraw = true;
-    reportReplacedModel(self, ctx, remembered) catch {};
+    adoptSettledModel(self, ctx, remembered, backend.model()) catch {};
 }
 
-/// The model remembered from last time gave way to one the provider offers:
-/// say so, and remember the new one so the next launch starts there.
-fn reportReplacedModel(self: *Model, ctx: *vxfw.EventContext, remembered: []const u8) !void {
-    const current = self.provider.model;
-    const is_replaced = remembered.len > 0 and !std.mem.eql(u8, remembered, current);
-    if (!is_replaced) return;
-    try rememberModelChoice(self, current);
-    try self.notification.showFmt(ctx, .warn, "{s} no longer offers {s}, so this session uses {s}.", .{ self.provider.name, remembered, current });
+/// The backend settled on a model other than the one it started with. Taken
+/// the way a pick is, so the sidebar, the session and the effort level follow,
+/// and said aloud when it replaced one remembered from last time.
+fn adoptSettledModel(self: *Model, ctx: *vxfw.EventContext, remembered: []const u8, settled: []const u8) !void {
+    if (std.mem.eql(u8, remembered, settled)) return;
+    _ = try switchModel(self, settled);
+    if (remembered.len == 0) return;
+    try self.notification.showFmt(ctx, .warn, "{s} no longer offers {s}, so this session uses {s}.", .{ self.provider.name, remembered, settled });
 }
 
 /// Take delivery of servers connected on a worker.
@@ -1063,11 +1062,13 @@ test "a remembered model that gave way at launch is reported" {
     var ctx = testContext();
     defer ctx.cmds.deinit(testing.allocator);
 
-    try reportReplacedModel(&model, &ctx, "qwen3-coder:30b");
+    try adoptSettledModel(&model, &ctx, "qwen3-coder:30b", "qwen3-coder:30b");
     try testing.expect(!isToastUp(&model, "no longer offers"));
 
-    try reportReplacedModel(&model, &ctx, "s");
+    try adoptSettledModel(&model, &ctx, "s", "glm-5.3-flash");
     try testing.expect(isToastUp(&model, "no longer offers s"));
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+    try testing.expectEqualStrings("glm-5.3-flash", model.loop.provider.model);
 }
 
 fn isToastUp(model: *Model, fragment: []const u8) bool {
