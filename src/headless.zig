@@ -5,27 +5,16 @@ const std = @import("std");
 const pkg = @import("pkg");
 
 const Conversation = @import("core/conversation.zig");
-const agents = @import("agent/agent.zig");
-const subagent = @import("agent/subagent.zig");
-const Loop = @import("agent/loop.zig");
+const Stack = @import("agent/stack.zig");
 const Auth = @import("core/auth.zig");
 const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const mcp = @import("mcp");
 
 const Config = @import("core/config.zig");
-const Hooks = @import("core/hooks.zig");
 const Database = @import("core/database.zig");
 const humanize = @import("core/humanize.zig");
-const Project = @import("core/project.zig");
-const skill = @import("core/skill.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
-const Provider = @import("provider/provider.zig");
-const Registry = @import("tools/registry.zig");
-const mcp_tools = @import("tools/mcp.zig");
-const skill_tool = @import("tools/skill.zig");
-const web = @import("tools/web.zig");
-const tool = @import("tools/tool.zig");
 
 const dim = "\x1b[2m";
 const bold = "\x1b[1m";
@@ -61,43 +50,12 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try std.process.currentPath(io, &path_buf);
-    var project = try Project.detect(allocator, io, path_buf[0..n]);
-    defer project.deinit(allocator);
-
-    var registry = try Registry.init(allocator);
-    defer registry.deinit();
-
-    var skills = try skill.load(allocator, io, project.root, config.skill_paths, init.environ_map.get("HOME"));
-    defer skills.deinit();
-    try skill_tool.install(&registry, &skills);
-
-    const web_settings: web.Settings = .{ .search_api_key = config.search_api_key };
-    try web.install(&registry, &web_settings);
-
-    var mcp_host: mcp_tools.Host = .init(allocator, io);
-    mcp_host.stderr = .inherit;
-    defer mcp_host.deinit();
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
 
     var mcp_auth = mcp.Auth.load(allocator, io, mcp_auth_path) catch mcp.Auth.init(allocator);
     defer mcp_auth.deinit();
-    mcp_host.auth = &mcp_auth;
-
-    if (config.mcp) |block| {
-        const servers = try mcp_tools.serversFromJson(init.arena.allocator(), block);
-        try mcp_host.connectAll(&registry, servers, .{
-            .name = pkg.name,
-            .version = pkg.version,
-        });
-    }
-
-    var reads: tool.ReadLog = .init(allocator);
-    defer reads.deinit();
-
-    var convo: Conversation = .init(allocator);
-    defer convo.deinit();
 
     var backend: Backend = .init(active.entry.kind, .{
         .allocator = allocator,
@@ -115,17 +73,30 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     try backend.start();
     backend.ensureModel() catch {};
-    const provider = backend.provider();
+
+    const stack = try Stack.create(allocator, io, .{
+        .config = &config,
+        .backend = &backend,
+        .cwd = path_buf[0..n],
+        .home = init.environ_map.get("HOME"),
+        .db = &db,
+        .mcp_auth = &mcp_auth,
+        .mcp_stderr = .inherit,
+    });
+    defer stack.destroy();
+    const loop = &stack.loop;
+    const convo = &stack.convo;
+    const runner = &stack.runner;
 
     try out.print("{s}provider{s} {s}  {s}root{s} {s}\n", .{
-        dim, reset, provider.name, dim, reset, project.root,
+        dim, reset, loop.provider.name, dim, reset, stack.project.root,
     });
     try out.print("{s}tools{s} {d} registered, mutating tools {s}\n", .{
-        dim,                                                                  reset, registry.tools.count(),
+        dim,                                                                  reset, stack.registry.tools.count(),
         if (allow_mutating) "ALLOWED" else "denied (pass --allow to enable)",
     });
 
-    const mcp_report = try mcp_host.report(allocator);
+    const mcp_report = try stack.mcp_host.report(allocator);
     defer allocator.free(mcp_report);
     if (mcp_report.len > 0) {
         try out.print("{s}mcp{s} {s}\n", .{ dim, reset, mcp_report });
@@ -137,33 +108,6 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     });
     try out.print("{s}▸ you{s} {s}\n", .{ bold, reset, prompt });
     try out.flush();
-
-    var loop: Loop = .init(allocator, io, provider, &registry, &convo, &reads, project.root);
-    var runner: subagent.Runner = .{ .parent = &loop, .backend = &backend };
-    loop.delegate = runner.delegate();
-
-    // Ordered: the loop joins the workers still writing to the runner.
-    defer {
-        loop.deinit();
-        runner.deinit();
-    }
-    loop.auto_approve_safe = config.auto_approve_safe_commands;
-    if (config.max_turn_ms) |ms| loop.max_turn_ms = ms;
-    if (config.max_stall_ms) |ms| loop.max_stall_ms = ms;
-    if (config.max_turn_tokens) |tokens| loop.max_turn_tokens = tokens;
-    if (config.system_prompt) |text| loop.system_prompt = text;
-    loop.project = &project;
-    loop.skills = skills.skills;
-    var hook_runner: Hooks.Runner = .{
-        .io = io,
-        .root = project.root,
-        .set = config.hooks,
-        .timeout_ms = config.hook_timeout_ms,
-    };
-    loop.hooks = &hook_runner;
-    try loop.useAgent(agents.default_id);
-
-    try loop.attachDatabase(&db, project.name(), project.cwd, backend.model());
 
     try loop.submit(prompt, .{});
 
@@ -182,7 +126,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
             continue;
         }
 
-        printed = try report(out, &convo, printed);
+        printed = try report(out, convo, printed);
         std.Io.sleep(io, .fromMilliseconds(20), .real) catch {};
     }
     if (loop.takeHookNotice()) |notice| {
@@ -191,7 +135,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         try out.flush();
         return;
     }
-    _ = try report(out, &convo, printed);
+    _ = try report(out, convo, printed);
 
     try out.print("\n{s}{d} messages, {d} model calls{s}\n", .{ dim, convo.messages.items.len, loop.steps, reset });
     try out.flush();
