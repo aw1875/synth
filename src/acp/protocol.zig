@@ -86,6 +86,7 @@ pub const Initialized = struct {
 
 pub const AgentCapabilities = struct {
     loadSession: bool = true,
+    mcpCapabilities: struct { http: bool = true } = .{},
     promptCapabilities: struct {
         image: bool = true,
         audio: bool = false,
@@ -101,15 +102,29 @@ pub const AgentCapabilities = struct {
 
 pub const NewSession = struct {
     cwd: []const u8,
-    /// Servers the client wants connected. synth reads its own from config.
-    mcpServers: []const std.json.Value = &.{},
+    /// Servers the client wants connected beside those in synth's config.
+    mcpServers: []const McpServer = &.{},
 };
 
 pub const LoadSession = struct {
     sessionId: []const u8,
     cwd: []const u8 = "",
-    mcpServers: []const std.json.Value = &.{},
+    mcpServers: []const McpServer = &.{},
 };
+
+/// A server run as a child when it names a `command`, else reached at its
+/// `url` (`type` "http"). Read loosely: ACP's `anyOf` has no single shape.
+pub const McpServer = struct {
+    type: ?[]const u8 = null,
+    name: []const u8,
+    command: ?[]const u8 = null,
+    args: []const []const u8 = &.{},
+    env: []const NameValue = &.{},
+    url: ?[]const u8 = null,
+    headers: []const NameValue = &.{},
+};
+
+pub const NameValue = struct { name: []const u8, value: []const u8 };
 
 pub const SessionSetup = struct {
     sessionId: []const u8,

@@ -35,6 +35,7 @@ const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 const SignInTask = @import("../provider/chatgpt_sign_in.zig");
 const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
+const mcp_tools = @import("../tools/mcp.zig");
 const skill_tool = @import("../tools/skill.zig");
 const shell = @import("../tools/shell.zig");
 const tool = @import("../tools/tool.zig");
@@ -282,7 +283,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
         if (connection.guest) return error.HostsOneSession;
         const request = try rpc.parse(protocol.NewSession, arena, params);
         if (!std.fs.path.isAbsolute(request.cwd)) return error.RelativeCwd;
-        const session = try self.open(request.cwd, null);
+        const session = try self.open(request.cwd, null, try mcpServers(arena, request.mcpServers));
         return connection.reply(asked, protocol.SessionSetup{
             .sessionId = session.handle,
             .modes = session.modes(),
@@ -296,7 +297,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
             _ = try self.sessionFor(request.sessionId);
             self.detached = false;
         }
-        const session = try self.open(request.cwd, request.sessionId);
+        const session = try self.open(request.cwd, request.sessionId, try mcpServers(arena, request.mcpServers));
         if (loads and connection.dialect == .standard) try session.replay(arena, connection);
         return connection.reply(asked, protocol.Loaded{
             .modes = session.modes(),
@@ -441,10 +442,39 @@ fn sessionFor(self: *Agent, id: []const u8) !*Session {
     return session;
 }
 
+/// The servers a client asked for, as synth reaches them. One synth cannot
+/// reach (SSE) is left out rather than failing the session.
+fn mcpServers(arena: std.mem.Allocator, wanted: []const protocol.McpServer) ![]const mcp_tools.Server {
+    var servers: std.ArrayList(mcp_tools.Server) = .empty;
+    for (wanted) |server| {
+        if (server.name.len == 0) continue;
+        const transport = try transportOf(arena, server) orelse continue;
+        try servers.append(arena, .{ .name = server.name, .transport = transport });
+    }
+    return servers.items;
+}
+
+fn transportOf(arena: std.mem.Allocator, server: protocol.McpServer) !?mcp_tools.Server.Transport {
+    if (server.command) |command| return .{ .stdio = .{
+        .command = command,
+        .args = server.args,
+        .env = try pairs(mcp_tools.Server.EnvPair, arena, server.env),
+    } };
+    const url = server.url orelse return null;
+    if (!std.mem.eql(u8, server.type orelse "", "http")) return null;
+    return .{ .http = .{ .url = url, .headers = try pairs(std.http.Header, arena, server.headers) } };
+}
+
+fn pairs(comptime Pair: type, arena: std.mem.Allocator, given: []const protocol.NameValue) ![]const Pair {
+    const out = try arena.alloc(Pair, given.len);
+    for (given, out) |pair, *converted| converted.* = .{ .name = pair.name, .value = pair.value };
+    return out;
+}
+
 /// Make the session in `cwd` - a new one, or the stored one `handle` names -
 /// the live one, and send every synth client its snapshot. A session already
-/// live is kept rather than built again.
-fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8) !*Session {
+/// live is kept rather than built again, with the MCP servers it has.
+fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8, servers: []const mcp_tools.Server) !*Session {
     if (handle) |wanted| {
         if (self.session) |session| {
             if (std.mem.eql(u8, session.handle, wanted)) {
@@ -474,7 +504,7 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8) !*Session {
     try db.takeLease(taken, self.pid);
     errdefer db.releaseLease(taken, self.pid) catch {};
     self.closeSession();
-    const session = try Session.create(self, id, taken, where);
+    const session = try Session.create(self, id, taken, where, servers);
     self.session = session;
     self.renewed_at = db.nowMs();
     try self.share(session);
@@ -1266,7 +1296,7 @@ const Session = struct {
 
     /// The stored session `id`, or a new one, whose row is made once there is
     /// anything to keep in it, as on master.
-    fn create(agent: *Agent, id: ?i64, handle: []const u8, cwd: []const u8) !*Session {
+    fn create(agent: *Agent, id: ?i64, handle: []const u8, cwd: []const u8, servers: []const mcp_tools.Server) !*Session {
         const allocator = agent.allocator;
         const io = agent.io;
         const options = agent.options;
@@ -1298,6 +1328,7 @@ const Session = struct {
             .db = options.db,
             .mcp_auth = if (self.mcp_auth) |*store| store else null,
             .mcp_connect = .background,
+            .mcp_servers = servers,
         });
         errdefer self.stack.destroy();
         self.stack.convo.max_messages = max_messages;
@@ -2674,6 +2705,31 @@ test "a resumed session is not replayed, and a deleted one is gone" {
     for (listed.sessions) |info| try testing.expect(!std.mem.eql(u8, info.sessionId, session));
     const again = try client.request(protocol.method.session_delete, protocol.SessionId{ .sessionId = session });
     try testing.expectEqualStrings("no such session", (try client.expectError(again)).message);
+}
+
+test "the MCP servers a client brings join the session's, but for those synth cannot reach" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    const arena = client.arena.allocator();
+    const initialized = try rpc.parse(protocol.Initialized, arena, try client.expectResult(try client.request(protocol.method.initialize, protocol.Initialize{
+        .protocolVersion = protocol.version,
+    })));
+    try testing.expect(initialized.agentCapabilities.mcpCapabilities.http);
+
+    _ = try client.expectResult(try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project, .mcpServers = &.{
+        .{ .name = "editor", .command = "definitely-not-a-real-program-xyz", .env = &.{.{ .name = "TOKEN", .value = "t" }} },
+        .{ .type = "http", .name = "docs", .url = "http://127.0.0.1:9/mcp", .headers = &.{.{ .name = "Authorization", .value = "Bearer k" }} },
+        .{ .type = "sse", .name = "old", .url = "http://127.0.0.1:9/sse" },
+    } }));
+
+    const servers = fixture.agent.session.?.stack.mcp_host.servers;
+    try testing.expectEqual(@as(usize, 2), servers.len);
+    try testing.expectEqualStrings("editor", servers[0].name);
+    try testing.expectEqualStrings("TOKEN", servers[0].transport.stdio.env[0].name);
+    try testing.expectEqualStrings("docs", servers[1].name);
+    try testing.expectEqualStrings("Bearer k", servers[1].transport.http.headers[0].value);
 }
 
 test "a client that keeps terminals runs commands in one, shown in the call's card" {

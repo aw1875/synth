@@ -66,6 +66,38 @@ pub const Server = struct {
     };
 
     pub const EnvPair = struct { name: []const u8, value: []const u8 };
+
+    pub fn dupe(self: Server, arena: std.mem.Allocator) !Server {
+        return .{
+            .name = try arena.dupe(u8, self.name),
+            .enabled = self.enabled,
+            .transport = switch (self.transport) {
+                .stdio => |stdio| .{ .stdio = .{
+                    .command = try arena.dupe(u8, stdio.command),
+                    .args = try dupeStrings(arena, stdio.args),
+                    .env = try dupePairs(EnvPair, arena, stdio.env),
+                    .cwd = if (stdio.cwd) |cwd| try arena.dupe(u8, cwd) else null,
+                } },
+                .http => |http| .{ .http = .{
+                    .url = try arena.dupe(u8, http.url),
+                    .headers = try dupePairs(std.http.Header, arena, http.headers),
+                    .scopes = try dupeStrings(arena, http.scopes),
+                } },
+            },
+        };
+    }
+
+    fn dupeStrings(arena: std.mem.Allocator, strings: []const []const u8) ![]const []const u8 {
+        const out = try arena.alloc([]const u8, strings.len);
+        for (strings, out) |string, *copy| copy.* = try arena.dupe(u8, string);
+        return out;
+    }
+
+    fn dupePairs(comptime Pair: type, arena: std.mem.Allocator, pairs: []const Pair) ![]const Pair {
+        const out = try arena.alloc(Pair, pairs.len);
+        for (pairs, out) |pair, *copy| copy.* = .{ .name = try arena.dupe(u8, pair.name), .value = try arena.dupe(u8, pair.value) };
+        return out;
+    }
 };
 
 /// What to tell someone about a server that would not start.

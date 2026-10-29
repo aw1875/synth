@@ -56,6 +56,9 @@ pub const Options = struct {
     db: ?*Database = null,
     mcp_auth: ?*mcp.Auth = null,
     mcp_stderr: mcp.Transport.Stderr = .ignore,
+    /// Servers to connect beside the config's, such as those an editor
+    /// brings. Copied. A config server of the same name wins.
+    mcp_servers: []const mcp_tools.Server = &.{},
     /// Wait for the MCP servers, so their tools are offered from the first
     /// turn, or leave them connecting for the owner to `install` once
     /// `mcp_host` has settled.
@@ -88,8 +91,8 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     errdefer self.mcp_host.deinit();
     self.mcp_host.auth = options.mcp_auth;
     self.mcp_host.stderr = options.mcp_stderr;
-    if (config.mcp) |block| {
-        const servers = try mcp_tools.serversFromJson(self.arena.allocator(), block);
+    const servers = try mcpServers(self.arena.allocator(), config, options.mcp_servers);
+    if (servers.len > 0) {
         const client: mcp.Implementation = .{ .name = pkg.name, .version = pkg.version };
         switch (options.mcp_connect) {
             .wait => try self.mcp_host.connectAll(&self.registry, servers, client),
@@ -130,6 +133,25 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
         try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
     return self;
+}
+
+fn mcpServers(arena: std.mem.Allocator, config: *const Config, extra: []const mcp_tools.Server) ![]const mcp_tools.Server {
+    const configured = if (config.mcp) |block| try mcp_tools.serversFromJson(arena, block) else &.{};
+    if (extra.len == 0) return configured;
+    var servers: std.ArrayList(mcp_tools.Server) = .empty;
+    try servers.appendSlice(arena, configured);
+    for (extra) |server| {
+        if (named(configured, server.name)) continue;
+        try servers.append(arena, try server.dupe(arena));
+    }
+    return servers.items;
+}
+
+fn named(servers: []const mcp_tools.Server, name: []const u8) bool {
+    for (servers) |server| {
+        if (std.mem.eql(u8, server.name, name)) return true;
+    }
+    return false;
 }
 
 pub fn destroy(self: *Stack) void {
