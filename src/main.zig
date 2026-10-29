@@ -12,6 +12,7 @@ const Connection = @import("acp/connection.zig");
 const Mirror = @import("acp/mirror.zig");
 const headless = @import("headless.zig");
 const prompt_dump = @import("prompt_dump.zig");
+const remote = @import("remote.zig");
 const tui_drive = @import("tui/drive.zig");
 
 // We don't want to see the log messages from the libraries we use
@@ -32,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     switch (command) {
         .help => |topic| try writeLine(init.io, cli.usageFor(topic)),
         .version => try writeLine(init.io, pkg.name ++ " " ++ pkg.version ++ "\n"),
-        .tui => |options| if (try runTui(init, options)) |left| try sayFarewell(init.io, left),
+        .tui => |options| if (try runTui(init, options)) |left| try tui_drive.sayFarewell(init.io, null, left),
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
         .acp => try acp.run(init),
@@ -41,30 +42,8 @@ pub fn main(init: std.process.Init) !void {
         .session => |sub| try commands.session(init, sub),
         .mcp => |sub| try commands.mcp_command(init, sub),
         .db => |sub| try commands.database(init, sub),
+        .remote => |sub| try remote.run(init, sub),
     }
-}
-
-/// How to come back to the session just left.
-fn sayFarewell(io: std.Io, left: tui_drive.Left) !void {
-    var buffer: [256]u8 = undefined;
-    var out = std.Io.File.stdout().writer(io, &buffer);
-    if (left.detached) {
-        try out.interface.print(
-            \\
-            \\Session {1s} is still running
-            \\  {0s} --session {1s}   attach to it from anywhere
-            \\
-        , .{ pkg.name, left.handle });
-    } else {
-        try out.interface.print(
-            \\
-            \\Session {1s}
-            \\  {0s} --continue               resume it here
-            \\  {0s} --session {1s}   resume it from anywhere
-            \\
-        , .{ pkg.name, left.handle });
-    }
-    try out.interface.flush();
 }
 
 fn writeLine(io: std.Io, text: []const u8) !void {

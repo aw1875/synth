@@ -61,6 +61,80 @@ pub fn spawn(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !*Connec
     return self;
 }
 
+/// Keep the exec channel a clean byte stream: no tty and so no banner in it,
+/// and no `RemoteCommand` or `LocalCommand` from the person's config standing
+/// in for the bridge. The keepalives notice a dead link in under a minute.
+const ssh_options = [_][]const u8{
+    "-T",
+    "-o",
+    "RequestTTY=no",
+    "-o",
+    "RemoteCommand=none",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+};
+
+/// Reach the sessions on `host` through `synth remote bridge` there: over ssh,
+/// so its config, keys, agents and jump hosts all apply, or directly for
+/// `here`. ssh's stderr is the terminal's, so a password or host-key prompt
+/// works as it always does.
+pub fn toHost(allocator: std.mem.Allocator, io: std.Io, host: []const u8) !*Connection {
+    const exe = try std.process.executablePathAlloc(io, allocator);
+    defer allocator.free(exe);
+    const argv = try bridgeCommand(allocator, host, exe);
+    defer allocator.free(argv);
+    const child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    const self = try create(allocator, io, .{ .child = child });
+    self.reader = child.stdout.?.readerStreaming(io, &self.read_buffer);
+    self.writer = child.stdin.?.writerStreaming(io, &self.write_buffer);
+    return self;
+}
+
+/// `--` before the host keeps one that starts with `-` from being read as an
+/// option.
+fn bridgeCommand(allocator: std.mem.Allocator, host: []const u8, exe: []const u8) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+    if (std.mem.eql(u8, host, here)) {
+        try argv.append(allocator, exe);
+    } else {
+        try argv.append(allocator, "ssh");
+        try argv.appendSlice(allocator, &ssh_options);
+        try argv.appendSlice(allocator, &.{ "--", host, pkg.name });
+    }
+    try argv.appendSlice(allocator, &.{ "remote", "bridge" });
+    return argv.toOwnedSlice(allocator);
+}
+
+test "a host is reached through ssh, this machine directly" {
+    const testing = std.testing;
+
+    const remote = try bridgeCommand(testing.allocator, "devbox", "/bin/" ++ pkg.name);
+    defer testing.allocator.free(remote);
+    try testing.expectEqualStrings("ssh", remote[0]);
+    try testing.expectEqualStrings("-T", remote[1]);
+    const tail = remote[remote.len - 5 ..];
+    const expected = [_][]const u8{ "--", "devbox", pkg.name, "remote", "bridge" };
+    for (expected, tail) |want, got| try testing.expectEqualStrings(want, got);
+
+    const local = try bridgeCommand(testing.allocator, here, "/bin/" ++ pkg.name);
+    defer testing.allocator.free(local);
+    const direct = [_][]const u8{ "/bin/" ++ pkg.name, "remote", "bridge" };
+    try testing.expectEqual(direct.len, local.len);
+    for (direct, local) |want, got| try testing.expectEqualStrings(want, got);
+}
+
 /// Talk over a socket already connected to an agent. The connection owns it.
 pub fn overSocket(allocator: std.mem.Allocator, io: std.Io, socket: std.Io.File) !*Connection {
     const self = try create(allocator, io, .{ .socket = socket });

@@ -18,6 +18,7 @@ pub const Command = union(enum) {
     prompt,
     /// Speak ACP on stdio, for an editor or the TUI.
     acp,
+    remote: Remote,
     /// Null for the whole menu, or the subcommand whose `-h` asked.
     help: ?Topic,
     version,
@@ -49,6 +50,15 @@ pub const Command = union(enum) {
         debug: []const u8,
         enable: []const u8,
         disable: []const u8,
+    };
+
+    /// Sessions on another machine, reached over ssh. `.` is this one.
+    pub const Remote = union(enum) {
+        list: []const u8,
+        connect: struct { host: []const u8, session: ?[]const u8 = null },
+        new: struct { host: []const u8, dir: []const u8 = "~" },
+        /// What ssh runs at the far end: this machine's sessions on stdio.
+        bridge,
     };
 
     pub const Session = union(enum) {
@@ -99,6 +109,14 @@ const session_params = clap.parseParamsComptime(
     \\
 );
 
+const remote_params = clap.parseParamsComptime(
+    \\-h, --help    show this help and exit
+    \\<str>         list, connect, new, or bridge
+    \\<str>         the host, as ssh knows it, or . for this machine
+    \\<str>         for connect: the session; for new: the directory
+    \\
+);
+
 const run_params = clap.parseParamsComptime(
     \\-h, --help     show this help and exit
     \\--allow        approve tool calls that would otherwise be denied
@@ -114,7 +132,7 @@ const subcommand_flags = std.StaticStringMap([]const u8).initComptime(.{
 
 /// Subcommand names. Anything else in the first position is a directory.
 const known = std.StaticStringMap(void).initComptime(.{
-    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"}, .{"acp"},
+    .{"session"}, .{"run"}, .{"models"}, .{"prompt"}, .{"mcp"}, .{"skills"}, .{"db"}, .{"acp"}, .{"remote"},
 });
 
 pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
@@ -148,6 +166,7 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
             if (std.mem.eql(u8, word, "models")) return .models;
             if (std.mem.eql(u8, word, "skills")) return .skills;
             if (std.mem.eql(u8, word, "acp")) return .acp;
+            if (std.mem.eql(u8, word, "remote")) return parseRemote(init, allocator, &iter);
             return .prompt;
         }
     }
@@ -214,6 +233,34 @@ fn parseMcp(
     if (std.mem.eql(u8, verb, "disable")) return .{ .mcp = .{ .disable = owned } };
 
     return error.UnknownSubcommand;
+}
+
+fn parseRemote(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    iter: *std.process.Args.Iterator,
+) !Command {
+    var diag: clap.Diagnostic = .{};
+    var res = clap.parseEx(clap.Help, &remote_params, clap.parsers.default, iter, .{
+        .diagnostic = &diag,
+        .allocator = init.gpa,
+    }) catch |err| {
+        try diag.reportToFile(init.io, .stderr(), err);
+        return err;
+    };
+    defer res.deinit();
+
+    if (res.args.help != 0) return .{ .help = .remote };
+
+    const verb = res.positionals[0] orelse return .{ .help = .remote };
+    if (std.mem.eql(u8, verb, "bridge")) return .{ .remote = .bridge };
+
+    const host = try allocator.dupe(u8, res.positionals[1] orelse return error.MissingHost);
+    const target = try dupeOptional(allocator, res.positionals[2]);
+    if (std.mem.eql(u8, verb, "list") or std.mem.eql(u8, verb, "ls")) return .{ .remote = .{ .list = host } };
+    if (std.mem.eql(u8, verb, "connect")) return .{ .remote = .{ .connect = .{ .host = host, .session = target } } };
+    if (std.mem.eql(u8, verb, "new")) return .{ .remote = .{ .new = .{ .host = host, .dir = target orelse "~" } } };
+    return error.UnknownRemoteCommand;
 }
 
 fn parseSession(
@@ -313,6 +360,7 @@ pub const Topic = enum {
     session,
     mcp,
     db,
+    remote,
 
     fn word(self: Topic) []const u8 {
         return @tagName(self);
@@ -358,6 +406,10 @@ const help_sections: []const Section = &.{
             .{ .left = "models", .right = "models the provider offers" },
             .{ .left = "prompt", .right = "print the system prompt" },
             .{ .left = "acp", .right = "speak the Agent Client Protocol on stdio" },
+            .{ .left = "remote list <host>", .right = "sessions on a host, the running ones marked (. is this machine)" },
+            .{ .left = "remote connect <host> [session]", .right = "drive a session on a host in the TUI" },
+            .{ .left = "remote new <host> [dir]", .right = "start a session on a host, in your home there by default" },
+            .{ .left = "remote bridge", .right = "this machine's sessions on stdio (what ssh runs)" },
         },
     },
     .{

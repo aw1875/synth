@@ -2041,7 +2041,7 @@ pub const Client = struct {
     arena: std.heap.ArenaAllocator,
     next_id: i64 = 1,
 
-    fn create(file: std.Io.File) !*Client {
+    pub fn create(file: std.Io.File) !*Client {
         const self = try testing.allocator.create(Client);
         self.* = .{ .file = file, .reader = undefined, .writer = undefined, .lines = .init(testing.allocator), .arena = .init(testing.allocator) };
         self.reader = file.readerStreaming(testing.io, &self.read_buffer);

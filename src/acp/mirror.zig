@@ -307,6 +307,12 @@ fn reach(self: *Mirror, handle: []const u8) !?*Connection {
     return try Connection.overSocket(self.allocator, self.io, socket);
 }
 
+/// Whether a session another process hosts is attached to here, rather than
+/// through the agent at the far end.
+pub fn attachesHere(self: *const Mirror) bool {
+    return self.socket_dir != null;
+}
+
 /// Leave this session for `handle`, which another process hosts, attaching
 /// to it there. This one ends as quitting would end it. Failing, it stays.
 pub fn attach(self: *Mirror, handle: []const u8) !void {
@@ -491,10 +497,10 @@ pub fn poll(self: *Mirror) !bool {
             if (self.lost_heard) return changed;
             self.lost_heard = true;
             self.ended = true;
-            if (std.mem.eql(u8, self.host, Connection.here)) {
+            if (self.socket_dir != null) {
                 try self.say("The agent running this session has stopped. Pick it up again with: synth --session {s}", .{self.status.handle});
             } else {
-                try self.say("Lost the connection to {s}.", .{self.host});
+                try self.say("The connection to {s} was lost. Pick the session up again with: synth remote connect {s} {s}", .{ self.host, self.host, self.status.handle });
             }
             return true;
         }

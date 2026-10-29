@@ -2,6 +2,7 @@
 
 const std = @import("std");
 
+const pkg = @import("pkg");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -20,6 +21,10 @@ const themes = @import("themes.zig");
 pub const Options = struct {
     /// Switch the session to this model once it is open.
     model: ?[]const u8 = null,
+    /// Attach to a session another process hosts on its socket here. Off
+    /// when sessions are reached through a host's bridge, which does that
+    /// at its end.
+    attach_here: bool = true,
 };
 
 /// How a TUI left its session.
@@ -74,7 +79,7 @@ pub fn drive(
     };
 
     var failure: Connection.Diagnostic = .{};
-    const socket_dir = try sockets.dir(init.arena.allocator(), init.environ_map);
+    const socket_dir = if (options.attach_here) try sockets.dir(init.arena.allocator(), init.environ_map) else null;
     handed = true;
     const mirror = Mirror.open(allocator, io, connection, &model.conversation, host, socket_dir, target, &failure) catch |err| {
         model.conversation.deinit();
@@ -105,6 +110,43 @@ pub fn drive(
         .spoken = mirror.spoken,
         .detached = mirror.detached,
     };
+}
+
+/// How to come back to the session just left: on `host` through its
+/// bridge, or here when null.
+pub fn sayFarewell(io: std.Io, host: ?[]const u8, left: Left) !void {
+    var buffer: [512]u8 = undefined;
+    var out = std.Io.File.stdout().writer(io, &buffer);
+    const name = pkg.name;
+    if (host) |remote| {
+        if (left.detached) {
+            try out.interface.print("\nSession {s} is still running on {s}\n", .{ left.handle, remote });
+        } else {
+            try out.interface.print("\nSession {s}\n", .{left.handle});
+        }
+        try out.interface.print("  {s} remote connect {s} {s}   {s}\n", .{
+            name,
+            remote,
+            left.handle,
+            if (left.detached) "attach to it" else "resume it",
+        });
+    } else if (left.detached) {
+        try out.interface.print(
+            \\
+            \\Session {1s} is still running
+            \\  {0s} --session {1s}   attach to it from anywhere
+            \\
+        , .{ name, left.handle });
+    } else {
+        try out.interface.print(
+            \\
+            \\Session {1s}
+            \\  {0s} --continue               resume it here
+            \\  {0s} --session {1s}   resume it from anywhere
+            \\
+        , .{ name, left.handle });
+    }
+    try out.interface.flush();
 }
 
 fn complain(io: std.Io, message: []const u8) !void {

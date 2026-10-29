@@ -74,6 +74,9 @@ synth skills                   skills on offer, and where they came from
 synth models                   models the provider offers
 synth prompt                   print the system prompt
 synth acp                      speak the Agent Client Protocol on stdio
+synth remote list <host>       sessions on a host over ssh (. is this machine)
+synth remote connect <host>    drive one in the TUI: name its id, or pick
+synth remote new <host> [dir]  start one there, in your home by default
 
   -c, --continue               resume the most recent session here
   -s, --session <id>           resume a session by handle (ses_7k3f9a2b)
@@ -92,6 +95,14 @@ Quitting stops the session, a turn in progress included. `/detach` leaves it
 running instead: `synth --session <id>`, `--continue` or `/sessions` attach to
 it again from any terminal, and quitting from there stops it. Each session
 listens on a socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`.
+
+`synth remote` reaches the sessions on another machine the same way, over
+ssh: your ssh config, keys and jump hosts apply, and synth must be on the far
+end's `PATH`. There `synth remote bridge` attaches to a running session or
+starts `synth acp` under your login shell, so tools see the environment a
+login there would. `/detach` keeps a remote session running after you
+disconnect, and `synth remote connect <host>` with no id offers the sessions
+there to pick from.
 
 ## Keys
 

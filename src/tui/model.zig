@@ -803,7 +803,7 @@ fn holdImage(self: *Model, bytes: []const u8, label: []const u8) void {
 /// one's transcript arrives on a later tick.
 pub fn switchSession(self: *Model, chosen: Database.SessionInfo) !void {
     if (std.mem.eql(u8, self.mirror.status.handle, chosen.public_id)) return;
-    if (chosen.live) {
+    if (chosen.live and self.mirror.attachesHere()) {
         try self.mirror.attach(chosen.public_id);
     } else {
         try self.mirror.switchTo(chosen.public_id);
