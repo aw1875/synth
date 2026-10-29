@@ -262,7 +262,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     if (eql(u8, method, protocol.method.session_close)) {
         _ = try self.sessionFor((try rpc.parse(protocol.SessionId, arena, params)).sessionId);
         self.closeSession();
-        return connection.reply(asked, .{});
+        return connection.reply(asked, protocol.Empty{});
     }
     if (eql(u8, method, protocol.method.session_prompt)) {
         const request = try rpc.parse(protocol.Prompt, arena, params);
@@ -280,7 +280,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
         const session = try self.sessionFor(request.sessionId);
         if (session.stack.loop.isBusy()) return error.Busy;
         try session.stack.loop.useAgent(request.modeId);
-        return connection.reply(asked, .{});
+        return connection.reply(asked, protocol.Empty{});
     }
     if (eql(u8, method, protocol.method.session_set_config_option)) {
         const request = try rpc.parse(protocol.SetConfigOption, arena, params);
@@ -334,7 +334,7 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         const asked = try rpc.parse(synth.Search, arena, params);
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
     } else return error.MethodNotFound;
-    connection.reply(id, .{});
+    connection.reply(id, protocol.Empty{});
 }
 
 fn need(id: ?rpc.Id) !rpc.Id {

@@ -146,6 +146,9 @@ pub const Prompted = struct {
     stopReason: StopReason,
 };
 
+/// A result with nothing to say. An empty literal would encode as `[]`.
+pub const Empty = struct {};
+
 pub const SessionId = struct {
     sessionId: []const u8,
 };
