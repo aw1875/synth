@@ -37,9 +37,10 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
     var db = Database{ .conn = conn, .io = io };
     errdefer db.deinit();
 
+    // First, so that switching a new database to WAL waits out another process creating it.
+    conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
     conn.execNoArgs("PRAGMA journal_mode = WAL") catch {};
     conn.execNoArgs("PRAGMA synchronous = NORMAL") catch {};
-    conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
     conn.execNoArgs("PRAGMA foreign_keys = ON") catch {};
 
     try db.migrate();
@@ -1283,6 +1284,38 @@ fn searchFixture(dir: *std.testing.TmpDir) !struct { db: Database, project_id: i
     _ = try db.appendMessage(other_session, 0, "user", "cancel this too", null, 0);
 
     return .{ .db = db, .project_id = project_id };
+}
+
+test "two processes opening a new database at once both get it, migrated once" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+
+    for (0..10) |round| {
+        var name: [16]u8 = undefined;
+        const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], try std.fmt.bufPrint(&name, "{d}.db", .{round}) });
+        defer testing.allocator.free(db_path);
+
+        const Opener = struct {
+            path: []const u8,
+            failed: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                var db = init(testing.allocator, testing.io, self.path) catch |err| {
+                    self.failed = err;
+                    return;
+                };
+                db.deinit();
+            }
+        };
+        var openers = [_]Opener{ .{ .path = db_path }, .{ .path = db_path } };
+        var threads: [openers.len]std.Thread = undefined;
+        for (&openers, &threads) |*opener, *thread| thread.* = try std.Thread.spawn(.{}, Opener.run, .{opener});
+        for (threads) |thread| thread.join();
+        for (openers) |opener| try testing.expectEqual(null, opener.failed);
+    }
 }
 
 test "a search finds messages whatever their case, within the project" {
