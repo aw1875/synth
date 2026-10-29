@@ -267,6 +267,9 @@ pub const Stored = struct {
     messages: u64 = 0,
     /// Milliseconds since the epoch.
     updated_at: i64 = 0,
+    /// Hosted by a process right now, so it is attached to rather than
+    /// loaded.
+    live: bool = false,
 };
 
 /// What a subagent said: its transcript, oldest first.

@@ -2,6 +2,7 @@
 //! remembered approvals.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const zqlite = @import("zqlite");
 
@@ -492,6 +493,64 @@ pub fn countMessages(self: *Database, session_id: i64) !u64 {
 /// Delete a session and everything hanging off it.
 pub fn deleteSession(self: *Database, session_id: i64) !void {
     try self.conn.exec("DELETE FROM session WHERE id = ?", .{session_id});
+}
+
+/// How long a lease outlives its holder's last renewal.
+pub const lease_ttl_ms: i64 = 30 * std.time.ms_per_s;
+
+/// Make process `pid` the host of session `public_id`, or renew its lease.
+/// `error.SessionHeld` when another process holds it.
+pub fn takeLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
+    try self.conn.execNoArgs("begin immediate");
+    errdefer self.conn.rollback();
+    const now = self.nowMs();
+    if (try self.conn.row("SELECT pid, heartbeat_at FROM lease WHERE public_id = ?", .{public_id})) |row| {
+        defer row.deinit();
+        const holder: std.posix.pid_t = @intCast(row.int(0));
+        if (holder != pid and isLive(holder, row.int(1), now)) return error.SessionHeld;
+    }
+    try self.conn.exec(
+        \\INSERT INTO lease (public_id, pid, heartbeat_at) VALUES (?, ?, ?)
+        \\ON CONFLICT(public_id) DO UPDATE SET pid = excluded.pid, heartbeat_at = excluded.heartbeat_at
+    , .{ public_id, @as(i64, pid), now });
+    try self.conn.commit();
+}
+
+/// Keep `pid`'s lease on `public_id` from going stale.
+pub fn renewLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
+    try self.conn.exec("UPDATE lease SET heartbeat_at = ? WHERE public_id = ? AND pid = ?", .{ self.nowMs(), public_id, @as(i64, pid) });
+}
+
+pub fn releaseLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
+    try self.conn.exec("DELETE FROM lease WHERE public_id = ? AND pid = ?", .{ public_id, @as(i64, pid) });
+}
+
+/// The handles of the sessions some process is hosting right now. Caller
+/// owns the result.
+pub fn heldSessions(self: *Database, allocator: std.mem.Allocator) ![][]const u8 {
+    var rows = try self.conn.rows("SELECT public_id, pid, heartbeat_at FROM lease", .{});
+    defer rows.deinit();
+    const now = self.nowMs();
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |handle| allocator.free(handle);
+        list.deinit(allocator);
+    }
+    while (rows.next()) |row| {
+        if (!isLive(@intCast(row.int(1)), row.int(2), now)) continue;
+        try list.append(allocator, try allocator.dupe(u8, row.text(0)));
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+/// A lease is held while it is renewed and its process is still there. The
+/// process check frees a crashed holder's sessions at once rather than after
+/// the time to live; the renewal frees them once its pid has gone to another.
+fn isLive(pid: std.posix.pid_t, heartbeat_at: i64, now: i64) bool {
+    if (now - heartbeat_at > lease_ttl_ms) return false;
+    const probe: std.posix.SIG = @enumFromInt(0);
+    const rc = if (builtin.os.tag == .linux) std.os.linux.kill(pid, probe) else std.c.kill(pid, probe);
+    return std.posix.errno(rc) != .SRCH;
 }
 
 /// Append a message row and return its id. Heavy bodies (reasoning, tool
@@ -1328,6 +1387,41 @@ test "two processes opening a new database at once both get it, migrated once" {
         for (threads) |thread| thread.join();
         for (openers) |opener| try testing.expectEqual(null, opener.failed);
     }
+}
+
+test "a session is hosted by one live process at a time" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], "lease.db" });
+    defer testing.allocator.free(db_path);
+    var db = try init(testing.allocator, testing.io, db_path);
+    defer db.deinit();
+
+    const us: std.posix.pid_t = if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+    const init_pid: std.posix.pid_t = 1;
+    try db.takeLease("ses_ours", us);
+    try db.takeLease("ses_ours", us);
+    try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
+
+    try db.takeLease("ses_theirs", init_pid);
+    try testing.expectError(error.SessionHeld, db.takeLease("ses_theirs", us));
+    const held = try db.heldSessions(testing.allocator);
+    defer {
+        for (held) |handle| testing.allocator.free(handle);
+        testing.allocator.free(held);
+    }
+    try testing.expectEqual(2, held.len);
+
+    try db.conn.exec("UPDATE lease SET heartbeat_at = ? WHERE public_id = 'ses_theirs'", .{db.nowMs() - lease_ttl_ms - 1});
+    try db.takeLease("ses_theirs", us);
+
+    try db.releaseLease("ses_ours", init_pid);
+    try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
+    try db.releaseLease("ses_ours", us);
+    try db.takeLease("ses_ours", init_pid);
 }
 
 test "a search finds messages whatever their case, within the project" {
