@@ -10,6 +10,7 @@ const pkg = @import("pkg");
 const mcp = @import("mcp");
 
 const Backend = @import("../provider/backend.zig");
+const Provider = @import("../provider/provider.zig");
 const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
@@ -43,19 +44,25 @@ loop: Loop,
 
 pub const Options = struct {
     config: *const Config,
-    /// The client this session's turns go through, and the one its subagents
-    /// are spawned from. Never shared with another session.
-    backend: *Backend,
+    /// What this session's turns go through. Never shared with another
+    /// session: a client is single-writer.
+    provider: Provider,
+    /// Where subagents get clients of their own. Null leaves them on
+    /// `provider`.
+    backend: ?*Backend = null,
     /// Where the session runs; the project is whatever repository holds it.
     cwd: []const u8,
     home: ?[]const u8 = null,
     db: ?*Database = null,
     mcp_auth: ?*mcp.Auth = null,
     mcp_stderr: mcp.Transport.Stderr = .ignore,
+    /// Wait for the MCP servers, so their tools are offered from the first
+    /// turn, or leave them connecting for the owner to `install` once
+    /// `mcp_host` has settled.
+    mcp_connect: enum { wait, background } = .wait,
 };
 
-/// Build a session, connecting its MCP servers before the first schema is
-/// built, so their tools are advertised from the first turn.
+/// Build a session, reaching its MCP servers as `options.mcp_connect` says.
 pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stack {
     const config = options.config;
 
@@ -83,7 +90,11 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.mcp_host.stderr = options.mcp_stderr;
     if (config.mcp) |block| {
         const servers = try mcp_tools.serversFromJson(self.arena.allocator(), block);
-        try self.mcp_host.connectAll(&self.registry, servers, .{ .name = pkg.name, .version = pkg.version });
+        const client: mcp.Implementation = .{ .name = pkg.name, .version = pkg.version };
+        switch (options.mcp_connect) {
+            .wait => try self.mcp_host.connectAll(&self.registry, servers, client),
+            .background => try self.mcp_host.beginConnectAll(servers, client),
+        }
     }
 
     self.reads = .init(allocator);
@@ -91,7 +102,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     self.convo = .init(allocator);
     errdefer self.convo.deinit();
 
-    self.loop = .init(allocator, io, options.backend.provider(), &self.registry, &self.convo, &self.reads, self.project.root);
+    self.loop = .init(allocator, io, options.provider, &self.registry, &self.convo, &self.reads, self.project.root);
     self.runner = .{ .parent = &self.loop, .backend = options.backend };
     self.loop.delegate = self.runner.delegate();
     errdefer {
@@ -116,7 +127,7 @@ pub fn create(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stac
     try self.loop.useAgent(agents.default_id);
 
     if (options.db) |db| {
-        try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.backend.model());
+        try self.loop.attachDatabase(db, self.project.name(), self.project.cwd, options.provider.model);
     }
     return self;
 }
@@ -154,7 +165,7 @@ test "a stack assembles a loop ready for its first turn" {
     });
     defer backend.deinit();
 
-    const stack = try create(testing.allocator, io, .{ .config = &config, .backend = &backend, .cwd = cwd });
+    const stack = try create(testing.allocator, io, .{ .config = &config, .provider = backend.provider(), .backend = &backend, .cwd = cwd });
     defer stack.destroy();
 
     try testing.expectEqualStrings(cwd, stack.project.cwd);
