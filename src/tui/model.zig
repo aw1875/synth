@@ -798,12 +798,16 @@ fn holdImage(self: *Model, bytes: []const u8, label: []const u8) void {
     self.input.insertText(token) catch {};
 }
 
-/// Swap the transcript for another session's, without leaving. A turn in
-/// progress carries on on the server, and the other session's transcript
-/// arrives on a later tick.
+/// Swap the transcript for another session's, ending this one as quitting
+/// would. A session another process hosts is attached to there; a stored
+/// one's transcript arrives on a later tick.
 pub fn switchSession(self: *Model, chosen: Database.SessionInfo) !void {
     if (std.mem.eql(u8, self.mirror.status.handle, chosen.public_id)) return;
-    try self.mirror.switchTo(chosen.public_id);
+    if (chosen.live) {
+        try self.mirror.attach(chosen.public_id);
+    } else {
+        try self.mirror.switchTo(chosen.public_id);
+    }
     self.input.clear();
     self.held.clear();
 }

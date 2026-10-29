@@ -33,10 +33,6 @@ pub const Served = struct {
         const fixture = try Agent.Fixture.create();
         errdefer fixture.destroy();
 
-        const connection = try Connection.overSocket(testing.allocator, testing.io, try fixture.socket());
-        var attached = false;
-        defer if (!attached) connection.close();
-
         const model = try testing.allocator.create(Model);
         errdefer testing.allocator.destroy(model);
         model.* = .{
@@ -47,14 +43,14 @@ pub const Served = struct {
             .cwd = try testing.allocator.dupe(u8, ""),
             .cwd_display = try testing.allocator.dupe(u8, "test"),
         };
-        model.mirror = Mirror.open(testing.allocator, testing.io, connection, &model.conversation, Connection.here, .{ .new = fixture.project }, null) catch |err| {
+        const connection = try Connection.overSocket(testing.allocator, testing.io, try fixture.socket());
+        model.mirror = Mirror.open(testing.allocator, testing.io, connection, &model.conversation, Connection.here, null, .{ .new = fixture.project }, null) catch |err| {
             model.conversation.deinit();
             model.input.deinit();
             testing.allocator.free(model.cwd);
             testing.allocator.free(model.cwd_display);
             return err;
         };
-        attached = true;
         try model.wire();
         errdefer model.deinit();
         try model.showReplacedTranscript();

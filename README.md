@@ -88,6 +88,11 @@ anything that would change the project unless `--allow` is given.
 `synth acp` is synth as an [ACP](https://agentclientprotocol.com) agent, for an
 editor to spawn: one session at a time, approvals asked as permission requests.
 
+Quitting stops the session, a turn in progress included. `/detach` leaves it
+running instead: `synth --session <id>`, `--continue` or `/sessions` attach to
+it again from any terminal, and quitting from there stops it. Each session
+listens on a socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`.
+
 ## Keys
 
 | key | what it does |
@@ -173,7 +178,7 @@ own business: `/api/ps` is the last word on what the runner actually got, and
 that is what the sidebar plans against.
 
 Some settings can be overridden per run by the environment: `SYNTH_PROVIDER`,
-`SYNTH_DB`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
+`SYNTH_DB`, `SYNTH_SOCKET_DIR`, `SYNTH_DEBUG_LOG`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OLLAMA_API_KEY`,
 `OLLAMA_THINK`, `OLLAMA_NUM_CTX`, `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `BRAVE_API_KEY`,
 `SYNTH_SEARCH_API_KEY`. `VISUAL` and `EDITOR` decide what `ctrl+e` opens. Which host-and-key pair applies depends on the protocol
 the chosen provider speaks, so having both sets exported does not hand one

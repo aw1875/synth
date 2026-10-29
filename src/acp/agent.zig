@@ -92,6 +92,9 @@ live: ?struct { handle: []u8, root: []u8 } = null,
 session: ?*Session = null,
 /// The live session's socket, while it has one.
 listener: ?*sockets.Listener = null,
+/// Serve on once every client has gone. Ended by a client attaching, or the
+/// session closing.
+detached: bool = false,
 /// The permission request out for the call waiting on a decision.
 asked: ?Asked = null,
 /// Prompts answered when the turn they started or steered ends.
@@ -151,7 +154,7 @@ pub fn serve(self: *Agent) void {
         defer gone.deinit(self.allocator);
         self.drainInbox();
         for (gone.items) |connection| self.drop(connection);
-        if (self.connectionCount() == 0) return;
+        if (self.connectionCount() == 0 and !self.detached) return;
 
         const arena = arena_state.allocator();
         if (self.session) |session| {
@@ -280,7 +283,10 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     }
     if (eql(u8, method, protocol.method.session_load)) {
         const request = try rpc.parse(protocol.LoadSession, arena, params);
-        if (connection.guest) _ = try self.sessionFor(request.sessionId);
+        if (connection.guest) {
+            _ = try self.sessionFor(request.sessionId);
+            self.detached = false;
+        }
         const session = try self.open(request.cwd, request.sessionId);
         if (connection.dialect == .standard) try session.replay(arena, connection);
         return connection.reply(asked, protocol.Loaded{
@@ -333,6 +339,9 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
 
     if (eql(u8, method, m.compact)) {
         try loop.compact();
+    } else if (eql(u8, method, m.detach)) {
+        if (self.listener == null) return error.Unreachable;
+        self.detached = true;
     } else if (eql(u8, method, m.rename)) {
         try loop.rename((try rpc.parse(synth.Rename, arena, params)).title);
     } else if (eql(u8, method, m.providers)) {
@@ -494,6 +503,7 @@ fn unshare(self: *Agent) void {
 /// End the live session, answering whatever was waiting on it.
 fn closeSession(self: *Agent) void {
     const session = self.session orelse return;
+    self.detached = false;
     self.stopListening();
     self.withdraw();
     for (self.prompts.items) |*waiting| {
@@ -769,6 +779,7 @@ fn describe(err: anyerror) []const u8 {
         error.StillConnecting => "still connecting - try again in a moment",
         error.NoMcpState => "no MCP state file, so this cannot be remembered",
         error.InvalidRequest => "a request needs an id",
+        error.Unreachable => "nothing could reach the session once you left: it has no socket",
         error.SessionHeld => "this session is open in another process",
         error.HostsOneSession => "this process hosts one session; attach to it with session/load",
         else => @errorName(err),
@@ -2589,4 +2600,31 @@ test "a session another process hosts is not taken up here, and is listed live" 
     try elsewhere.releaseLease(session, init_pid);
     const load = try client.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
     _ = try client.expectResult(load);
+}
+
+test "a detached session outlives its clients until one attaches and leaves" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const host = try fixture.connect();
+    const unreachable_id = try host.request(synth.method.detach, protocol.SessionId{ .sessionId = "ses_none" });
+    _ = try host.expectError(unreachable_id);
+    try host.initialize(true);
+    const lone = (try host.open(fixture.project)).sessionId;
+    const refused = try host.request(synth.method.detach, protocol.SessionId{ .sessionId = lone });
+    try testing.expectEqualStrings("nothing could reach the session once you left: it has no socket", (try host.expectError(refused)).message);
+
+    const socket_dir = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "sockets" });
+    fixture.agent.options.socket_dir = socket_dir;
+    const session = (try host.open(fixture.project)).sessionId;
+    const detach = try host.request(synth.method.detach, protocol.SessionId{ .sessionId = session });
+    _ = try host.expectResult(detach);
+    const path = try sockets.pathFor(fixture.arena.allocator(), socket_dir, session);
+    const handle = try fixture.arena.allocator().dupe(u8, session);
+    host.close();
+
+    const guest = try Client.create(try sockets.connect(path));
+    defer guest.close();
+    try guest.initialize(true);
+    const attach = try guest.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = handle, .cwd = fixture.project });
+    _ = try guest.expectResult(attach);
 }

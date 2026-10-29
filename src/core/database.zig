@@ -181,6 +181,8 @@ pub const SessionInfo = struct {
     title: []const u8,
     updated_at: i64,
     messages: u64,
+    /// Hosted by a process right now: see `heldSessions`.
+    live: bool = false,
 
     pub fn deinit(self: *const SessionInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.public_id);

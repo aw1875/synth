@@ -32,20 +32,7 @@ pub fn main(init: std.process.Init) !void {
     switch (command) {
         .help => |topic| try writeLine(init.io, cli.usageFor(topic)),
         .version => try writeLine(init.io, pkg.name ++ " " ++ pkg.version ++ "\n"),
-        .tui => |options| {
-            if (try runTui(init, options)) |handle| {
-                var farewell: [256]u8 = undefined;
-                var out = std.Io.File.stdout().writer(init.io, &farewell);
-                try out.interface.print(
-                    \\
-                    \\Session {1s}
-                    \\  {0s} --continue               resume it here
-                    \\  {0s} --session {1s}   resume it from anywhere
-                    \\
-                , .{ pkg.name, handle });
-                try out.interface.flush();
-            }
-        },
+        .tui => |options| if (try runTui(init, options)) |left| try sayFarewell(init.io, left),
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
         .acp => try acp.run(init),
@@ -57,6 +44,29 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// How to come back to the session just left.
+fn sayFarewell(io: std.Io, left: tui_drive.Left) !void {
+    var buffer: [256]u8 = undefined;
+    var out = std.Io.File.stdout().writer(io, &buffer);
+    if (left.detached) {
+        try out.interface.print(
+            \\
+            \\Session {1s} is still running
+            \\  {0s} --session {1s}   attach to it from anywhere
+            \\
+        , .{ pkg.name, left.handle });
+    } else {
+        try out.interface.print(
+            \\
+            \\Session {1s}
+            \\  {0s} --continue               resume it here
+            \\  {0s} --session {1s}   resume it from anywhere
+            \\
+        , .{ pkg.name, left.handle });
+    }
+    try out.interface.flush();
+}
+
 fn writeLine(io: std.Io, text: []const u8) !void {
     var buffer: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &buffer);
@@ -65,9 +75,10 @@ fn writeLine(io: std.Io, text: []const u8) !void {
 }
 
 /// Run the TUI on a session hosted by a `synth acp` child, which has this
-/// terminal's environment and ends when the TUI does. Returns the session's
-/// handle when there is anything in it to come back to, in the process arena.
-fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
+/// terminal's environment and ends when the TUI does, unless detached.
+/// Returns how the TUI left the session when there is anything to come back
+/// to.
+fn runTui(init: std.process.Init, options: cli.Command.Tui) !?tui_drive.Left {
     const io = init.io;
     const root = try std.Io.Dir.cwd().realPathFileAlloc(io, options.project orelse ".", init.arena.allocator());
 
@@ -79,7 +90,7 @@ fn runTui(init: std.process.Init, options: cli.Command.Tui) !?[]const u8 {
         .{ .new = root };
     const connection = try Connection.spawn(init.gpa, io, root);
     const left = try tui_drive.drive(init, connection, Connection.here, target, .{ .model = options.model }) orelse return null;
-    return if (left.spoken) left.handle else null;
+    return if (left.spoken or left.detached) left else null;
 }
 
 test {

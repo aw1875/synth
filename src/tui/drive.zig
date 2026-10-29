@@ -7,6 +7,7 @@ const vxfw = vaxis.vxfw;
 
 const Connection = @import("../acp/connection.zig");
 const Mirror = @import("../acp/mirror.zig");
+const sockets = @import("../acp/sockets.zig");
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const tui_app = @import("app.zig");
@@ -28,10 +29,13 @@ pub const Left = struct {
     handle: []const u8,
     /// It has anything in it worth coming back to.
     spoken: bool,
+    /// It is still running.
+    detached: bool,
 };
 
-/// Run the TUI on `target`, taking `connection` over. Null, having said why,
-/// when the session could not be opened.
+/// Run the TUI on `target`, taking `connection` over, or the connection to
+/// whichever process hosts it. Null, having said why, when the session could
+/// not be opened.
 pub fn drive(
     init: std.process.Init,
     connection: *Connection,
@@ -41,8 +45,8 @@ pub fn drive(
 ) !?Left {
     const io = init.io;
     const allocator = init.gpa;
-    var opened = false;
-    defer if (!opened) connection.close();
+    var handed = false;
+    defer if (!handed) connection.close();
 
     var config = try Config.open(allocator, io, init.environ_map);
     defer config.deinit();
@@ -70,7 +74,9 @@ pub fn drive(
     };
 
     var failure: Connection.Diagnostic = .{};
-    const mirror = Mirror.open(allocator, io, connection, &model.conversation, host, target, &failure) catch |err| {
+    const socket_dir = try sockets.dir(init.arena.allocator(), init.environ_map);
+    handed = true;
+    const mirror = Mirror.open(allocator, io, connection, &model.conversation, host, socket_dir, target, &failure) catch |err| {
         model.conversation.deinit();
         model.input.deinit();
         allocator.free(model.cwd);
@@ -79,7 +85,6 @@ pub fn drive(
         try complain(io, if (failure.message.len > 0) failure.message else "the agent did not answer");
         return null;
     };
-    opened = true;
     model.mirror = mirror;
     if (options.model) |name| try mirror.switchModel(name, null, null);
 
@@ -98,6 +103,7 @@ pub fn drive(
     return .{
         .handle = try init.arena.allocator().dupe(u8, mirror.status.handle),
         .spoken = mirror.spoken,
+        .detached = mirror.detached,
     };
 }
 

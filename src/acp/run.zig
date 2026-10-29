@@ -15,6 +15,8 @@ const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 pub fn run(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.gpa;
+    // Closing a terminal hangs up its session's processes, a detached one's host among them.
+    _ = std.c.setsid();
 
     var config = try Config.open(allocator, io, init.environ_map);
     defer config.deinit();

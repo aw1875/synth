@@ -12,6 +12,7 @@ const protocol = @import("protocol.zig");
 const synth = @import("synth.zig");
 const updates = @import("updates.zig");
 const Connection = @import("connection.zig");
+const sockets = @import("sockets.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const skill = @import("../core/skill.zig");
@@ -30,6 +31,8 @@ connection: ?*Connection,
 /// The transcript the TUI draws, kept in step with the agent's. Borrowed.
 conversation: *Conversation,
 host: []const u8,
+/// Where sessions hosted by other processes listen, to attach to them there.
+socket_dir: ?[]const u8 = null,
 reader: std.Thread = undefined,
 
 inbox_mutex: std.Io.Mutex = .init,
@@ -64,6 +67,8 @@ answers: std.ArrayList(Answer) = .empty,
 switched: bool = false,
 /// The session open has anything in it.
 spoken: bool = false,
+/// The session goes on after we leave.
+detached: bool = false,
 /// Requests sent and not yet answered, by id.
 waiting: std.AutoHashMapUnmanaged(i64, Awaited) = .empty,
 /// The request out for the call waiting on a person. Owned.
@@ -109,6 +114,7 @@ const Awaited = union(enum) {
     providers,
     /// The call whose subagent, by the TUI's own numbering.
     subagent: struct { seq: u64, call: u32 },
+    detach,
 };
 
 /// What a request the TUI made came back with, for it to show.
@@ -125,6 +131,8 @@ pub const Answer = union(enum) {
     files: [][]const u8,
     /// The models the agent's provider offers, in an arena of their own.
     models: struct { arena: std.heap.ArenaAllocator, models: synth.Models },
+    /// The session will go on without us: time to leave.
+    detached,
 
     pub fn deinit(self: Answer, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -153,6 +161,7 @@ pub const Answer = union(enum) {
                 for (paths) |path| allocator.free(path);
                 allocator.free(paths);
             },
+            .detached => {},
         }
     }
 };
@@ -183,49 +192,172 @@ pub const Target = union(enum) {
     load: Stored,
     latest: []const u8,
 
-    pub const Stored = struct { handle: []const u8, cwd: []const u8 = "" };
+    pub const Stored = struct {
+        handle: []const u8,
+        cwd: []const u8 = "",
+        /// Hosted by another process, so attached to there.
+        live: bool = false,
+    };
 };
 
 /// Say hello to the agent at the far end of `connection`, open `target`, and
-/// fill `conversation` from its snapshot. The mirror owns the connection once
-/// this succeeds; until then it is still the caller's.
+/// fill `conversation` from its snapshot. A stored session another process
+/// hosts is attached to on its socket in `socket_dir` instead, and
+/// `connection` closed. The mirror owns the connection either way.
 pub fn open(
     allocator: std.mem.Allocator,
     io: std.Io,
     connection: *Connection,
     conversation: *Conversation,
     host: []const u8,
+    socket_dir: ?[]const u8,
     target: Target,
     failure: ?*Connection.Diagnostic,
 ) !*Mirror {
-    const self = try create(allocator, io, connection, conversation, host);
+    const self = create(allocator, io, connection, conversation, host) catch |err| {
+        connection.close();
+        return err;
+    };
     errdefer self.destroy();
+    errdefer self.connection.?.close();
+    self.socket_dir = socket_dir;
 
     var arena_state: std.heap.ArenaAllocator = .init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try connection.initialize(arena, failure);
-    const id = switch (target) {
-        .new => |cwd| try newSession(connection, cwd),
-        .load => |named| try loadSession(connection, named),
-        .latest => |cwd| if (try latestIn(connection, arena, cwd, failure)) |named|
-            try loadSession(connection, named)
-        else
-            try newSession(connection, cwd),
+    const stored: ?Target.Stored = switch (target) {
+        .new => null,
+        .load => |named| named,
+        .latest => |cwd| blk: {
+            try connection.initialize(arena, failure);
+            break :blk try latestIn(connection, arena, cwd, failure);
+        },
     };
-    while (try connection.next(arena)) |message| {
-        const replied = message.method == null and message.id != null and message.id.?.eql(id);
-        if (!replied) {
-            try self.apply(message);
-            continue;
-        }
-        const err = message.err orelse break;
-        if (failure) |d| d.say("{s}", .{err.message});
-        return error.Refused;
-    } else return error.ConnectionLost;
+    const elsewhere = if (stored) |named| try self.reach(named.handle) else null;
+    if (elsewhere) |reached| {
+        connection.close();
+        self.connection = reached;
+    }
+    if (target != .latest or elsewhere != null) try self.connection.?.initialize(arena, failure);
 
+    const cwd = switch (target) {
+        .new, .latest => |dir| dir,
+        .load => |named| named.cwd,
+    };
+    const id = if (stored) |named| try loadSession(self.connection.?, named) else try newSession(self.connection.?, cwd);
+    var held = try awaitOpened(allocator, self.connection.?, id, failure);
+    try self.applyAll(&held);
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
     return self;
+}
+
+/// Read until the agent answers request `id`, which opens a session,
+/// returning what came before the answer to be applied in order.
+fn awaitOpened(allocator: std.mem.Allocator, connection: *Connection, id: rpc.Id, failure: ?*Connection.Diagnostic) !std.DoublyLinkedList {
+    var held: std.DoublyLinkedList = .{};
+    errdefer discard(&held);
+    while (true) {
+        const inbound = try Inbound.create(allocator);
+        inbound.message = (connection.next(inbound.arena.allocator()) catch |err| {
+            inbound.destroy();
+            return err;
+        }) orelse {
+            inbound.destroy();
+            return error.ConnectionLost;
+        };
+        const message = inbound.message;
+        if (message.method != null or message.id == null or !message.id.?.eql(id)) {
+            held.append(&inbound.node);
+            continue;
+        }
+        defer inbound.destroy();
+        const err = message.err orelse return held;
+        if (failure) |d| d.say("{s}", .{err.message});
+        return error.Refused;
+    }
+}
+
+fn applyAll(self: *Mirror, held: *std.DoublyLinkedList) !void {
+    errdefer discard(held);
+    while (held.popFirst()) |node| {
+        const inbound: *Inbound = @fieldParentPtr("node", node);
+        defer inbound.destroy();
+        try self.apply(inbound.message);
+    }
+}
+
+fn discard(held: *std.DoublyLinkedList) void {
+    while (held.popFirst()) |node| {
+        const inbound: *Inbound = @fieldParentPtr("node", node);
+        inbound.destroy();
+    }
+}
+
+/// A connection to the process hosting session `handle`, or null when none
+/// listens for it.
+fn reach(self: *Mirror, handle: []const u8) !?*Connection {
+    const socket_dir = self.socket_dir orelse return null;
+    const path = try sockets.pathFor(self.allocator, socket_dir, handle);
+    defer self.allocator.free(path);
+    const socket = sockets.connect(path) catch |err| switch (err) {
+        error.NotListening => return null,
+        else => return err,
+    };
+    errdefer socket.close(self.io);
+    return try Connection.overSocket(self.allocator, self.io, socket);
+}
+
+/// Leave this session for `handle`, which another process hosts, attaching
+/// to it there. This one ends as quitting would end it. Failing, it stays.
+pub fn attach(self: *Mirror, handle: []const u8) !void {
+    var failure: Connection.Diagnostic = .{};
+    self.attachTo(handle, &failure) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.NotListening => return self.say("Attaching to {s} failed: it is not running", .{handle}),
+        else => return self.say("Attaching to {s} failed: {s}", .{
+            handle,
+            if (failure.message.len > 0) failure.message else @errorName(err),
+        }),
+    };
+}
+
+fn attachTo(self: *Mirror, handle: []const u8, failure: *Connection.Diagnostic) !void {
+    const old = try self.live();
+    const elsewhere = try self.reach(handle) orelse return error.NotListening;
+    var held = blk: {
+        errdefer elsewhere.close();
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        try elsewhere.initialize(arena_state.allocator(), failure);
+        const id = try loadSession(elsewhere, .{ .handle = handle });
+        break :blk try awaitOpened(self.allocator, elsewhere, id, failure);
+    };
+    errdefer discard(&held);
+
+    old.interrupt();
+    self.reader.join();
+    old.close();
+    self.connection = elsewhere;
+    self.forgetConnection();
+    try self.applyAll(&held);
+    self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
+}
+
+/// Drop what was waiting on the connection just replaced: its queue, its
+/// requests, the question it asked.
+fn forgetConnection(self: *Mirror) void {
+    while (self.inbox.popFirst()) |node| {
+        const inbound: *Inbound = @fieldParentPtr("node", node);
+        if (inbound != self.lost) inbound.destroy();
+    }
+    var waited = self.waiting.valueIterator();
+    while (waited.next()) |awaited| if (awaited.* == .search) self.allocator.free(awaited.search);
+    self.waiting.clearRetainingCapacity();
+    self.forgetAsked();
+    self.forgetEarly();
+    self.paging = false;
+    self.ended = false;
+    self.lost_heard = false;
 }
 
 fn newSession(connection: *Connection, cwd: []const u8) !rpc.Id {
@@ -241,7 +373,8 @@ fn latestIn(connection: *Connection, arena: std.mem.Allocator, cwd: []const u8, 
     const result = try connection.call(arena, protocol.method.session_list, protocol.ListSessions{ .cwd = cwd }, failure);
     const listed = try rpc.parse(protocol.SessionList, arena, result);
     if (listed.sessions.len == 0) return null;
-    return .{ .handle = listed.sessions[0].sessionId, .cwd = cwd };
+    const latest = listed.sessions[0];
+    return .{ .handle = latest.sessionId, .cwd = cwd, .live = if (latest._meta) |meta| meta.synth.live else false };
 }
 
 /// A mirror with no agent behind it, whose status a test sets by hand to
@@ -359,7 +492,7 @@ pub fn poll(self: *Mirror) !bool {
             self.lost_heard = true;
             self.ended = true;
             if (std.mem.eql(u8, self.host, Connection.here)) {
-                try self.say("The agent running this session has stopped.", .{});
+                try self.say("The agent running this session has stopped. Pick it up again with: synth --session {s}", .{self.status.handle});
             } else {
                 try self.say("Lost the connection to {s}.", .{self.host});
             }
@@ -637,6 +770,7 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             .files => "listing the files",
             .providers => "listing the providers",
             .subagent => "loading the subagent's transcript",
+            .detach => "Detaching",
         };
         return self.say("{s} failed: {s}", .{ what, err.message });
     }
@@ -683,6 +817,12 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
                 built += 1;
             }
             try self.conversation.prepend(owned);
+        },
+        .detach => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            (try self.live()).detached = true;
+            self.detached = true;
+            self.answers.appendAssumeCapacity(.detached);
         },
         .sessions => |limit| {
             const listed = try rpc.parse(protocol.SessionList, arena, result);
@@ -765,6 +905,7 @@ fn ownSessions(allocator: std.mem.Allocator, listed: []const protocol.SessionInf
             .title = try allocator.dupe(u8, session.title orelse ""),
             .updated_at = stored.updated_at,
             .messages = stored.messages,
+            .live = stored.live,
         };
         built += 1;
     }
@@ -1091,6 +1232,12 @@ pub fn startFresh(self: *Mirror) !void {
     try self.send(protocol.method.session_new, protocol.NewSession{ .cwd = self.status.root }, .{ .command = "Starting a session" });
 }
 
+/// Ask the agent to keep the session running once we leave. Its answer says
+/// when to.
+pub fn detach(self: *Mirror) !void {
+    try self.send(synth.method.detach, protocol.SessionId{ .sessionId = self.status.handle }, .detach);
+}
+
 /// Ask for the project's stored sessions. They land on a later poll.
 pub fn listSessions(self: *Mirror, limit: usize) !void {
     try self.send(protocol.method.session_list, protocol.ListSessions{ .cwd = self.status.root }, .{ .sessions = limit });
@@ -1136,8 +1283,7 @@ const project_files = @import("../core/files.zig");
 /// A mirror of a fresh session on `fixture`'s agent, into `convo`.
 fn openFresh(fixture: *Agent.Fixture, convo: *Conversation) !*Mirror {
     const connection = try Connection.overSocket(testing.allocator, testing.io, try fixture.socket());
-    errdefer connection.close();
-    return open(testing.allocator, testing.io, connection, convo, Connection.here, .{ .new = fixture.project }, null);
+    return open(testing.allocator, testing.io, connection, convo, Connection.here, null, .{ .new = fixture.project }, null);
 }
 
 /// Poll until `done` says so, or fail after a few seconds.
@@ -1474,4 +1620,35 @@ test "a mirror loads the transcript a subagent call left" {
     const notice = mirror.takeNotice().?;
     defer testing.allocator.free(notice);
     try testing.expect(std.mem.indexOf(u8, notice, "no transcript") != null);
+}
+
+test "a session another process hosts is attached to on its socket, opening or switching" {
+    const hosting = try Agent.Fixture.create();
+    defer hosting.destroy();
+    const socket_dir = try std.fs.path.join(hosting.arena.allocator(), &.{ std.fs.path.dirname(hosting.project).?, "sockets" });
+    hosting.agent.options.socket_dir = socket_dir;
+    const host = try hosting.connect();
+    defer host.close();
+    try host.initialize(true);
+    const handle = try hosting.arena.allocator().dupe(u8, (try host.open(hosting.project)).sessionId);
+
+    const other = try Agent.Fixture.create();
+    defer other.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const opened = try open(testing.allocator, testing.io, try Connection.overSocket(testing.allocator, testing.io, try other.socket()), &convo, Connection.here, socket_dir, .{ .load = .{ .handle = handle } }, null);
+    try testing.expectEqualStrings(handle, opened.status.handle);
+    opened.close();
+
+    const switching = try openFresh(other, &convo);
+    defer switching.close();
+    switching.socket_dir = socket_dir;
+    try switching.attach("ses_nowhere");
+    const refused = switching.takeNotice().?;
+    defer testing.allocator.free(refused);
+    try testing.expectEqualStrings("Attaching to ses_nowhere failed: it is not running", refused);
+    try switching.attach(handle);
+    try testing.expectEqualStrings(handle, switching.status.handle);
+    try testing.expect(switching.takeSwitched());
 }

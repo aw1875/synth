@@ -52,6 +52,9 @@ pub const method = struct {
     pub const subagent = "_synth/subagent";
     pub const page_history = "_synth/page_history";
     pub const search = "_synth/search";
+    /// Keep the session running once every client has gone, to be attached
+    /// to again over its socket.
+    pub const detach = "_synth/detach";
 };
 
 pub const ToolCall = struct {

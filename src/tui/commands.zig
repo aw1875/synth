@@ -65,6 +65,10 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (std.mem.eql(u8, line, "/detach")) {
+        self.mirror.detach() catch {};
+        return true;
+    }
     if (std.mem.eql(u8, line, "/sessions")) {
         try showSessions(self);
         ctx.redraw = true;
@@ -222,6 +226,7 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             };
             try self.connect.show(states);
         },
+        .detached => ctx.quit = true,
     }
 }
 

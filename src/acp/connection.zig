@@ -23,6 +23,8 @@ reader: std.Io.File.Reader = undefined,
 writer: std.Io.File.Writer = undefined,
 lines: rpc.LineReader,
 next_id: i64 = 1,
+/// The agent was told to keep its session once we hang up.
+detached: bool = false,
 
 const Transport = union(enum) {
     child: std.process.Child,
@@ -73,11 +75,16 @@ fn create(allocator: std.mem.Allocator, io: std.Io, transport: Transport) !*Conn
     return self;
 }
 
-/// Hang up, and for a child, wait for it to go: its session ends with it.
+/// Hang up, and for a child, wait for it to go: its session ends with it,
+/// unless detached.
 pub fn close(self: *Connection) void {
     self.interrupt();
     switch (self.transport) {
-        .child => |*child| _ = child.wait(self.io) catch {},
+        .child => |*child| if (self.detached) {
+            if (child.stdout) |stdout| stdout.close(self.io);
+        } else {
+            _ = child.wait(self.io) catch {};
+        },
         .socket => |socket| socket.close(self.io),
     }
     self.lines.deinit();

@@ -151,14 +151,16 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
         var x = w.writeText(surface, pad + 1, row, info.public_id, base.withFg(theme.accent_alt).cell);
         x = w.writeText(surface, x + 1, row, "  ", base.cell);
 
+        var count: [48]u8 = undefined;
+        const text = std.fmt.bufPrint(&count, "{s}{d} msgs", .{ if (info.live) "running · " else "", info.messages }) catch "";
+        const text_width = w.textWidth(text);
+
         const label = if (info.title.len > 0) info.title else "untitled";
         const label_style = if (info.title.len > 0) base.withFg(theme.fg) else base.withFg(theme.fg_dim);
-        const room = width -| (x + pad + 14);
+        const room = width -| (x + pad + text_width + 4);
         x = w.writeText(surface, x, row, clip(label, room), label_style.cell);
 
-        var count: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&count, "{d} msgs", .{info.messages}) catch "";
-        const at = width -| (pad + @as(u16, @intCast(text.len)));
+        const at = width -| (pad + text_width);
         _ = w.writeText(surface, at, row, try ctx.arena.dupe(u8, text), base.withFg(theme.fg_dim).cell);
 
         if (std.mem.eql(u8, info.public_id, self.current)) {
