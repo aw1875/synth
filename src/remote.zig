@@ -7,7 +7,7 @@ const std = @import("std");
 const pkg = @import("pkg");
 
 const cli = @import("cli.zig");
-const bridge = @import("acp/bridge.zig");
+const router = @import("acp/router.zig");
 const Connection = @import("acp/connection.zig");
 const Mirror = @import("acp/mirror.zig");
 const protocol = @import("acp/protocol.zig");
@@ -18,7 +18,7 @@ const tui_drive = @import("tui/drive.zig");
 
 pub fn run(init: std.process.Init, command: cli.Command.Remote) !void {
     switch (command) {
-        .bridge => try bridge.main(init),
+        .bridge => try router.bridge(init),
         .list => |host| try list(init, host),
         .connect => |asked| try connect(init, asked.host, asked.session),
         .new => |asked| try drive(init, asked.host, try Connection.toHost(init.gpa, init.io, asked.host), .{ .new = asked.dir }),

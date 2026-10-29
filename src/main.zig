@@ -8,6 +8,7 @@ const cli = @import("cli.zig");
 const commands = @import("commands.zig");
 
 const acp = @import("acp/run.zig");
+const router = @import("acp/router.zig");
 const Connection = @import("acp/connection.zig");
 const Mirror = @import("acp/mirror.zig");
 const headless = @import("headless.zig");
@@ -36,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
         .tui => |options| if (try runTui(init, options)) |left| try tui_drive.sayFarewell(init.io, null, left),
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
-        .acp => try acp.run(init),
+        .acp => |options| try if (options.host) acp.run(init) else router.front(init),
         .models => try commands.models(init),
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),

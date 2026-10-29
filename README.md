@@ -89,7 +89,9 @@ calls" - it drives the real loop and provider and prints each step, denying
 anything that would change the project unless `--allow` is given.
 
 `synth acp` is synth as an [ACP](https://agentclientprotocol.com) agent, for an
-editor to spawn: one session at a time, approvals asked as permission requests.
+editor to spawn: each session it opens runs in a process of its own, and
+approvals are asked as permission requests. Loading a session that is running
+elsewhere attaches to it there.
 
 Quitting stops the session, a turn in progress included. `/detach` leaves it
 running instead: `synth --session <id>`, `--continue` or `/sessions` attach to

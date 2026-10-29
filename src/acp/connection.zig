@@ -42,14 +42,14 @@ pub const Diagnostic = struct {
     }
 };
 
-/// Start `synth acp` in `cwd` with this terminal's environment, so the
+/// Start `synth acp --host` in `cwd` with this terminal's environment, so the
 /// session's tools see what a shell here would.
 pub fn spawn(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !*Connection {
     const exe = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(exe);
     // Its stderr would land on the screen the TUI is drawing.
     const child = try std.process.spawn(io, .{
-        .argv = &.{ exe, "acp" },
+        .argv = &.{ exe, "acp", "--host" },
         .cwd = .{ .path = cwd },
         .stdin = .pipe,
         .stdout = .pipe,
