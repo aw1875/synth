@@ -1031,6 +1031,38 @@ fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
 
 const unserved_model = "asdf";
 
+test "the picker opens on what a provider offered last, from where it is reached now" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ollama = catalog.findOrDefault(catalog.default_id);
+    const offered: []const ModelListing.Offered = &.{.{ .name = "qwen3:8b", .efforts = .{} }};
+
+    try keepOffered(&model, try answeredListing(offered, ollama.host));
+    try testing.expectEqual(@as(usize, 1), (try lastOffered(&model, arena)).len);
+
+    try keepOffered(&model, try answeredListing(null, ollama.host));
+    try testing.expectEqual(@as(usize, 1), (try lastOffered(&model, arena)).len);
+
+    try keepOffered(&model, try answeredListing(offered, "http://elsewhere:11434"));
+    try testing.expectEqual(@as(usize, 0), (try lastOffered(&model, arena)).len);
+}
+
+/// A listing that has finished, made to say `models` from `host`.
+fn answeredListing(models: ?[]const ModelListing.Offered, host: []const u8) !*ModelListing {
+    const unreachable_host = "http://127.0.0.1:1";
+    const entry = catalog.findOrDefault(catalog.default_id);
+    const listing = try ModelListing.start(testing.allocator, testing.io, entry, .{ .host = unreachable_host, .api_key = null, .chatgpt = null });
+    listing.join();
+    listing.models = models;
+    listing.reach.host = host;
+    return listing;
+}
+
 /// A model in a test needs only enough to hold a provider and a transcript.
 fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []const u8) !Model {
     var self: Model = .{

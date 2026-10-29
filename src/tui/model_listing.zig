@@ -116,8 +116,6 @@ test "a provider that cannot be reached lists nothing" {
         .api_key = null,
         .chatgpt = null,
     });
-    while (!listing.isFinished()) try std.Io.sleep(testing.io, .fromMilliseconds(5), .awake);
-
     listing.join();
     defer listing.destroy();
     try testing.expect(listing.models == null);
