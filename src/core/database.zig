@@ -2,7 +2,6 @@
 //! remembered approvals.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const zqlite = @import("zqlite");
 
@@ -549,8 +548,7 @@ pub fn heldSessions(self: *Database, allocator: std.mem.Allocator) ![][]const u8
 fn isLive(pid: std.posix.pid_t, heartbeat_at: i64, now: i64) bool {
     if (now - heartbeat_at > lease_ttl_ms) return false;
     const probe: std.posix.SIG = @enumFromInt(0);
-    const rc = if (builtin.os.tag == .linux) std.os.linux.kill(pid, probe) else std.c.kill(pid, probe);
-    return std.posix.errno(rc) != .SRCH;
+    return std.posix.errno(std.posix.system.kill(pid, probe)) != .SRCH;
 }
 
 /// Append a message row and return its id. Heavy bodies (reasoning, tool
@@ -1400,7 +1398,7 @@ test "a session is hosted by one live process at a time" {
     var db = try init(testing.allocator, testing.io, db_path);
     defer db.deinit();
 
-    const us: std.posix.pid_t = if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+    const us = std.posix.system.getpid();
     const init_pid: std.posix.pid_t = 1;
     try db.takeLease("ses_ours", us);
     try db.takeLease("ses_ours", us);
@@ -1422,6 +1420,12 @@ test "a session is hosted by one live process at a time" {
     try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
     try db.releaseLease("ses_ours", us);
     try db.takeLease("ses_ours", init_pid);
+
+    var gone = try std.process.spawn(testing.io, .{ .argv = &.{"true"} });
+    const dead = gone.id.?;
+    _ = try gone.wait(testing.io);
+    try db.takeLease("ses_crashed", dead);
+    try db.takeLease("ses_crashed", us);
 }
 
 test "a search finds messages whatever their case, within the project" {

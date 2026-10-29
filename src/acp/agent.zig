@@ -9,7 +9,6 @@
 //! were made.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const pkg = @import("pkg");
 const mcp = @import("mcp");
@@ -104,8 +103,7 @@ pid: std.posix.pid_t,
 renewed_at: i64 = 0,
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) Agent {
-    const pid = if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
-    return .{ .allocator = allocator, .io = io, .options = options, .pid = pid };
+    return .{ .allocator = allocator, .io = io, .options = options, .pid = std.posix.system.getpid() };
 }
 
 /// Join every connection and end the session. Called once `serve` returns.
