@@ -89,6 +89,16 @@ pub const Failure = struct {
     reason: []const u8,
 };
 
+/// Where a configured server stands.
+pub const Status = struct {
+    name: []const u8,
+    state: State,
+    /// Why it failed, for `.failed`.
+    reason: []const u8 = "",
+
+    pub const State = enum { off, connecting, connected, failed };
+};
+
 /// The connected servers and the tools they contributed.
 ///
 /// Owns its clients and every string it registered. Touched from the thread
@@ -288,6 +298,32 @@ pub const Host = struct {
                 self.recordFailure(server.name, reasonFor(err)) catch {};
             };
         }
+    }
+
+    /// Whether a server is wanted: configured on, and not turned off since.
+    pub fn wants(self: *const Host, server: Server) bool {
+        const store = self.auth orelse return server.enabled;
+        return server.enabled and store.isEnabled(server.name);
+    }
+
+    pub fn statusOf(self: *const Host, server: Server) Status {
+        if (!self.wants(server)) return .{ .name = server.name, .state = .off };
+        if (self.find(server.name)) |connection| {
+            return .{ .name = server.name, .state = if (connection.installed) .connected else .connecting };
+        }
+        for (self.failures.items) |failure| {
+            if (std.mem.eql(u8, failure.server, server.name)) {
+                return .{ .name = server.name, .state = .failed, .reason = failure.reason };
+            }
+        }
+        return .{ .name = server.name, .state = .connecting };
+    }
+
+    /// Every configured server's status, borrowing this host's strings.
+    pub fn statuses(self: *const Host, allocator: std.mem.Allocator) ![]Status {
+        const out = try allocator.alloc(Status, self.servers.len);
+        for (self.servers, out) |server, *status| status.* = self.statusOf(server);
+        return out;
     }
 
     /// The connection for `name`, or null when it is not up.

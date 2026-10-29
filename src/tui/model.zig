@@ -768,9 +768,9 @@ pub fn beginTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8, extr
 /// what was a correction is now simply the next thing to do.
 pub fn drainSteering(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.loop.isBusy()) return;
-    const prompt = self.loop.takeSteering() orelse return;
-    defer self.allocator.free(prompt);
-    try self.startTurn(ctx, prompt);
+    var taken = self.loop.takeSteering() orelse return;
+    defer taken.deinit(self.loop.allocator);
+    try self.startTurn(ctx, taken.prompt);
 }
 
 /// Terminals send a carriage return for each pasted newline, so the buffer is

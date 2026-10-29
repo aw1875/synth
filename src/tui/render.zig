@@ -365,7 +365,7 @@ fn enumerateBlocks(self: *Model, arena: std.mem.Allocator, pending: usize) ![]Bl
             try blocks.append(arena, .{ .steering_more = steering.len - i });
             break;
         }
-        try blocks.append(arena, .{ .steering = prompt });
+        try blocks.append(arena, .{ .steering = prompt.prompt });
     }
 
     return blocks.toOwnedSlice(arena);

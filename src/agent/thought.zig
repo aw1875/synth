@@ -93,6 +93,16 @@ pub const Stream = struct {
         return arena.dupe(u8, self.text.items);
     }
 
+    /// A copy of the text from `from` up to `to`, or to the end when `to` is
+    /// null, taken under the lock.
+    pub fn copyRange(self: *Stream, arena: std.mem.Allocator, from: usize, to: ?usize) ![]const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const end = @min(to orelse self.text.items.len, self.text.items.len);
+        if (from >= end) return "";
+        return arena.dupe(u8, self.text.items[from..end]);
+    }
+
     pub fn isEmpty(self: *Stream) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -27,6 +27,27 @@ pub fn duration(buffer: []u8, ms: u64) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}h {d:0>2}m", .{ minutes / 60, minutes % 60 }) catch unreachable;
 }
 
+/// Longest string `ago` can produce, so callers can size a buffer.
+pub const ago_bytes = 24;
+
+/// How long ago something was, coarsely: `just now`, `5m ago`, `3h ago`,
+/// `12d ago`.
+pub fn ago(buffer: []u8, ms: u64) []const u8 {
+    std.debug.assert(buffer.len >= ago_bytes);
+    if (ms < std.time.ms_per_min) return "just now";
+    if (ms < std.time.ms_per_hour) return std.fmt.bufPrint(buffer, "{d}m ago", .{ms / std.time.ms_per_min}) catch unreachable;
+    if (ms < std.time.ms_per_day) return std.fmt.bufPrint(buffer, "{d}h ago", .{ms / std.time.ms_per_hour}) catch unreachable;
+    return std.fmt.bufPrint(buffer, "{d}d ago", .{ms / std.time.ms_per_day}) catch unreachable;
+}
+
+test "ago rounds down to the largest whole unit" {
+    var buffer: [ago_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("just now", ago(&buffer, 59 * std.time.ms_per_s));
+    try std.testing.expectEqualStrings("5m ago", ago(&buffer, 5 * std.time.ms_per_min + 59 * std.time.ms_per_s));
+    try std.testing.expectEqualStrings("23h ago", ago(&buffer, std.time.ms_per_day - 1));
+    try std.testing.expectEqualStrings("12d ago", ago(&buffer, 12 * std.time.ms_per_day));
+}
+
 /// Longest string `bytes` can produce, so callers can size a buffer.
 pub const bytes_len = 16;
 
