@@ -177,6 +177,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
     switch (event) {
         .init => {
             try commands.applyMcp(self, ctx);
+            commands.askProviders(self, ctx) catch {};
             if (self.pending_model_check) try self.scheduleTick(ctx);
             if (self.mcp) |host| {
                 if (host.connecting()) try self.scheduleTick(ctx);
@@ -192,11 +193,13 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             self.normalizePaste();
             try self.handlePaste(self.paste_buffer.items);
             self.paste_buffer.clearRetainingCapacity();
+            try self.followDraft(ctx);
             return ctx.consumeAndRedraw();
         },
         .paste => |text| {
             defer self.allocator.free(text);
             try self.handlePaste(text);
+            try self.followDraft(ctx);
             return ctx.consumeAndRedraw();
         },
         .mouse => |mouse| {
@@ -226,6 +229,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             self.tick_pending = false;
             try commands.pollSignIn(self, ctx);
             try commands.pollSignOut(self, ctx);
+            try commands.pollModelListings(self, ctx);
             commands.checkModel(self, ctx);
             try commands.applyMcp(self, ctx);
             if (self.mcp) |host| {
@@ -352,8 +356,10 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     .none => {},
                     .cancel => self.models.close(),
                     .choose => {
-                        if (self.models.selected()) |entry| try commands.switchTo(self, entry);
-                        self.models.close();
+                        defer self.models.close();
+                        if (try commands.refuseMidTurn(self, ctx)) return ctx.consumeAndRedraw();
+                        const entry = self.models.selected() orelse return ctx.consumeAndRedraw();
+                        commands.switchTo(self, entry) catch |err| try commands.reportSwitchFailure(self, ctx, entry.name, err);
                     },
                 }
                 return ctx.consumeAndRedraw();
@@ -387,7 +393,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             // Not ctrl+m: in the legacy encoding that is carriage return.
             if (key.matches('o', .{ .ctrl = true })) {
-                try commands.showModels(self);
+                if (!try commands.refuseMidTurn(self, ctx)) try commands.showModels(self, ctx);
                 return ctx.consumeAndRedraw();
             }
 
@@ -407,6 +413,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             if (key.matches('v', .{ .ctrl = true })) {
                 self.attachClipboardImage();
+                try self.followDraft(ctx);
                 return ctx.consumeAndRedraw();
             }
 
@@ -501,9 +508,9 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
-                    const command = self.slash.selectedCommand().?;
+                    const is_run_on_enter = self.slash.runsOnEnter();
                     try self.acceptCommand();
-                    if (command.argument.len == 0) {
+                    if (is_run_on_enter) {
                         const line = try self.allocator.dupe(u8, self.input.text.items);
                         defer self.allocator.free(line);
                         self.input.clear();
@@ -533,10 +540,16 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             if (key.matches(vaxis.Key.up, .{})) {
-                if (try self.recall(.back)) return ctx.consumeAndRedraw();
+                if (try self.recall(.back)) {
+                    try self.followDraft(ctx);
+                    return ctx.consumeAndRedraw();
+                }
             }
             if (key.matches(vaxis.Key.down, .{})) {
-                if (try self.recall(.forward)) return ctx.consumeAndRedraw();
+                if (try self.recall(.forward)) {
+                    try self.followDraft(ctx);
+                    return ctx.consumeAndRedraw();
+                }
             }
 
             if (self.selection.isActive() and key.text != null) {
@@ -545,10 +558,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
 
             _ = try self.input.handleEvent(ctx, event);
-            try self.refreshMentions();
-            try self.awaitMentions(ctx);
-            self.slash.chatgpt_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
-            try self.slash.update(self.input.text.items, self.input.cursor);
+            try self.followDraft(ctx);
             if (ctx.consume_event) return;
         },
         else => {},
@@ -586,6 +596,7 @@ fn openEditor(self: *Model, ctx: *vxfw.EventContext) !void {
 
     self.input.clear();
     try self.input.insertText(edited);
+    try self.followDraft(ctx);
 }
 
 /// Hand the terminal back and stop the process, the way ctrl+z does for any

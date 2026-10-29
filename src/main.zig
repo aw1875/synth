@@ -37,9 +37,9 @@ const themes = @import("tui/themes.zig");
 
 // We don't want to see the log messages from the libraries we use
 pub const std_options = std.Options{
+    .logFn = logOutsideOllama,
     .log_scope_levels = &[_]std.log.ScopeLevel{
         .{ .scope = .vaxis, .level = .warn },
-        .{ .scope = .ollama, .level = .warn },
         .{ .scope = .zqlite, .level = .warn },
         .{ .scope = .clap, .level = .warn },
         .{ .scope = .oauth2, .level = .warn },
@@ -47,6 +47,20 @@ pub const std_options = std.Options{
         .{ .scope = .websocket, .level = .warn },
     },
 };
+
+/// The ollama package logs every failed request as an error and then returns
+/// it, and synth explains the error itself. Written to stderr, the log lands
+/// on top of the TUI, which a model listing for a stopped server would do at
+/// every launch.
+fn logOutsideOllama(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (scope == .ollama) return;
+    std.log.defaultLog(level, scope, format, args);
+}
 
 pub fn main(init: std.process.Init) !void {
     const command = try cli.parse(init, init.arena.allocator());

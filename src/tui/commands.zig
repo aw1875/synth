@@ -22,6 +22,7 @@ const SignInTask = @import("chatgpt_sign_in.zig");
 const SignOutTask = @import("chatgpt_sign_out.zig");
 const keys = @import("keys.zig");
 const Model = @import("model.zig");
+const ModelListing = @import("model_listing.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const Slash = @import("slash.zig");
@@ -31,6 +32,8 @@ const search_limit: usize = 20;
 const theme = @import("theme.zig");
 const themes = @import("themes.zig");
 const humanize = @import("../core/humanize.zig");
+
+const finish_turn_first = "Finish the turn first";
 
 pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !bool {
     const line = std.mem.trim(u8, value, " \t\r\n");
@@ -46,8 +49,8 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/search")) {
-        try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
+    if (isCommand(line, "/search")) {
+        try searchTranscripts(self, ctx, commandArgument(line));
         return true;
     }
     if (std.mem.eql(u8, line, "/prune")) {
@@ -56,13 +59,12 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     }
     if (std.mem.eql(u8, line, "/compact")) {
         if (try offerProvidersInstead(self)) return true;
+        if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
         try self.startCompaction(ctx);
         return true;
     }
     if (std.mem.eql(u8, line, "/clear")) {
-        if (!self.clearSession()) {
-            try self.notification.show(ctx, .info, "Finish the turn first");
-        }
+        if (!self.clearSession()) return refuseCommand(self, ctx, line, finish_turn_first);
         ctx.redraw = true;
         return true;
     }
@@ -75,8 +77,8 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/agent")) {
-        const name = std.mem.trim(u8, line["/agent".len..], " ");
+    if (isCommand(line, "/agent")) {
+        const name = commandArgument(line);
         if (name.len > 0) {
             try switchAgent(self, ctx, agents.findOrDefault(name).id);
         } else {
@@ -84,8 +86,8 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         }
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/theme")) {
-        const name = std.mem.trim(u8, line["/theme".len..], " ");
+    if (isCommand(line, "/theme")) {
+        const name = commandArgument(line);
         if (name.len > 0) {
             keepTheme(self, themes.findOrDefault(name).id);
         } else {
@@ -122,7 +124,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     if (isCommand(line, "/effort")) {
-        try chooseEffort(self, ctx, std.mem.trim(u8, line["/effort".len..], " "));
+        try chooseEffort(self, ctx, commandArgument(line));
         ctx.redraw = true;
         return true;
     }
@@ -136,19 +138,21 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/model")) {
+    if (isCommand(line, "/model")) {
         if (try offerProvidersInstead(self)) return true;
-        const name = std.mem.trim(u8, line["/model".len..], " ");
-        if (name.len > 0) {
-            _ = switchModel(self, name) catch "";
-        } else {
-            try showModels(self);
+        if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
+        const name = commandArgument(line);
+        if (name.len == 0) {
+            try showModels(self, ctx);
+        } else if (switchModel(self, name)) |_| {} else |err| {
+            if (err == error.UnknownModel) return refuseUnknownModel(self, ctx, line, name);
+            try reportSwitchFailure(self, ctx, name, err);
         }
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/rename")) {
-        const name = std.mem.trim(u8, line["/rename".len..], " ");
+    if (isCommand(line, "/rename")) {
+        const name = commandArgument(line);
         if (name.len > 0) {
             self.loop.rename(name) catch {};
         } else {
@@ -160,6 +164,30 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     return runSkill(self, ctx, line);
 }
 
+/// Turn down what is not a draft to hand back: a key, or a pick in a picker.
+pub fn refuseMidTurn(self: *Model, ctx: *vxfw.EventContext) !bool {
+    if (!self.loop.isBusy()) return false;
+    try self.notification.show(ctx, .info, finish_turn_first);
+    return true;
+}
+
+/// Turn a command down and hand the draft back, so nothing typed is lost.
+fn refuseCommand(self: *Model, ctx: *vxfw.EventContext, line: []const u8, said: []const u8) !bool {
+    try self.input.insertText(line);
+    try self.followDraft(ctx);
+    try self.notification.show(ctx, .info, said);
+    ctx.redraw = true;
+    return true;
+}
+
+fn commandName(line: []const u8) []const u8 {
+    return line[1..Slash.commandWordEnd(line)];
+}
+
+fn commandArgument(line: []const u8) []const u8 {
+    return std.mem.trim(u8, line[Slash.commandWordEnd(line)..], " \t\r\n");
+}
+
 /// Invoke a skill by name: `/release 2.1`.
 ///
 /// The instructions travel as an attachment rather than as the message text, so
@@ -167,15 +195,9 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
 /// skill. It is the same path an `@path` mention takes, which is what keeps a
 /// two hundred line skill from being pasted into the conversation view.
 fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
-    const word_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
-    const id = line[1..word_end];
-    const found = skill.findIn(self.loop.skills, id) orelse return false;
+    const found = skill.findIn(self.loop.skills, commandName(line)) orelse return false;
 
-    if (self.loop.isBusy()) {
-        try self.notification.show(ctx, .info, "Finish the turn first");
-        ctx.redraw = true;
-        return true;
-    }
+    if (self.loop.isBusy()) return refuseCommand(self, ctx, line, finish_turn_first);
 
     const path = try std.fs.path.join(self.allocator, &.{ found.dir, skill.file_name });
     defer self.allocator.free(path);
@@ -502,8 +524,8 @@ pub fn note(self: *Model, comptime fmt: []const u8, args: anytype) !void {
 /// Whether `line` is `command` alone or followed by an argument, so `/effortx`
 /// is not read as `/effort x`.
 fn isCommand(line: []const u8, command: []const u8) bool {
-    if (!std.mem.startsWith(u8, line, command)) return false;
-    return line.len == command.len or line[command.len] == ' ';
+    const typed = line[0..Slash.commandWordEnd(line)];
+    return std.mem.eql(u8, typed, command);
 }
 
 /// Nothing usable is selected: none was chosen, or the ChatGPT session in use
@@ -528,8 +550,11 @@ pub fn offerProvidersInstead(self: *Model) !bool {
     return true;
 }
 
-/// Open the model switcher, asking each provider what it offers.
-pub fn showModels(self: *Model) !void {
+/// Open the model switcher at once on what each connected provider last
+/// offered, and ask them all again in the background. Each answer replaces that
+/// provider's models as it lands, so a slow or hung one never holds the picker
+/// shut.
+pub fn showModels(self: *Model, ctx: *vxfw.EventContext) !void {
     if (try offerProvidersInstead(self)) return;
     if (!self.provider.switchable()) return;
 
@@ -537,23 +562,27 @@ pub fn showModels(self: *Model) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var entries: std.ArrayList(ModelPicker.Entry) = .empty;
-    const active_id = try activeProviderId(self, arena);
+    try self.models.show(try lastOffered(self, arena), try recentModels(self, arena), self.provider.model);
+    try askProviders(self, ctx);
+    self.models.asking = try countUnlisted(self, arena);
+}
 
+/// Ask every connected provider what it offers, unless it is being asked
+/// already. Done once at launch too, so the first picker opens with rows.
+pub fn askProviders(self: *Model, ctx: *vxfw.EventContext) !void {
+    if (needsProvider(self)) return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const active_id = try activeProviderId(self, arena);
     for (catalog.all) |entry| {
         if (!isConnected(self, entry)) continue;
-
-        try entries.appendSlice(arena, try listModels(self, arena, entry, active_id));
+        if (isBeingAsked(self, entry.id)) continue;
+        try startModelListing(self, arena, entry, active_id);
     }
-
-    var recent: []const []const u8 = &.{};
-    if (self.loop.database()) |db| {
-        if (self.loop.project_id) |project_id| {
-            recent = db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
-        }
-    }
-
-    try self.models.show(entries.items, recent, self.provider.model);
+    if (self.model_listings.items.len > 0) try self.scheduleTick(ctx);
 }
 
 /// Whether a provider has what it needs to be asked what it offers.
@@ -562,19 +591,35 @@ pub fn isConnected(self: *Model, entry: catalog.Entry) bool {
     return entry.ready(auth, self.chatgpt);
 }
 
-/// The models one provider offers.
-///
-/// The one in use answers through the live backend; the rest get a client of
-/// their own, built from the host the database remembers and the key
-/// `auth.json` holds. Nothing is reconnected to list a model - that only
-/// happens when one is picked.
-pub fn listModels(
-    self: *Model,
-    arena: std.mem.Allocator,
-    entry: catalog.Entry,
-    active_id: []const u8,
-) ![]const ModelPicker.Entry {
-    if (std.mem.eql(u8, entry.id, active_id)) return modelEntries(self, arena, entry, self.provider);
+/// Each provider is asked through a client of its own, never the one a turn
+/// uses. A provider that cannot be given a thread is left out.
+fn startModelListing(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !void {
+    const reach = try reachOf(self, arena, entry, active_id);
+    const listing = ModelListing.start(self.allocator, self.io, entry, reach) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return,
+        else => return err,
+    };
+    errdefer listing.abandon();
+    try self.model_listings.append(self.allocator, listing);
+}
+
+fn isBeingAsked(self: *Model, provider_id: []const u8) bool {
+    for (self.model_listings.items) |listing| {
+        if (std.mem.eql(u8, listing.entry.id, provider_id)) return true;
+    }
+    return false;
+}
+
+/// The provider in use is reached where it is pointed now, which a runtime
+/// connect may have moved; the rest where the database remembers, with the key
+/// `auth.json` holds.
+fn reachOf(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !ModelListing.Reach {
+    const is_active = std.mem.eql(u8, entry.id, active_id);
+    if (is_active) {
+        if (self.backend) |backend| {
+            return .{ .host = backend.currentHost(), .api_key = backend.currentKey(), .chatgpt = self.chatgpt };
+        }
+    }
 
     var host = entry.host;
     if (entry.host_editable) {
@@ -583,52 +628,119 @@ pub fn listModels(
             if (remembered.len > 0) host = remembered;
         }
     }
-
-    var backend: Backend = .init(entry.kind, .{
-        .allocator = arena,
-        .io = self.io,
-        .host = host,
-        .label = entry.label,
-        .api_key = if (self.auth) |auth| auth.key(entry.id) else null,
-        .chatgpt = self.chatgpt,
-    });
-    defer backend.deinit();
-    backend.start() catch return &.{};
-
-    return modelEntries(self, arena, entry, backend.provider());
+    const api_key = if (self.auth) |auth| auth.key(entry.id) else null;
+    return .{ .host = host, .api_key = api_key, .chatgpt = self.chatgpt };
 }
 
-/// Each model a provider offers, with its effort levels and the level last
-/// chosen for it. Copied into `arena`: a listing backend dies straight after.
+pub fn pollModelListings(self: *Model, ctx: *vxfw.EventContext) !void {
+    const listings = &self.model_listings;
+    var is_any_finished = false;
+    var index: usize = 0;
+    while (index < listings.items.len) {
+        const listing = listings.items[index];
+        if (!listing.isFinished()) {
+            index += 1;
+            continue;
+        }
+        _ = listings.orderedRemove(index);
+        listing.join();
+        try keepOffered(self, listing);
+        is_any_finished = true;
+    }
+    if (is_any_finished and self.models.open) {
+        try refillModels(self);
+        ctx.redraw = true;
+    }
+    if (listings.items.len > 0) try self.scheduleTick(ctx);
+}
+
+/// A provider that could not be asked leaves what it offered last in place.
+fn keepOffered(self: *Model, listing: *ModelListing) !void {
+    if (listing.models == null) return listing.destroy();
+    for (self.offered_models.items) |*kept| {
+        if (!std.mem.eql(u8, kept.*.entry.id, listing.entry.id)) continue;
+        kept.*.destroy();
+        kept.* = listing;
+        return;
+    }
+    errdefer listing.destroy();
+    try self.offered_models.append(self.allocator, listing);
+}
+
+fn refillModels(self: *Model) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try self.models.refill(try lastOffered(self, arena), try recentModels(self, arena));
+    self.models.asking = try countUnlisted(self, arena);
+}
+
+/// Every connected provider's models, in catalog order.
+fn lastOffered(self: *Model, arena: std.mem.Allocator) ![]const ModelPicker.Entry {
+    const active_id = try activeProviderId(self, arena);
+    var entries: std.ArrayList(ModelPicker.Entry) = .empty;
+    for (catalog.all) |entry| {
+        if (!isConnected(self, entry)) continue;
+        const models = try offeredBy(self, arena, entry, active_id) orelse continue;
+        try entries.appendSlice(arena, try modelEntries(self, arena, entry, models));
+    }
+    return entries.items;
+}
+
+/// What a provider last offered from where it is reached now. A list from a
+/// host it has since moved off is no answer: an OpenAI-compatible server takes
+/// any name, so its rows would set a model the new host does not have.
+fn offeredBy(self: *Model, arena: std.mem.Allocator, entry: catalog.Entry, active_id: []const u8) !?[]const ModelListing.Offered {
+    const reach = try reachOf(self, arena, entry, active_id);
+    for (self.offered_models.items) |kept| {
+        if (!std.mem.eql(u8, kept.entry.id, entry.id)) continue;
+        if (!std.mem.eql(u8, kept.reach.host, reach.host)) return null;
+        return kept.models;
+    }
+    return null;
+}
+
+/// Providers still being asked that have no rows to show yet.
+fn countUnlisted(self: *Model, arena: std.mem.Allocator) !usize {
+    const active_id = try activeProviderId(self, arena);
+    var count: usize = 0;
+    for (self.model_listings.items) |listing| {
+        const offered = try offeredBy(self, arena, listing.entry, active_id);
+        if (offered == null) count += 1;
+    }
+    return count;
+}
+
+fn recentModels(self: *Model, arena: std.mem.Allocator) ![]const []const u8 {
+    const db = self.loop.database() orelse return &.{};
+    const project_id = self.loop.project_id orelse return &.{};
+    return db.recentModels(arena, project_id, ModelPicker.max_recent) catch &.{};
+}
+
+/// Each model a provider offers, with the effort level last chosen for it.
+/// Borrows from `offered`; the picker copies what it keeps.
 fn modelEntries(
     self: *Model,
     arena: std.mem.Allocator,
     entry: catalog.Entry,
-    provider: Provider,
+    offered: []const ModelListing.Offered,
 ) ![]const ModelPicker.Entry {
-    const names = provider.models(arena) catch return &.{};
-    const entries = try arena.alloc(ModelPicker.Entry, names.len);
-    for (names, entries) |name, *model| {
-        const efforts = provider.effortsFor(name);
-        const remembered = try rememberedEffort(self, arena, entry.id, name);
-        const is_remembered_offered = for (efforts.levels) |level| {
+    const entries = try arena.alloc(ModelPicker.Entry, offered.len);
+    for (offered, entries) |model, *picked| {
+        const remembered = try rememberedEffort(self, arena, entry.id, model.name);
+        const is_remembered_offered = for (model.efforts.levels) |level| {
             if (std.mem.eql(u8, level, remembered)) break true;
         } else false;
-        model.* = .{
-            .name = name,
+        picked.* = .{
+            .name = model.name,
             .provider = entry.label,
             .provider_id = entry.id,
-            .efforts = try dupeLevels(arena, efforts.levels),
-            .effort = try arena.dupe(u8, if (is_remembered_offered) remembered else efforts.default),
+            .efforts = model.efforts.levels,
+            .effort = if (is_remembered_offered) remembered else model.efforts.default,
         };
     }
     return entries;
-}
-
-fn dupeLevels(arena: std.mem.Allocator, levels: []const []const u8) ![]const []const u8 {
-    const copies = try arena.alloc([]const u8, levels.len);
-    for (levels, copies) |level, *copy| copy.* = try arena.dupe(u8, level);
-    return copies;
 }
 
 fn effortKey(arena: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
@@ -702,7 +814,7 @@ fn chooseEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void 
 
 /// Refused mid-turn: the request in flight reads the level as it is built.
 pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void {
-    if (self.loop.isBusy()) return self.notification.show(ctx, .info, "Finish the turn first");
+    if (try refuseMidTurn(self, ctx)) return;
     try applyEffort(self, level);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -754,7 +866,10 @@ pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
             // A provider we never reached is still on the old model.
             if (!try pointAt(self, connection)) return;
 
-            const running = try switchModel(self, entry.name);
+            const running = switchModel(self, entry.name) catch |err| {
+                try announceProvider(self, connection, self.provider.model);
+                return err;
+            };
             if (entry.effort_changed) try applyEffort(self, entry.effort);
             try announceProvider(self, connection, running);
             return;
@@ -782,6 +897,29 @@ pub fn switchModel(self: *Model, name: []const u8) ![]const u8 {
     try rememberModelChoice(self, current.model);
     try restoreEffort(self);
     return self.provider.model;
+}
+
+/// In the backend's words where it has some. A switch that went through before
+/// a later step failed, such as remembering the choice, is said to have.
+pub fn reportSwitchFailure(self: *Model, ctx: *vxfw.EventContext, name: []const u8, err: anyerror) !void {
+    if (err == error.UnknownModel) {
+        return self.notification.showFmt(ctx, .warn, unknown_model_format, .{ self.provider.name, name });
+    }
+    const is_switched = std.mem.eql(u8, self.provider.model, name);
+    if (is_switched) {
+        return self.notification.showFmt(ctx, .warn, "Switched to {s}, but could not remember it for next time: {s}", .{ name, @errorName(err) });
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    try self.notification.show(ctx, .err, try self.provider.explain(err, arena_state.allocator()));
+}
+
+const unknown_model_format = "{s} has no model called {s}. ctrl+o lists what it has.";
+
+fn refuseUnknownModel(self: *Model, ctx: *vxfw.EventContext, line: []const u8, name: []const u8) !bool {
+    const said = try std.fmt.allocPrint(self.allocator, unknown_model_format, .{ self.provider.name, name });
+    defer self.allocator.free(said);
+    return refuseCommand(self, ctx, line, said);
 }
 
 /// Remember the model per provider so the next launch reopens on it.
@@ -847,9 +985,21 @@ pub fn checkModel(self: *Model, ctx: *vxfw.EventContext) void {
     self.pending_model_check = false;
 
     const backend = self.backend orelse return;
+    const remembered = self.allocator.dupe(u8, backend.model()) catch return;
+    defer self.allocator.free(remembered);
     backend.ensureModel() catch {};
-    syncProvider(self);
     ctx.redraw = true;
+    adoptSettledModel(self, ctx, remembered, backend.model()) catch {};
+}
+
+/// The backend settled on a model other than the one it started with. Taken
+/// the way a pick is, so the sidebar, the session and the effort level follow,
+/// and said aloud when it replaced one remembered from last time.
+fn adoptSettledModel(self: *Model, ctx: *vxfw.EventContext, remembered: []const u8, settled: []const u8) !void {
+    if (std.mem.eql(u8, remembered, settled)) return;
+    _ = try switchModel(self, settled);
+    if (remembered.len == 0) return;
+    try self.notification.showFmt(ctx, .warn, "{s} no longer offers {s}, so this session uses {s}.", .{ self.provider.name, remembered, settled });
 }
 
 /// Take delivery of servers connected on a worker.
@@ -899,7 +1049,65 @@ const testing = std.testing;
 
 /// Stands in for a backend that can be pointed at another of its models.
 fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
+    if (std.mem.eql(u8, name, unserved_model)) return error.UnknownModel;
     return .{ .model = name };
+}
+
+const unserved_model = "asdf";
+
+test "a remembered model that gave way at launch is reported" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try adoptSettledModel(&model, &ctx, "qwen3-coder:30b", "qwen3-coder:30b");
+    try testing.expect(!isToastUp(&model, "no longer offers"));
+
+    try adoptSettledModel(&model, &ctx, "s", "glm-5.3-flash");
+    try testing.expect(isToastUp(&model, "no longer offers s"));
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+    try testing.expectEqualStrings("glm-5.3-flash", model.loop.provider.model);
+}
+
+fn isToastUp(model: *Model, fragment: []const u8) bool {
+    for (model.notification.toasts) |toast| {
+        if (std.mem.indexOf(u8, toast.body, fragment) != null) return true;
+    }
+    return false;
+}
+
+test "the picker opens on what a provider offered last, from where it is reached now" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ollama = catalog.findOrDefault(catalog.default_id);
+    const offered: []const ModelListing.Offered = &.{.{ .name = "qwen3:8b", .efforts = .{} }};
+
+    try keepOffered(&model, try answeredListing(offered, ollama.host));
+    try testing.expectEqual(@as(usize, 1), (try lastOffered(&model, arena)).len);
+
+    try keepOffered(&model, try answeredListing(null, ollama.host));
+    try testing.expectEqual(@as(usize, 1), (try lastOffered(&model, arena)).len);
+
+    try keepOffered(&model, try answeredListing(offered, "http://elsewhere:11434"));
+    try testing.expectEqual(@as(usize, 0), (try lastOffered(&model, arena)).len);
+}
+
+/// A listing that has finished, made to say `models` from `host`.
+fn answeredListing(models: ?[]const ModelListing.Offered, host: []const u8) !*ModelListing {
+    const unreachable_host = "http://127.0.0.1:1";
+    const entry = catalog.findOrDefault(catalog.default_id);
+    const listing = try ModelListing.start(testing.allocator, testing.io, entry, .{ .host = unreachable_host, .api_key = null, .chatgpt = null });
+    listing.join();
+    listing.models = models;
+    listing.reach.host = host;
+    return listing;
 }
 
 /// A model in a test needs only enough to hold a provider and a transcript.
@@ -919,6 +1127,91 @@ fn switchFixture(allocator: std.mem.Allocator, userdata: *u8, model_name: []cons
     };
     try self.wire();
     return self;
+}
+
+test "a model the provider does not serve is refused, and the one in use stays" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    const refused = "/model " ++ unserved_model;
+    try testing.expect(try runCommand(&model, &ctx, refused));
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+    try testing.expectEqualStrings(refused, model.input.text.items);
+
+    model.input.clear();
+    try testing.expect(try runCommand(&model, &ctx, "/model glm-5.3-flash"));
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+}
+
+test "the model is not switched under a running turn" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    model.loop.state = .awaiting_approval;
+    defer model.loop.state = .idle;
+
+    const line = "/model glm-5.3-flash";
+    try testing.expect(try runCommand(&model, &ctx, line));
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+    try testing.expectEqualStrings(line, model.input.text.items);
+}
+
+test "a word that names no command goes to the model as written" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try testing.expect(!try runCommand(&model, &ctx, "/models"));
+    try testing.expectEqualStrings("qwen3-coder:30b", model.provider.model);
+}
+
+test "clearing the draft closes the slash menu over it" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try model.input.insertText("/mo");
+    try model.followDraft(&ctx);
+    try testing.expect(model.slash.isOpen());
+
+    try model.handleInterrupt(&ctx);
+    try testing.expect(!model.slash.isOpen());
+}
+
+test "a tab separates a command from its argument" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try testing.expect(try runCommand(&model, &ctx, "/model\tglm-5.3-flash"));
+    try testing.expectEqualStrings("glm-5.3-flash", model.provider.model);
+}
+
+test "a command is matched by its whole name, not as a prefix" {
+    try testing.expect(isCommand("/model", "/model"));
+    try testing.expect(isCommand("/model glm-5.3-flash", "/model"));
+    try testing.expect(!isCommand("/models", "/model"));
+}
+
+fn testContext() vxfw.EventContext {
+    return .{
+        .phase = .at_target,
+        .io = testing.io,
+        .alloc = testing.allocator,
+        .cmds = .empty,
+    };
 }
 
 test "the provider is announced with the model that was actually picked" {

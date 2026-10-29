@@ -124,20 +124,24 @@ pub fn startLike(self: *OllamaProvider, other: *const OllamaProvider) !void {
     self.supports_vision = other.supports_vision;
 }
 
-/// Read what this model can do and how much it can hold. Failures leave the
-/// defaults in place: a server that will not answer `show` is a problem the
-/// first request reports better than startup can.
+/// Read what this model can do and how much it can hold.
 fn probe(self: *OllamaProvider) void {
+    var response = self.client.show(.{ .model = self.model }) catch return self.learnCapabilities(null);
+    defer response.deinit();
+    self.learnCapabilities(response.body() catch null);
+}
+
+/// Take in the server's answer to `show`. No answer leaves the defaults in
+/// place: a server that will not answer is a problem the first request reports
+/// better than this can.
+fn learnCapabilities(self: *OllamaProvider, shown: ?Ollama.ShowResponse) void {
     self.context_limit = 0;
     self.runtime_limit = 0;
     self.think = self.want_think;
     self.supports_tools = true;
     self.supports_vision = true;
 
-    var response = self.client.show(.{ .model = self.model }) catch return;
-    defer response.deinit();
-    const body = response.body() catch return;
-
+    const body = shown orelse return;
     self.context_limit = contextLength(body.model_info);
 
     const capabilities = body.capabilities orelse return;
@@ -598,32 +602,61 @@ fn optionalFields(self: *const OllamaProvider) []const u8 {
 /// Point this provider at another model, re-reading the context window since
 /// that is per-model and the sidebar's "how full is the context" figure is
 /// meaningless against the wrong number.
+///
+/// Refused only when the server says it has no such model. The listing cannot
+/// judge: ollama resolves a bare name to `:latest` and serves `:cloud` models it
+/// never lists.
 pub fn setModel(self: *OllamaProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
+    if (!self.started) return self.adoptModel(name);
 
+    var response = self.client.show(.{ .model = name }) catch {
+        try self.adoptModel(name);
+        return self.learnCapabilities(null);
+    };
+    defer response.deinit();
+    if (isUnknownModel(response.status)) return error.UnknownModel;
+
+    try self.adoptModel(name);
+    self.learnCapabilities(response.body() catch null);
+}
+
+fn adoptModel(self: *OllamaProvider, name: []const u8) !void {
     const owned = try self.allocator.dupe(u8, name);
     if (self.model_owned) |previous| self.allocator.free(previous);
     self.model_owned = owned;
     self.model = owned;
     self.runtime_limit = 0;
-
-    if (self.started) self.probe();
 }
 
 /// Make sure the configured model is one the server actually has, and fall back
-/// to the first it lists when it is not.
+/// to the first it lists when it is not. Judged as `setModel` judges, so a
+/// `:cloud` model chosen today is still there at the next launch.
 pub fn ensureModel(self: *OllamaProvider) !void {
+    if (try self.serves(self.model)) return;
+
     const names = try self.listModels(self.allocator);
     defer {
         for (names) |name| self.allocator.free(name);
         self.allocator.free(names);
     }
     if (names.len == 0) return;
-
-    for (names) |name| {
-        if (sameModel(name, self.model)) return;
-    }
     try self.setModel(names[0]);
+}
+
+/// A server that cannot be asked counts as serving it: the first request
+/// reports an unreachable server better than this can.
+fn serves(self: *OllamaProvider, name: []const u8) !bool {
+    if (!self.started) try self.startWithoutProbe();
+    var response = self.client.show(.{ .model = name }) catch return true;
+    defer response.deinit();
+    return !isUnknownModel(response.status);
+}
+
+/// How `/api/show` refuses a name: 404 for one it does not have, 400 for one
+/// that cannot be a model name at all, such as one with a space in it.
+fn isUnknownModel(status: std.http.Status) bool {
+    return status == .not_found or status == .bad_request;
 }
 
 /// Whether a listed tag is the model that was asked for. Ollama lists

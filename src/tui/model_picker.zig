@@ -21,6 +21,7 @@ pub const max_recent: usize = 5;
 const box_width: u16 = 76;
 /// Left and right padding inside the box.
 const pad: u16 = 2;
+const hint_gap: u16 = 2;
 
 /// One model on offer.
 pub const Entry = struct {
@@ -64,6 +65,8 @@ scroll: usize = 0,
 search: Input,
 /// The model in use, marked in the list.
 current: []const u8 = "",
+/// Providers still being asked that have nothing listed yet.
+asking: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) Picker {
     return .{ .allocator = allocator, .search = .init(allocator) };
@@ -77,9 +80,13 @@ pub fn deinit(self: *Picker) void {
 }
 
 fn release(self: *Picker) void {
-    for (self.entries) |entry| freeEntry(self.allocator, entry);
-    self.allocator.free(self.entries);
+    freeEntries(self.allocator, self.entries);
     self.entries = &.{};
+}
+
+fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
+    for (entries) |entry| freeEntry(allocator, entry);
+    allocator.free(entries);
 }
 
 fn freeEntry(allocator: std.mem.Allocator, entry: Entry) void {
@@ -134,18 +141,7 @@ pub fn show(
     current: []const u8,
 ) !void {
     self.release();
-
-    const entries = try self.allocator.alloc(Entry, models.len);
-    var filled: usize = 0;
-    errdefer {
-        for (entries[0..filled]) |entry| freeEntry(self.allocator, entry);
-        self.allocator.free(entries);
-    }
-    for (models, entries) |src, *dst| {
-        dst.* = try dupeEntry(self.allocator, src, recent);
-        filled += 1;
-    }
-    self.entries = entries;
+    self.entries = try copyEntries(self.allocator, models, recent, &.{});
 
     self.current = current;
     self.search.clear();
@@ -153,6 +149,92 @@ pub fn show(
     self.scroll = 0;
     try self.filter();
     self.open = true;
+}
+
+/// Show `models` in place of the list, as a provider answers again, keeping the
+/// highlight on its row and any effort level stepped here. Borrowed like
+/// `show`.
+pub fn refill(self: *Picker, models: []const Entry, recent: []const []const u8) !void {
+    const place = self.highlightedPlace();
+    const scroll = self.scroll;
+    const previous = self.entries;
+    self.entries = try copyEntries(self.allocator, models, recent, previous);
+    defer freeEntries(self.allocator, previous);
+
+    try self.filter();
+    if (place) |kept| self.restore(kept, scroll);
+}
+
+fn copyEntries(allocator: std.mem.Allocator, models: []const Entry, recent: []const []const u8, previous: []const Entry) ![]Entry {
+    const entries = try allocator.alloc(Entry, models.len);
+    var filled: usize = 0;
+    errdefer {
+        for (entries[0..filled]) |entry| freeEntry(allocator, entry);
+        allocator.free(entries);
+    }
+    for (models, entries) |source, *copy| {
+        copy.* = try dupeEntry(allocator, source, recent);
+        filled += 1;
+        keepSteppedEffort(copy, previous);
+    }
+    return entries;
+}
+
+/// A level stepped before the provider answered again outlasts the answer,
+/// while the model still offers it.
+fn keepSteppedEffort(entry: *Entry, previous: []const Entry) void {
+    for (previous) |old| {
+        if (!old.effort_changed or !isSameModel(old, entry.*)) continue;
+        const level = matchingLevel(entry.efforts, old.effort);
+        if (level.len == 0) return;
+        entry.effort = level;
+        entry.effort_changed = true;
+        return;
+    }
+}
+
+fn isSameModel(a: Entry, b: Entry) bool {
+    return std.mem.eql(u8, a.provider_id, b.provider_id) and std.mem.eql(u8, a.name, b.name);
+}
+
+/// A highlighted model and which of its rows: a recent model is listed twice,
+/// once under Recent and once under its provider.
+const Place = struct {
+    entry: Entry,
+    occurrence: usize,
+};
+
+fn highlightedPlace(self: *const Picker) ?Place {
+    const entry = self.selected() orelse return null;
+    var occurrence: usize = 0;
+    for (self.rows.items[0..self.cursor]) |row| {
+        if (self.isRowFor(row, entry)) occurrence += 1;
+    }
+    return .{ .entry = entry, .occurrence = occurrence };
+}
+
+/// Back to the same row of the same model, or its last row when the answer
+/// left fewer of them.
+fn restore(self: *Picker, place: Place, scroll: usize) void {
+    var occurrence: usize = 0;
+    var found: ?usize = null;
+    for (self.rows.items, 0..) |row, at| {
+        if (!self.isRowFor(row, place.entry)) continue;
+        found = at;
+        if (occurrence == place.occurrence) break;
+        occurrence += 1;
+    }
+    self.cursor = found orelse return;
+    self.scroll = scroll;
+    self.keepCursorVisible();
+}
+
+fn isRowFor(self: *const Picker, row: Row, entry: Entry) bool {
+    const index = switch (row) {
+        .heading => return false,
+        .entry => |index| index,
+    };
+    return isSameModel(self.entries[index], entry);
 }
 
 fn isRecent(name: []const u8, recent: []const []const u8) bool {
@@ -297,6 +379,10 @@ fn move(self: *Picker, delta: i32) void {
     }
 
     self.cursor = @intCast(at);
+    self.keepCursorVisible();
+}
+
+fn keepCursorVisible(self: *Picker) void {
     if (self.cursor < self.scroll) self.scroll = self.cursor;
     if (self.cursor >= self.scroll + max_rows) self.scroll = self.cursor - max_rows + 1;
     if (self.scroll > 0 and self.rows.items[self.scroll - 1] == .heading) self.scroll -= 1;
@@ -353,7 +439,9 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
     const first_row: u16 = field_row + 2;
     if (self.rows.items.len == 0) {
-        _ = w.writeText(surface, pad, first_row, "no models", theme.on_card(theme.fg_dim).cell);
+        const is_waiting = self.asking > 0;
+        const empty = if (is_waiting) "asking providers…" else "no models";
+        _ = w.writeText(surface, pad, first_row, empty, theme.on_card(theme.fg_dim).cell);
     }
 
     for (self.rows.items[self.scroll..][0..visible], 0..) |row, i| {
@@ -396,7 +484,13 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
     const offers_effort = if (self.selected()) |entry| entry.efforts.len > 0 else false;
     if (offers_effort) {
         hint = w.writeText(surface, hint, hint_row, "   ←→", theme.on_card(theme.fg_muted).bold().cell);
-        _ = w.writeText(surface, hint, hint_row, " effort", theme.on_card(theme.fg_dim).cell);
+        hint = w.writeText(surface, hint, hint_row, " effort", theme.on_card(theme.fg_dim).cell);
+    }
+    const is_still_asking = self.asking > 0 and self.rows.items.len > 0;
+    if (is_still_asking) {
+        const asking = try std.fmt.allocPrint(ctx.arena, "asking {d} more…", .{self.asking});
+        const has_room = hint + hint_gap + w.textWidth(asking) + pad <= width;
+        if (has_room) w.writeTextRight(surface, hint_row, pad, asking, theme.on_card(theme.fg_dim).cell);
     }
 
     return .{
@@ -422,6 +516,39 @@ test "the list groups by provider and lifts what was used before" {
     try std.testing.expectEqualStrings("Ollama Cloud", picker.rows.items[5].heading);
 
     try std.testing.expectEqualStrings("llama3:70b", picker.selected().?.name);
+}
+
+test "a fresh answer keeps the highlight on its row" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    const cloud: Entry = .{ .name = "gpt-oss", .provider = "Ollama Cloud", .provider_id = "ollama-cloud" };
+    const local: Entry = .{ .name = "qwen3:8b", .provider = "Ollama", .provider_id = "ollama" };
+    const recent: []const []const u8 = &.{cloud.name};
+
+    try picker.show(&.{cloud}, recent, "");
+    picker.move(1);
+    const row_under_provider = picker.cursor;
+
+    try picker.refill(&.{ local, cloud }, recent);
+
+    try std.testing.expectEqualStrings(cloud.name, picker.selected().?.name);
+    try std.testing.expect(picker.cursor > row_under_provider);
+}
+
+test "a fresh answer keeps an effort level stepped before it" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    const levels: []const []const u8 = &.{ "low", "medium", "high" };
+    const model: Entry = .{ .name = "gpt-5", .provider = "OpenAI", .provider_id = "openai", .efforts = levels, .effort = "medium" };
+
+    try picker.show(&.{model}, &.{}, "");
+    picker.stepEffort(1);
+    try picker.refill(&.{model}, &.{});
+
+    try std.testing.expectEqualStrings("high", picker.selected().?.effort);
+    try std.testing.expect(picker.selected().?.effort_changed);
 }
 
 test "a model remembers which provider offers it" {

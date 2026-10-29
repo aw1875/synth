@@ -36,6 +36,7 @@ const diff = @import("diff.zig");
 const Input = @import("input.zig");
 const markdown = @import("markdown.zig");
 const MentionPopup = @import("mention_popup.zig");
+const ModelListing = @import("model_listing.zig");
 const ModelPicker = @import("model_picker.zig");
 const Notification = @import("notification.zig");
 const Rename = @import("rename.zig");
@@ -248,6 +249,13 @@ provider_missing: bool = false,
 chatgpt_sign_in: ?*SignInTask = null,
 /// A sign-out waiting on OpenAI to confirm the revocation.
 chatgpt_sign_out: ?*SignOutTask = null,
+/// Providers being asked what they offer, at most one listing apiece. Left
+/// to finish when the model picker closes: cancelling one waits on the
+/// network, and on macOS a name lookup cannot be interrupted at all.
+model_listings: std.ArrayList(*ModelListing) = .empty,
+/// What each provider last said it offers, one finished listing apiece. The
+/// model picker opens on these while every provider is asked again.
+offered_models: std.ArrayList(*ModelListing) = .empty,
 /// The client behind `provider`. Borrowed; it outlives the model. Needed
 /// because connecting a provider of another protocol replaces the client, which
 /// the erased `Provider` has no way to do.
@@ -626,6 +634,10 @@ pub fn deinit(self: *Model) void {
         task.abandon();
         self.chatgpt_sign_out = null;
     }
+    for (self.model_listings.items) |listing| listing.abandon();
+    self.model_listings.deinit(self.allocator);
+    for (self.offered_models.items) |listing| listing.destroy();
+    self.offered_models.deinit(self.allocator);
     self.closeSubagent();
     self.subagent_sessions.deinit(self.allocator);
     self.loop.deinit();
@@ -695,7 +707,7 @@ pub fn acceptCommand(self: *Model) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
 
-    const completion = try self.slash.completion(arena_state.allocator()) orelse return;
+    const completion = try self.slash.completion(arena_state.allocator(), self.input.text.items) orelse return;
     self.input.clear();
     try self.input.insertText(completion);
     self.slash.close();
@@ -936,6 +948,8 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     self.loop.dropSteering();
     try self.seedHistory();
     self.input.clear();
+    self.mentions.close();
+    self.slash.close();
     self.held.clear();
     self.scroll = 0;
 }
@@ -1050,6 +1064,7 @@ pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.input.text.items.len > 0) {
         self.input.clear();
         self.mentions.close();
+        self.slash.close();
         self.endRecall();
         if (self.loop.pendingSteering().len == 0) self.held.clear();
         return ctx.consumeAndRedraw();
@@ -1100,6 +1115,20 @@ pub fn refreshMentions(self: *Model) !void {
 /// the tick loop running to notice the scan land.
 pub fn awaitMentions(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.mentions.isScanning()) try self.scheduleTick(ctx);
+}
+
+/// Recompute the `@` and `/` pickers from the draft. Needed after anything that
+/// changes the draft, or a picker goes on offering what is no longer typed.
+pub fn followDraft(self: *Model, ctx: *vxfw.EventContext) !void {
+    try self.refreshMentions();
+    try self.awaitMentions(ctx);
+    try self.refreshSlash();
+}
+
+fn refreshSlash(self: *Model) !void {
+    const is_signed_in = if (self.chatgpt) |store| store.isSignedIn() else false;
+    self.slash.chatgpt_signed_in = is_signed_in;
+    try self.slash.update(self.input.text.items, self.input.cursor);
 }
 
 /// Replace the partial `@token` under the cursor with the selected path.

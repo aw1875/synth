@@ -88,8 +88,8 @@ anything that would change the project unless `--allow` is given.
 
 | key | what it does |
 | --- | --- |
-| `enter` | send, or steer the turn already running |
-| `tab` | cycle mode: build, plan, review |
+| `enter` | send, or steer the turn already running; in the `/` menu, run the highlighted command |
+| `tab` | cycle mode: build, plan, review; in the `/` menu, complete the command |
 | `esc` | cancel the turn, reject a pending call, or close what is open |
 | `ctrl+o` / `ctrl+p` / `ctrl+s` | model / provider / session |
 | `ctrl+r` | rename this session |
@@ -98,6 +98,10 @@ anything that would change the project unless `--allow` is given.
 | `ctrl+v` | paste an image |
 | `ctrl+c` | clear the draft, interrupt a turn, then quit |
 | `ctrl+z` | suspend to the shell |
+
+In the `/` menu, `enter` only completes a skill, a command still missing its
+argument, and `/clear`, `/compact`, `/prune` or `/logout` until the whole name
+is typed. A `/word` that names no command is sent as a message.
 
 `/help` lists the slash commands. `@path` pulls a file into the prompt - an
 image comes along as a picture, and a name with spaces is written
@@ -399,8 +403,8 @@ whatever `skill_paths` names, then the same pair under `$HOME`. Skills written
 for other harnesses work unchanged.
 
 Only the name and description reach the model unasked - it loads the rest when
-one applies, or you run it yourself with `/release`. `synth skills` lists what
-was found and every directory that was searched.
+one applies, or you run it yourself, as in `/release 2.1`. `synth skills` lists
+what was found and every directory that was searched.
 
 ## Layout
 

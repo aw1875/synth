@@ -53,6 +53,8 @@ auth_value: []const u8 = "",
 
 client: std.http.Client = undefined,
 started: bool = false,
+/// Set at start when OpenAI's own API does not list the model in use.
+is_model_unlisted: bool = false,
 /// The socket the turn in flight is reading. Guarded rather than atomic: the
 /// shutdown has to happen while the handle is still owned. See `abort`.
 live_socket: std.posix.fd_t = -1,
@@ -117,17 +119,22 @@ pub fn startLike(self: *OpenAIProvider, other: *const OpenAIProvider) !void {
     self.send_stream_options = other.send_stream_options;
 }
 
-/// Read the context window for the current model. Failures leave the table's
-/// guess in place: a server that will not answer `/v1/models` is a problem the
-/// first request reports better than startup can.
+/// Read the context window for the current model.
 fn probe(self: *OpenAIProvider) void {
-    self.context_limit = knownWindow(self.model);
-
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = self.get(arena, "/models") catch return;
+    const listing = self.get(arena, models_path) catch null;
+    self.is_model_unlisted = self.isRefused(arena, listing, self.model);
+    self.learnWindow(arena, listing);
+}
+
+/// No listing leaves the table's guess in place: a server that will not answer
+/// `/v1/models` is a problem the first request reports better than this can.
+fn learnWindow(self: *OpenAIProvider, arena: std.mem.Allocator, listing: ?[]const u8) void {
+    self.context_limit = knownWindow(self.model);
+    const body = listing orelse return;
     const reported = listedWindow(arena, body, self.model);
     if (reported > 0) self.context_limit = reported;
 }
@@ -289,10 +296,22 @@ pub fn reconnect(self: *OpenAIProvider, connection: Provider.Connection) !void {
 
 /// Point this provider at another model, re-reading the context window since
 /// that is per-model and the sidebar's "how full is the context" figure is
-/// meaningless against the wrong number.
+/// meaningless against the wrong number. The same listing judges the name.
 pub fn setModel(self: *OpenAIProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
+    if (!self.started) return self.adoptModel(name);
 
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const listing = self.get(arena, models_path) catch null;
+    if (self.isRefused(arena, listing, name)) return error.UnknownModel;
+    try self.adoptModel(name);
+    self.learnWindow(arena, listing);
+}
+
+fn adoptModel(self: *OpenAIProvider, name: []const u8) !void {
     const owned = try self.allocator.dupe(u8, name);
     if (self.model_owned) |previous| self.allocator.free(previous);
     self.model_owned = owned;
@@ -300,16 +319,44 @@ pub fn setModel(self: *OpenAIProvider, name: []const u8) !void {
     self.supports_tools = true;
     self.supports_vision = true;
     self.send_stream_options = true;
-
-    if (self.started) self.probe();
 }
 
-/// Settle on a model when the config named none. Unlike ollama, a named model
-/// that the listing does not mention is left alone: a gateway is under no
-/// obligation to list everything it will route, and silently answering as some
-/// other model would be worse than the error the first turn returns.
+const models_path = "/models";
+const official_domain = "api.openai.com";
+
+/// Only OpenAI's own API is judged by its listing, since it lists every model a
+/// key can use; a gateway need not list everything it routes.
+fn isRefused(self: *const OpenAIProvider, arena: std.mem.Allocator, listing: ?[]const u8, name: []const u8) bool {
+    const body = listing orelse return false;
+    return isOfficialHost(self.host) and isUnlisted(arena, body, name);
+}
+
+fn isOfficialHost(host: []const u8) bool {
+    const uri = std.Uri.parse(host) catch return false;
+    const domain = uri.host orelse return false;
+    return switch (domain) {
+        inline else => |text| std.ascii.eqlIgnoreCase(text, official_domain),
+    };
+}
+
+fn isUnlisted(arena: std.mem.Allocator, body: []const u8, name: []const u8) bool {
+    const Listing = struct {
+        data: []const struct { id: []const u8 = "" } = &.{},
+    };
+    const parsed = std.json.parseFromSliceLeaky(Listing, arena, body, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    for (parsed.data) |entry| {
+        if (std.mem.eql(u8, entry.id, name)) return false;
+    }
+    return true;
+}
+
+/// Settle on a model when the config named none, or named one OpenAI's own API
+/// does not list. A gateway's named model is left alone: it need not list
+/// everything it will route.
 pub fn ensureModel(self: *OpenAIProvider) !void {
-    if (self.model.len > 0) return;
+    if (self.model.len > 0 and !self.is_model_unlisted) return;
 
     const names = try self.listModels(self.allocator);
     defer {
@@ -332,7 +379,7 @@ pub fn listModels(self: *OpenAIProvider, allocator: std.mem.Allocator) ![][]cons
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const body = try self.get(arena, "/models");
+    const body = try self.get(arena, models_path);
 
     const Listing = struct {
         data: []const struct { id: []const u8 = "" } = &.{},
@@ -1157,6 +1204,22 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
     }
     return false;
+}
+
+test "only OpenAI's own API judges a name by its listing" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const listing = "{\"data\":[{\"id\":\"gpt-5\"}]}";
+
+    const official: OpenAIProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = "https://api.openai.com/v1/", .model = "" };
+    try std.testing.expect(!official.isRefused(arena, listing, "gpt-5"));
+    try std.testing.expect(official.isRefused(arena, listing, "asdf"));
+    try std.testing.expect(!official.isRefused(arena, "not json", "asdf"));
+    try std.testing.expect(!official.isRefused(arena, null, "asdf"));
+
+    const gateway: OpenAIProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = "https://openrouter.ai/api/v1", .model = "" };
+    try std.testing.expect(!gateway.isRefused(arena, listing, "asdf"));
 }
 
 /// The context window a listing reports for `model`. Not part of the OpenAI

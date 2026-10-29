@@ -240,8 +240,13 @@ pub fn reconnect(self: *ChatGPTProvider, connection: Provider.Connection) !void 
     try self.start();
 }
 
+/// Refused for a slug the catalog holds no entry for, as codex refuses one it
+/// does not list. Judged against the catalog fetched at start, never a fetch of
+/// its own: without one, the first turn reports a bad slug.
 pub fn setModel(self: *ChatGPTProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
+    const is_catalog_loaded = self.catalog.len > 0;
+    if (is_catalog_loaded and self.catalogEntry(name) == null) return error.UnknownModel;
     const owned = try self.allocator.dupe(u8, name);
     if (self.model_owned) |previous| self.allocator.free(previous);
     self.model_owned = owned;
@@ -250,9 +255,11 @@ pub fn setModel(self: *ChatGPTProvider, name: []const u8) !void {
 }
 
 /// The first model the account lists, in the server's own order, when none
-/// was chosen.
+/// was chosen or the one chosen is no longer listed.
 pub fn ensureModel(self: *ChatGPTProvider) !void {
     try self.loadCatalog(false);
+    const is_unlisted = self.catalog.len > 0 and self.catalogEntry(self.model) == null;
+    if (is_unlisted) self.model = "";
     try self.chooseModel();
 }
 
@@ -1441,6 +1448,34 @@ test "effort is one of the model's API levels, always sent, and dropped where un
 
     try chat.setModel("gpt-small");
     try testing.expectEqualStrings("low", chat.current().effort);
+}
+
+test "a slug the catalog does not hold is refused, and the model stays put" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+    try catalogFixture(&chat);
+    try chat.setModel("gpt-test");
+
+    try testing.expectError(error.UnknownModel, chat.setModel("gpt-nope"));
+    try testing.expectEqualStrings("gpt-test", chat.model);
+}
+
+test "a remembered slug the catalog no longer holds gives way to the first one listed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+    try catalogFixture(&chat);
+    chat.model = "s";
+
+    try chat.ensureModel();
+    try testing.expectEqualStrings("gpt-test", chat.model);
 }
 
 test "a summary is asked for only from a model that takes the parameter" {
