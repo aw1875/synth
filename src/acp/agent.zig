@@ -17,6 +17,7 @@ const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
 const synth = @import("synth.zig");
 const Providers = @import("providers.zig");
+const updates = @import("updates.zig");
 const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
@@ -222,7 +223,7 @@ fn dispatch(self: *Agent, inbound: *Inbound) void {
 fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u8, params: ?std.json.Value, arena: std.mem.Allocator) !void {
     const eql = std.mem.eql;
     if (eql(u8, method, protocol.method.initialize)) return self.initialize(connection, try need(id), try rpc.parse(protocol.Initialize, arena, params));
-    if (!connection.initialized) {
+    if (connection.dialect == null) {
         if (id == null) return;
         return error.NotInitialized;
     }
@@ -249,6 +250,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     if (eql(u8, method, protocol.method.session_load)) {
         const request = try rpc.parse(protocol.LoadSession, arena, params);
         const session = try self.open(request.cwd, request.sessionId);
+        if (connection.dialect == .standard) try session.replay(arena, connection);
         return connection.reply(asked, protocol.Loaded{
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
@@ -351,7 +353,6 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
             return connection.fail(id, rpc.code.invalid_params, reason);
         }
     }
-    connection.initialized = true;
     connection.dialect = if (asked != null) .synth else .standard;
     connection.reply(id, protocol.Initialized{
         .agentInfo = .{ .name = pkg.name, .version = pkg.version },
@@ -461,23 +462,27 @@ fn sendSnapshots(self: *Agent, session: *Session) !void {
     const snapshot = try session.snapshot(arena_state.allocator());
     var encoded: std.Io.Writer.Allocating = .init(arena_state.allocator());
     try rpc.notify(&encoded.writer, synth.method.snapshot, snapshot);
-    self.pushSynth(encoded.written());
+    self.broadcast(.synth, encoded.written());
 }
 
-/// Send a line to every client speaking synth's extension.
-fn pushSynth(self: *Agent, line: []const u8) void {
+/// What a client is sent as the session changes: `session/update`, or
+/// synth's extension in its place.
+const Dialect = enum { standard, synth };
+
+/// Send a line to every client speaking `dialect`.
+fn broadcast(self: *Agent, dialect: Dialect, line: []const u8) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     for (self.connections.items) |connection| {
-        if (connection.dialect == .synth) connection.push(line);
+        if (connection.dialect == dialect) connection.push(line);
     }
 }
 
-fn notifySynth(self: *Agent, method: []const u8, params: anytype) void {
+fn notifyAll(self: *Agent, dialect: Dialect, method: []const u8, params: anytype) void {
     var encoded: std.Io.Writer.Allocating = .init(self.allocator);
     defer encoded.deinit();
     rpc.notify(&encoded.writer, method, params) catch return;
-    self.pushSynth(encoded.written());
+    self.broadcast(dialect, encoded.written());
 }
 
 fn noticeFmt(self: *Agent, comptime fmt: []const u8, args: anytype) void {
@@ -488,7 +493,7 @@ fn noticeFmt(self: *Agent, comptime fmt: []const u8, args: anytype) void {
 
 fn notice(self: *Agent, text: []const u8) void {
     const session = self.session orelse return;
-    self.notifySynth(synth.method.notice, synth.Notice{ .sessionId = session.handle, .text = text });
+    self.notifyAll(.synth, synth.method.notice, synth.Notice{ .sessionId = session.handle, .text = text });
 }
 
 /// Answer the prompts waiting on the session once it has nothing left to do
@@ -541,12 +546,7 @@ fn settleApproval(self: *Agent, arena: std.mem.Allocator) void {
 fn ask(self: *Agent, arena: std.mem.Allocator, session: *Session, waiting: Session.Waiting) !void {
     const params: protocol.RequestPermission = .{
         .sessionId = session.handle,
-        .toolCall = .{
-            .toolCallId = try toolCallId(arena, waiting.seq, waiting.call),
-            .title = waiting.tool.name,
-            .status = .pending,
-            .rawInput = std.json.parseFromSliceLeaky(std.json.Value, arena, waiting.tool.arguments, .{}) catch null,
-        },
+        .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
         .options = &permission_options,
     };
 
@@ -555,7 +555,7 @@ fn ask(self: *Agent, arena: std.mem.Allocator, session: *Session, waiting: Sessi
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     for (self.connections.items) |connection| {
-        if (!connection.initialized) continue;
+        if (connection.dialect == null) continue;
         const id = self.next_id;
         self.next_id += 1;
         try asked.requests.append(self.allocator, .{ .connection = connection, .id = id });
@@ -642,12 +642,6 @@ fn isoTime(arena: std.mem.Allocator, ms: i64) ![]const u8 {
         time.getMinutesIntoHour(),
         time.getSecondsIntoMinute(),
     });
-}
-
-/// How ACP names a tool call: its message, then its place in that message.
-/// A provider's own call ids repeat from turn to turn.
-pub fn toolCallId(arena: std.mem.Allocator, seq: u64, call: usize) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{d}.{d}", .{ seq, call });
 }
 
 /// Why a request failed, for the person who made it.
@@ -757,8 +751,7 @@ const Connection = struct {
     /// Raised once the reader is done with everything but being freed.
     finished: std.atomic.Value(bool) = .init(false),
     /// Set by `initialize`. Session's thread only.
-    initialized: bool = false,
-    dialect: enum { standard, synth } = .standard,
+    dialect: ?Dialect = null,
 
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
@@ -965,6 +958,29 @@ const Session = struct {
     stream_thinking: usize = 0,
     stream_text: usize = 0,
     stream_closed: bool = false,
+    /// Each call as clients without synth's extension were last told it, by
+    /// a signature of what can change about it.
+    told_calls: std.AutoHashMapUnmanaged(Place, u64) = .empty,
+    /// The reply they have been streamed so far, which the message it lands
+    /// as is told after.
+    told_text: std.ArrayList(u8) = .empty,
+    told_thinking: usize = 0,
+    /// The rest of what they were last told, encoded.
+    told: Told = .{},
+
+    const Place = struct { seq: u64, call: usize };
+
+    const Told = struct {
+        plan: std.ArrayList(u8) = .empty,
+        mode: std.ArrayList(u8) = .empty,
+        title: std.ArrayList(u8) = .empty,
+        config: std.ArrayList(u8) = .empty,
+        usage: std.ArrayList(u8) = .empty,
+
+        fn deinit(self: *Told, allocator: std.mem.Allocator) void {
+            inline for (std.meta.fields(Told)) |slot| @field(self, slot.name).deinit(allocator);
+        }
+    };
 
     fn create(agent: *Agent, id: i64, cwd: []const u8) !*Session {
         const allocator = agent.allocator;
@@ -1016,6 +1032,9 @@ const Session = struct {
         if (self.mcp_auth) |*store| store.deinit();
         self.sent.deinit(self.allocator);
         self.sent_status.deinit(self.allocator);
+        self.told_calls.deinit(self.allocator);
+        self.told_text.deinit(self.allocator);
+        self.told.deinit(self.allocator);
         self.allocator.free(self.handle);
         self.allocator.free(self.cwd);
         self.allocator.destroy(self);
@@ -1178,18 +1197,20 @@ const Session = struct {
             if (entry.found_existing and entry.value_ptr.* == mark) continue;
             if (send) {
                 const params: synth.Appended = .{ .sessionId = self.handle, .message = try synth.Message.from(arena, msg) };
-                self.agent.notifySynth(if (entry.found_existing) synth.method.updated else synth.method.appended, params);
+                self.agent.notifyAll(.synth, if (entry.found_existing) synth.method.updated else synth.method.appended, params);
             }
             entry.value_ptr.* = mark;
+            try self.tellMessage(arena, msg, !entry.found_existing, send);
         }
         if (self.sent.count() > convo.messages.items.len) try self.forgetTrimmed(arena);
 
         try self.publishStream(arena, send);
+        try self.tellState(arena, send);
 
         var encoded: std.Io.Writer.Allocating = .init(arena);
         try rpc.notify(&encoded.writer, synth.method.status, synth.StatusUpdate{ .sessionId = self.handle, .status = try self.currentStatus(arena) });
         if (!std.mem.eql(u8, encoded.written(), self.sent_status.items)) {
-            if (send) self.agent.pushSynth(encoded.written());
+            if (send) self.agent.broadcast(.synth, encoded.written());
             self.sent_status.clearRetainingCapacity();
             try self.sent_status.appendSlice(self.allocator, encoded.written());
         }
@@ -1203,6 +1224,13 @@ const Session = struct {
             if (seq.* < first) try trimmed.append(arena, seq.*);
         }
         for (trimmed.items) |seq| _ = self.sent.remove(seq);
+
+        var gone: std.ArrayList(Place) = .empty;
+        var places = self.told_calls.keyIterator();
+        while (places.next()) |place| {
+            if (place.seq < first) try gone.append(arena, place.*);
+        }
+        for (gone.items) |place| _ = self.told_calls.remove(place);
     }
 
     fn publishStream(self: *Session, arena: std.mem.Allocator, send: bool) !void {
@@ -1213,13 +1241,22 @@ const Session = struct {
             self.stream_thinking = 0;
             self.stream_text = 0;
             self.stream_closed = false;
+            self.told_text.clearRetainingCapacity();
+            self.told_thinking = 0;
         }
         const thinking = try request.thoughts.copyRange(arena, self.stream_thinking, null);
         const text = try request.content.copyRange(arena, self.stream_text, null);
         const closed = request.thoughts.isClosed();
         if (thinking.len == 0 and text.len == 0 and closed == self.stream_closed) return;
 
-        if (send) self.agent.notifySynth(synth.method.stream, synth.StreamUpdate{ .sessionId = self.handle, .stream = .{
+        if (!loop.compacting) {
+            if (send and thinking.len > 0) self.tell(.{ .agent_thought_chunk = .{ .content = .{ .text = thinking } } });
+            if (send and text.len > 0) self.tell(.{ .agent_message_chunk = .{ .content = .{ .text = text } } });
+            self.told_thinking += thinking.len;
+            try self.told_text.appendSlice(self.allocator, text);
+        }
+
+        if (send) self.agent.notifyAll(.synth, synth.method.stream, synth.StreamUpdate{ .sessionId = self.handle, .stream = .{
             .request = self.stream_request,
             .thinking = thinking,
             .text = text,
@@ -1228,6 +1265,76 @@ const Session = struct {
         self.stream_thinking += thinking.len;
         self.stream_text += text.len;
         self.stream_closed = closed;
+    }
+
+    fn tell(self: *Session, update: protocol.Update) void {
+        self.agent.notifyAll(.standard, protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = update });
+    }
+
+    /// Tell clients without synth's extension what changed in `msg`: the
+    /// part of a reply its stream did not carry, and its calls.
+    fn tellMessage(self: *Session, arena: std.mem.Allocator, msg: *const Conversation.Message, appended: bool, send: bool) !void {
+        if (appended and msg.role == .assistant) {
+            if (send) self.tellRest(msg);
+            self.told_text.clearRetainingCapacity();
+            self.told_thinking = 0;
+        }
+        for (msg.tool_calls, 0..) |*call, index| {
+            const mark = callSignature(call);
+            const entry = try self.told_calls.getOrPut(self.allocator, .{ .seq = msg.seq, .call = index });
+            if (entry.found_existing and entry.value_ptr.* == mark) continue;
+            entry.value_ptr.* = mark;
+            if (!send) continue;
+            const told = try updates.toolCall(arena, self.stack.project.root, msg.seq, index, call);
+            self.tell(if (entry.found_existing) .{ .tool_call_update = told } else .{ .tool_call = told });
+        }
+    }
+
+    /// A reply's stream ends when its request does, which can be between two
+    /// polls, so the tail is told from the message. A failed request lands as
+    /// text of its own rather than the reply streamed.
+    fn tellRest(self: *Session, msg: *const Conversation.Message) void {
+        if (msg.thinking) |thinking| {
+            if (thinking.len > self.told_thinking) self.tell(.{ .agent_thought_chunk = .{ .content = .{ .text = thinking[self.told_thinking..] } } });
+        }
+        const streamed = self.told_text.items;
+        const rest = if (std.mem.startsWith(u8, msg.text, streamed)) msg.text[streamed.len..] else msg.text;
+        if (rest.len > 0) self.tell(.{ .agent_message_chunk = .{ .content = .{ .text = rest } } });
+    }
+
+    /// Tell clients without synth's extension the plan, agent, title, model
+    /// and context use, when they change.
+    fn tellState(self: *Session, arena: std.mem.Allocator, send: bool) !void {
+        const loop = &self.stack.loop;
+        try self.tellChanged(arena, &self.told.plan, .{ .plan = .{ .entries = try updates.plan(arena, loop.todos.items.items) } }, send);
+        try self.tellChanged(arena, &self.told.mode, .{ .current_mode_update = .{ .currentModeId = loop.agent.id } }, send);
+        try self.tellChanged(arena, &self.told.title, .{ .session_info_update = .{ .title = if (loop.title().len > 0) loop.title() else null } }, send);
+        try self.tellChanged(arena, &self.told.config, .{ .config_option_update = .{ .configOptions = try self.configOptions(arena) } }, send);
+        if (loop.provider.context_limit > 0) {
+            try self.tellChanged(arena, &self.told.usage, .{ .usage_update = .{ .used = loop.usage.context_tokens, .size = loop.provider.context_limit } }, send);
+        }
+    }
+
+    fn tellChanged(self: *Session, arena: std.mem.Allocator, last: *std.ArrayList(u8), update: protocol.Update, send: bool) !void {
+        var encoded: std.Io.Writer.Allocating = .init(arena);
+        try rpc.notify(&encoded.writer, protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = update });
+        if (std.mem.eql(u8, encoded.written(), last.items)) return;
+        if (send) self.agent.broadcast(.standard, encoded.written());
+        last.clearRetainingCapacity();
+        try last.appendSlice(self.allocator, encoded.written());
+    }
+
+    /// The transcript from the start, for a client without synth's extension
+    /// loading the session.
+    fn replay(self: *Session, arena: std.mem.Allocator, connection: *Connection) !void {
+        const loop = &self.stack.loop;
+        var told: std.ArrayList(protocol.Update) = .empty;
+        try told.appendSlice(arena, try updates.replay(arena, self.stack.project.root, self.stack.convo.messages.items));
+        if (loop.title().len > 0) try told.append(arena, .{ .session_info_update = .{ .title = loop.title() } });
+        if (loop.todos.items.items.len > 0) try told.append(arena, .{ .plan = .{ .entries = try updates.plan(arena, loop.todos.items.items) } });
+        for (told.items) |update| {
+            connection.notify(protocol.method.session_update, protocol.Notification{ .sessionId = self.handle, .update = update });
+        }
     }
 
     /// Everything a synth client needs to draw the session, cut at the point
@@ -1574,6 +1681,13 @@ const Session = struct {
         return null;
     }
 };
+
+fn callSignature(call: *const Conversation.ToolCall) u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    std.hash.autoHash(&hasher, call.status);
+    std.hash.autoHash(&hasher, if (call.result) |result| result.len else 0);
+    return hasher.final();
+}
 
 /// What can change about a message once it is in the transcript: calls
 /// settle, and heavy bodies shrink to previews once they are persisted.
@@ -1941,7 +2055,7 @@ test "a turn runs, its approval asked as a permission request and its prompt ans
         }
     }{});
     const asked = try client.awaitPermission();
-    try testing.expectEqualStrings(try toolCallId(arena, status.pending_seq.?, 0), asked.call);
+    try testing.expectEqualStrings(try updates.toolCallId(arena, status.pending_seq.?, 0), asked.call);
 
     try client.choose(asked.id, "once");
     try testing.expectEqual(protocol.StopReason.end_turn, try client.stopReason(prompted));
@@ -2047,6 +2161,80 @@ test "a client that did not ask for synth's extension is sent none of it" {
     const setup = try rpc.parse(protocol.SessionSetup, client.arena.allocator(), message.result);
     try testing.expectEqualStrings(agents.default_id, setup.modes.?.currentModeId);
     try testing.expectEqualStrings("scripted", setup.configOptions[0].currentValue);
+}
+
+test "a client without synth's extension is told the turn as session updates, and replayed it on load" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const client = try fixture.connect();
+    defer client.close();
+    try client.initialize(false);
+    const arena = client.arena.allocator();
+
+    const opened = try client.request(protocol.method.session_new, protocol.NewSession{ .cwd = fixture.project });
+    const session = (try rpc.parse(protocol.SessionSetup, arena, try client.expectResult(opened))).sessionId;
+
+    const Told = struct {
+        thinking: std.ArrayList(u8) = .empty,
+        text: std.ArrayList(u8) = .empty,
+        user: std.ArrayList(u8) = .empty,
+        calls: std.ArrayList(std.json.ObjectMap) = .empty,
+
+        fn take(self: *@This(), a: std.mem.Allocator, message: rpc.Message) !void {
+            try testing.expectEqualStrings(protocol.method.session_update, message.method.?);
+            const update = message.params.?.object.get("update").?.object;
+            const kind = update.get("sessionUpdate").?.string;
+            const text = if (update.get("content")) |content| switch (content) {
+                .object => |object| object.get("text").?.string,
+                else => "",
+            } else "";
+            if (std.mem.eql(u8, kind, "agent_thought_chunk")) try self.thinking.appendSlice(a, text);
+            if (std.mem.eql(u8, kind, "agent_message_chunk")) try self.text.appendSlice(a, text);
+            if (std.mem.eql(u8, kind, "user_message_chunk")) try self.user.appendSlice(a, text);
+            if (std.mem.startsWith(u8, kind, "tool_call")) try self.calls.append(a, update);
+        }
+    };
+
+    var live: Told = .{};
+    const prompted = try client.prompt(session, "make a note");
+    while (true) {
+        const message = try client.next();
+        if (message.id != null and message.id.?.eql(prompted)) {
+            try testing.expectEqualStrings("end_turn", message.result.?.object.get("stopReason").?.string);
+            break;
+        }
+        if (std.mem.eql(u8, message.method orelse "", protocol.method.session_request_permission)) {
+            try client.choose(message.id.?, "once");
+            continue;
+        }
+        try live.take(arena, message);
+    }
+    try testing.expectEqualStrings("weighing it upweighing it up", live.thinking.items);
+    try testing.expectEqualStrings("Let me write that down.done", live.text.items);
+    try testing.expectEqualStrings("", live.user.items);
+    const first = live.calls.items[0];
+    const last = live.calls.items[live.calls.items.len - 1];
+    try testing.expectEqualStrings("tool_call", first.get("sessionUpdate").?.string);
+    try testing.expectEqualStrings("write note.txt", first.get("title").?.string);
+    try testing.expectEqualStrings("edit", first.get("kind").?.string);
+    try testing.expectEqualStrings("tool_call_update", last.get("sessionUpdate").?.string);
+    try testing.expectEqualStrings(first.get("toolCallId").?.string, last.get("toolCallId").?.string);
+    try testing.expectEqualStrings("completed", last.get("status").?.string);
+
+    const other = try fixture.connect();
+    defer other.close();
+    try other.initialize(false);
+    const load = try other.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
+    var replayed: Told = .{};
+    while (true) {
+        const message = try other.next();
+        if (message.id != null and message.id.?.eql(load)) break;
+        try replayed.take(other.arena.allocator(), message);
+    }
+    try testing.expectEqualStrings("make a note", replayed.user.items);
+    try testing.expectEqualStrings("Let me write that down.done", replayed.text.items);
+    try testing.expectEqual(@as(usize, 1), replayed.calls.items.len);
+    try testing.expectEqualStrings("completed", replayed.calls.items[0].get("status").?.string);
 }
 
 test "a model and its effort are chosen through config options, and remembered" {
