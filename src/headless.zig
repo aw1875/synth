@@ -12,6 +12,7 @@ const mcp = @import("mcp");
 
 const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
+const McpStore = @import("core/mcp_store.zig");
 const humanize = @import("core/humanize.zig");
 const catalog = @import("provider/catalog.zig");
 const Backend = @import("provider/backend.zig");
@@ -54,7 +55,9 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
 
-    var mcp_auth = mcp.Auth.load(allocator, io, mcp_auth_path) catch mcp.Auth.init(allocator);
+    const mcp_store = try McpStore.open(allocator, io, config.database_path, mcp_auth_path);
+    defer mcp_store.close();
+    var mcp_auth = mcp_store.load() catch mcp.Auth.init(allocator);
     defer mcp_auth.deinit();
 
     var backend: Backend = .init(active.entry.kind, .{

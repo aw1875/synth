@@ -8,6 +8,7 @@ const sockets = @import("sockets.zig");
 const Auth = @import("../core/auth.zig");
 const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
+const McpStore = @import("../core/mcp_store.zig");
 const Backend = @import("../provider/backend.zig");
 const catalog = @import("../provider/catalog.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
@@ -46,6 +47,8 @@ pub fn run(init: std.process.Init) !void {
 
     const mcp_auth_path = try Config.defaultMcpAuthPath(allocator, init.environ_map);
     defer allocator.free(mcp_auth_path);
+    const mcp_store = try McpStore.open(allocator, io, config.database_path, mcp_auth_path);
+    defer mcp_store.close();
     const socket_dir = try sockets.dir(allocator, init.environ_map);
     defer allocator.free(socket_dir);
 
@@ -54,7 +57,7 @@ pub fn run(init: std.process.Init) !void {
         .db = &db,
         .source = .{ .providers = &providers },
         .home = init.environ_map.get("HOME"),
-        .mcp_auth_path = mcp_auth_path,
+        .mcp_store = mcp_store,
         .socket_dir = socket_dir,
     });
     defer agent.deinit();

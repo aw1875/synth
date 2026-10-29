@@ -574,6 +574,36 @@ fn isLive(pid: std.posix.pid_t, heartbeat_at: i64, now: i64) bool {
     return std.posix.errno(std.posix.system.kill(pid, probe)) != .SRCH;
 }
 
+/// One MCP server's stored entry, as the `mcp` package encodes it.
+pub const McpAuthEntry = struct { name: []const u8, entry: []const u8 };
+
+/// Every MCP server's stored entry, in `arena`.
+pub fn mcpAuthEntries(self: *Database, arena: std.mem.Allocator) ![]McpAuthEntry {
+    var rows = try self.conn.rows("SELECT name, entry FROM mcp_auth", .{});
+    defer rows.deinit();
+    var list: std.ArrayList(McpAuthEntry) = .empty;
+    while (rows.next()) |row| {
+        try list.append(arena, .{ .name = try arena.dupe(u8, row.text(0)), .entry = try arena.dupe(u8, row.text(1)) });
+    }
+    return list.items;
+}
+
+/// One MCP server's stored entry, in `arena`, or null when there is none.
+pub fn mcpAuthEntry(self: *Database, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    const row = try self.conn.row("SELECT entry FROM mcp_auth WHERE name = ?", .{name}) orelse return null;
+    defer row.deinit();
+    return try arena.dupe(u8, row.text(0));
+}
+
+/// Replace one MCP server's entry, or remove it when `entry` is null.
+pub fn setMcpAuthEntry(self: *Database, name: []const u8, entry: ?[]const u8) !void {
+    const kept = entry orelse return self.conn.exec("DELETE FROM mcp_auth WHERE name = ?", .{name});
+    try self.conn.exec(
+        \\INSERT INTO mcp_auth (name, entry) VALUES (?, ?)
+        \\ON CONFLICT(name) DO UPDATE SET entry = excluded.entry
+    , .{ name, kept });
+}
+
 /// Append a message row and return its id. Heavy bodies (reasoning, tool
 /// results) are written separately via `appendBlob` so a transcript load never
 /// drags them in.

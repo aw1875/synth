@@ -22,6 +22,7 @@ const updates = @import("updates.zig");
 const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
+const McpStore = @import("../core/mcp_store.zig");
 const mention = @import("../core/mention.zig");
 const Project = @import("../core/project.zig");
 const skill = @import("../core/skill.zig");
@@ -69,7 +70,7 @@ pub const Options = struct {
     source: Source,
     home: ?[]const u8 = null,
     /// Where MCP tokens and on/off choices are kept.
-    mcp_auth_path: ?[]const u8 = null,
+    mcp_store: ?*McpStore = null,
     /// Where the session listens for clients besides the one that started
     /// the agent. Null for none.
     socket_dir: ?[]const u8 = null,
@@ -777,7 +778,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownAttachment => "no such attachment",
         error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
-        error.NoMcpState => "no MCP state file, so this cannot be remembered",
+        error.NoMcpState => "nowhere to keep MCP state, so this cannot be remembered",
         error.InvalidRequest => "a request needs an id",
         error.Unreachable => "nothing could reach the session once you left: it has no socket",
         error.SessionHeld => "this session is open in another process",
@@ -1126,8 +1127,8 @@ const Session = struct {
         errdefer allocator.free(owned_cwd);
         self.* = .{ .agent = agent, .allocator = allocator, .io = io, .handle = owned_handle, .cwd = owned_cwd, .stack = undefined };
 
-        if (options.mcp_auth_path) |path| {
-            self.mcp_auth = mcp.Auth.load(allocator, io, path) catch mcp.Auth.init(allocator);
+        if (options.mcp_store) |store| {
+            self.mcp_auth = store.load() catch mcp.Auth.init(allocator);
         }
         errdefer if (self.mcp_auth) |*store| store.deinit();
 
@@ -1731,7 +1732,7 @@ const Session = struct {
 
         const wanted = mcp_host.wants(server);
         try store.setEnabled(server.name, !wanted);
-        store.save(self.io, null) catch |err| self.notice("Could not remember that: {s}", .{@errorName(err)});
+        store.save(server.name) catch |err| self.notice("Could not remember that: {s}", .{@errorName(err)});
         if (wanted) {
             if (mcp_host.disconnect(&self.stack.registry, server.name)) try self.stack.loop.useAgent(self.stack.loop.agent.id);
         } else {

@@ -11,6 +11,7 @@ const Auth = @import("core/auth.zig");
 const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
+const McpStore = @import("core/mcp_store.zig");
 const humanize = @import("core/humanize.zig");
 const Project = @import("core/project.zig");
 const skill = @import("core/skill.zig");
@@ -408,8 +409,8 @@ test "elapsed time reads in the roughest useful unit" {
 
 /// `mcp list`, `mcp auth`, `mcp logout`, `mcp enable`, `mcp disable`.
 ///
-/// No database and no project: an MCP server is configured for the machine,
-/// not for a directory, so none of this needs to know where it was run.
+/// No project: an MCP server is configured for the machine, not for a
+/// directory, so none of this needs to know where it was run.
 pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
     const allocator = init_process.gpa;
     const io = init_process.io;
@@ -427,8 +428,10 @@ pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
 
     const path = try Config.defaultMcpAuthPath(allocator, init_process.environ_map);
     defer allocator.free(path);
+    const kept = try McpStore.open(allocator, io, config.database_path, path);
+    defer kept.close();
 
-    var store = mcp.Auth.load(allocator, io, path) catch mcp.Auth.init(allocator);
+    var store = try kept.load();
     defer store.deinit();
 
     var buffer: [8192]u8 = undefined;
@@ -438,15 +441,15 @@ pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
 
     switch (sub) {
         .list => try listServers(&store, servers, out),
-        .auth => |name| try authServer(allocator, io, &store, servers, name, path, out),
+        .auth => |name| try authServer(allocator, io, &store, servers, name, out),
         .debug => |name| try debugServer(allocator, io, &store, servers, name, out),
         .logout => |name| {
             store.forget(name);
-            try store.save(io, path);
+            try store.save(name);
             try out.print("Forgot credentials for {s}.\n", .{name});
         },
-        .enable => |name| try toggleServer(io, &store, name, true, path, out),
-        .disable => |name| try toggleServer(io, &store, name, false, path, out),
+        .enable => |name| try toggleServer(&store, name, true, out),
+        .disable => |name| try toggleServer(&store, name, false, out),
     }
 }
 
@@ -480,15 +483,13 @@ fn listServers(store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io
 }
 
 fn toggleServer(
-    io: std.Io,
     store: *mcp.Auth,
     name: []const u8,
     enabled: bool,
-    path: []const u8,
     out: *std.Io.Writer,
 ) !void {
     try store.setEnabled(name, enabled);
-    try store.save(io, path);
+    try store.save(name);
     try out.print("{s} is now {s}.\n", .{ name, if (enabled) "enabled" else "disabled" });
 }
 
@@ -498,7 +499,6 @@ fn authServer(
     store: *mcp.Auth,
     servers: []const mcp_tools.Server,
     name: []const u8,
-    path: []const u8,
     out: *std.Io.Writer,
 ) !void {
     const found = for (servers) |server| {
@@ -533,7 +533,7 @@ fn authServer(
         return err;
     };
 
-    try store.save(io, path);
+    try store.save(name);
     try out.print("Signed in to {s}.\n", .{name});
 }
 

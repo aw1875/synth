@@ -1,27 +1,20 @@
 //! Per-MCP-server OAuth state.
 //!
 //! Each entry holds the tokens, registered client info, and in-flight OAuth
-//! handshake pieces (PKCE verifier, CSRF state) keyed by MCP server name. The
-//! file lives next to `auth.json` because both are state this program writes,
-//! not anything a person edits, and because the permissions question is the
-//! same: owner-only.
+//! handshake pieces (PKCE verifier, CSRF state) keyed by MCP server name.
 //!
-//! Storage matches opencode's `mcp-auth.json` shape so a config from that
-//! ecosystem drops in cleanly.
+//! Where entries are kept between runs is the caller's decision, given as a
+//! `Storage`; nothing here knows a path, a database or the program's name.
+//! That is what keeps the module `std`-and-`oauth2` only. Entries are written
+//! one server at a time, so processes sharing a storage each change only what
+//! they touched.
 //!
-//! Where the file lives is the caller's decision, not this module's. A path is
-//! passed to `load` and `save`; nothing here reads an environment variable or
-//! knows the program's name. That is what keeps the module `std`-and-`oauth2`
-//! only, and it is the reason `defaultPath` does not exist here.
+//! An entry is encoded in the shape of opencode's `mcp-auth.json`, and
+//! `readFile` reads such a file, to bring one in.
 
 const std = @import("std");
 
 const Auth = @This();
-
-const owner_only: std.Io.File.Permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode"))
-    .fromMode(0o600)
-else
-    .default_file;
 
 const max_file_bytes: std.Io.Limit = .limited(256 * 1024);
 
@@ -61,9 +54,24 @@ pub const Entry = struct {
     enabled: ?bool = null,
 };
 
+/// Where entries outlive the process, a server at a time, each encoded as a
+/// JSON object.
+pub const Storage = struct {
+    context: *anyopaque,
+    /// Every server's entry stored, in `arena`.
+    readAll: *const fn (context: *anyopaque, arena: std.mem.Allocator) anyerror![]const Stored,
+    /// One server's entry, in `arena`, or null when none is stored.
+    read: *const fn (context: *anyopaque, arena: std.mem.Allocator, mcp_name: []const u8) anyerror!?[]const u8,
+    /// Replace one server's entry, or remove it when `encoded` is null.
+    write: *const fn (context: *anyopaque, mcp_name: []const u8, encoded: ?[]const u8) anyerror!void,
+
+    pub const Stored = struct { name: []const u8, encoded: []const u8 };
+};
+
 arena: std.heap.ArenaAllocator,
 entries: std.StringArrayHashMapUnmanaged(Entry) = .empty,
-path: []const u8 = "",
+/// Null keeps entries in memory only, and `save` refuses.
+storage: ?Storage = null,
 
 pub fn init(allocator: std.mem.Allocator) Auth {
     return .{ .arena = .init(allocator) };
@@ -73,13 +81,62 @@ pub fn deinit(self: *Auth) void {
     self.arena.deinit();
 }
 
-pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Auth {
+/// The store `storage` keeps, holding what it holds now. An entry that will
+/// not decode is skipped: it should cost that server, not every other one.
+pub fn open(allocator: std.mem.Allocator, storage: Storage) !Auth {
+    var self: Auth = .init(allocator);
+    errdefer self.deinit();
+    self.storage = storage;
+
+    const arena = self.arena.allocator();
+    for (try storage.readAll(storage.context, arena)) |stored| {
+        const entry = decode(arena, stored.encoded) catch continue;
+        (try self.reserve(stored.name)).* = entry;
+    }
+    return self;
+}
+
+/// Write `mcp_name`'s entry to storage as it stands here, or remove it there
+/// when it is gone here. Every other server's entry is left as stored.
+pub fn save(self: *const Auth, mcp_name: []const u8) !void {
+    const storage = self.storage orelse return error.NoStorage;
+    const entry = self.entries.get(mcp_name) orelse return storage.write(storage.context, mcp_name, null);
+    var out: std.Io.Writer.Allocating = .init(self.arena.child_allocator);
+    defer out.deinit();
+    try encode(entry, &out.writer);
+    try storage.write(storage.context, mcp_name, out.written());
+}
+
+/// Take up `mcp_name`'s entry as stored now: another process sharing the
+/// storage may have refreshed its tokens since this one read them, and a
+/// server that rotates refresh tokens refuses the old one.
+pub fn reload(self: *Auth, mcp_name: []const u8) !void {
+    const storage = self.storage orelse return;
+    const arena = self.arena.allocator();
+    const encoded = try storage.read(storage.context, arena, mcp_name) orelse return;
+    (try self.reserve(mcp_name)).* = try decode(arena, encoded);
+}
+
+fn decode(arena: std.mem.Allocator, encoded: []const u8) !Entry {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{});
+    return switch (parsed) {
+        .object => |fields| parseEntry(arena, fields),
+        else => error.InvalidEntry,
+    };
+}
+
+fn encode(entry: Entry, out: *std.Io.Writer) !void {
+    var json: std.json.Stringify = .{ .writer = out };
+    try writeJsonEntry(entry, &json);
+}
+
+/// The entries in a JSON file of opencode's `mcp-auth.json` shape, kept in
+/// memory: a missing file is an empty store.
+pub fn readFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Auth {
     var self: Auth = .init(allocator);
     errdefer self.deinit();
 
     const arena = self.arena.allocator();
-    self.path = try arena.dupe(u8, path);
-
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, arena, max_file_bytes) catch |err| switch (err) {
         error.FileNotFound => return self,
         else => return err,
@@ -279,54 +336,6 @@ pub fn clearOAuthState(self: *Auth, mcp_name: []const u8) void {
     if (self.entries.getPtr(mcp_name)) |e| e.oauth_state = null;
 }
 
-/// Write the store to `path`, or to the path it was loaded from when `path`
-/// is null. Written to a sibling temp file and renamed, so a crash midway
-/// leaves the previous tokens intact rather than a truncated file.
-pub fn save(self: *const Auth, io: std.Io, path: ?[]const u8) !void {
-    const destination = path orelse self.path;
-    if (destination.len == 0) return error.NoPath;
-    try ensureDir(io, destination);
-
-    var temp_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    if (destination.len + ".tmp".len > temp_buffer.len) return error.NameTooLong;
-    const temp_path = try std.fmt.bufPrint(&temp_buffer, "{s}.tmp", .{destination});
-
-    {
-        const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{ .permissions = owner_only });
-        errdefer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-        defer file.close(io);
-
-        var buffer: [1024]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        try self.write(&writer.interface);
-        try writer.interface.flush();
-    }
-    errdefer std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-
-    try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), destination, io);
-}
-
-/// Create the directories `path`'s file needs. A path with no directory part
-/// is already where it belongs.
-fn ensureDir(io: std.Io, path: []const u8) !void {
-    const dir = std.fs.path.dirname(path) orelse return;
-    if (dir.len == 0) return;
-    try std.Io.Dir.cwd().createDirPath(io, dir);
-}
-
-fn write(self: *const Auth, out: *std.Io.Writer) !void {
-    var json: std.json.Stringify = .{ .writer = out, .options = .{ .whitespace = .indent_2 } };
-
-    try json.beginObject();
-    var it = self.entries.iterator();
-    while (it.next()) |entry| {
-        try json.objectField(entry.key_ptr.*);
-        try writeJsonEntry(entry.value_ptr.*, &json);
-    }
-    try json.endObject();
-    try out.writeByte('\n');
-}
-
 fn writeJsonEntry(entry: Entry, json: *std.json.Stringify) !void {
     try json.beginObject();
     if (entry.server_url) |u| {
@@ -400,51 +409,146 @@ fn writeJsonClientInfo(info: ClientInfo, json: *std.json.Stringify) !void {
 
 const testing = std.testing;
 
+/// A storage in memory, standing in for a database two processes share.
+const Shared = struct {
+    entries: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+
+    fn deinit(self: *Shared) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            testing.allocator.free(entry.key_ptr.*);
+            testing.allocator.free(entry.value_ptr.*);
+        }
+        self.entries.deinit(testing.allocator);
+    }
+
+    fn storage(self: *Shared) Storage {
+        return .{ .context = self, .readAll = readAll, .read = read, .write = write };
+    }
+
+    fn readAll(context: *anyopaque, arena: std.mem.Allocator) anyerror![]const Storage.Stored {
+        const self: *Shared = @ptrCast(@alignCast(context));
+        const out = try arena.alloc(Storage.Stored, self.entries.count());
+        for (self.entries.keys(), self.entries.values(), out) |name, encoded, *stored| {
+            stored.* = .{ .name = try arena.dupe(u8, name), .encoded = try arena.dupe(u8, encoded) };
+        }
+        return out;
+    }
+
+    fn read(context: *anyopaque, arena: std.mem.Allocator, mcp_name: []const u8) anyerror!?[]const u8 {
+        const self: *Shared = @ptrCast(@alignCast(context));
+        return try arena.dupe(u8, self.entries.get(mcp_name) orelse return null);
+    }
+
+    fn write(context: *anyopaque, mcp_name: []const u8, encoded: ?[]const u8) anyerror!void {
+        const self: *Shared = @ptrCast(@alignCast(context));
+        if (self.entries.fetchOrderedRemove(mcp_name)) |gone| {
+            testing.allocator.free(gone.key);
+            testing.allocator.free(gone.value);
+        }
+        const kept = encoded orelse return;
+        try self.entries.put(testing.allocator, try testing.allocator.dupe(u8, mcp_name), try testing.allocator.dupe(u8, kept));
+    }
+};
+
 test "a missing mcp-auth file is an empty store" {
-    var auth = try load(testing.allocator, testing.io, "definitely-not-a-real-mcp-auth.json");
+    var auth = try readFile(testing.allocator, testing.io, "definitely-not-a-real-mcp-auth.json");
     defer auth.deinit();
 
     try testing.expectEqual(@as(usize, 0), auth.entries.count());
     try testing.expect(auth.get("files") == null);
 }
 
-test "tokens survive a save and a load" {
+test "a file of opencode's shape is read, and a malformed entry costs only itself" {
     const io = testing.io;
-
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-
+    try tmp.dir.writeFile(io, .{ .sub_path = "mcp-auth.json", .data =
+        \\{"rh-trading":{"server_url":"https://api.example/mcp","tokens":{"access_token":"sk-token","expires_at":"1234567890"},"enabled":false},
+        \\ "broken":{"tokens":{"refresh_token":"no access token"}}}
+    });
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
-
     const path = try std.fs.path.join(testing.allocator, &.{ root, "mcp-auth.json" });
     defer testing.allocator.free(path);
 
-    var auth = Auth.init(testing.allocator);
+    var auth = try readFile(testing.allocator, io, path);
     defer auth.deinit();
+    const e = auth.getForUrl("rh-trading", "https://api.example/mcp").?;
+    try testing.expectEqualStrings("sk-token", e.tokens.?.access_token);
+    try testing.expectEqual(@as(i64, 1234567890), e.tokens.?.expires_at.?);
+    try testing.expect(!auth.isEnabled("rh-trading"));
+    try testing.expect(auth.get("broken") == null);
+}
 
-    try auth.updateTokens("rh-trading", .{
-        .access_token = "sk-token",
-        .refresh_token = "sk-refresh",
-        .expires_at = 1234567890,
-        .scope = "read write",
-    }, "https://api.example/mcp");
+test "tokens survive a save and an open" {
+    var shared: Shared = .{};
+    defer shared.deinit();
 
-    try auth.updateClientInfo("rh-trading", .{
-        .client_id = "client-123",
-        .client_id_issued_at = 1000,
-    }, null);
+    {
+        var auth = try open(testing.allocator, shared.storage());
+        defer auth.deinit();
+        try auth.updateTokens("rh-trading", .{
+            .access_token = "sk-token",
+            .refresh_token = "sk-refresh",
+            .expires_at = 1234567890,
+            .scope = "read write",
+        }, "https://api.example/mcp");
+        try auth.updateClientInfo("rh-trading", .{ .client_id = "client-123", .client_id_issued_at = 1000 }, null);
+        try auth.setEnabled("linear", false);
+        try auth.save("rh-trading");
+        try auth.save("linear");
+    }
 
-    try auth.save(io, path);
-
-    var reloaded = try load(testing.allocator, io, path);
-    defer reloaded.deinit();
-
-    const e = reloaded.getForUrl("rh-trading", "https://api.example/mcp") orelse return error.TestUnexpectedResult;
+    var reopened = try open(testing.allocator, shared.storage());
+    defer reopened.deinit();
+    const e = reopened.getForUrl("rh-trading", "https://api.example/mcp") orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("sk-token", e.tokens.?.access_token);
     try testing.expectEqualStrings("sk-refresh", e.tokens.?.refresh_token.?);
     try testing.expectEqual(@as(i64, 1234567890), e.tokens.?.expires_at.?);
     try testing.expectEqualStrings("client-123", e.client_info.?.client_id);
+    try testing.expect(!reopened.isEnabled("linear"));
+}
+
+test "two processes sharing a storage keep each other's sign-ins, and see each other's refreshes" {
+    var shared: Shared = .{};
+    defer shared.deinit();
+    var first = try open(testing.allocator, shared.storage());
+    defer first.deinit();
+    var second = try open(testing.allocator, shared.storage());
+    defer second.deinit();
+
+    try second.updateTokens("linear", .{ .access_token = "linear-token" }, null);
+    try second.save("linear");
+    try first.updateTokens("github", .{ .access_token = "github-token", .refresh_token = "r1" }, null);
+    try first.save("github");
+
+    var reopened = try open(testing.allocator, shared.storage());
+    defer reopened.deinit();
+    try testing.expectEqualStrings("linear-token", reopened.get("linear").?.tokens.?.access_token);
+    try testing.expectEqualStrings("github-token", reopened.get("github").?.tokens.?.access_token);
+
+    try reopened.updateTokens("github", .{ .access_token = "github-fresh", .refresh_token = "r2" }, null);
+    try reopened.save("github");
+    try first.reload("github");
+    try testing.expectEqualStrings("r2", first.get("github").?.tokens.?.refresh_token.?);
+
+    _ = reopened.remove("linear");
+    try reopened.save("linear");
+    try second.reload("linear");
+    try testing.expectEqualStrings("linear-token", second.get("linear").?.tokens.?.access_token);
+    var after = try open(testing.allocator, shared.storage());
+    defer after.deinit();
+    try testing.expect(after.get("linear") == null);
+}
+
+test "a store with no storage keeps its entries in memory, and will not save" {
+    var auth: Auth = .init(testing.allocator);
+    defer auth.deinit();
+    try auth.updateTokens("files", .{ .access_token = "x" }, null);
+    try auth.reload("files");
+    try testing.expectEqualStrings("x", auth.get("files").?.tokens.?.access_token);
+    try testing.expectError(error.NoStorage, auth.save("files"));
 }
 
 test "getForUrl rejects an entry whose URL changed" {
@@ -496,34 +600,6 @@ test "a server nobody has said anything about is enabled" {
 
     try auth.updateTokens("files", .{ .access_token = "x" }, null);
     try testing.expect(auth.isEnabled("files"));
-}
-
-test "being turned off survives a save and a load" {
-    const io = testing.io;
-
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
-
-    const path = try std.fs.path.join(testing.allocator, &.{ root, "mcp-auth.json" });
-    defer testing.allocator.free(path);
-
-    {
-        var auth: Auth = .init(testing.allocator);
-        defer auth.deinit();
-
-        try auth.setEnabled("linear", false);
-        try auth.setEnabled("files", true);
-        try auth.save(io, path);
-    }
-
-    var reloaded = try load(testing.allocator, io, path);
-    defer reloaded.deinit();
-
-    try testing.expect(!reloaded.isEnabled("linear"));
-    try testing.expect(reloaded.isEnabled("files"));
 }
 
 test "turning a server off leaves its tokens alone" {
