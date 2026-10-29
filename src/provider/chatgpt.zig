@@ -1464,6 +1464,20 @@ test "a slug the catalog does not hold is refused, and the model stays put" {
     try testing.expectEqualStrings("gpt-test", chat.model);
 }
 
+test "a remembered slug the catalog no longer holds gives way to the first one listed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+    try catalogFixture(&chat);
+    chat.model = "s";
+
+    try chat.ensureModel();
+    try testing.expectEqualStrings("gpt-test", chat.model);
+}
+
 test "a summary is asked for only from a model that takes the parameter" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

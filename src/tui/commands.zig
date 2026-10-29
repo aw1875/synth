@@ -973,9 +973,22 @@ pub fn checkModel(self: *Model, ctx: *vxfw.EventContext) void {
     self.pending_model_check = false;
 
     const backend = self.backend orelse return;
+    const remembered = self.allocator.dupe(u8, backend.model()) catch return;
+    defer self.allocator.free(remembered);
     backend.ensureModel() catch {};
     syncProvider(self);
     ctx.redraw = true;
+    reportReplacedModel(self, ctx, remembered) catch {};
+}
+
+/// The model remembered from last time gave way to one the provider offers:
+/// say so, and remember the new one so the next launch starts there.
+fn reportReplacedModel(self: *Model, ctx: *vxfw.EventContext, remembered: []const u8) !void {
+    const current = self.provider.model;
+    const is_replaced = remembered.len > 0 and !std.mem.eql(u8, remembered, current);
+    if (!is_replaced) return;
+    try rememberModelChoice(self, current);
+    try self.notification.showFmt(ctx, .warn, "{s} no longer offers {s}, so this session uses {s}.", .{ self.provider.name, remembered, current });
 }
 
 /// Take delivery of servers connected on a worker.
@@ -1030,6 +1043,27 @@ fn fakeSetModel(_: *anyopaque, name: []const u8) anyerror!Provider.Current {
 }
 
 const unserved_model = "asdf";
+
+test "a remembered model that gave way at launch is reported" {
+    var userdata: u8 = 0;
+    var model = try switchFixture(testing.allocator, &userdata, "qwen3-coder:30b");
+    defer model.deinit();
+    var ctx = testContext();
+    defer ctx.cmds.deinit(testing.allocator);
+
+    try reportReplacedModel(&model, &ctx, "qwen3-coder:30b");
+    try testing.expect(!isToastUp(&model, "no longer offers"));
+
+    try reportReplacedModel(&model, &ctx, "s");
+    try testing.expect(isToastUp(&model, "no longer offers s"));
+}
+
+fn isToastUp(model: *Model, fragment: []const u8) bool {
+    for (model.notification.toasts) |toast| {
+        if (std.mem.indexOf(u8, toast.body, fragment) != null) return true;
+    }
+    return false;
+}
 
 test "the picker opens on what a provider offered last, from where it is reached now" {
     var userdata: u8 = 0;
