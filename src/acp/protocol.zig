@@ -272,15 +272,41 @@ pub const Notification = struct {
     update: Update,
 };
 
-/// A prompt content block, as much of it as synth takes in.
+/// A prompt content block, as much of it as synth takes in or sends.
 pub const Content = union(enum) {
     text: []const u8,
-    /// Base64 data.
+    /// Base64 PNG data.
     image: []const u8,
     /// A file the client attached, by path, with its text.
     resource: struct { path: []const u8, text: []const u8 },
     /// Anything else, which is skipped.
     other,
+
+    pub fn jsonStringify(self: Content, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("type");
+        switch (self) {
+            .text => |text| {
+                try jws.write("text");
+                try jws.objectField("text");
+                try jws.write(text);
+            },
+            .image => |data| {
+                try jws.write("image");
+                try jws.objectField("mimeType");
+                try jws.write("image/png");
+                try jws.objectField("data");
+                try jws.write(data);
+            },
+            .resource => |resource| {
+                try jws.write("resource");
+                try jws.objectField("resource");
+                try jws.write(.{ .uri = resource.path, .text = resource.text });
+            },
+            .other => return error.WriteFailed,
+        }
+        try jws.endObject();
+    }
 
     pub fn of(block: std.json.Value) Content {
         const kind = field(block, "type") orelse return .other;
@@ -344,6 +370,21 @@ test "prompt blocks are read for what synth takes, and the rest skipped" {
     try testing.expectEqualStrings("aGk=", Content.of(blocks[1]).image);
     try testing.expectEqualStrings("/src/a.zig", Content.of(blocks[2]).resource.path);
     try testing.expect(Content.of(blocks[3]) == .other);
+}
+
+test "a block sent is read back as the same block" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sent = [_]Content{ .{ .text = "look" }, .{ .image = "aGk=" }, .{ .resource = .{ .path = "pasted", .text = "a paste" } } };
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(sent, .{}, &out.writer);
+    const blocks = try std.json.parseFromSliceLeaky([]const std.json.Value, arena, out.written(), .{});
+    try testing.expectEqualStrings("look", Content.of(blocks[0]).text);
+    try testing.expectEqualStrings("aGk=", Content.of(blocks[1]).image);
+    try testing.expectEqualStrings("pasted", Content.of(blocks[2]).resource.path);
+    try testing.expectEqualStrings("a paste", Content.of(blocks[2]).resource.text);
 }
 
 test "a permission answer names its option, and a cancelled one none" {

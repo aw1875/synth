@@ -1717,21 +1717,32 @@ pub const Fixture = struct {
         return self;
     }
 
-    /// A new client, connected over a socket pair. The first starts the agent.
+    /// A new client, connected over a socket pair.
     pub fn connect(self: *Fixture) !*Client {
+        const far = try self.socket();
+        errdefer far.close(testing.io);
+        return Client.create(far);
+    }
+
+    /// The far end of a new connection to the agent, which the caller owns.
+    /// The first starts the agent.
+    pub fn socket(self: *Fixture) !std.Io.File {
         var fds: [2]i32 = undefined;
         if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS) return error.SocketPair;
         const ours: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
-        const client = Client.create(.{ .handle = fds[0], .flags = .{ .nonblocking = false } }) catch |err| {
+        const theirs: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+        errdefer theirs.close(testing.io);
+        const first = self.agent.connectionCount() == 0;
+        self.agent.connect(ours, ours) catch |err| {
             ours.close(testing.io);
-            std.Io.File.close(.{ .handle = fds[0], .flags = .{ .nonblocking = false } }, testing.io);
             return err;
         };
-        errdefer client.close();
-        const first = self.agent.connectionCount() == 0;
-        try self.agent.connect(ours, ours);
         if (first) self.thread = try std.Thread.spawn(.{}, Agent.serve, .{&self.agent});
-        return client;
+
+        // A missing message fails the test rather than hanging it.
+        const timeout: linux.timeval = .{ .sec = 10, .usec = 0 };
+        _ = linux.setsockopt(theirs.handle, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(linux.timeval));
+        return theirs;
     }
 
     /// Every client must have closed: the agent serves until the last one has.
@@ -1760,11 +1771,6 @@ pub const Client = struct {
     fn create(file: std.Io.File) !*Client {
         const self = try testing.allocator.create(Client);
         self.* = .{ .file = file, .reader = undefined, .writer = undefined, .lines = .init(testing.allocator), .arena = .init(testing.allocator) };
-
-        // A missing message fails the test rather than hanging it.
-        const timeout: linux.timeval = .{ .sec = 10, .usec = 0 };
-        _ = linux.setsockopt(file.handle, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(linux.timeval));
-
         self.reader = file.readerStreaming(testing.io, &self.read_buffer);
         self.writer = file.writerStreaming(testing.io, &self.write_buffer);
         return self;
