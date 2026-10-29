@@ -115,13 +115,14 @@ pub fn signedOut(self: *Providers) void {
     if (std.mem.eql(u8, self.active_id, catalog.chatgpt_id)) self.missing = true;
 }
 
-/// The models every connected provider offers, with their efforts and the
-/// level last chosen for each. The one in use answers through `session`; the
-/// rest get a client of their own just for the asking.
+/// The models every usable provider offers, with their efforts and the level
+/// last chosen for each: one whose key is optional counts without one, unlike
+/// `isConnected`. The one in use answers through `session`; the rest get a
+/// client of their own just for the asking.
 pub fn offered(self: *const Providers, arena: std.mem.Allocator, db: *Database, session: Provider) ![]const synth.Offered {
     var out: std.ArrayList(synth.Offered) = .empty;
     for (catalog.all) |entry| {
-        if (!self.isConnected(entry)) continue;
+        if (!entry.ready(self.auth, self.chatgpt)) continue;
         if (std.mem.eql(u8, entry.id, self.active_id)) {
             try appendOffered(arena, db, &out, entry.id, entry.label, session);
             continue;
