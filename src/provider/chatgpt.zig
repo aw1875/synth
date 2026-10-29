@@ -240,12 +240,11 @@ pub fn reconnect(self: *ChatGPTProvider, connection: Provider.Connection) !void 
     try self.start();
 }
 
-/// Refused for a slug the catalog does not hold, as codex refuses one it does
-/// not list. A catalog that cannot be fetched judges nothing, and the first
-/// turn reports a bad slug.
+/// Refused for a slug the catalog holds no entry for, as codex refuses one it
+/// does not list. Judged against the catalog fetched at start, never a fetch of
+/// its own: without one, the first turn reports a bad slug.
 pub fn setModel(self: *ChatGPTProvider, name: []const u8) !void {
     if (std.mem.eql(u8, name, self.model)) return;
-    self.loadCatalog(false) catch {};
     const is_catalog_loaded = self.catalog.len > 0;
     if (is_catalog_loaded and self.catalogEntry(name) == null) return error.UnknownModel;
     const owned = try self.allocator.dupe(u8, name);
@@ -256,9 +255,11 @@ pub fn setModel(self: *ChatGPTProvider, name: []const u8) !void {
 }
 
 /// The first model the account lists, in the server's own order, when none
-/// was chosen.
+/// was chosen or the one chosen is no longer listed.
 pub fn ensureModel(self: *ChatGPTProvider) !void {
     try self.loadCatalog(false);
+    const is_unlisted = self.catalog.len > 0 and self.catalogEntry(self.model) == null;
+    if (is_unlisted) self.model = "";
     try self.chooseModel();
 }
 
