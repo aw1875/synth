@@ -512,7 +512,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     return ctx.consumeAndRedraw();
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
-                    const is_run_on_enter = self.slash.runsOnEnter(self.input.text.items);
+                    const is_run_on_enter = self.slash.runsOnEnter();
                     try self.acceptCommand();
                     if (is_run_on_enter) {
                         const line = try self.allocator.dupe(u8, self.input.text.items);

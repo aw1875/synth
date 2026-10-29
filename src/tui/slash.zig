@@ -6,7 +6,6 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const fuzzy = @import("../core/fuzzy.zig");
 const skill = @import("../core/skill.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -29,8 +28,8 @@ pub const Command = struct {
     is_skill: bool = false,
     /// Only offered while signed in to ChatGPT.
     needs_chatgpt: bool = false,
-    /// Throws away what cannot be had back, so Enter runs it only once its
-    /// whole name is typed: `/c` must not clear a session.
+    /// Enter runs it only once its whole name is typed: `/c` must not clear a
+    /// session.
     is_destructive: bool = false,
 };
 
@@ -42,11 +41,6 @@ pub const Argument = union(enum) {
     /// Shown `<text>`: the command has nothing to do until it is typed.
     required: []const u8,
 };
-
-/// Ranked fuzzy matches kept when nothing matched by prefix. A ceiling on the
-/// ranking buffer, not on what can be typed: a project with two hundred skills
-/// still completes them all by prefix.
-const max_ranked: usize = 32;
 
 /// What a skill offers when it has no description of its own.
 const unlabelled_skill = "run this skill";
@@ -81,9 +75,10 @@ chatgpt_signed_in: bool = false,
 
 /// Indices into everything on offer, matching what has been typed, best first.
 matches: std.ArrayList(usize) = .empty,
-/// How many of `matches`, from the front, were found by the name typed rather
-/// than by a fuzzy guess. Zero for a bare `/`, where nothing has been named.
-named: usize = 0,
+/// How many of `matches`, from the front, are named exactly what was typed.
+exact_matches: usize = 0,
+/// Whether anything follows the command's name in the draft.
+has_argument: bool = false,
 selected: usize = 0,
 /// Whether the draft currently is a slash command being typed.
 active: bool = false,
@@ -124,7 +119,8 @@ pub fn isOpen(self: *const Slash) bool {
 pub fn close(self: *Slash) void {
     self.active = false;
     self.selected = 0;
-    self.named = 0;
+    self.exact_matches = 0;
+    self.has_argument = false;
     self.matches.clearRetainingCapacity();
 }
 
@@ -143,40 +139,29 @@ pub fn update(self: *Slash, text: []const u8, cursor: usize) !void {
     }
 
     self.active = true;
+    self.selected = 0;
+    self.has_argument = std.mem.trim(u8, text[word_end..], whitespace).len > 0;
     try self.filter(text[1..word_end]);
-    if (self.selected >= self.matches.items.len) self.selected = 0;
 }
 
-/// Exact names first, then names that start with what was typed, then fuzzy
-/// guesses for a half-remembered command.
+/// Exact names first, then the names that start with what was typed, as codex
+/// lists them.
 fn filter(self: *Slash, query: []const u8) !void {
     self.matches.clearRetainingCapacity();
-    self.named = 0;
+    self.exact_matches = 0;
 
-    var exact_count: usize = 0;
     for (0..self.total()) |i| {
         const command = self.at(i);
         if (!self.isOffered(command)) continue;
         if (!std.ascii.startsWithIgnoreCase(command.name, query)) continue;
         const is_exact = command.name.len == query.len;
         if (is_exact) {
-            try self.matches.insert(self.allocator, exact_count, i);
-            exact_count += 1;
+            try self.matches.insert(self.allocator, self.exact_matches, i);
+            self.exact_matches += 1;
         } else {
             try self.matches.append(self.allocator, i);
         }
     }
-    if (query.len == 0) return;
-    self.named = self.matches.items.len;
-
-    var top: fuzzy.Top(max_ranked) = .{};
-    for (0..self.total()) |i| {
-        const command = self.at(i);
-        if (!self.isOffered(command)) continue;
-        if (std.ascii.startsWithIgnoreCase(command.name, query)) continue;
-        top.consider(i, command.name, query, .{});
-    }
-    for (top.ranked()) |entry| try self.matches.append(self.allocator, entry.index);
 }
 
 fn isOffered(self: *const Slash, command: Command) bool {
@@ -197,19 +182,14 @@ pub fn selectedCommand(self: *const Slash) ?Command {
 }
 
 /// Whether Enter runs the highlighted command rather than only completing it.
-/// As in codex, only a command picked by its name runs, never a fuzzy guess or
-/// whatever a bare `/` lists first. A skill waits for what to work on, the way
-/// codex inserts a `$skill` mention, and so does a command whose argument is
-/// required and not yet typed. A destructive command runs only by its full
-/// name.
-pub fn runsOnEnter(self: *const Slash, draft: []const u8) bool {
+/// A skill waits for what to work on, the way codex inserts a `$skill`
+/// mention.
+pub fn runsOnEnter(self: *const Slash) bool {
     const command = self.selectedCommand() orelse return false;
-    const is_named = self.selected < self.named;
-    const is_missing_argument = command.argument == .required and typedArgument(draft).len == 0;
-    const typed_name = draft[1..commandWordEnd(draft)];
-    const is_full_name = std.ascii.eqlIgnoreCase(typed_name, command.name);
-    const is_unconfirmed = command.is_destructive and !is_full_name;
-    return is_named and !command.is_skill and !is_missing_argument and !is_unconfirmed;
+    const is_missing_argument = command.argument == .required and !self.has_argument;
+    const is_typed_in_full = self.selected < self.exact_matches;
+    const is_unconfirmed = command.is_destructive and !is_typed_in_full;
+    return !command.is_skill and !is_missing_argument and !is_unconfirmed;
 }
 
 /// What the draft becomes when the highlighted command is accepted: the word
@@ -223,9 +203,10 @@ pub fn completion(self: *const Slash, arena: std.mem.Allocator, draft: []const u
     return try std.fmt.allocPrint(arena, "/{s} ", .{command.name});
 }
 
-/// Where a command's name ends in a line typed after `/`.
+const whitespace = " \t\r\n";
+
 pub fn commandWordEnd(text: []const u8) usize {
-    return std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+    return std.mem.indexOfAny(u8, text, whitespace) orelse text.len;
 }
 
 fn typedArgument(draft: []const u8) []const u8 {
@@ -244,7 +225,7 @@ fn argumentHint(arena: std.mem.Allocator, argument: Argument) ![]const u8 {
 /// beside the command table for the same reason: one place to read, one place
 /// to add to.
 pub const shortcuts: []const struct { keys: []const u8, description: []const u8 } = &.{
-    .{ .keys = "enter", .description = "run the highlighted / command; tab completes it" },
+    .{ .keys = "enter", .description = "run the highlighted / command; tab only completes it" },
     .{ .keys = "tab", .description = "cycle mode: build, plan, review" },
     .{ .keys = "ctrl+o", .description = "switch model" },
     .{ .keys = "ctrl+s", .description = "switch session" },
@@ -411,26 +392,47 @@ test "completion keeps what was already typed after the command" {
     try std.testing.expectEqualStrings("/compact", (try slash.completion(arena_state.allocator(), "/comp is full")).?);
 }
 
-test "enter runs a command picked by name, unless it is waiting for input" {
+test "enter runs the highlighted command, unless it is waiting for input" {
     var slash: Slash = .init(std.testing.allocator);
     defer slash.deinit();
     slash.skills = &.{
         .{ .id = "release", .name = "Release", .description = "cut a release", .dir = "/p/release", .body = "b" },
     };
 
+    try slash.update("/theme", 6);
+    try std.testing.expect(slash.runsOnEnter());
     try slash.update("/mod", 4);
-    try std.testing.expect(slash.runsOnEnter("/mod"));
+    try std.testing.expect(slash.runsOnEnter());
     try slash.update("/sea foo", 4);
-    try std.testing.expect(slash.runsOnEnter("/sea foo"));
+    try std.testing.expect(slash.runsOnEnter());
 
-    try slash.update("/search", 7);
-    try std.testing.expect(!slash.runsOnEnter("/search"));
+    try slash.update("/search ", 7);
+    try std.testing.expect(!slash.runsOnEnter());
     try slash.update("/release", 8);
-    try std.testing.expect(!slash.runsOnEnter("/release"));
+    try std.testing.expect(!slash.runsOnEnter());
     try slash.update("/opt", 4);
-    try std.testing.expect(!slash.runsOnEnter("/opt"));
+    try std.testing.expect(!slash.runsOnEnter());
+}
+
+test "enter runs a row reached with the arrows" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
     try slash.update("/", 1);
-    try std.testing.expect(!slash.runsOnEnter("/"));
+    try std.testing.expect(!slash.runsOnEnter());
+    slash.moveSelection(2);
+    try std.testing.expectEqualStrings("model", slash.selectedCommand().?.name);
+    try std.testing.expect(slash.runsOnEnter());
+}
+
+test "typing moves the highlight back to the best match" {
+    var slash: Slash = .init(std.testing.allocator);
+    defer slash.deinit();
+
+    try slash.update("/", 1);
+    slash.moveSelection(3);
+    try slash.update("/m", 2);
+    try std.testing.expectEqual(@as(usize, 0), slash.selected);
 }
 
 test "a destructive command runs on enter only by its full name" {
@@ -439,10 +441,10 @@ test "a destructive command runs on enter only by its full name" {
 
     try slash.update("/c", 2);
     try std.testing.expectEqualStrings("clear", slash.selectedCommand().?.name);
-    try std.testing.expect(!slash.runsOnEnter("/c"));
+    try std.testing.expect(!slash.runsOnEnter());
 
     try slash.update("/clear", 6);
-    try std.testing.expect(slash.runsOnEnter("/clear"));
+    try std.testing.expect(slash.runsOnEnter());
 }
 
 test "an exact name is offered before the longer names it starts" {
@@ -456,7 +458,7 @@ test "an exact name is offered before the longer names it starts" {
     try std.testing.expectEqualStrings("pr", slash.selectedCommand().?.name);
 }
 
-test "a half-remembered command still lands" {
+test "only names that start with what was typed are offered" {
     var slash: Slash = .init(std.testing.allocator);
     defer slash.deinit();
 
@@ -464,9 +466,6 @@ test "a half-remembered command still lands" {
     try std.testing.expectEqualStrings("compact", commands[slash.matches.items[0]].name);
 
     try slash.filter("prvdrs");
-    try std.testing.expectEqualStrings("providers", commands[slash.matches.items[0]].name);
-
-    try slash.filter("zzz");
     try std.testing.expectEqual(@as(usize, 0), slash.matches.items.len);
 }
 
@@ -494,9 +493,6 @@ test "a skill is offered like any other command, and says it is one" {
 
     try slash.update("/commit-style", 13);
     try std.testing.expectEqualStrings("run this skill", slash.selectedCommand().?.description);
-
-    try slash.filter("cmtstyl");
-    try std.testing.expectEqualStrings("commit-style", slash.at(slash.matches.items[0]).name);
 }
 
 test "a name a skill shares with a command still reaches the command" {
