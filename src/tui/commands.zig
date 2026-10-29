@@ -33,7 +33,7 @@ const theme = @import("theme.zig");
 const themes = @import("themes.zig");
 const humanize = @import("../core/humanize.zig");
 
-pub const finish_turn_first = "Finish the turn first";
+const finish_turn_first = "Finish the turn first";
 
 pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !bool {
     const line = std.mem.trim(u8, value, " \t\r\n");
@@ -161,6 +161,13 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         return true;
     }
     return runSkill(self, ctx, line);
+}
+
+/// Turn down what is not a draft to hand back: a key, or a pick in a picker.
+pub fn refuseMidTurn(self: *Model, ctx: *vxfw.EventContext) !bool {
+    if (!self.loop.isBusy()) return false;
+    try self.notification.show(ctx, .info, finish_turn_first);
+    return true;
 }
 
 /// Turn a command down and hand the draft back, so nothing typed is lost.
@@ -806,7 +813,7 @@ fn chooseEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void 
 
 /// Refused mid-turn: the request in flight reads the level as it is built.
 pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void {
-    if (self.loop.isBusy()) return self.notification.show(ctx, .info, finish_turn_first);
+    if (try refuseMidTurn(self, ctx)) return;
     try applyEffort(self, level);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
