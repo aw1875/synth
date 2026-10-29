@@ -948,6 +948,8 @@ pub fn switchSession(self: *Model, session_id: i64) !void {
     self.loop.dropSteering();
     try self.seedHistory();
     self.input.clear();
+    self.mentions.close();
+    self.slash.close();
     self.held.clear();
     self.scroll = 0;
 }
@@ -1115,8 +1117,8 @@ pub fn awaitMentions(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.mentions.isScanning()) try self.scheduleTick(ctx);
 }
 
-/// Recompute the `@` and `/` pickers from the draft. Every path that changes
-/// the draft ends here, or a picker goes on offering what is no longer typed.
+/// Recompute the `@` and `/` pickers from the draft. Needed after anything that
+/// changes the draft, or a picker goes on offering what is no longer typed.
 pub fn followDraft(self: *Model, ctx: *vxfw.EventContext) !void {
     try self.refreshMentions();
     try self.awaitMentions(ctx);

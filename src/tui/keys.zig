@@ -413,6 +413,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
 
             if (key.matches('v', .{ .ctrl = true })) {
                 self.attachClipboardImage();
+                try self.followDraft(ctx);
                 return ctx.consumeAndRedraw();
             }
 
