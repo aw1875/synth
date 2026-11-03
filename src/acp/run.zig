@@ -13,7 +13,8 @@ const Backend = @import("../provider/backend.zig");
 const catalog = @import("../provider/catalog.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
 
-pub fn run(init: std.process.Init) !void {
+/// `editor` for a session an editor started, which ends when cut off from it.
+pub fn run(init: std.process.Init, editor: bool) !void {
     const io = init.io;
     const allocator = init.gpa;
     // Closing a terminal hangs up its session's processes, a detached one's host among them.
@@ -59,6 +60,7 @@ pub fn run(init: std.process.Init) !void {
         .home = init.environ_map.get("HOME"),
         .mcp_store = mcp_store,
         .socket_dir = socket_dir,
+        .detaches = !editor,
     });
     defer agent.deinit();
     try agent.connect(.stdin(), .stdout());

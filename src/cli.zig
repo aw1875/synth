@@ -17,8 +17,9 @@ pub const Command = union(enum) {
     models,
     prompt,
     /// Speak ACP on stdio, for an editor: each session in a process of its
-    /// own. `--host`, which is not offered in the help, is that process.
-    acp: struct { host: bool = false },
+    /// own. `--host`, which is not offered in the help, is that process;
+    /// `--editor` after it, one serving an editor.
+    acp: struct { host: bool = false, editor: bool = false },
     remote: Remote,
     /// Null for the whole menu, or the subcommand whose `-h` asked.
     help: ?Topic,
@@ -168,7 +169,9 @@ pub fn parse(init: std.process.Init, allocator: std.mem.Allocator) !Command {
             if (std.mem.eql(u8, word, "skills")) return .skills;
             if (std.mem.eql(u8, word, "acp")) {
                 const flag = iter.next() orelse return .{ .acp = .{} };
-                if (std.mem.eql(u8, flag, "--host")) return .{ .acp = .{ .host = true } };
+                if (!std.mem.eql(u8, flag, "--host")) return error.UnknownAcpOption;
+                const role = iter.next() orelse return .{ .acp = .{ .host = true } };
+                if (std.mem.eql(u8, role, "--editor")) return .{ .acp = .{ .host = true, .editor = true } };
                 return error.UnknownAcpOption;
             }
             if (std.mem.eql(u8, word, "remote")) return parseRemote(init, allocator, &iter);

@@ -75,6 +75,10 @@ pub const Options = struct {
     /// Where the session listens for clients besides the one that started
     /// the agent. Null for none.
     socket_dir: ?[]const u8 = null,
+    /// A session whose last client was cut off runs on, to be attached to
+    /// again. Not an editor's: an editor may be killed outright, never
+    /// saying it is leaving, and its sessions must go with it.
+    detaches: bool = true,
 };
 
 allocator: std.mem.Allocator,
@@ -175,9 +179,10 @@ pub fn serve(self: *Agent) void {
     }
 }
 
-/// Whether a client cut off could attach to the live session again.
+/// Whether the live session runs on with no one connected, for a client cut
+/// off to attach to again.
 fn reachable(self: *const Agent) bool {
-    return self.session != null and self.listener != null;
+    return self.options.detaches and self.session != null and self.listener != null;
 }
 
 fn connectionCount(self: *Agent) usize {
@@ -2476,6 +2481,8 @@ pub const Fixture = struct {
     project: []const u8,
     agent: Agent,
     thread: std.Thread,
+    /// The agent has stopped serving.
+    served: std.atomic.Value(bool),
 
     pub fn create() !*Fixture {
         const allocator = testing.allocator;
@@ -2483,6 +2490,7 @@ pub const Fixture = struct {
         const self = try allocator.create(Fixture);
         errdefer allocator.destroy(self);
         self.script = .{};
+        self.served = .init(false);
         self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
         self.arena = .init(allocator);
@@ -2524,11 +2532,16 @@ pub const Fixture = struct {
             ours.close(testing.io);
             return err;
         };
-        if (first) self.thread = try std.Thread.spawn(.{}, Agent.serve, .{&self.agent});
+        if (first) self.thread = try std.Thread.spawn(.{}, runAgent, .{self});
 
         // A missing message fails the test rather than hanging it.
         sockets.timeOutReads(theirs, 10);
         return theirs;
+    }
+
+    fn runAgent(self: *Fixture) void {
+        self.agent.serve();
+        self.served.store(true, .release);
     }
 
     /// Every client must have closed: the agent serves until the last one has.
@@ -3426,6 +3439,24 @@ test "a session another process hosts is not taken up here, and is listed live" 
     held.release(testing.io);
     const load = try client.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
     _ = try client.expectResult(load);
+}
+
+test "an editor's session ends when the editor is cut off, never saying it is leaving" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const socket_dir = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "sockets" });
+    fixture.agent.options.socket_dir = socket_dir;
+    fixture.agent.options.detaches = false;
+    const editor = try fixture.connect();
+    try editor.initialize(true);
+    _ = try editor.open(fixture.project);
+    try testing.expect(fixture.agent.listener != null);
+    editor.close();
+    for (0..500) |_| {
+        if (fixture.served.load(.acquire)) break;
+        try std.Io.sleep(testing.io, .fromMilliseconds(2), .awake);
+    }
+    try testing.expect(fixture.served.load(.acquire));
 }
 
 test "a session outlives a client cut off, and ends once the last one leaves" {

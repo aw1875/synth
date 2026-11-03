@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
         .tui => |options| if (try runTui(init, options)) |left| try tui_drive.sayFarewell(init.io, null, left),
         .run => |options| try headless.run(init, options.message, options.allow),
         .prompt => try prompt_dump.dump(init),
-        .acp => |options| try if (options.host) acp.run(init) else router.front(init),
+        .acp => |options| try if (options.host) acp.run(init, options.editor) else router.front(init),
         .models => try commands.models(init),
         .skills => try commands.skills(init),
         .session => |sub| try commands.session(init, sub),

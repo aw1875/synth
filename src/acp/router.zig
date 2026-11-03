@@ -730,7 +730,7 @@ pub fn front(process: std.process.Init) !void {
     const exe = try std.process.executablePathAlloc(process.io, arena_state.allocator());
     var children: Children = .{
         .io = process.io,
-        .argv = try arena_state.allocator().dupe([]const u8, &.{ exe, "acp", "--host" }),
+        .argv = try arena_state.allocator().dupe([]const u8, &.{ exe, "acp", "--host", "--editor" }),
     };
     try serve(process, &children, .{});
 }
