@@ -288,12 +288,7 @@ fn anyEnd(self: *Router) !*End {
 
 fn reach(self: *Router, handle: []const u8) !?std.Io.File {
     const socket_dir = self.socket_dir orelse return null;
-    const path = try sockets.pathFor(self.allocator, socket_dir, handle);
-    defer self.allocator.free(path);
-    return sockets.connect(path) catch |err| switch (err) {
-        error.NotListening => null,
-        else => err,
-    };
+    return sockets.reach(self.allocator, socket_dir, handle);
 }
 
 /// A new end on `pipe`, a child when null, said hello to when `hello_again`.
@@ -845,10 +840,7 @@ const Rig = struct {
     client: *Agent.Client = undefined,
 
     fn start(self: *Rig, socket_dir: ?[]const u8, options: Options) !void {
-        const linux = std.os.linux;
-        var fds: [2]i32 = undefined;
-        if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS) return error.SocketPair;
-        const ours: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+        const theirs, const ours = try sockets.pair();
         self.router = .init(testing.allocator, testing.io, ours, ours, socket_dir, .{ .context = &self.children, .start = Fixtures.start }, options);
         self.thread = try std.Thread.spawn(.{}, struct {
             fn run(router: *Router) void {
@@ -856,9 +848,8 @@ const Rig = struct {
                 router.client_in.close(router.io);
             }
         }.run, .{&self.router});
-        self.client = try Agent.Client.create(.{ .handle = fds[0], .flags = .{ .nonblocking = false } });
-        const timeout: linux.timeval = .{ .sec = 10, .usec = 0 };
-        _ = linux.setsockopt(fds[0], linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(linux.timeval));
+        self.client = try Agent.Client.create(theirs);
+        sockets.timeOutReads(theirs, 10);
     }
 
     fn stop(self: *Rig) void {

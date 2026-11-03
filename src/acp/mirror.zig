@@ -297,12 +297,7 @@ fn discard(held: *std.DoublyLinkedList) void {
 /// listens for it.
 fn reach(self: *Mirror, handle: []const u8) !?*Connection {
     const socket_dir = self.socket_dir orelse return null;
-    const path = try sockets.pathFor(self.allocator, socket_dir, handle);
-    defer self.allocator.free(path);
-    const socket = sockets.connect(path) catch |err| switch (err) {
-        error.NotListening => return null,
-        else => return err,
-    };
+    const socket = try sockets.reach(self.allocator, socket_dir, handle) orelse return null;
     errdefer socket.close(self.io);
     return try Connection.overSocket(self.allocator, self.io, socket);
 }

@@ -2342,7 +2342,6 @@ fn signature(msg: *const Conversation.Message) u64 {
 }
 
 const testing = std.testing;
-const linux = std.os.linux;
 
 /// Answers the first turn by thinking aloud and asking to write a note, or,
 /// for a prompt of "ask me", asking which colour; and the second, once the
@@ -2502,10 +2501,7 @@ pub const Fixture = struct {
     /// The far end of a new connection to the agent, which the caller owns.
     /// The first starts the agent.
     pub fn socket(self: *Fixture) !std.Io.File {
-        var fds: [2]i32 = undefined;
-        if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS) return error.SocketPair;
-        const ours: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
-        const theirs: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+        const theirs, const ours = try sockets.pair();
         errdefer theirs.close(testing.io);
         const first = self.agent.connectionCount() == 0;
         self.agent.connect(ours, ours) catch |err| {
@@ -2515,8 +2511,7 @@ pub const Fixture = struct {
         if (first) self.thread = try std.Thread.spawn(.{}, Agent.serve, .{&self.agent});
 
         // A missing message fails the test rather than hanging it.
-        const timeout: linux.timeval = .{ .sec = 10, .usec = 0 };
-        _ = linux.setsockopt(theirs.handle, linux.SOL.SOCKET, linux.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(linux.timeval));
+        sockets.timeOutReads(theirs, 10);
         return theirs;
     }
 
@@ -2553,7 +2548,7 @@ pub const Client = struct {
 
     /// Hang up, which the agent sees as the end of its input.
     pub fn close(self: *Client) void {
-        _ = linux.shutdown(self.file.handle, linux.SHUT.RDWR);
+        _ = std.posix.system.shutdown(self.file.handle, std.posix.SHUT.RDWR);
         self.file.close(testing.io);
         self.lines.deinit();
         self.arena.deinit();
