@@ -283,16 +283,15 @@ fn removeSession(ctx: *Context, out: *std.Io.Writer, handle: []const u8) !void {
         try out.print("no session {s} in {s}\n", .{ handle, ctx.project.name() });
         return;
     };
-    const pid = std.posix.system.getpid();
-    ctx.db.takeLease(handle, pid) catch |err| switch (err) {
+    const lock = ctx.db.lockSession(handle) catch |err| switch (err) {
         error.SessionHeld => {
             try out.print("{s} is running; quit it first\n", .{handle});
             return;
         },
         else => return err,
     };
-    defer ctx.db.releaseLease(handle, pid) catch {};
-    try ctx.db.deleteSession(id);
+    defer lock.release(ctx.io);
+    try ctx.db.deleteLockedSession(id, handle);
     try out.print("deleted {s}\n", .{handle});
 }
 

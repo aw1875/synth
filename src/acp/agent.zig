@@ -22,6 +22,7 @@ const updates = @import("updates.zig");
 const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
+const SessionLock = @import("../core/session_lock.zig");
 const McpStore = @import("../core/mcp_store.zig");
 const mention = @import("../core/mention.zig");
 const Project = @import("../core/project.zig");
@@ -48,9 +49,6 @@ const max_messages: usize = 200;
 
 /// How often a busy session is polled. An idle one sleeps until told to act.
 const poll_interval: std.Io.Duration = .fromMilliseconds(20);
-/// How often the live session's lease is renewed, well inside its time to live.
-const lease_renewal_ms: i64 = Database.lease_ttl_ms / 3;
-
 /// What a client may have queued and unsent before it is cut off, rather
 /// than the agent holding an unbounded backlog for it.
 const max_outbox_bytes: usize = 64 * 1024 * 1024;
@@ -107,13 +105,11 @@ calls: std.AutoHashMapUnmanaged(i64, *ClientCall) = .empty,
 /// Prompts answered when the turn they started or steered ends.
 prompts: std.ArrayList(Prompting) = .empty,
 next_id: i64 = 1,
-/// Whose lease the live session is held under.
-pid: std.posix.pid_t,
-/// When the live session's lease was last renewed, in milliseconds.
-renewed_at: i64 = 0,
+/// Says this process hosts the live session.
+lock: ?SessionLock = null,
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, options: Options) Agent {
-    return .{ .allocator = allocator, .io = io, .options = options, .pid = std.posix.system.getpid() };
+    return .{ .allocator = allocator, .io = io, .options = options };
 }
 
 /// Join every connection and end the session. Called once `serve` returns.
@@ -166,7 +162,6 @@ pub fn serve(self: *Agent) void {
 
         const arena = arena_state.allocator();
         if (self.session) |session| {
-            self.renewLease(session);
             session.step();
             session.publish(arena, true) catch |err| self.noticeFmt(.warning, "Could not report progress: {s}", .{@errorName(err)});
             self.settleAsked(arena);
@@ -177,8 +172,6 @@ pub fn serve(self: *Agent) void {
         const busy = if (self.session) |session| session.busy() else false;
         if (busy) {
             self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = poll_interval, .clock = .awake } }) catch {};
-        } else if (self.session != null) {
-            self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(lease_renewal_ms), .clock = .awake } }) catch {};
         } else {
             self.wake.waitUncancelable(self.io);
         }
@@ -459,7 +452,7 @@ fn initialize(self: *Agent, connection: *Connection, id: rpc.Id, request: protoc
 
 /// The live session, when `id` names it.
 /// Delete stored session `handle`, closing it first if it is live here. One
-/// another process hosts is refused: its lease cannot be taken.
+/// another process hosts is refused: its lock cannot be taken.
 fn deleteSession(self: *Agent, handle: []const u8) !void {
     const db = self.options.db;
     const live_here = if (self.session) |session| std.mem.eql(u8, session.handle, handle) else false;
@@ -468,9 +461,9 @@ fn deleteSession(self: *Agent, handle: []const u8) !void {
         if (live_here) return;
         return error.UnknownSession;
     };
-    try db.takeLease(handle, self.pid);
-    defer db.releaseLease(handle, self.pid) catch {};
-    try db.deleteSession(id);
+    const lock = try db.lockSession(handle);
+    defer lock.release(self.io);
+    try db.deleteLockedSession(id, handle);
 }
 
 fn sessionFor(self: *Agent, id: []const u8) !*Session {
@@ -538,12 +531,12 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8, servers: []const mcp
     };
     defer self.allocator.free(where);
 
-    try db.takeLease(taken, self.pid);
-    errdefer db.releaseLease(taken, self.pid) catch {};
+    const lock = try db.lockSession(taken);
+    errdefer lock.release(self.io);
     self.closeSession();
     const session = try Session.create(self, id, taken, where, servers);
     self.session = session;
-    self.renewed_at = db.nowMs();
+    self.lock = lock;
     try self.share(session);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -614,18 +607,9 @@ fn closeSession(self: *Agent) void {
     self.prompts.clearRetainingCapacity();
     self.unshare();
     self.session = null;
-    self.options.db.releaseLease(session.handle, self.pid) catch {};
     session.destroy();
-}
-
-/// Keep the live session's lease, so no other process takes the session up
-/// while this one hosts it.
-fn renewLease(self: *Agent, session: *Session) void {
-    const db = self.options.db;
-    const now = db.nowMs();
-    if (now - self.renewed_at < lease_renewal_ms) return;
-    db.renewLease(session.handle, self.pid) catch return;
-    self.renewed_at = now;
+    if (self.lock) |lock| lock.release(self.io);
+    self.lock = null;
 }
 
 fn sendSnapshots(self: *Agent, session: *Session) !void {
@@ -840,7 +824,6 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
 /// `cwd`, or every project's when it names none.
 fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSessions) !protocol.SessionList {
     const db = self.options.db;
-    const held = try db.heldSessions(arena);
     const cwd = request.cwd orelse {
         const recent = try db.recentSessions(arena, listed_sessions);
         const out = try arena.alloc(protocol.SessionInfo, recent.len);
@@ -849,7 +832,7 @@ fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSe
             .cwd = info.cwd,
             .title = if (info.title.len > 0) info.title else null,
             .updatedAt = try isoTime(arena, info.updated_at),
-            ._meta = .{ .synth = .{ .messages = info.messages, .updated_at = info.updated_at, .live = isHeld(held, info.public_id) } },
+            ._meta = .{ .synth = .{ .messages = info.messages, .updated_at = info.updated_at, .live = db.isSessionHeld(info.public_id) } },
         };
         return .{ .sessions = out };
     };
@@ -864,7 +847,7 @@ fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSe
         .cwd = try arena.dupe(u8, cwd),
         .title = if (info.title.len > 0) info.title else null,
         .updatedAt = try isoTime(arena, info.updated_at),
-        ._meta = .{ .synth = .{ .messages = info.messages, .updated_at = info.updated_at, .live = isHeld(held, info.public_id) } },
+        ._meta = .{ .synth = .{ .messages = info.messages, .updated_at = info.updated_at, .live = db.isSessionHeld(info.public_id) } },
     };
     return .{ .sessions = out };
 }
@@ -872,13 +855,6 @@ fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSe
 fn projectRelative(root: []const u8, path: []const u8) []const u8 {
     if (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == std.fs.path.sep) return path[root.len + 1 ..];
     return path;
-}
-
-fn isHeld(held: []const []const u8, handle: []const u8) bool {
-    for (held) |live| {
-        if (std.mem.eql(u8, live, handle)) return true;
-    }
-    return false;
 }
 
 /// Milliseconds since the epoch, as ISO 8601 in UTC.
@@ -3427,8 +3403,7 @@ test "a session another process hosts is not taken up here, and is listed live" 
 
     var elsewhere = try Database.init(testing.allocator, testing.io, try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "synth.db" }));
     defer elsewhere.deinit();
-    const init_pid: std.posix.pid_t = 1;
-    try elsewhere.takeLease(session, init_pid);
+    const held = try elsewhere.lockSession(session);
 
     const refused = try client.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
     try testing.expectEqualStrings("this session is open in another process", (try client.expectError(refused)).message);
@@ -3436,7 +3411,7 @@ test "a session another process hosts is not taken up here, and is listed live" 
     const listed = try rpc.parse(protocol.SessionList, client.arena.allocator(), try client.expectResult(asked));
     try testing.expect(listed.sessions[0]._meta.?.synth.live);
 
-    try elsewhere.releaseLease(session, init_pid);
+    held.release(testing.io);
     const load = try client.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
     _ = try client.expectResult(load);
 }

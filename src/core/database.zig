@@ -9,11 +9,16 @@ const Conversation = @import("conversation.zig");
 const Todo = @import("todo.zig");
 const Config = @import("config.zig");
 const migrations = @import("migrations.zig");
+const SessionLock = @import("session_lock.zig");
 
 const Database = @This();
 
 conn: zqlite.Conn,
 io: std.Io,
+allocator: std.mem.Allocator,
+/// Where the locks saying which process hosts a live session are kept.
+/// Null in memory. Owned.
+locks_dir: ?[]u8 = null,
 
 /// The blob kind a provider's replay record is stored under.
 pub const provider_state_blob = "provider_state";
@@ -35,8 +40,9 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
     var conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.NoMutex);
     errdefer conn.close();
 
-    var db = Database{ .conn = conn, .io = io };
+    var db = Database{ .conn = conn, .io = io, .allocator = allocator };
     errdefer db.deinit();
+    db.locks_dir = try SessionLock.dirFor(allocator, db_path);
 
     // First, so that switching a new database to WAL waits out another process creating it.
     conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
@@ -51,6 +57,7 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
 
 pub fn deinit(self: *Database) void {
     self.conn.close();
+    if (self.locks_dir) |dir| self.allocator.free(dir);
 }
 
 const owner_only: std.Io.File.Permissions = .fromMode(0o600);
@@ -517,61 +524,23 @@ pub fn deleteSession(self: *Database, session_id: i64) !void {
     try self.conn.exec("DELETE FROM session WHERE id = ?", .{session_id});
 }
 
-/// How long a lease outlives its holder's last renewal.
-pub const lease_ttl_ms: i64 = 30 * std.time.ms_per_s;
-
-/// Make process `pid` the host of session `public_id`, or renew its lease.
-/// `error.SessionHeld` when another process holds it.
-pub fn takeLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
-    try self.conn.execNoArgs("begin immediate");
-    errdefer self.conn.rollback();
-    const now = self.nowMs();
-    if (try self.conn.row("SELECT pid, heartbeat_at FROM lease WHERE public_id = ?", .{public_id})) |row| {
-        defer row.deinit();
-        const holder: std.posix.pid_t = @intCast(row.int(0));
-        if (holder != pid and isLive(holder, row.int(1), now)) return error.SessionHeld;
-    }
-    try self.conn.exec(
-        \\INSERT INTO lease (public_id, pid, heartbeat_at) VALUES (?, ?, ?)
-        \\ON CONFLICT(public_id) DO UPDATE SET pid = excluded.pid, heartbeat_at = excluded.heartbeat_at
-    , .{ public_id, @as(i64, pid), now });
-    try self.conn.commit();
+/// Host session `public_id` from this process until the lock is released.
+/// `error.SessionHeld` when another process hosts it.
+pub fn lockSession(self: *Database, public_id: []const u8) !SessionLock {
+    const dir = self.locks_dir orelse return .{ .file = null };
+    return SessionLock.take(self.io, dir, public_id);
 }
 
-/// Keep `pid`'s lease on `public_id` from going stale.
-pub fn renewLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
-    try self.conn.exec("UPDATE lease SET heartbeat_at = ? WHERE public_id = ? AND pid = ?", .{ self.nowMs(), public_id, @as(i64, pid) });
+/// Whether some process hosts session `public_id` right now.
+pub fn isSessionHeld(self: *Database, public_id: []const u8) bool {
+    const dir = self.locks_dir orelse return false;
+    return SessionLock.isHeld(self.io, dir, public_id);
 }
 
-pub fn releaseLease(self: *Database, public_id: []const u8, pid: std.posix.pid_t) !void {
-    try self.conn.exec("DELETE FROM lease WHERE public_id = ? AND pid = ?", .{ public_id, @as(i64, pid) });
-}
-
-/// The handles of the sessions some process is hosting right now. Caller
-/// owns the result.
-pub fn heldSessions(self: *Database, allocator: std.mem.Allocator) ![][]const u8 {
-    var rows = try self.conn.rows("SELECT public_id, pid, heartbeat_at FROM lease", .{});
-    defer rows.deinit();
-    const now = self.nowMs();
-    var list: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (list.items) |handle| allocator.free(handle);
-        list.deinit(allocator);
-    }
-    while (rows.next()) |row| {
-        if (!isLive(@intCast(row.int(1)), row.int(2), now)) continue;
-        try list.append(allocator, try allocator.dupe(u8, row.text(0)));
-    }
-    return list.toOwnedSlice(allocator);
-}
-
-/// A lease is held while it is renewed and its process is still there. The
-/// process check frees a crashed holder's sessions at once rather than after
-/// the time to live; the renewal frees them once its pid has gone to another.
-fn isLive(pid: std.posix.pid_t, heartbeat_at: i64, now: i64) bool {
-    if (now - heartbeat_at > lease_ttl_ms) return false;
-    const probe: std.posix.SIG = @enumFromInt(0);
-    return std.posix.errno(std.posix.system.kill(pid, probe)) != .SRCH;
+/// Delete a session, and its lock with it. The caller holds the lock.
+pub fn deleteLockedSession(self: *Database, session_id: i64, public_id: []const u8) !void {
+    try self.deleteSession(session_id);
+    if (self.locks_dir) |dir| SessionLock.forget(self.io, dir, public_id);
 }
 
 /// One MCP server's stored entry, as the `mcp` package encodes it.
@@ -1472,47 +1441,6 @@ test "two processes opening a new database at once both get it, migrated once" {
     }
 }
 
-test "a session is hosted by one live process at a time" {
-    const testing = std.testing;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(testing.io, &buf);
-    const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], "lease.db" });
-    defer testing.allocator.free(db_path);
-    var db = try init(testing.allocator, testing.io, db_path);
-    defer db.deinit();
-
-    const us = std.posix.system.getpid();
-    const init_pid: std.posix.pid_t = 1;
-    try db.takeLease("ses_ours", us);
-    try db.takeLease("ses_ours", us);
-    try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
-
-    try db.takeLease("ses_theirs", init_pid);
-    try testing.expectError(error.SessionHeld, db.takeLease("ses_theirs", us));
-    const held = try db.heldSessions(testing.allocator);
-    defer {
-        for (held) |handle| testing.allocator.free(handle);
-        testing.allocator.free(held);
-    }
-    try testing.expectEqual(2, held.len);
-
-    try db.conn.exec("UPDATE lease SET heartbeat_at = ? WHERE public_id = 'ses_theirs'", .{db.nowMs() - lease_ttl_ms - 1});
-    try db.takeLease("ses_theirs", us);
-
-    try db.releaseLease("ses_ours", init_pid);
-    try testing.expectError(error.SessionHeld, db.takeLease("ses_ours", init_pid));
-    try db.releaseLease("ses_ours", us);
-    try db.takeLease("ses_ours", init_pid);
-
-    var gone = try std.process.spawn(testing.io, .{ .argv = &.{"true"} });
-    const dead = gone.id.?;
-    _ = try gone.wait(testing.io);
-    try db.takeLease("ses_crashed", dead);
-    try db.takeLease("ses_crashed", us);
-}
-
 test "a search finds messages whatever their case, within the project" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
@@ -1839,6 +1767,7 @@ test "an older database is brought forward, keeping what it held" {
         var db: Database = .{
             .conn = try zqlite.open(db_path, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.NoMutex),
             .io = testing.io,
+            .allocator = testing.allocator,
         };
         defer db.deinit();
 
