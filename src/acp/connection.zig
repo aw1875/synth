@@ -8,6 +8,7 @@ const pkg = @import("pkg");
 const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
 const synth = @import("synth.zig");
+const sockets = @import("sockets.zig");
 
 const Connection = @This();
 
@@ -25,6 +26,9 @@ lines: rpc.LineReader,
 next_id: i64 = 1,
 /// The agent was told to keep its session once we hang up.
 detached: bool = false,
+/// The host reached over ssh, to say what to check when it does not answer.
+/// Owned.
+ssh_host: ?[]u8 = null,
 
 const Transport = union(enum) {
     child: std.process.Child,
@@ -34,7 +38,7 @@ const Transport = union(enum) {
 
 /// Why a connection was refused, in words for the person who asked.
 pub const Diagnostic = struct {
-    buffer: [256]u8 = undefined,
+    buffer: [512]u8 = undefined,
     message: []const u8 = "",
 
     pub fn say(self: *Diagnostic, comptime fmt: []const u8, args: anytype) void {
@@ -98,6 +102,7 @@ pub fn toHost(allocator: std.mem.Allocator, io: std.Io, host: []const u8) !*Conn
     const self = try create(allocator, io, .{ .child = child });
     self.reader = child.stdout.?.readerStreaming(io, &self.read_buffer);
     self.writer = child.stdin.?.writerStreaming(io, &self.write_buffer);
+    if (!std.mem.eql(u8, host, here)) self.ssh_host = allocator.dupe(u8, host) catch null;
     return self;
 }
 
@@ -162,6 +167,7 @@ pub fn close(self: *Connection) void {
         .socket => |socket| socket.close(self.io),
     }
     self.lines.deinit();
+    if (self.ssh_host) |host| self.allocator.free(host);
     self.allocator.destroy(self);
 }
 
@@ -186,7 +192,14 @@ pub fn initialize(self: *Connection, arena: std.mem.Allocator, diagnostic: ?*Dia
         .clientInfo = .{ .name = pkg.name, .version = pkg.version },
         ._meta = .{ .synth = .{ .protocol = synth.version } },
     }, diagnostic) catch |err| {
-        if (err == error.ConnectionLost) if (diagnostic) |d| d.say("the agent did not answer", .{});
+        const d = diagnostic orelse return err;
+        if (err == error.ConnectionLost) d.say("the agent did not answer", .{});
+        if (err != error.ConnectionLost and err != error.Refused) return err;
+        const host = self.ssh_host orelse return err;
+        var said: [256]u8 = undefined;
+        const why = said[0..@min(said.len, d.message.len)];
+        @memcpy(why, d.message[0..why.len]);
+        d.say("{s}\ncheck that `ssh {s} {s} --version` prints the version and nothing else", .{ why, host, pkg.name });
         return err;
     };
 }
@@ -224,10 +237,16 @@ pub fn next(self: *Connection, arena: std.mem.Allocator) !?rpc.Message {
 }
 
 /// Send a request and wait for its reply, passing over anything else. Only
-/// for before a reader thread takes the connection over.
+/// for before a reader thread takes the connection over. Anything but JSON
+/// is refused, quoted: a remote shell's startup files printing to stdout.
 pub fn call(self: *Connection, arena: std.mem.Allocator, method: []const u8, params: anytype, diagnostic: ?*Diagnostic) !std.json.Value {
     const id = try self.request(method, params);
-    while (try self.next(arena)) |message| {
+    while (true) {
+        const line = try self.lines.next(&self.reader.interface) orelse break;
+        const message = rpc.Message.parse(arena, try arena.dupe(u8, line)) catch {
+            if (diagnostic) |d| d.say("got \"{s}\" where the agent should have answered", .{line[0..@min(line.len, 120)]});
+            return error.Refused;
+        };
         if (message.method != null or message.id == null or !message.id.?.eql(id)) continue;
         if (message.err) |err| {
             if (diagnostic) |d| d.say("{s}", .{err.message});
@@ -236,4 +255,25 @@ pub fn call(self: *Connection, arena: std.mem.Allocator, method: []const u8, par
         return message.result orelse .null;
     }
     return error.ConnectionLost;
+}
+
+test "a line that is not JSON is refused, quoted, rather than read as the agent going quiet" {
+    const testing = std.testing;
+    const ours, const theirs = try sockets.pair();
+    defer theirs.close(testing.io);
+    const connection = try overSocket(testing.allocator, testing.io, ours);
+    defer connection.close();
+    var writer = theirs.writerStreaming(testing.io, &.{});
+    try writer.interface.writeAll("Welcome to devbox!\n");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var failure: Diagnostic = .{};
+    try testing.expectError(error.Refused, connection.initialize(arena_state.allocator(), &failure));
+    try testing.expectEqualStrings("got \"Welcome to devbox!\" where the agent should have answered", failure.message);
+
+    connection.ssh_host = try testing.allocator.dupe(u8, "devbox");
+    try writer.interface.writeAll("Last login: today\n");
+    try testing.expectError(error.Refused, connection.initialize(arena_state.allocator(), &failure));
+    try testing.expect(std.mem.endsWith(u8, failure.message, "check that `ssh devbox " ++ pkg.name ++ " --version` prints the version and nothing else"));
 }
