@@ -52,9 +52,13 @@ pub const method = struct {
     pub const subagent = "_synth/subagent";
     pub const page_history = "_synth/page_history";
     pub const search = "_synth/search";
-    /// Keep the session running once every client has gone, to be attached
-    /// to again over its socket.
+    /// Check the session can be attached to again over its socket, once
+    /// this client has gone without leaving.
     pub const detach = "_synth/detach";
+    /// A notification: this client is going on purpose. A session whose
+    /// last client left this way ends; one whose last client was cut off
+    /// runs on, to be attached to again.
+    pub const leave = "_synth/leave";
 };
 
 pub const ToolCall = struct {

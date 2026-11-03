@@ -338,6 +338,7 @@ fn attachTo(self: *Mirror, handle: []const u8, failure: *Connection.Diagnostic) 
     };
     errdefer discard(&held);
 
+    self.leave(old);
     old.interrupt();
     self.reader.join();
     old.close();
@@ -345,6 +346,12 @@ fn attachTo(self: *Mirror, handle: []const u8, failure: *Connection.Diagnostic) 
     self.forgetConnection();
     try self.applyAll(&held);
     self.reader = try std.Thread.spawn(.{}, readLoop, .{self});
+}
+
+/// Say we are going on purpose, so a session no one else is on ends rather
+/// than waiting to be attached to again.
+fn leave(self: *Mirror, connection: *Connection) void {
+    connection.notify(synth.method.leave, protocol.SessionId{ .sessionId = self.status.handle }) catch {};
 }
 
 /// Drop what was waiting on the connection just replaced: its queue, its
@@ -412,9 +419,11 @@ fn create(allocator: std.mem.Allocator, io: std.Io, connection: ?*Connection, co
     return self;
 }
 
-/// Hang up. A session in an agent of its own ends with the connection.
+/// Hang up, leaving: the session ends unless it was detached, or other
+/// clients are still on it.
 pub fn close(self: *Mirror) void {
     if (self.connection) |connection| {
+        if (!self.detached) self.leave(connection);
         connection.interrupt();
         self.reader.join();
         connection.close();
@@ -843,7 +852,6 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         },
         .detach => {
             try self.answers.ensureUnusedCapacity(self.allocator, 1);
-            (try self.live()).detached = true;
             self.detached = true;
             self.answers.appendAssumeCapacity(.detached);
         },
@@ -1709,9 +1717,9 @@ test "a session another process hosts is attached to on its socket, opening or s
     const socket_dir = try std.fs.path.join(hosting.arena.allocator(), &.{ std.fs.path.dirname(hosting.project).?, "sockets" });
     hosting.agent.options.socket_dir = socket_dir;
     const host = try hosting.connect();
-    defer host.close();
     try host.initialize(true);
     const handle = try hosting.arena.allocator().dupe(u8, (try host.open(hosting.project)).sessionId);
+    defer host.leave(handle);
 
     const other = try Agent.Fixture.create();
     defer other.destroy();

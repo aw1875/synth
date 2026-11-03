@@ -97,18 +97,21 @@ terminals runs commands in them, shown in the call as they run. MCP servers
 the editor brings connect beside those in `config.json`, which wins a clash of
 names; skills and `/compact` are offered as its slash commands.
 
-Quitting stops the session, a turn in progress included. `/detach` leaves it
-running instead: `synth --session <id>`, `--continue` or `/sessions` attach to
-it again from any terminal, and quitting from there stops it. Each session
-listens on a socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`.
+Quitting stops the session, a turn in progress included, unless another
+terminal is attached to it. `/detach` leaves it running instead, and so does
+losing the terminal without quitting, a closed window or a crash:
+`synth --session <id>`, `--continue` or `/sessions` attach to it again from
+any terminal, and quitting from there stops it. Each session listens on a
+socket in `$SYNTH_SOCKET_DIR`, else `/tmp/synth-<uid>`. An editor's sessions
+stop when the editor goes.
 
 `synth remote` reaches the sessions on another machine the same way, over
 ssh: your ssh config, keys and jump hosts apply, and synth must be on the far
 end's `PATH`. There `synth remote bridge` attaches to a running session or
 starts `synth acp` under your login shell, so tools see the environment a
-login there would. `/detach` keeps a remote session running after you
-disconnect, and `synth remote connect <host>` with no id offers the sessions
-there to pick from.
+login there would. A remote session keeps running when the connection
+drops, as it does after `/detach`, and `synth remote connect <host>` with no
+id offers the sessions there to pick from.
 
 ## Keys
 

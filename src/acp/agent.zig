@@ -94,9 +94,6 @@ live: ?struct { handle: []u8, root: []u8 } = null,
 session: ?*Session = null,
 /// The live session's socket, while it has one.
 listener: ?*sockets.Listener = null,
-/// Serve on once every client has gone. Ended by a client attaching, or the
-/// session closing.
-detached: bool = false,
 /// The permission request out for the call waiting on a decision.
 asked: ?Asked = null,
 /// Requests a tool put to a client and is waiting on, by id. Guarded by
@@ -158,7 +155,7 @@ pub fn serve(self: *Agent) void {
         defer gone.deinit(self.allocator);
         self.drainInbox();
         for (gone.items) |connection| self.drop(connection);
-        if (self.connectionCount() == 0 and !self.detached) return;
+        if (self.connectionCount() == 0 and !self.reachable()) return;
 
         const arena = arena_state.allocator();
         if (self.session) |session| {
@@ -176,6 +173,11 @@ pub fn serve(self: *Agent) void {
             self.wake.waitUncancelable(self.io);
         }
     }
+}
+
+/// Whether a client cut off could attach to the live session again.
+fn reachable(self: *const Agent) bool {
+    return self.session != null and self.listener != null;
 }
 
 fn connectionCount(self: *Agent) usize {
@@ -197,8 +199,10 @@ fn finishedConnections(self: *Agent) !std.ArrayList(*Connection) {
     return out;
 }
 
-/// Forget a connection that has gone, and free it.
+/// Forget a connection that has gone, and free it. The last client leaving
+/// on purpose ends the session.
 fn drop(self: *Agent, connection: *Connection) void {
+    const left = connection.leaving;
     if (self.asked) |*asked| asked.forget(connection);
     var at: usize = 0;
     while (at < self.prompts.items.len) {
@@ -215,6 +219,7 @@ fn drop(self: *Agent, connection: *Connection) void {
         self.releaseCalls(connection);
     }
     connection.destroy();
+    if (left and self.connectionCount() == 0) self.closeSession();
 }
 
 fn post(self: *Agent, inbound: *Inbound) void {
@@ -271,6 +276,10 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     if (eql(u8, method, protocol.method.cancel_request)) {
         return self.cancelPrompt(connection, (try rpc.parse(protocol.CancelRequest, arena, params)).requestId);
     }
+    if (eql(u8, method, synth.method.leave)) {
+        connection.leaving = true;
+        return;
+    }
     const asked = try need(id);
     if (eql(u8, method, protocol.method.session_new)) {
         if (connection.guest) return error.HostsOneSession;
@@ -288,10 +297,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
     const loads = eql(u8, method, protocol.method.session_load);
     if (loads or eql(u8, method, protocol.method.session_resume)) {
         const request = try rpc.parse(protocol.LoadSession, arena, params);
-        if (connection.guest) {
-            _ = try self.sessionFor(request.sessionId);
-            self.detached = false;
-        }
+        if (connection.guest) _ = try self.sessionFor(request.sessionId);
         const session = try self.open(request.cwd, request.sessionId, try mcpServers(arena, request.mcpServers));
         if (loads and connection.dialect == .standard) try session.replay(arena, connection);
         connection.reply(asked, protocol.Loaded{
@@ -353,7 +359,6 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
         try loop.compact();
     } else if (eql(u8, method, m.detach)) {
         if (self.listener == null) return error.Unreachable;
-        self.detached = true;
     } else if (eql(u8, method, m.rename)) {
         try loop.rename((try rpc.parse(synth.Rename, arena, params)).title);
     } else if (eql(u8, method, m.providers)) {
@@ -597,7 +602,6 @@ fn unshare(self: *Agent) void {
 /// End the live session, answering whatever was waiting on it.
 fn closeSession(self: *Agent) void {
     const session = self.session orelse return;
-    self.detached = false;
     self.stopListening();
     self.withdraw();
     for (self.prompts.items) |*waiting| {
@@ -1108,6 +1112,8 @@ const Connection = struct {
     dialect: ?Dialect = null,
     /// Opened or loaded the session, so it can be put what the session asks.
     joined: bool = false,
+    /// Said it is going on purpose.
+    leaving: bool = false,
     /// Draws forms, so a question can be put to it.
     forms: bool = false,
     /// Offers its own view of files, unsaved changes and all.
@@ -2557,6 +2563,12 @@ pub const Client = struct {
     }
 
     /// Hang up, which the agent sees as the end of its input.
+    /// Leave `session` on purpose, then hang up.
+    pub fn leave(self: *Client, session: []const u8) void {
+        self.notify(synth.method.leave, protocol.SessionId{ .sessionId = session }) catch {};
+        self.close();
+    }
+
     pub fn close(self: *Client) void {
         _ = std.posix.system.shutdown(self.file.handle, std.posix.SHUT.RDWR);
         self.file.close(testing.io);
@@ -3368,14 +3380,14 @@ test "a client that attaches while a call waits is asked about it too" {
     const socket_dir = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "sockets" });
     fixture.agent.options.socket_dir = socket_dir;
     const host = try fixture.connect();
-    defer host.close();
     try host.initialize(true);
-    const session = (try host.open(fixture.project)).sessionId;
+    const session = try fixture.arena.allocator().dupe(u8, (try host.open(fixture.project)).sessionId);
+    defer host.leave(session);
     const prompted = try host.prompt(session, "make a note");
     const mine = try host.awaitPermission();
 
     const guest = try Client.create((try sockets.reach(fixture.arena.allocator(), socket_dir, session)).?);
-    defer guest.close();
+    defer guest.leave(session);
     try guest.initialize(true);
     const attach = try guest.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
     _ = try guest.expectResult(attach);
@@ -3416,7 +3428,7 @@ test "a session another process hosts is not taken up here, and is listed live" 
     _ = try client.expectResult(load);
 }
 
-test "a detached session outlives its clients until one attaches and leaves" {
+test "a session outlives a client cut off, and ends once the last one leaves" {
     const fixture = try Fixture.create();
     defer fixture.destroy();
     const host = try fixture.connect();
@@ -3429,16 +3441,22 @@ test "a detached session outlives its clients until one attaches and leaves" {
 
     const socket_dir = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "sockets" });
     fixture.agent.options.socket_dir = socket_dir;
-    const session = (try host.open(fixture.project)).sessionId;
-    const detach = try host.request(synth.method.detach, protocol.SessionId{ .sessionId = session });
-    _ = try host.expectResult(detach);
-    const path = try sockets.pathFor(fixture.arena.allocator(), socket_dir, session);
-    const handle = try fixture.arena.allocator().dupe(u8, session);
+    const handle = try fixture.arena.allocator().dupe(u8, (try host.open(fixture.project)).sessionId);
     host.close();
 
-    const guest = try Client.create(try sockets.connect(path));
-    defer guest.close();
-    try guest.initialize(true);
-    const attach = try guest.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = handle, .cwd = fixture.project });
-    _ = try guest.expectResult(attach);
+    const first = try Client.create((try sockets.reach(fixture.arena.allocator(), socket_dir, handle)).?);
+    try first.initialize(true);
+    _ = try first.expectResult(try first.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = handle, .cwd = fixture.project }));
+    const second = try Client.create((try sockets.reach(fixture.arena.allocator(), socket_dir, handle)).?);
+    try second.initialize(true);
+    _ = try second.expectResult(try second.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = handle, .cwd = fixture.project }));
+
+    first.leave(handle);
+    for (0..500) |_| {
+        if (fixture.agent.connectionCount() == 1) break;
+        try std.Io.sleep(testing.io, .fromMilliseconds(2), .awake);
+    }
+    const kept = try second.request(synth.method.rename, synth.Rename{ .sessionId = handle, .title = "still here" });
+    _ = try second.expectResult(kept);
+    second.leave(handle);
 }

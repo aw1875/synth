@@ -17,6 +17,8 @@ const std = @import("std");
 const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
 const sockets = @import("sockets.zig");
+const synth = @import("synth.zig");
+const Connection = @import("connection.zig");
 
 const Router = @This();
 
@@ -53,6 +55,10 @@ pub const Options = struct {
     /// Where a relative `cwd` in `session/new` is taken from. Null leaves it
     /// to the agent, which refuses one.
     home: ?[]const u8 = null,
+    /// The client going leaves its sessions running, to be attached to
+    /// again: over ssh, a dropped link is not the person quitting. Otherwise
+    /// they end with it, unless someone else is on them.
+    keep_when_cut_off: bool = false,
 };
 
 pub const Spawner = struct {
@@ -127,7 +133,7 @@ pub fn init(
     };
 }
 
-/// Pipe until the client leaves. A session it had detached goes on.
+/// Pipe until the client leaves.
 pub fn run(self: *Router) !void {
     self.client_writer = self.client_out.writerStreaming(self.io, &self.client_buffer);
     defer self.deinit();
@@ -296,12 +302,12 @@ fn start(self: *Router, given: ?Pipe, hello_again: bool) !*End {
     const pipe = given orelse try self.spawner.start(self.spawner.context);
     const end = self.allocator.create(End) catch |err| {
         var unused = pipe;
-        closePipe(self.io, &unused, false);
+        closePipe(self.io, &unused);
         return err;
     };
     end.* = .{ .router = self, .pipe = pipe, .attached = given != null };
     end.writer = pipe.input.writerStreaming(self.io, &end.buffer);
-    errdefer self.drop(end, false);
+    errdefer self.drop(end);
 
     if (hello_again) if (self.hello) |hello| try self.greet(end, hello);
     {
@@ -353,23 +359,30 @@ fn reap(self: *Router) void {
     }
 }
 
-/// End `end` on purpose, a child included, waiting until it has had its
-/// say.
+/// End `end` on purpose, leaving its session, once it has had its say.
 fn retire(self: *Router, end: *End) void {
     end.retired.store(true, .release);
+    sayLeaving(end);
     hangUp(self.io, &end.pipe);
     end.thread.join();
     self.forget(end);
-    self.drop(end, true);
+    self.drop(end);
 }
 
-/// Leave `end` as the client leaves: a session it had detached goes on, and
-/// nothing waits for it.
+/// Let `end` go as the client goes.
 fn leave(self: *Router, end: *End) void {
     end.retired.store(true, .release);
+    if (!self.options.keep_when_cut_off) sayLeaving(end);
     hangUp(self.io, &end.pipe);
     end.thread.join();
-    self.drop(end, false);
+    self.drop(end);
+}
+
+/// Tell `end` the client is leaving its session on purpose.
+fn sayLeaving(end: *End) void {
+    const handle = end.handle orelse return;
+    rpc.notify(&end.writer.interface, synth.method.leave, protocol.SessionId{ .sessionId = handle }) catch return;
+    end.writer.interface.flush() catch {};
 }
 
 /// Drop what is waiting on `end`, which is going.
@@ -393,8 +406,8 @@ fn forget(self: *Router, end: *End) void {
     }
 }
 
-fn drop(self: *Router, end: *End, wait: bool) void {
-    closePipe(self.io, &end.pipe, wait);
+fn drop(self: *Router, end: *End) void {
+    closePipe(self.io, &end.pipe);
     if (end.handle) |handle| self.allocator.free(handle);
     if (end.swallow) |id| self.allocator.free(id);
     self.allocator.destroy(end);
@@ -521,12 +534,13 @@ fn hangUp(io: std.Io, pipe: *Pipe) void {
     _ = std.posix.system.shutdown(pipe.input.handle, std.posix.SHUT.RDWR);
 }
 
-fn closePipe(io: std.Io, pipe: *Pipe, wait: bool) void {
+/// A child is left to go in its own time: it may be serving other clients.
+fn closePipe(io: std.Io, pipe: *Pipe) void {
     if (pipe.child) |*child| {
         hangUp(io, pipe);
-        if (wait) {
-            _ = child.wait(io) catch {};
-        } else if (child.stdout) |stdout| stdout.close(io);
+        if (child.stdout) |stdout| stdout.close(io);
+        child.stdout = null;
+        Connection.reapLater(io, child.*);
         return;
     }
     pipe.input.close(io);
@@ -706,7 +720,7 @@ pub fn bridge(process: std.process.Init) !void {
         .argv = try hostCommand(arena_state.allocator(), process.environ_map, exe),
         .cwd = home,
     };
-    try serve(process, &children, .{ .exclusive = true, .home = home });
+    try serve(process, &children, .{ .exclusive = true, .home = home, .keep_when_cut_off = true });
 }
 
 /// `synth acp` on this process's stdio: a session a child.
@@ -777,7 +791,6 @@ fn quote(writer: *std.Io.Writer, text: []const u8) !void {
 
 const testing = std.testing;
 const Agent = @import("agent.zig");
-const synth = @import("synth.zig");
 
 test "a session ssh asked for starts under a login shell, one from a terminal as it is" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -815,11 +828,14 @@ test "a relative directory is taken from the far end's home" {
 /// be.
 const Fixtures = struct {
     fixtures: std.ArrayList(*Agent.Fixture) = .empty,
+    /// Where each child's session listens, if anywhere.
+    socket_dir: ?[]const u8 = null,
 
     fn start(context: *anyopaque) anyerror!Pipe {
         const self: *Fixtures = @ptrCast(@alignCast(context));
         const fixture = try Agent.Fixture.create();
         errdefer fixture.destroy();
+        fixture.agent.options.socket_dir = self.socket_dir;
         try self.fixtures.append(testing.allocator, fixture);
         const far = try fixture.socket();
         return .{ .input = far, .output = far };
@@ -859,15 +875,44 @@ const Rig = struct {
     }
 };
 
+test "a bridge cut off leaves its session running, and an editor going ends its own" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &root);
+    const socket_dir = try std.fs.path.join(testing.allocator, &.{ root[0..n], "sockets" });
+    defer testing.allocator.free(socket_dir);
+
+    var over_ssh: Rig = .{ .children = .{ .socket_dir = socket_dir } };
+    try over_ssh.start(socket_dir, .{ .exclusive = true, .keep_when_cut_off = true });
+    try over_ssh.client.initialize(true);
+    const handle = try testing.allocator.dupe(u8, (try over_ssh.client.open(over_ssh.children.fixtures.items[0].project)).sessionId);
+    defer testing.allocator.free(handle);
+    over_ssh.client.close();
+    over_ssh.thread.join();
+
+    const back = try Agent.Client.create((try sockets.reach(testing.allocator, socket_dir, handle)).?);
+    try back.initialize(true);
+    _ = try back.expectResult(try back.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = handle }));
+    back.leave(handle);
+    over_ssh.children.deinit();
+
+    var editor: Rig = .{ .children = .{ .socket_dir = socket_dir } };
+    try editor.start(socket_dir, .{});
+    try editor.client.initialize(true);
+    _ = try editor.client.open(editor.children.fixtures.items[0].project);
+    editor.stop();
+}
+
 test "the bridge pipes to a child, attaches to a session hosted elsewhere, and goes back for a new one" {
     const elsewhere_host = try Agent.Fixture.create();
     defer elsewhere_host.destroy();
     const socket_dir = try std.fs.path.join(elsewhere_host.arena.allocator(), &.{ std.fs.path.dirname(elsewhere_host.project).?, "sockets" });
     elsewhere_host.agent.options.socket_dir = socket_dir;
     const host = try elsewhere_host.connect();
-    defer host.close();
     try host.initialize(true);
     const handle = try elsewhere_host.arena.allocator().dupe(u8, (try host.open(elsewhere_host.project)).sessionId);
+    defer host.leave(handle);
 
     var rig: Rig = .{};
     try rig.start(socket_dir, .{ .exclusive = true, .home = "/nowhere" });

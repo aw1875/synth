@@ -24,8 +24,6 @@ reader: std.Io.File.Reader = undefined,
 writer: std.Io.File.Writer = undefined,
 lines: rpc.LineReader,
 next_id: i64 = 1,
-/// The agent was told to keep its session once we hang up.
-detached: bool = false,
 /// The host reached over ssh, to say what to check when it does not answer.
 /// Owned.
 ssh_host: ?[]u8 = null,
@@ -154,21 +152,33 @@ fn create(allocator: std.mem.Allocator, io: std.Io, transport: Transport) !*Conn
     return self;
 }
 
-/// Hang up, and for a child, wait for it to go: its session ends with it,
-/// unless detached.
+/// Hang up. A child is left to go in its own time: its session may have
+/// other clients to serve, or no one left to wait for it.
 pub fn close(self: *Connection) void {
     self.interrupt();
     switch (self.transport) {
-        .child => |*child| if (self.detached) {
+        .child => |*child| {
             if (child.stdout) |stdout| stdout.close(self.io);
-        } else {
-            _ = child.wait(self.io) catch {};
+            child.stdout = null;
+            reapLater(self.io, child.*);
         },
         .socket => |socket| socket.close(self.io),
     }
     self.lines.deinit();
     if (self.ssh_host) |host| self.allocator.free(host);
     self.allocator.destroy(self);
+}
+
+/// Collect `child` once it exits, on a thread of its own. Its stdin and
+/// stdout must already be closed.
+pub fn reapLater(io: std.Io, child: std.process.Child) void {
+    const thread = std.Thread.spawn(.{}, reap, .{ io, child }) catch return;
+    thread.detach();
+}
+
+fn reap(io: std.Io, child: std.process.Child) void {
+    var exited = child;
+    _ = exited.wait(io) catch {};
 }
 
 /// Stop reading from another thread: whoever is blocked in `next` gets end
