@@ -219,7 +219,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
         .tick => {
             self.tick_pending = false;
             try commands.followSignIn(self);
-            const changed = try self.mirror.poll();
+            const changes = try self.mirror.poll();
             if (self.mirror.takeNotice()) |notice| {
                 defer self.allocator.free(notice);
                 try self.notification.show(ctx, .warn, notice);
@@ -227,8 +227,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             if (self.mirror.takeSwitched()) try self.showReplacedTranscript();
             try self.followSubagent();
             while (self.mirror.takeAnswer()) |answer| try commands.showAnswer(self, ctx, answer);
-            if (changed) {
-                try commands.refreshMcpPicker(self);
+            if (changes.any) try commands.refreshMcpPicker(self);
+            if (changes.transcript) {
                 widget_pool.pruneWidgets(self);
                 self.mentions.invalidate();
             }
@@ -243,7 +243,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             // A server speaks whenever it likes, and vxfw has no way in but a tick.
             try self.scheduleTick(ctx);
-            if (changed) self.scroll = 0;
+            if (changes.grew) self.scroll = 0;
             ctx.redraw = true;
         },
         .key_press => |key| {

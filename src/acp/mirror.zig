@@ -66,6 +66,8 @@ notices: std.ArrayList([]u8) = .empty,
 answers: std.ArrayList(Answer) = .empty,
 /// A snapshot replaced the transcript since the TUI last asked.
 switched: bool = false,
+/// What has changed since the last `poll`.
+changes: Changes = .{},
 /// The session open has anything in it.
 spoken: bool = false,
 /// The session goes on after we leave.
@@ -476,21 +478,32 @@ fn queue(self: *Mirror, inbound: *Inbound) void {
     self.inbox.append(&inbound.node);
 }
 
-/// Apply everything the agent has said since the last call. Returns whether
-/// anything changed.
-pub fn poll(self: *Mirror) !bool {
+pub const Changes = struct {
+    /// Anything at all, worth drawing again.
+    any: bool = false,
+    /// A message was added, changed or loaded in full.
+    transcript: bool = false,
+    /// A message was added at the end, or the transcript replaced: the view
+    /// follows it down.
+    grew: bool = false,
+};
+
+/// Apply everything the agent has said since the last call, and say what
+/// that changed.
+pub fn poll(self: *Mirror) !Changes {
     self.inbox_mutex.lockUncancelable(self.io);
     var received = self.inbox;
     self.inbox = .{};
     self.inbox_mutex.unlock(self.io);
 
-    var changed = false;
+    defer self.changes = .{};
     while (received.popFirst()) |node| {
         const inbound: *Inbound = @fieldParentPtr("node", node);
+        self.changes.any = true;
         if (inbound == self.lost) {
             // Left queued for `close`, which frees it last.
             self.queue(inbound);
-            if (self.lost_heard) return changed;
+            if (self.lost_heard) return self.changes;
             self.lost_heard = true;
             self.ended = true;
             if (self.socket_dir != null) {
@@ -498,13 +511,12 @@ pub fn poll(self: *Mirror) !bool {
             } else {
                 try self.say("The connection to {s} was lost. Pick the session up again with: synth remote connect {s} {s}", .{ self.host, self.host, self.status.handle });
             }
-            return true;
+            return self.changes;
         }
         defer inbound.destroy();
         try self.apply(inbound.message);
-        changed = true;
     }
-    return changed;
+    return self.changes;
 }
 
 fn apply(self: *Mirror, message: rpc.Message) !void {
@@ -642,6 +654,8 @@ fn applySnapshot(self: *Mirror, snapshot: synth.Snapshot) !void {
     self.forgetAsked();
     self.forgetEarly();
     self.switched = true;
+    self.changes.transcript = true;
+    self.changes.grew = true;
     for (snapshot.messages) |message| try self.conversation.adoptMessage(try self.own(message));
     self.conversation.dropped += snapshot.dropped;
     self.spoken = snapshot.messages.len > 0 or snapshot.dropped > 0;
@@ -673,9 +687,12 @@ fn applyMessage(self: *Mirror, message: synth.Message, changed: bool) !void {
         const replacement = try self.own(message);
         held.deinit(self.allocator);
         held.* = replacement;
+        self.changes.transcript = true;
     } else if (!changed) {
         try self.conversation.adoptMessage(try self.own(message));
         self.spoken = true;
+        self.changes.transcript = true;
+        self.changes.grew = true;
     }
 }
 
@@ -781,6 +798,10 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const result = message.result;
+    switch (awaited) {
+        .tool_result, .attachment, .thinking, .history => self.changes.transcript = true,
+        else => {},
+    }
     switch (awaited) {
         .command, .prompt => {},
         .tool_result => |at| {
@@ -1334,6 +1355,35 @@ test "a question is answered from here, whether or not its request has arrived y
     try testing.expectEqual(@as(?Loop.Outcome, .done), mirror.status.outcome);
     try testing.expectEqualStrings("green", convo.messages.items[1].tool_calls[0].result.?);
     try testing.expect(mirror.asked == null and mirror.early == null);
+}
+
+test "only a message added at the end moves the view down" {
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try offline(testing.allocator, testing.io, &convo, "here");
+    defer mirror.close();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    mirror.status.handle = "ses_view";
+
+    const said: synth.Message = .{ .seq = 1, .role = .assistant, .text = "hello" };
+    try mirror.apply(try heard(arena, synth.method.stream, synth.StreamUpdate{ .sessionId = "ses_view", .stream = .{ .request = 1, .text = "hel" } }));
+    try testing.expectEqual(Changes{}, mirror.changes);
+    try mirror.apply(try heard(arena, synth.method.appended, synth.Appended{ .sessionId = "ses_view", .message = said }));
+    try testing.expectEqual(Changes{ .transcript = true, .grew = true }, mirror.changes);
+
+    mirror.changes = .{};
+    var settled = said;
+    settled.text = "hello there";
+    try mirror.apply(try heard(arena, synth.method.updated, synth.Appended{ .sessionId = "ses_view", .message = settled }));
+    try testing.expectEqual(Changes{ .transcript = true }, mirror.changes);
+}
+
+fn heard(arena: std.mem.Allocator, method: []const u8, params: anytype) !rpc.Message {
+    var encoded: std.Io.Writer.Allocating = .init(arena);
+    try rpc.notify(&encoded.writer, method, params);
+    return rpc.Message.parse(arena, std.mem.trimEnd(u8, encoded.written(), "\n"));
 }
 
 test "steering takes what the draft holds along with it" {
