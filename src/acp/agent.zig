@@ -289,6 +289,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
+        connection.joined = true;
         return session.welcome(arena, connection);
     }
     const loads = eql(u8, method, protocol.method.session_load);
@@ -304,6 +305,7 @@ fn perform(self: *Agent, connection: *Connection, id: ?rpc.Id, method: []const u
             .modes = session.modes(),
             .configOptions = try session.configOptions(arena),
         });
+        connection.joined = true;
         return session.welcome(arena, connection);
     }
     if (eql(u8, method, protocol.method.session_delete)) {
@@ -714,14 +716,15 @@ fn cancelPrompt(self: *Agent, connection: *Connection, request: std.json.Value) 
     }
 }
 
-/// Ask every client about the call waiting on a person, once; and take the
-/// request back from all of them once it is no longer waiting.
+/// Ask every client about the call waiting on a person, including one that
+/// joins while it waits; and take the request back from all of them once it
+/// is no longer waiting.
 fn settleAsked(self: *Agent, arena: std.mem.Allocator) void {
     const session = self.session orelse return self.withdraw();
     const waiting = session.waitingCall();
-    if (self.asked) |asked| {
+    if (self.asked) |*asked| {
         if (waiting) |call| {
-            if (asked.for_answer == call.for_answer and asked.seq == call.seq and asked.call == call.call) return;
+            if (asked.isFor(call)) return self.put(arena, session, asked, call) catch |err| self.noticeFmt(.warning, "Could not ask: {s}", .{@errorName(err)});
         }
         self.withdraw();
     }
@@ -735,39 +738,56 @@ fn settleAsked(self: *Agent, arena: std.mem.Allocator) void {
 fn ask(self: *Agent, arena: std.mem.Allocator, session: *Session, waiting: Session.Waiting) !void {
     var asked: Asked = .{ .for_answer = waiting.for_answer, .seq = waiting.seq, .call = waiting.call };
     errdefer asked.deinit(self.allocator);
-    if (!waiting.for_answer) {
-        _ = try self.put(&asked, protocol.method.session_request_permission, protocol.RequestPermission{
-            .sessionId = session.handle,
-            .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
-            .options = &permission_options,
-        });
-        self.asked = asked;
-        return;
-    }
-    const greeted = try self.put(&asked, protocol.method.elicitation_create, try updates.question(arena, session.handle, waiting.seq, waiting.call, waiting.tool));
-    if (asked.requests.items.len == 0 and greeted > 0) {
+    try self.put(arena, session, &asked, waiting);
+    if (asked.for_answer and asked.requests.items.len == 0 and asked.considered.items.len > 0) {
         asked.deinit(self.allocator);
         return session.stack.loop.answer(unanswerable);
     }
     self.asked = asked;
 }
 
-/// Send `method` to every client that can take it, noting each request in
-/// `asked`. Returns how many clients have said hello, able to take it or not.
-fn put(self: *Agent, asked: *Asked, method: []const u8, params: anytype) !usize {
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    var greeted: usize = 0;
-    for (self.connections.items) |connection| {
-        if (connection.dialect == null) continue;
-        greeted += 1;
-        if (asked.for_answer and !connection.forms) continue;
-        const id = self.next_id;
-        self.next_id += 1;
-        try asked.requests.append(self.allocator, .{ .connection = connection, .id = id });
-        connection.request(.{ .number = id }, method, params);
+/// Put the waiting call to every client that has said hello and not yet
+/// been considered for it, noting each request in `asked`.
+fn put(self: *Agent, arena: std.mem.Allocator, session: *Session, asked: *Asked, waiting: Session.Waiting) !void {
+    var fresh: std.ArrayList(*Connection) = .empty;
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.connections.items) |connection| {
+            if (!connection.joined or asked.considers(connection)) continue;
+            try fresh.append(arena, connection);
+        }
     }
-    return greeted;
+    if (fresh.items.len == 0) return;
+
+    try asked.considered.ensureUnusedCapacity(self.allocator, fresh.items.len);
+    try asked.requests.ensureUnusedCapacity(self.allocator, fresh.items.len);
+    if (waiting.for_answer) {
+        const question = try updates.question(arena, session.handle, waiting.seq, waiting.call, waiting.tool);
+        for (fresh.items) |connection| {
+            asked.considered.appendAssumeCapacity(connection);
+            if (connection.forms) self.putTo(asked, connection, protocol.method.elicitation_create, question);
+        }
+        return;
+    }
+    const permission: protocol.RequestPermission = .{
+        .sessionId = session.handle,
+        .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
+        .options = &permission_options,
+    };
+    for (fresh.items) |connection| {
+        asked.considered.appendAssumeCapacity(connection);
+        self.putTo(asked, connection, protocol.method.session_request_permission, permission);
+    }
+}
+
+fn putTo(self: *Agent, asked: *Asked, connection: *Connection, method: []const u8, params: anytype) void {
+    self.mutex.lockUncancelable(self.io);
+    const id = self.next_id;
+    self.next_id += 1;
+    self.mutex.unlock(self.io);
+    asked.requests.appendAssumeCapacity(.{ .connection = connection, .id = id });
+    connection.request(.{ .number = id }, method, params);
 }
 
 /// Take back every request still out.
@@ -1035,9 +1055,20 @@ const Asked = struct {
     seq: u64,
     call: usize,
     requests: std.ArrayList(struct { connection: *Connection, id: i64 }) = .empty,
+    /// Every client the call has been weighed for, asked or not.
+    considered: std.ArrayList(*Connection) = .empty,
 
     fn deinit(self: *Asked, allocator: std.mem.Allocator) void {
         self.requests.deinit(allocator);
+        self.considered.deinit(allocator);
+    }
+
+    fn isFor(self: *const Asked, waiting: Session.Waiting) bool {
+        return self.for_answer == waiting.for_answer and self.seq == waiting.seq and self.call == waiting.call;
+    }
+
+    fn considers(self: *const Asked, connection: *Connection) bool {
+        return std.mem.indexOfScalar(*Connection, self.considered.items, connection) != null;
     }
 
     fn find(self: *const Asked, connection: *Connection, id: rpc.Id) ?usize {
@@ -1048,6 +1079,7 @@ const Asked = struct {
     }
 
     fn forget(self: *Asked, connection: *Connection) void {
+        if (std.mem.indexOfScalar(*Connection, self.considered.items, connection)) |at| _ = self.considered.swapRemove(at);
         var at: usize = 0;
         while (at < self.requests.items.len) {
             if (self.requests.items[at].connection == connection) {
@@ -1098,6 +1130,8 @@ const Connection = struct {
     guest: bool = false,
     /// Set by `initialize`. Session's thread only.
     dialect: ?Dialect = null,
+    /// Opened or loaded the session, so it can be put what the session asks.
+    joined: bool = false,
     /// Draws forms, so a question can be put to it.
     forms: bool = false,
     /// Offers its own view of files, unsaved changes and all.
@@ -3017,6 +3051,8 @@ test "the first answer to a permission request wins, and the rest are taken back
     try first.initialize(true);
     try second.initialize(false);
     const session = (try first.open(fixture.project)).sessionId;
+    const join = try second.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
+    _ = try second.expectResult(join);
 
     const prompted = try first.prompt(session, "make a note");
     const mine = try first.awaitPermission();
@@ -3348,6 +3384,33 @@ test "a session listens on its socket, where a client can attach to it and nothi
     try testing.expect(try host.expectResult(close) == .object);
     while (guest.next()) |_| {} else |err| try testing.expectEqual(error.Closed, err);
     try testing.expectError(error.NotListening, sockets.connect(path));
+}
+
+test "a client that attaches while a call waits is asked about it too" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const socket_dir = try std.fs.path.join(fixture.arena.allocator(), &.{ std.fs.path.dirname(fixture.project).?, "sockets" });
+    fixture.agent.options.socket_dir = socket_dir;
+    const host = try fixture.connect();
+    defer host.close();
+    try host.initialize(true);
+    const session = (try host.open(fixture.project)).sessionId;
+    const prompted = try host.prompt(session, "make a note");
+    const mine = try host.awaitPermission();
+
+    const guest = try Client.create((try sockets.reach(fixture.arena.allocator(), socket_dir, session)).?);
+    defer guest.close();
+    try guest.initialize(true);
+    const attach = try guest.request(protocol.method.session_load, protocol.LoadSession{ .sessionId = session, .cwd = fixture.project });
+    _ = try guest.expectResult(attach);
+    const theirs = try guest.awaitPermission();
+    try testing.expectEqualStrings(mine.call, theirs.call);
+
+    try guest.choose(theirs.id, "once");
+    const withdrawn = try host.awaitMethod(protocol.method.cancel_request);
+    const cancel = try rpc.parse(protocol.CancelRequest, host.arena.allocator(), withdrawn.params);
+    try testing.expect(mine.id.eql(rpc.Id.from(cancel.requestId).?));
+    try testing.expectEqual(protocol.StopReason.end_turn, try host.stopReason(prompted));
 }
 
 test "a session another process hosts is not taken up here, and is listed live" {
