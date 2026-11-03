@@ -623,11 +623,26 @@ pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !voi
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try self.beginTurn(ctx, prompt, .{
+    try self.beginTurn(ctx, prompt, try self.heldFor(arena, prompt));
+    self.held.consume(prompt);
+}
+
+/// Steer the running turn with `prompt` and what it holds. False when no
+/// turn is running.
+pub fn steerTurn(self: *Model, prompt: []const u8) !bool {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    if (!try self.mirror.steer(prompt, try self.heldFor(arena_state.allocator(), prompt))) return false;
+    self.held.consume(prompt);
+    return true;
+}
+
+/// The pastes and images `prompt` still names.
+fn heldFor(self: *Model, arena: std.mem.Allocator, prompt: []const u8) !AgentLoop.Extras {
+    return .{
         .attachments = try self.held.textAttachments(arena, prompt),
         .images = try self.held.images(arena, prompt),
-    });
-    self.held.consume(prompt);
+    };
 }
 
 /// Everything starting a turn involves besides the prompt itself.

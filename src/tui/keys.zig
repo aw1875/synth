@@ -39,7 +39,7 @@ pub fn handleSubmit(ptr: ?*anyopaque, ctx: *vxfw.EventContext, value: []const u8
         return;
     }
 
-    if (try self.mirror.steer(value)) {
+    if (try self.steerTurn(value)) {
         self.scroll = 0;
         ctx.redraw = true;
         return;

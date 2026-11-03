@@ -18,6 +18,7 @@ const Database = @import("../core/database.zig");
 const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
 const mcp_tools = @import("../tools/mcp.zig");
+const mention = @import("../core/mention.zig");
 const Loop = @import("../agent/loop.zig");
 const Thought = @import("../agent/thought.zig");
 const Provider = @import("../provider/provider.zig");
@@ -1074,9 +1075,9 @@ pub fn submit(self: *Mirror, prompt: []const u8, extras: Loop.Extras) !void {
 
 /// Whether the text went in as steering. Only while busy: otherwise it is a
 /// prompt of its own, which is the caller's to send.
-pub fn steer(self: *Mirror, text: []const u8) !bool {
+pub fn steer(self: *Mirror, text: []const u8, extras: Loop.Extras) !bool {
     if (!self.isBusy()) return false;
-    try self.submit(text, .{});
+    try self.submit(text, extras);
     return true;
 }
 
@@ -1335,6 +1336,35 @@ test "a question is answered from here, whether or not its request has arrived y
     try testing.expect(mirror.asked == null and mirror.early == null);
 }
 
+test "steering takes what the draft holds along with it" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, awaitingApproval);
+    const pasted = [_]mention.Attachment{.{ .path = "[pasted 2 lines]", .content = "one\ntwo" }};
+    try testing.expect(try mirror.steer("and keep this", .{ .attachments = &pasted }));
+    try mirror.decide(.once);
+    try pollUntil(mirror, steered);
+
+    const said = for (convo.messages.items) |msg| {
+        if (std.mem.eql(u8, msg.text, "and keep this")) break msg;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), said.attachments.len);
+    try testing.expectEqualStrings("one\ntwo", said.attachments[0].content);
+}
+
+fn steered(mirror: *Mirror) bool {
+    for (mirror.conversation.messages.items) |msg| {
+        if (std.mem.eql(u8, msg.text, "and keep this")) return true;
+    }
+    return false;
+}
+
 test "a mirror follows a turn, and its approval is answered from here" {
     const fixture = try Agent.Fixture.create();
     defer fixture.destroy();
@@ -1344,7 +1374,7 @@ test "a mirror follows a turn, and its approval is answered from here" {
     const mirror = try openFresh(fixture, &convo);
     defer mirror.close();
     try testing.expectEqual(@as(usize, 0), convo.messages.items.len);
-    try testing.expect(!try mirror.steer("not busy, so not steering"));
+    try testing.expect(!try mirror.steer("not busy, so not steering", .{}));
     try testing.expectError(error.NothingToDecide, mirror.decide(.once));
 
     try mirror.submit("make a note", .{});
