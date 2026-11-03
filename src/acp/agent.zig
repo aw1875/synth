@@ -542,11 +542,14 @@ fn open(self: *Agent, cwd: []const u8, handle: ?[]const u8, servers: []const mcp
     defer self.allocator.free(where);
 
     const lock = try db.lockSession(taken);
-    errdefer lock.release(self.io);
     self.closeSession();
-    const session = try Session.create(self, id, taken, where, servers);
+    const session = Session.create(self, id, taken, where, servers) catch |err| {
+        lock.release(self.io);
+        return err;
+    };
     self.session = session;
     self.lock = lock;
+    errdefer self.closeSession();
     try self.share(session);
 
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
