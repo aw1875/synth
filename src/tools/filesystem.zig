@@ -102,7 +102,7 @@ fn read(ctx: Context, input: Input) !Output {
     const resolved = resolve(ctx, path) catch |err| return pathError(ctx, path, err);
     defer ctx.allocator.free(resolved);
 
-    const source = std.Io.Dir.cwd().readFileAlloc(ctx.io, resolved, ctx.allocator, max_file_bytes) catch |err| {
+    const source = readText(ctx, resolved) catch |err| {
         return Output.err(try std.fmt.allocPrint(ctx.allocator, "read {s}: {s}", .{ path, @errorName(err) }));
     };
     defer ctx.allocator.free(source);
@@ -494,7 +494,7 @@ fn write(ctx: Context, input: Input) !Output {
         std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
     }
 
-    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = resolved, .data = content }) catch |err| {
+    writeText(ctx, resolved, content) catch |err| {
         return Output.err(try std.fmt.allocPrint(ctx.allocator, "write {s}: {s}", .{ path, @errorName(err) }));
     };
 
@@ -538,7 +538,7 @@ fn edit(ctx: Context, input: Input) !Output {
         ));
     }
 
-    const source = std.Io.Dir.cwd().readFileAlloc(ctx.io, resolved, ctx.allocator, max_file_bytes) catch |err| {
+    const source = readText(ctx, resolved) catch |err| {
         return Output.err(try std.fmt.allocPrint(ctx.allocator, "edit {s}: {s}", .{ path, @errorName(err) }));
     };
     defer ctx.allocator.free(source);
@@ -573,7 +573,7 @@ fn edit(ctx: Context, input: Input) !Output {
         current = next.written();
     }
 
-    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = resolved, .data = current }) catch |err| {
+    writeText(ctx, resolved, current) catch |err| {
         return Output.err(try std.fmt.allocPrint(ctx.allocator, "edit {s}: {s}", .{ path, @errorName(err) }));
     };
 
@@ -593,6 +593,16 @@ fn edit(ctx: Context, input: Input) !Output {
         "edited {s}: {d} replacements",
         .{ path, edits.len },
     ));
+}
+
+fn readText(ctx: Context, path: []const u8) ![]u8 {
+    if (ctx.files) |through| if (try through.read(through.context, ctx, path)) |text| return text;
+    return std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.allocator, max_file_bytes);
+}
+
+fn writeText(ctx: Context, path: []const u8, content: []const u8) !void {
+    if (ctx.files) |through| if (try through.write(through.context, ctx, path, content)) return;
+    try std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = content });
 }
 
 fn resolve(ctx: Context, path: []const u8) ![]u8 {

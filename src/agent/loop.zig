@@ -124,7 +124,7 @@ conversation: *Conversation,
 reads: *tool.ReadLog,
 hooks: ?*const Hooks.Runner = null,
 hook_dispatch: ?*Hooks.Dispatch = null,
-pending_submit: ?PendingSubmit = null,
+pending_submit: ?Submission = null,
 hook_notice: ?[]u8 = null,
 /// Root every tool resolves against. Borrowed.
 project_root: []const u8,
@@ -145,6 +145,9 @@ session_cwd: []const u8 = "",
 /// provider frees its own copy on the *next* switch, so keeping that slice
 /// would leave this dangling.
 session_model: []const u8 = "",
+/// The handle the session row is created under, when one was given out before
+/// the row existed. Borrowed.
+session_public_id: ?[]const u8 = null,
 session_model_owned: ?[]u8 = null,
 /// Database message id for each conversation message, keyed by the message's
 /// stable `seq`. Keyed by seq rather than index so trimming older messages from
@@ -153,6 +156,9 @@ message_ids: std.AutoHashMapUnmanaged(u64, i64) = .empty,
 
 state: State = .idle,
 request: ?*Request = null,
+/// Requests started so far, so a watcher can tell one stream from the next
+/// even when a request ends and another begins inside the same poll.
+requests_started: u64 = 0,
 tools: ?*ToolRun = null,
 /// How many of the running batch's results have been copied into the
 /// conversation. Advances while the batch runs, so cards settle one at a time.
@@ -176,8 +182,8 @@ steps: usize = 0,
 turn_started_ms: ?i64 = null,
 turn_tokens: u64 = 0,
 /// What the user typed while the turn was running, waiting to be handed to the
-/// model at its next step. Owned.
-steering: std.ArrayList([]const u8) = .empty,
+/// model at its next step.
+steering: std.ArrayList(Submission) = .empty,
 /// The turn's limits. Zero disables either one.
 max_turn_ms: i64 = default_turn_ms,
 max_turn_tokens: u64 = default_turn_tokens,
@@ -202,6 +208,8 @@ auto_approve_safe: bool = true,
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
 delegate: ?tool.Delegate = null,
+/// What the session's client does in place of the disk and a shell.
+handoff: tool.Handoff = .{},
 /// What the model may do this turn. The tool schema sent with every request is
 /// this agent's list, and the gate refuses anything outside it.
 agent: agents.Agent = agents.all[0],
@@ -424,6 +432,16 @@ fn restoreModel(self: *Loop, session_id: i64) !void {
     if (std.mem.eql(u8, stored, self.provider.model)) return;
 
     const now = set(self.provider.userdata, stored) catch return;
+    try self.adoptModel(now);
+}
+
+/// Point the provider at another of its models and record it on the session.
+pub fn switchModel(self: *Loop, model: []const u8) !void {
+    const set = self.provider.set_model orelse return error.ModelFixed;
+    try self.adoptModel(try set(self.provider.userdata, model));
+}
+
+fn adoptModel(self: *Loop, now: Provider.Current) !void {
     self.provider.model = now.model;
     if (now.name.len > 0) self.provider.name = now.name;
     self.provider.context_limit = now.context_limit;
@@ -509,7 +527,10 @@ fn ensureSession(self: *Loop) !i64 {
     if (self.session_id) |id| return id;
     const db = self.db orelse return error.NoDatabase;
     const project_id = self.project_id orelse return error.NoProject;
-    const id = try db.createSession(project_id, self.session_cwd, self.session_model);
+    const id = if (self.session_public_id) |handle|
+        try db.createSessionAs(project_id, self.session_cwd, self.session_model, handle)
+    else
+        try db.createSession(project_id, self.session_cwd, self.session_model);
     self.session_id = id;
     try db.setSessionAgent(id, self.agent.id);
     return id;
@@ -554,7 +575,7 @@ pub fn deinit(self: *Loop) void {
     self.clearNotes();
     self.todos.deinit();
     if (self.hook_notice) |notice| self.allocator.free(notice);
-    for (self.steering.items) |text| self.allocator.free(text);
+    for (self.steering.items) |*pending| pending.deinit(self.allocator);
     self.steering.deinit(self.allocator);
     self.prompt_cache.deinit(self.allocator);
     if (self.last_calls) |calls| self.allocator.free(calls);
@@ -581,6 +602,14 @@ pub fn syncProvider(self: *Loop) void {
     self.provider.context_limit = now.context_limit;
     self.provider.vision = now.vision;
     self.provider.effort = now.effort;
+}
+
+/// Run the current model at `level` from the next turn on. Between turns
+/// only: the request in flight reads the level as it is built.
+pub fn setEffort(self: *Loop, level: []const u8) void {
+    const set = self.provider.set_effort orelse return;
+    set(self.provider.userdata, level);
+    self.syncProvider();
 }
 
 /// What the loop is doing, for the UI's status row.
@@ -613,12 +642,13 @@ pub const Extras = struct {
     images: []const []const u8 = &.{},
 };
 
-const PendingSubmit = struct {
+/// A prompt and what came with it, owned.
+pub const Submission = struct {
     prompt: []u8,
     attachments: []mention.Attachment,
     images: [][]u8,
 
-    fn init(allocator: std.mem.Allocator, prompt: []const u8, extras: Extras) !PendingSubmit {
+    fn init(allocator: std.mem.Allocator, prompt: []const u8, extras: Extras) !Submission {
         const owned_prompt = try allocator.dupe(u8, prompt);
         errdefer allocator.free(owned_prompt);
 
@@ -653,11 +683,11 @@ const PendingSubmit = struct {
         return .{ .prompt = owned_prompt, .attachments = attachments, .images = images };
     }
 
-    fn asExtras(self: *const PendingSubmit) Extras {
+    pub fn asExtras(self: *const Submission) Extras {
         return .{ .attachments = self.attachments, .images = self.images };
     }
 
-    fn deinit(self: *PendingSubmit, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         for (self.attachments) |*attachment| attachment.deinit(allocator);
         allocator.free(self.attachments);
@@ -700,6 +730,7 @@ fn startCompaction(self: *Loop, resume_turn: bool) !void {
         self.conversation,
         request_turn,
     );
+    self.requests_started += 1;
     self.compacting = true;
     self.resume_after_compaction = resume_turn;
     self.state = .compacting;
@@ -742,7 +773,8 @@ fn finishCompaction(self: *Loop, summary: []const u8) !void {
     try self.persistMessage(self.conversation.messages.items.len - 1);
 
     self.usage.context_tokens = 0;
-    if (resume_turn) try self.ask();
+    if (resume_turn) return self.ask();
+    self.outcome = .done;
 }
 
 /// Start a turn. Attachments come from `@path` mentions in the prompt, plus
@@ -756,7 +788,7 @@ pub fn submit(self: *Loop, prompt: []const u8, extras: Extras) !void {
     if (self.hooks) |runner| {
         if (runner.set.forEvent(.user_prompt_submit).len == 0) return self.finishSubmit(prompt, extras);
 
-        self.pending_submit = try PendingSubmit.init(self.allocator, prompt, extras);
+        self.pending_submit = try Submission.init(self.allocator, prompt, extras);
         errdefer {
             self.pending_submit.?.deinit(self.allocator);
             self.pending_submit = null;
@@ -942,6 +974,7 @@ fn ask(self: *Loop) !void {
         self.conversation,
         self.turn(""),
     );
+    self.requests_started += 1;
     self.state = .thinking;
 }
 
@@ -953,9 +986,9 @@ fn ask(self: *Loop) !void {
 /// every result is in.
 fn applySteering(self: *Loop) !void {
     while (self.steering.items.len > 0) {
-        const text = self.steering.orderedRemove(0);
-        defer self.allocator.free(text);
-        _ = try self.conversation.addUser(text, &.{}, &.{});
+        var pending = self.steering.orderedRemove(0);
+        defer pending.deinit(self.allocator);
+        _ = try self.conversation.addUser(pending.prompt, pending.attachments, pending.images);
         try self.persistMessage(self.conversation.messages.items.len - 1);
     }
 }
@@ -964,18 +997,18 @@ fn applySteering(self: *Loop) !void {
 ///
 /// A correction is only worth anything while there is still work to redirect,
 /// so this is refused when the loop is idle - the caller starts a turn instead.
-pub fn steer(self: *Loop, text: []const u8) !bool {
+pub fn steer(self: *Loop, text: []const u8, extras: Extras) !bool {
     if (!self.isBusy()) return false;
 
-    const owned = try self.allocator.dupe(u8, text);
-    errdefer self.allocator.free(owned);
-    try self.steering.append(self.allocator, owned);
+    var pending: Submission = try .init(self.allocator, text, extras);
+    errdefer pending.deinit(self.allocator);
+    try self.steering.append(self.allocator, pending);
     return true;
 }
 
 /// What has been typed mid-turn and not yet handed over, for the UI to show as
 /// waiting.
-pub fn pendingSteering(self: *const Loop) []const []const u8 {
+pub fn pendingSteering(self: *const Loop) []const Submission {
     return self.steering.items;
 }
 
@@ -985,7 +1018,7 @@ pub fn pendingSteering(self: *const Loop) []const []const u8 {
 /// over - cancelled, or stopped at a limit. It is a prompt now rather than a
 /// correction, and the caller starts a turn with it. Leaving it pending would
 /// mean it silently rode along with whatever was typed next.
-pub fn takeSteering(self: *Loop) ?[]const u8 {
+pub fn takeSteering(self: *Loop) ?Submission {
     if (self.steering.items.len == 0) return null;
     return self.steering.orderedRemove(0);
 }
@@ -993,7 +1026,7 @@ pub fn takeSteering(self: *Loop) ?[]const u8 {
 /// Throw away anything typed mid-turn that has not been handed over. Used when
 /// the transcript it was meant for is being swapped out from under it.
 pub fn dropSteering(self: *Loop) void {
-    for (self.steering.items) |text| self.allocator.free(text);
+    for (self.steering.items) |*pending| pending.deinit(self.allocator);
     self.steering.clearRetainingCapacity();
 }
 
@@ -1883,7 +1916,7 @@ fn persistSubagent(
                 @tagName(call.status),
                 call.result,
                 @intCast(call.result_bytes),
-            if (call.elapsed_ms) |ms| @intCast(ms) else null,
+                if (call.elapsed_ms) |ms| @intCast(ms) else null,
             );
         }
     }
@@ -1959,6 +1992,7 @@ fn runApproved(self: *Loop) !void {
         if (call.status != .running) continue;
         if (std.mem.eql(u8, call.name, todo_tool.name)) continue;
         try batch.append(self.allocator, .{
+            .seq = self.conversation.messages.items[message_index].seq,
             .index = i,
             .name = call.name,
             .arguments = call.arguments,
@@ -1985,6 +2019,7 @@ fn runApproved(self: *Loop) !void {
         self.project_root,
         self.reads,
         self.delegate,
+        self.handoff,
         self.hooks,
         batch.items,
     );
@@ -3027,6 +3062,23 @@ test "compaction summarises the transcript into a system message" {
     try testing.expect(std.mem.indexOf(u8, summary.text, "Summarise this conversation") != null);
 }
 
+test "a compaction after a cancelled turn ends done" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try loop.cancel();
+    try loop.settle();
+    try testing.expectEqual(@as(?Outcome, .cancelled), loop.outcome);
+
+    try loop.compact();
+    try settle(&loop);
+    try testing.expectEqual(@as(?Outcome, .done), loop.outcome);
+}
+
 test "a turn carries the agent's prompt and tools, not the provider's" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -3657,8 +3709,8 @@ test "a correction typed mid-turn reaches the model at its next step" {
     try loop.submit("go", .{});
     try testing.expect(loop.isBusy());
 
-    try testing.expect(try loop.steer("no, not that file"));
-    try testing.expect(try loop.steer("and be quick"));
+    try testing.expect(try loop.steer("no, not that file", .{}));
+    try testing.expect(try loop.steer("and be quick", .{}));
     try testing.expectEqual(@as(usize, 2), loop.pendingSteering().len);
 
     try settle(&loop);
@@ -3674,6 +3726,25 @@ test "a correction typed mid-turn reaches the model at its next step" {
     try testing.expectEqual(@as(usize, 2), seen);
 }
 
+test "steering brings along what came with it" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    const attachments = [_]mention.Attachment{.{ .path = "pasted", .content = "a long paste" }};
+    try testing.expect(try loop.steer("and look at this", .{ .attachments = &attachments, .images = &.{"aW1hZ2U="} }));
+    try settle(&loop);
+
+    const steered = for (loop.conversation.messages.items) |msg| {
+        if (msg.role == .user and std.mem.eql(u8, msg.text, "and look at this")) break msg;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("a long paste", steered.attachments[0].content);
+    try testing.expectEqualStrings("aW1hZ2U=", steered.images[0]);
+}
+
 test "steering never splits an assistant's calls from their results" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -3682,7 +3753,7 @@ test "steering never splits an assistant's calls from their results" {
     defer loop.deinit();
 
     try loop.submit("go", .{});
-    try testing.expect(try loop.steer("actually, stop reading"));
+    try testing.expect(try loop.steer("actually, stop reading", .{}));
     try settle(&loop);
 
     const messages = loop.conversation.messages.items;
@@ -3706,7 +3777,7 @@ test "there is nothing to steer when the loop is idle" {
     var loop = fixture.loop();
     defer loop.deinit();
 
-    try testing.expect(!try loop.steer("hello?"));
+    try testing.expect(!try loop.steer("hello?", .{}));
     try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
 }
 
@@ -3718,7 +3789,7 @@ test "steering is dropped when the transcript it was meant for is swapped out" {
     defer loop.deinit();
 
     try loop.submit("go", .{});
-    try testing.expect(try loop.steer("never mind"));
+    try testing.expect(try loop.steer("never mind", .{}));
 
     loop.dropSteering();
     try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
@@ -3739,14 +3810,14 @@ test "a cancelled turn hands back what was typed during it" {
     fixture.fake.latency = .fromMilliseconds(50);
 
     try loop.submit("go", .{});
-    try testing.expect(try loop.steer("wait, do this instead"));
+    try testing.expect(try loop.steer("wait, do this instead", .{}));
 
     try loop.cancel();
     try settle(&loop);
 
-    const left = loop.takeSteering() orelse return error.TestUnexpectedResult;
-    defer testing.allocator.free(left);
-    try testing.expectEqualStrings("wait, do this instead", left);
+    var left = loop.takeSteering() orelse return error.TestUnexpectedResult;
+    defer left.deinit(testing.allocator);
+    try testing.expectEqualStrings("wait, do this instead", left.prompt);
     try testing.expectEqual(@as(usize, 0), loop.pendingSteering().len);
 
     for (loop.conversation.messages.items) |msg| {

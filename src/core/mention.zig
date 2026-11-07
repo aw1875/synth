@@ -165,30 +165,47 @@ pub fn resolve(
         }
         if (seen) continue;
 
-        const full = resolveInRoot(allocator, root, span.path) catch continue;
-        defer allocator.free(full);
-
-        if (image.hasImageExtension(span.path)) {
-            if (images.items.len >= max_images) continue;
-            const encoded = readImage(allocator, io, full) catch continue;
-            if (encoded) |body| {
+        if (image.hasImageExtension(span.path) and images.items.len >= max_images) continue;
+        switch (try readPath(allocator, io, root, span.path) orelse continue) {
+            .image => |body| {
+                errdefer allocator.free(body);
                 try images.append(allocator, body);
-                continue;
-            }
+            },
+            .text => |content| {
+                errdefer allocator.free(content);
+                try attachments.append(allocator, .{
+                    .path = try allocator.dupe(u8, span.path),
+                    .content = content,
+                });
+            },
         }
-
-        const content = readEntry(allocator, io, full) catch continue;
-        errdefer allocator.free(content);
-
-        try attachments.append(allocator, .{
-            .path = try allocator.dupe(u8, span.path),
-            .content = content,
-        });
     }
 
     resolved.attachments = try attachments.toOwnedSlice(allocator);
     resolved.images = try images.toOwnedSlice(allocator);
     return resolved;
+}
+
+/// What naming `path` comes to, as a mention of it would.
+pub const Entry = union(enum) {
+    /// A file's text, or a directory's listing.
+    text: []u8,
+    /// Base64-encoded image data.
+    image: []const u8,
+};
+
+/// Read `path` as a mention of it would. Null when it lies outside the
+/// project or cannot be read.
+pub fn readPath(allocator: std.mem.Allocator, io: std.Io, root: []const u8, path: []const u8) !?Entry {
+    const full = resolveInRoot(allocator, root, path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer allocator.free(full);
+    if (image.hasImageExtension(path)) {
+        if (readImage(allocator, io, full) catch null) |body| return .{ .image = body };
+    }
+    return .{ .text = readEntry(allocator, io, full) catch return null };
 }
 
 /// A mentioned image, base64 for the wire. Null when the file is named like an

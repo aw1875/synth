@@ -12,7 +12,7 @@ const w = @import("widgets.zig");
 const Picker = @This();
 
 /// Sessions fetched. More than this and the list stops being a list.
-const fetch_limit: usize = 50;
+pub const fetch_limit: usize = 50;
 /// Rows visible at once.
 const max_rows: usize = 10;
 /// Box width, clamped to the terminal when it is smaller.
@@ -30,8 +30,9 @@ sessions: []Database.SessionInfo = &.{},
 selected: usize = 0,
 /// First visible row, so a long list scrolls under the cursor.
 scroll: usize = 0,
-/// The session showing in the transcript right now, marked in the list.
-current: ?i64 = null,
+/// The handle of the session showing in the transcript right now, marked in
+/// the list. Owned.
+current: []const u8 = "",
 
 pub fn init(allocator: std.mem.Allocator) Picker {
     return .{ .allocator = allocator };
@@ -45,21 +46,22 @@ fn release(self: *Picker) void {
     for (self.sessions) |info| info.deinit(self.allocator);
     self.allocator.free(self.sessions);
     self.sessions = &.{};
+    self.allocator.free(self.current);
+    self.current = "";
 }
 
-/// Load the project's sessions and show the list. The cursor starts on the
-/// session already open, which is the one you are most likely comparing against.
-pub fn show(self: *Picker, db: *Database, project_id: i64, current: ?i64) !void {
+/// Show `sessions`, which the picker takes, whether or not this succeeds. The
+/// cursor starts on `current`, the session already open, which is the one you
+/// are most likely comparing against.
+pub fn show(self: *Picker, sessions: []Database.SessionInfo, current: []const u8) !void {
     self.release();
-    self.sessions = try db.listSessions(self.allocator, project_id, fetch_limit);
-    self.current = current;
+    self.sessions = sessions;
+    self.current = try self.allocator.dupe(u8, current);
     self.selected = 0;
     self.scroll = 0;
 
-    if (current) |id| {
-        for (self.sessions, 0..) |info, i| {
-            if (info.id == id) self.selected = i;
-        }
+    for (self.sessions, 0..) |info, i| {
+        if (std.mem.eql(u8, info.public_id, current)) self.selected = i;
     }
     self.clampScroll();
     self.open = true;
@@ -71,9 +73,9 @@ pub fn close(self: *Picker) void {
 }
 
 /// The session under the cursor, or null when the list is empty.
-pub fn selectedId(self: *const Picker) ?i64 {
+pub fn selectedSession(self: *const Picker) ?Database.SessionInfo {
     if (self.selected >= self.sessions.len) return null;
-    return self.sessions[self.selected].id;
+    return self.sessions[self.selected];
 }
 
 pub const Action = enum { none, cancel, choose };
@@ -149,20 +151,20 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
         var x = w.writeText(surface, pad + 1, row, info.public_id, base.withFg(theme.accent_alt).cell);
         x = w.writeText(surface, x + 1, row, "  ", base.cell);
 
+        var count: [48]u8 = undefined;
+        const text = std.fmt.bufPrint(&count, "{s}{d} msgs", .{ if (info.live) "running · " else "", info.messages }) catch "";
+        const text_width = w.textWidth(text);
+
         const label = if (info.title.len > 0) info.title else "untitled";
         const label_style = if (info.title.len > 0) base.withFg(theme.fg) else base.withFg(theme.fg_dim);
-        const room = width -| (x + pad + 14);
+        const room = width -| (x + pad + text_width + 4);
         x = w.writeText(surface, x, row, clip(label, room), label_style.cell);
 
-        var count: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&count, "{d} msgs", .{info.messages}) catch "";
-        const at = width -| (pad + @as(u16, @intCast(text.len)));
+        const at = width -| (pad + text_width);
         _ = w.writeText(surface, at, row, try ctx.arena.dupe(u8, text), base.withFg(theme.fg_dim).cell);
 
-        if (self.current) |id| {
-            if (id == info.id) {
-                _ = w.writeText(surface, width -| (pad + 1), row, "•", base.withFg(theme.success).cell);
-            }
+        if (std.mem.eql(u8, info.public_id, self.current)) {
+            _ = w.writeText(surface, width -| (pad + 1), row, "•", base.withFg(theme.success).cell);
         }
     }
 

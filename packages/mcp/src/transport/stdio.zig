@@ -1,7 +1,7 @@
 //! The stdio transport: a server as a child process, one JSON message per line.
 //!
 //! MCP frames stdio messages by newline, and forbids an embedded newline in a
-//! message, so reading is `takeDelimiter` and writing is "append one". No
+//! message, so reading is "up to a newline" and writing is "append one". No
 //! length prefixes, no framing headers.
 //!
 //! A server's own logging goes to its stderr, which is why `stderr` is a choice
@@ -17,6 +17,8 @@ const StdioTransport = @This();
 /// Longest single message. A tool result can carry a whole file, so this is
 /// generous; a server that exceeds it has almost certainly gone wrong.
 pub const default_max_message: usize = 4 * 1024 * 1024;
+
+const buffer_bytes: usize = 64 * 1024;
 
 pub const Stderr = enum {
     /// Thrown away. What a TUI wants: a server writing to the terminal would
@@ -54,6 +56,11 @@ child: std.process.Child,
 /// Owned; the reader and writer below borrow these and must not outlive them.
 read_buffer: []u8,
 write_buffer: []u8,
+/// The message being read, sized to it rather than to `max_message`: a
+/// buffer that long would be resident from the start, since safe builds fill
+/// every allocation.
+line: std.Io.Writer.Allocating,
+max_message: usize,
 reader: std.Io.File.Reader,
 writer: std.Io.File.Writer,
 /// Cleared by `stop`, so stopping twice is safe and sending afterwards is an
@@ -76,10 +83,10 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stdio
     const self = try allocator.create(StdioTransport);
     errdefer allocator.destroy(self);
 
-    const read_buffer = try allocator.alloc(u8, options.max_message);
+    const read_buffer = try allocator.alloc(u8, buffer_bytes);
     errdefer allocator.free(read_buffer);
 
-    const write_buffer = try allocator.alloc(u8, 64 * 1024);
+    const write_buffer = try allocator.alloc(u8, buffer_bytes);
     errdefer allocator.free(write_buffer);
 
     var child = try std.process.spawn(io, .{
@@ -107,6 +114,8 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Stdio
         .child = child,
         .read_buffer = read_buffer,
         .write_buffer = write_buffer,
+        .line = .init(allocator),
+        .max_message = options.max_message,
         .reader = undefined,
         .writer = undefined,
         .transport = .{ .vtable = vtable },
@@ -131,18 +140,33 @@ pub fn send(self: *StdioTransport, message: []const u8) !void {
 pub fn receive(self: *StdioTransport) ![]const u8 {
     if (!self.running) return Error.ServerClosed;
 
+    const reader = &self.reader.interface;
     while (true) {
-        const line = self.reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+        self.resetLine();
+        _ = reader.streamDelimiterLimit(&self.line.writer, '\n', .limited(self.max_message)) catch |err| switch (err) {
             error.StreamTooLong => return Error.MessageTooLong,
             error.ReadFailed => return Error.ServerClosed,
-        } orelse return Error.ServerClosed;
+            error.WriteFailed => return Error.MessageTooLong,
+        };
+        const ended = if (reader.takeByte()) |_| true else |err| switch (err) {
+            error.EndOfStream => false,
+            error.ReadFailed => return Error.ServerClosed,
+        };
 
         // A server may write a blank line between messages; nothing says it
         // must not, and an empty line is not a message.
-        const trimmed = std.mem.trimEnd(u8, line, "\r");
-        if (trimmed.len == 0) continue;
-        return trimmed;
+        const trimmed = std.mem.trimEnd(u8, self.line.written(), "\r");
+        if (trimmed.len > 0) return trimmed;
+        if (!ended) return Error.ServerClosed;
     }
+}
+
+/// Give back a long message's memory before the next read, so one large tool
+/// result does not stay resident for the life of the server.
+fn resetLine(self: *StdioTransport) void {
+    if (self.line.writer.buffer.len <= buffer_bytes) return self.line.clearRetainingCapacity();
+    self.line.deinit();
+    self.line = .init(self.allocator);
 }
 
 /// Close the server down: shut its input, which is how a well-behaved server is
@@ -168,6 +192,7 @@ pub fn destroy(self: *StdioTransport) void {
     const allocator = self.allocator;
     allocator.free(self.read_buffer);
     allocator.free(self.write_buffer);
+    self.line.deinit();
     allocator.destroy(self);
 }
 
@@ -211,6 +236,23 @@ test "messages round-trip a line at a time" {
 
     try stdio.send("{\"second\":true}");
     try testing.expectEqualStrings("{\"second\":true}", try stdio.receive());
+}
+
+test "a message longer than the read buffer comes whole, and its memory is given back" {
+    const allocator = testing.allocator;
+
+    var stdio = StdioTransport.start(allocator, testing.io, .{ .argv = echoCommand() }) catch |err| {
+        if (err == error.FileNotFound or err == error.AccessDenied) return error.SkipZigTest;
+        return err;
+    };
+    defer stdio.destroy();
+
+    const long = "x" ** (buffer_bytes + 1024);
+    try stdio.send(long);
+    try stdio.send("{\"after\":true}");
+    try testing.expectEqualStrings(long, try stdio.receive());
+    try testing.expectEqualStrings("{\"after\":true}", try stdio.receive());
+    try testing.expect(stdio.line.writer.buffer.len <= buffer_bytes);
 }
 
 test "a blank line is skipped rather than returned as a message" {

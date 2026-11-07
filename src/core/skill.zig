@@ -51,6 +51,29 @@ pub const Skill = struct {
     body: []const u8,
 };
 
+/// What `/skills` shows: each skill, and every directory looked in.
+pub fn describe(arena: std.mem.Allocator, skills: []const Skill, paths: []const []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+
+    if (skills.len == 0) {
+        try out.appendSlice(arena, "No skills found.\n");
+    } else {
+        try out.appendSlice(arena, "**Skills**\n\n");
+        for (skills) |entry| {
+            try out.print(arena, "- `/{s}` - {s}\n", .{
+                entry.id,
+                if (entry.description.len > 0) entry.description else "no description",
+            });
+            try out.print(arena, "  `{s}`\n", .{entry.dir});
+        }
+    }
+
+    try out.appendSlice(arena, "\n**Looked in**\n\n");
+    for (paths) |path| try out.print(arena, "- `{s}`\n", .{path});
+
+    return out.toOwnedSlice(arena);
+}
+
 /// Every skill found, and the arena holding their strings.
 pub const Set = struct {
     arena: std.heap.ArenaAllocator,
@@ -71,25 +94,7 @@ pub const Set = struct {
     /// Written here rather than in the UI because both the TUI and a future command
     /// line listing want the same answer.
     pub fn listText(self: *const Set, arena: std.mem.Allocator) ![]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-
-        if (self.skills.len == 0) {
-            try out.appendSlice(arena, "No skills found.\n");
-        } else {
-            try out.appendSlice(arena, "**Skills**\n\n");
-            for (self.skills) |entry| {
-                try out.print(arena, "- `/{s}` - {s}\n", .{
-                    entry.id,
-                    if (entry.description.len > 0) entry.description else "no description",
-                });
-                try out.print(arena, "  `{s}`\n", .{entry.dir});
-            }
-        }
-
-        try out.appendSlice(arena, "\n**Looked in**\n\n");
-        for (self.paths) |path| try out.print(arena, "- `{s}`\n", .{path});
-
-        return out.toOwnedSlice(arena);
+        return describe(arena, self.skills, self.paths);
     }
 
     /// Whether any skill was found at all. What decides if the prompt gets a
@@ -106,6 +111,12 @@ pub fn idFromPath(path: []const u8) ?[]const u8 {
     const dir = std.fs.path.dirname(path) orelse return null;
     const id = std.fs.path.basename(dir);
     return if (id.len > 0) id else null;
+}
+
+/// The id a typed `/id args` line invokes.
+pub fn idOf(line: []const u8) []const u8 {
+    const word_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+    return std.mem.trimStart(u8, line[0..word_end], "/");
 }
 
 /// The skill with this id, from a plain slice. What the parts holding skills

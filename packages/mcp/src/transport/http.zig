@@ -36,6 +36,8 @@ pub const default_max_message: usize = 4 * 1024 * 1024;
 /// chain. RFC 9110 suggests at least this much.
 const redirect_buffer_bytes: usize = 8 * 1024;
 
+const transfer_buffer_bytes: usize = 64 * 1024;
+
 /// The session header MCP defines for Streamable HTTP. A server that opens a
 /// session names it here on its first reply, and expects it back on every
 /// request after that.
@@ -95,7 +97,6 @@ version: ?[]u8 = null,
 challenge: ?[]u8 = null,
 max_message: usize,
 redirect_buffer: []u8,
-send_buffer: []u8,
 transfer_buffer: []u8,
 pending: Pending = .none,
 /// The message the last `receive` handed out, freed on the next call. This is
@@ -132,10 +133,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Http 
     const redirect_buffer = try allocator.alloc(u8, redirect_buffer_bytes);
     errdefer allocator.free(redirect_buffer);
 
-    const send_buffer = try allocator.alloc(u8, options.max_message);
-    errdefer allocator.free(send_buffer);
-
-    const transfer_buffer = try allocator.alloc(u8, options.max_message);
+    const transfer_buffer = try allocator.alloc(u8, transfer_buffer_bytes);
     errdefer allocator.free(transfer_buffer);
 
     self.* = .{
@@ -147,7 +145,6 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, options: Options) !*Http 
         .extra = extra,
         .max_message = options.max_message,
         .redirect_buffer = redirect_buffer,
-        .send_buffer = send_buffer,
         .transfer_buffer = transfer_buffer,
         .transport = .{ .vtable = &vtable },
     };
@@ -168,7 +165,6 @@ pub fn destroy(self: *Http) void {
     if (self.challenge) |value| allocator.free(value);
     freeHeaders(allocator, self.extra);
     allocator.free(self.transfer_buffer);
-    allocator.free(self.send_buffer);
     allocator.free(self.redirect_buffer);
     allocator.free(self.url);
     allocator.destroy(self);
@@ -205,9 +201,7 @@ pub fn send(self: *Http, message: []const u8) Transport.Error!void {
     // Anything still outstanding belongs to a request this one supersedes.
     self.clear();
 
-    if (message.len > self.send_buffer.len) return Transport.Error.MessageTooLong;
-    const body = self.send_buffer[0..message.len];
-    @memcpy(body, message);
+    if (message.len > self.max_message) return Transport.Error.MessageTooLong;
 
     var headers: [5]std.http.Header = undefined;
     var count: usize = 0;
@@ -244,8 +238,11 @@ pub fn send(self: *Http, message: []const u8) Transport.Error!void {
     var keep_open = false;
     defer if (!keep_open) request.deinit();
 
-    request.transfer_encoding = .{ .content_length = body.len };
-    request.sendBodyComplete(body) catch return Transport.Error.ConnectionFailed;
+    request.transfer_encoding = .{ .content_length = message.len };
+    var body = request.sendBodyUnflushed(&.{}) catch return Transport.Error.ConnectionFailed;
+    body.writer.writeAll(message) catch return Transport.Error.ConnectionFailed;
+    body.end() catch return Transport.Error.ConnectionFailed;
+    request.connection.?.flush() catch return Transport.Error.ConnectionFailed;
 
     var response = request.receiveHead(self.redirect_buffer) catch return Transport.Error.ConnectionFailed;
 
@@ -412,17 +409,17 @@ fn freeHeaders(allocator: std.mem.Allocator, headers: []std.http.Header) void {
 /// returns what had accumulated, because a server that dies mid-event has
 /// still told us something. The returned slice is owned by the caller.
 ///
-/// A single `data:` line has to fit in the reader's buffer for `takeDelimiter`
-/// to hand it over, which is why that buffer is sized to `max_message` rather
-/// than to something merely comfortable. `error.StreamTooLong` from here means
-/// the line was longer than a whole message is allowed to be.
+/// Lines are gathered beside the reader rather than in its buffer, so a
+/// `data:` line may be longer than that buffer. `error.StreamTooLong` means a
+/// line was longer than a whole message is allowed to be.
 fn readSseMessage(allocator: std.mem.Allocator, reader: *std.Io.Reader, limit: usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
+    var raw: std.Io.Writer.Allocating = .init(allocator);
+    defer raw.deinit();
 
     while (true) {
-        const raw = try reader.takeDelimiter('\n');
-        const line_or_end = raw orelse {
+        const line_or_end = try takeLine(reader, &raw, limit +| "data: ".len) orelse {
             if (out.written().len > 0) break;
             return error.EndOfStream;
         };
@@ -449,6 +446,17 @@ fn readSseMessage(allocator: std.mem.Allocator, reader: *std.Io.Reader, limit: u
     }
 
     return out.toOwnedSlice();
+}
+
+/// The next line without its newline, or null at the end of the stream: what
+/// `takeDelimiter` gives, held in `line` instead of the reader's buffer.
+fn takeLine(reader: *std.Io.Reader, line: *std.Io.Writer.Allocating, limit: usize) !?[]const u8 {
+    line.clearRetainingCapacity();
+    _ = try reader.streamDelimiterLimit(&line.writer, '\n', .limited(limit));
+    if (reader.takeByte()) |_| return line.written() else |err| switch (err) {
+        error.EndOfStream => return if (line.written().len > 0) line.written() else null,
+        error.ReadFailed => return error.ReadFailed,
+    }
 }
 
 fn sendErased(t: *Transport, message: []const u8) Transport.Error!void {
@@ -601,14 +609,15 @@ test "a data line longer than a whole message is refused, not mistaken for the e
     );
 }
 
-test "the read buffer is large enough for any message the transport allows" {
-    var http = try start(testing.allocator, testing.io, .{
-        .url = "https://example.invalid/mcp",
-        .max_message = 128 * 1024,
-    });
-    defer http.destroy();
+test "readSseMessage takes a data line longer than the reader's buffer" {
+    const value = "x" ** 4096;
+    var source = std.Io.Reader.fixed("data: " ++ value ++ "\n\n");
+    var buffer: [64]u8 = undefined;
+    var reader = source.limited(.unlimited, &buffer);
+    const out = try readSseMessage(testing.allocator, &reader.interface, default_max_message);
+    defer testing.allocator.free(out);
 
-    try testing.expectEqual(@as(usize, 128 * 1024), http.transfer_buffer.len);
+    try testing.expectEqualStrings(value, out);
 }
 
 test "the settled revision is remembered and replaced, not appended" {

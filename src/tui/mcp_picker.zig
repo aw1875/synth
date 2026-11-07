@@ -28,50 +28,65 @@ const box_width: u16 = 62;
 const pad: u16 = 2;
 
 open: bool = false,
-/// Indices into `host.servers` matching the search, in display order.
+/// Indices into `rows` matching the search, in display order.
 matches: std.ArrayList(usize) = .empty,
 cursor: usize = 0,
 scroll: usize = 0,
 search: Input,
 allocator: std.mem.Allocator,
-/// Borrowed for as long as the picker is open, which is inside one frame's
-/// event handling and never across a teardown.
-host: ?*mcp_tools.Host = null,
+/// Every configured server, in `rows_arena`.
+rows: []const mcp_tools.Status = &.{},
+rows_arena: std.heap.ArenaAllocator,
 
 pub fn init(allocator: std.mem.Allocator) Picker {
-    return .{ .allocator = allocator, .search = .init(allocator) };
+    return .{ .allocator = allocator, .search = .init(allocator), .rows_arena = .init(allocator) };
 }
 
 pub fn deinit(self: *Picker) void {
     self.matches.deinit(self.allocator);
     self.search.deinit();
+    self.rows_arena.deinit();
 }
 
 pub fn isOpen(self: *const Picker) bool {
     return self.open;
 }
 
-pub fn show(self: *Picker, host: *mcp_tools.Host) !void {
-    self.host = host;
+/// Open on `statuses`, which are copied.
+pub fn show(self: *Picker, statuses: []const mcp_tools.Status) !void {
     self.search.clear();
     self.cursor = 0;
     self.scroll = 0;
-    try self.filter();
+    try self.refresh(statuses);
     self.open = true;
+}
+
+/// Take newer statuses without moving the cursor or losing the search.
+pub fn refresh(self: *Picker, statuses: []const mcp_tools.Status) !void {
+    self.matches.clearRetainingCapacity();
+    self.rows = &.{};
+    _ = self.rows_arena.reset(.retain_capacity);
+    const arena = self.rows_arena.allocator();
+    const rows = try arena.alloc(mcp_tools.Status, statuses.len);
+    for (statuses, rows) |status, *row| row.* = .{
+        .name = try arena.dupe(u8, status.name),
+        .state = status.state,
+        .reason = try arena.dupe(u8, status.reason),
+    };
+    self.rows = rows;
+    try self.filter();
 }
 
 pub fn close(self: *Picker) void {
     self.open = false;
-    self.host = null;
     self.search.clear();
     self.matches.clearRetainingCapacity();
 }
 
-/// The highlighted server, or null when nothing matches the search.
-pub fn selected(self: *const Picker) ?mcp_tools.Server {
-    const host = self.host orelse return null;
+/// The name of the highlighted server, or null when nothing matches.
+pub fn selected(self: *const Picker) ?mcp_tools.Status {
     if (self.cursor >= self.matches.items.len) return null;
-    return host.servers[self.matches.items[self.cursor]];
+    return self.rows[self.matches.items[self.cursor]];
 }
 
 pub const Action = enum { none, cancel, toggle };
@@ -97,17 +112,16 @@ pub fn handleKey(self: *Picker, ctx: *vxfw.EventContext, key: vaxis.Key) !Action
 /// Rebuild the visible list, keeping the cursor where it was so a toggle does
 /// not move the selection out from under the next key press.
 pub fn filter(self: *Picker) !void {
-    const host = self.host orelse return;
     const query = std.mem.trim(u8, self.search.text.items, " \t");
     const was = self.cursor;
 
     self.matches.clearRetainingCapacity();
 
     if (query.len == 0) {
-        for (host.servers, 0..) |_, i| try self.matches.append(self.allocator, i);
+        for (self.rows, 0..) |_, i| try self.matches.append(self.allocator, i);
     } else {
         var top: fuzzy.Top(max_rows) = .{};
-        for (host.servers, 0..) |server, i| top.consider(i, server.name, query, .{});
+        for (self.rows, 0..) |row, i| top.consider(i, row.name, query, .{});
         for (top.ranked()) |ranked| try self.matches.append(self.allocator, ranked.index);
     }
 
@@ -135,7 +149,6 @@ pub const Drawn = struct {
 
 pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxfw.Size) !?Drawn {
     if (!self.open) return null;
-    const host = self.host orelse return null;
 
     const chrome: u16 = 8;
     const visible: u16 = @intCast(@min(self.matches.items.len, max_rows));
@@ -180,23 +193,23 @@ pub fn draw(self: *Picker, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: vxf
 
     const first_row: u16 = field_row + 2;
     if (self.matches.items.len == 0) {
-        const empty = if (host.servers.len == 0) "no servers configured" else "no matches";
+        const empty = if (self.rows.len == 0) "no servers configured" else "no matches";
         _ = w.writeText(surface, pad, first_row, empty, theme.on_card(theme.fg_dim).cell);
     }
 
     for (self.matches.items[self.scroll..][0..visible], 0..) |index, i| {
-        const server = host.servers[index];
+        const row = self.rows[index];
         const y: u16 = @intCast(first_row + i);
         const chosen = self.scroll + i == self.cursor;
         const base = if (chosen) theme.card.withBg(theme.surface_alt) else theme.card;
 
         if (chosen) w.fillRow(surface, y, 1, width - 2, base.cell);
 
-        const state = describe(host, server);
+        const state = describe(row);
         _ = w.writeText(surface, pad, y, state.mark, base.withFg(state.color).cell);
 
         const name_style = if (state.on) base.withFg(theme.fg) else base.withFg(theme.fg_dim);
-        const x = w.writeText(surface, pad + 2, y, server.name, name_style.cell);
+        const x = w.writeText(surface, pad + 2, y, row.name, name_style.cell);
         _ = w.writeText(surface, x + 1, y, state.detail, base.withFg(theme.fg_muted).cell);
     }
 
@@ -220,27 +233,14 @@ const State = struct {
     detail: []const u8,
 };
 
-/// What to say about one server: whether it is wanted, and what came of it.
-fn describe(host: *mcp_tools.Host, server: mcp_tools.Server) State {
-    const wanted = server.enabled and if (host.auth) |store| store.isEnabled(server.name) else true;
-    if (!wanted) return .{ .on = false, .mark = "○", .color = theme.fg_dim, .detail = "off" };
-
-    if (host.find(server.name)) |connection| {
-        return .{
-            .on = true,
-            .mark = "●",
-            .color = theme.success,
-            .detail = if (connection.installed) "connected" else "connecting",
-        };
-    }
-
-    for (host.failures.items) |failure| {
-        if (std.mem.eql(u8, failure.server, server.name)) {
-            return .{ .on = true, .mark = "✕", .color = theme.danger, .detail = failure.reason };
-        }
-    }
-
-    return .{ .on = true, .mark = "◌", .color = theme.fg_muted, .detail = "connecting" };
+/// How to show one server: whether it is wanted, and what came of it.
+fn describe(status: mcp_tools.Status) State {
+    return switch (status.state) {
+        .off => .{ .on = false, .mark = "○", .color = theme.fg_dim, .detail = "off" },
+        .connected => .{ .on = true, .mark = "●", .color = theme.success, .detail = "connected" },
+        .connecting => .{ .on = true, .mark = "◌", .color = theme.fg_muted, .detail = "connecting" },
+        .failed => .{ .on = true, .mark = "✕", .color = theme.danger, .detail = status.reason },
+    };
 }
 
 test "an empty search lists every configured server" {
@@ -254,7 +254,9 @@ test "an empty search lists every configured server" {
         .{ .name = "linear", .transport = .{ .http = .{ .url = "https://x/mcp" } } },
     };
 
-    try picker.show(&host);
+    const statuses = try host.statuses(testing.allocator);
+    defer testing.allocator.free(statuses);
+    try picker.show(statuses);
     try testing.expectEqual(@as(usize, 2), picker.matches.items.len);
     try testing.expectEqualStrings("files", picker.selected().?.name);
 }
@@ -267,15 +269,14 @@ test "a server nobody has turned off reads as wanted" {
         .name = "files",
         .transport = .{ .stdio = .{ .command = "npx" } },
     };
-
-    try testing.expect(describe(&host, server).on);
+    try testing.expect(describe(host.statusOf(server)).on);
 
     const off: mcp_tools.Server = .{
         .name = "off",
         .transport = .{ .stdio = .{ .command = "npx" } },
         .enabled = false,
     };
-    try testing.expect(!describe(&host, off).on);
+    try testing.expect(!describe(host.statusOf(off)).on);
 }
 
 test "a failure is what the row says, not a bare dot" {
@@ -284,9 +285,9 @@ test "a failure is what the row says, not a bare dot" {
 
     try host.failures.append(testing.allocator, .{ .server = "linear", .reason = "not signed in" });
 
-    const state = describe(&host, .{
+    const state = describe(host.statusOf(.{
         .name = "linear",
         .transport = .{ .http = .{ .url = "https://x/mcp" } },
-    });
+    }));
     try testing.expectEqualStrings("not signed in", state.detail);
 }

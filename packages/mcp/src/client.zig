@@ -321,7 +321,7 @@ fn reauthorize(self: *Client) !bool {
 
     // Tokens are worth keeping across runs; a store with nowhere to go says so
     // and is left alone.
-    auth.store.save(self.io, null) catch {};
+    auth.store.save(auth.flow.name) catch {};
     return true;
 }
 

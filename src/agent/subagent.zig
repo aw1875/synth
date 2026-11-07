@@ -230,6 +230,8 @@ pub const Runner = struct {
         child.loop.skills = parent.skills;
         child.loop.system_prompt = parent.system_prompt;
         child.loop.delegate = null;
+        // Its calls are not the session's, so they have no card for a terminal to show in.
+        child.loop.handoff = .{ .files = parent.handoff.files };
         // A standing allowance is the person's, not something to inherit.
         child.loop.auto_approve_safe = false;
         child.loop.max_turn_ms = parent.max_turn_ms;
@@ -651,7 +653,7 @@ test "a running subagent is visible before it has answered" {
     var future = try testing.io.concurrent(Job.go, .{&job});
 
     var seen_running = false;
-    while (harness.runner.active.items.len == 0 or !job.finished.load(.acquire)) {
+    while (!job.finished.load(.acquire)) {
         _ = try harness.runner.poll();
         if (harness.runner.running(3) != null) seen_running = true;
         try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
@@ -698,7 +700,7 @@ fn runTask(harness: *Harness, task: tool.Delegate.Task) ![]const u8 {
     var job: Job = .{ .harness = harness, .task = task };
     var future = try testing.io.concurrent(Job.go, .{&job});
 
-    while (harness.runner.active.items.len == 0 or !job.finished.load(.acquire)) {
+    while (!job.finished.load(.acquire)) {
         _ = try harness.runner.poll();
         try std.Io.sleep(testing.io, .fromMilliseconds(1), .real);
     }
