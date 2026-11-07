@@ -180,6 +180,18 @@ pub fn refresh(
     store: *Auth,
     options: Options,
 ) ![]const u8 {
+    return redeem(gpa, io, store, options) catch |err| {
+        if (err != error.RotatedElsewhere) return err;
+        return redeem(gpa, io, store, options) catch |again| return if (again == error.RotatedElsewhere) Error.SignInExpired else again;
+    };
+}
+
+fn redeem(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    store: *Auth,
+    options: Options,
+) ![]const u8 {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -232,8 +244,9 @@ pub fn refresh(
 
 /// What is left once the server has refused `spent`. Another process sharing
 /// the storage may have rotated it a moment before, and a server refuses the
-/// old token then, so what that process saved is kept. Otherwise the sign-in
-/// is over; the client registration outlives it.
+/// old token then, so what that process saved is kept: its access token if
+/// that is still good, or `error.RotatedElsewhere` to redeem its refresh token.
+/// Otherwise the sign-in is over; the client registration outlives it.
 fn afterRefusal(io: std.Io, store: *Auth, options: Options, spent: []const u8) ![]const u8 {
     store.reload(options.name) catch {};
     const entry = store.getForUrl(options.name, options.server_url) orelse return Error.SignInExpired;
@@ -244,7 +257,7 @@ fn afterRefusal(io: std.Io, store: *Auth, options: Options, spent: []const u8) !
         store.save(options.name) catch {};
         return Error.SignInExpired;
     }
-    if (expired(io, tokens.expires_at)) return Error.SignInExpired;
+    if (expired(io, tokens.expires_at)) return error.RotatedElsewhere;
     return tokens.access_token;
 }
 
@@ -484,6 +497,8 @@ const FakeTokenEndpoint = struct {
     reply: []const u8,
     kept: *OneEntry,
     rotated: ?[]const u8 = null,
+    /// What the token endpoint says to a second request, when one is expected.
+    then: ?struct { status: []const u8, reply: []const u8 } = null,
     url_buffer: [64]u8 = undefined,
 
     fn start(self: *FakeTokenEndpoint) ![]const u8 {
@@ -522,9 +537,13 @@ const FakeTokenEndpoint = struct {
                 continue;
             }
             if (self.rotated) |entry| try self.kept.put(entry);
+            self.rotated = null;
             try out.interface.print("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ self.status, self.reply.len, self.reply });
             try out.interface.flush();
-            return;
+            const next = self.then orelse return;
+            self.status = next.status;
+            self.reply = next.reply;
+            self.then = null;
         }
     }
 };
@@ -603,6 +622,57 @@ test "a refusal after another process rotated the token keeps what that process 
     var next_run = try Auth.open(testing.allocator, kept.storage());
     defer next_run.deinit();
     try testing.expectEqualStrings("R2", next_run.get("files").?.tokens.?.refresh_token.?);
+}
+
+test "a refusal after another process rotated to a token since expired redeems that one" {
+    var kept: OneEntry = .{};
+    defer kept.deinit();
+    var endpoint = try fakeEndpoint(&kept, "400 Bad Request",
+        \\{"error":"invalid_grant"}
+    );
+    const url = try endpoint.start();
+    defer endpoint.stop();
+    try signInWithSpentToken(&kept, url);
+
+    var encoded: [256]u8 = undefined;
+    endpoint.rotated = try std.fmt.bufPrint(&encoded, "{{\"server_url\":\"{s}\",\"tokens\":{{\"access_token\":\"A2\",\"refresh_token\":\"R2\",\"expires_at\":1000}},\"client_info\":{{\"client_id\":\"client\"}}}}", .{url});
+    endpoint.then = .{ .status = "200 OK", .reply =
+        \\{"access_token":"A3","refresh_token":"R3","expires_in":3600}
+    };
+
+    var store = try Auth.open(testing.allocator, kept.storage());
+    defer store.deinit();
+    const token = try accessToken(testing.allocator, testing.io, &store, .{ .name = "files", .server_url = url, .client_name = "test" });
+    try testing.expectEqualStrings("A3", token.?);
+
+    var next_run = try Auth.open(testing.allocator, kept.storage());
+    defer next_run.deinit();
+    try testing.expectEqualStrings("R3", next_run.get("files").?.tokens.?.refresh_token.?);
+}
+
+test "a second refusal, of a token another process rotated to, ends the sign-in" {
+    var kept: OneEntry = .{};
+    defer kept.deinit();
+    var endpoint = try fakeEndpoint(&kept, "400 Bad Request",
+        \\{"error":"invalid_grant"}
+    );
+    const url = try endpoint.start();
+    defer endpoint.stop();
+    try signInWithSpentToken(&kept, url);
+
+    var encoded: [256]u8 = undefined;
+    endpoint.rotated = try std.fmt.bufPrint(&encoded, "{{\"server_url\":\"{s}\",\"tokens\":{{\"access_token\":\"A2\",\"refresh_token\":\"R2\",\"expires_at\":1000}},\"client_info\":{{\"client_id\":\"client\"}}}}", .{url});
+    endpoint.then = .{ .status = "400 Bad Request", .reply =
+        \\{"error":"invalid_grant"}
+    };
+
+    var store = try Auth.open(testing.allocator, kept.storage());
+    defer store.deinit();
+    try testing.expectError(Error.SignInExpired, accessToken(testing.allocator, testing.io, &store, .{ .name = "files", .server_url = url, .client_name = "test" }));
+
+    var next_run = try Auth.open(testing.allocator, kept.storage());
+    defer next_run.deinit();
+    try testing.expect(next_run.get("files").?.tokens == null);
 }
 
 test "a token endpoint that fails for its own reasons leaves the sign-in alone" {
