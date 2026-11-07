@@ -448,7 +448,7 @@ pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
     defer out.flush() catch {};
 
     switch (sub) {
-        .list => try listServers(&store, servers, out),
+        .list => try listServers(io, &store, servers, out),
         .auth => |name| try authServer(allocator, io, &store, servers, name, out),
         .debug => |name| try debugServer(allocator, io, &store, servers, name, out),
         .logout => |name| {
@@ -461,7 +461,7 @@ pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
     }
 }
 
-fn listServers(store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io.Writer) !void {
+fn listServers(io: std.Io, store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io.Writer) !void {
     if (servers.len == 0) {
         try out.print("No MCP servers configured. Add an \"mcp\" block to your config.\n", .{});
         return;
@@ -478,16 +478,18 @@ fn listServers(store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io
             .http => |http| {
                 try out.print("  {s}remote{s}  {s}\n", .{ dim, reset, http.url });
 
-                const entry = store.getForUrl(server.name, http.url);
-                const signed_in = if (entry) |e| e.tokens != null else false;
-                try out.print("  {s}auth{s}    {s}\n", .{
-                    dim,
-                    reset,
-                    if (signed_in) "signed in" else "not signed in",
-                });
+                try out.print("  {s}auth{s}    {s}\n", .{ dim, reset, signInState(io, store.getForUrl(server.name, http.url)) });
             },
         }
     }
+}
+
+/// A token that has run out still counts while there is a refresh token to
+/// renew it with; whether the server honours that one is only known by asking.
+fn signInState(io: std.Io, entry: ?mcp.Auth.Entry) []const u8 {
+    const tokens = (entry orelse return "not signed in").tokens orelse return "not signed in";
+    if (tokens.refresh_token == null and mcp.flow.expired(io, tokens.expires_at)) return "expired, sign in again";
+    return "signed in";
 }
 
 fn toggleServer(
@@ -651,11 +653,7 @@ fn debugServer(
         reset,
         if (entry) |e| e.redirect_uri orelse "none stored" else "none stored",
     });
-    try out.print("  {s}tokens{s}     {s}\n", .{
-        dim,
-        reset,
-        if (entry) |e| if (e.tokens != null) "stored" else "none" else "none",
-    });
+    try out.print("  {s}auth{s}       {s}\n", .{ dim, reset, signInState(io, entry) });
     try out.flush();
 
     try probeInitialize(allocator, io, store, name, http.url, http.headers, arena, out);
@@ -682,7 +680,10 @@ fn probeInitialize(
         .name = name,
         .server_url = url,
         .client_name = pkg.name,
-    }) catch null;
+    }) catch |err| failed: {
+        try out.print("\n  {s}refresh{s}    failed: {s}\n", .{ dim, reset, @errorName(err) });
+        break :failed null;
+    };
 
     const authorization = if (token) |value|
         try std.fmt.allocPrint(arena, "Bearer {s}", .{value})

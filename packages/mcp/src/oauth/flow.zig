@@ -33,6 +33,9 @@ pub const Error = error{
     TokenRequestFailed,
     /// A refresh was asked for with nothing to refresh.
     NoRefreshToken,
+    /// The authorization server no longer honours the stored refresh token, so
+    /// the user has to sign in again.
+    SignInExpired,
 };
 
 /// Treat a token as expired this many seconds early, so one that would have
@@ -210,6 +213,10 @@ pub fn refresh(
     );
     defer response.deinit();
 
+    if (response.oauthError()) |refusal| {
+        if (std.mem.eql(u8, refusal.code, "invalid_grant")) return afterRefusal(io, store, options, refresh_token);
+    }
+
     var fresh = try settle(io, response);
 
     // Not every server rotates the refresh token, and one that does not simply
@@ -218,7 +225,27 @@ pub fn refresh(
     if (fresh.refresh_token == null) fresh.refresh_token = refresh_token;
 
     try store.updateTokens(options.name, fresh, options.server_url);
+    // A server that rotates has already disowned the stored refresh token.
+    store.save(options.name) catch {};
     return store.get(options.name).?.tokens.?.access_token;
+}
+
+/// What is left once the server has refused `spent`. Another process sharing
+/// the storage may have rotated it a moment before, and a server refuses the
+/// old token then, so what that process saved is kept. Otherwise the sign-in
+/// is over; the client registration outlives it.
+fn afterRefusal(io: std.Io, store: *Auth, options: Options, spent: []const u8) ![]const u8 {
+    store.reload(options.name) catch {};
+    const entry = store.getForUrl(options.name, options.server_url) orelse return Error.SignInExpired;
+    const tokens = entry.tokens orelse return Error.SignInExpired;
+
+    if (std.mem.eql(u8, tokens.refresh_token orelse "", spent)) {
+        store.forgetTokens(options.name);
+        store.save(options.name) catch {};
+        return Error.SignInExpired;
+    }
+    if (expired(io, tokens.expires_at)) return Error.SignInExpired;
+    return tokens.access_token;
 }
 
 /// A usable access token for `name`, refreshed if the stored one has run out.
@@ -408,6 +435,193 @@ test "refreshing without a refresh token says so" {
         .server_url = "https://mcp.example/mcp",
         .client_name = "test",
     }));
+}
+
+/// One server's entry kept the way a database would keep it, apart from any
+/// `Auth` reading it.
+const OneEntry = struct {
+    encoded: ?[]u8 = null,
+
+    fn deinit(self: *OneEntry) void {
+        if (self.encoded) |old| testing.allocator.free(old);
+    }
+
+    fn storage(self: *OneEntry) Auth.Storage {
+        return .{ .context = self, .readAll = readAll, .read = read, .write = write };
+    }
+
+    fn put(self: *OneEntry, encoded: []const u8) !void {
+        self.deinit();
+        self.encoded = try testing.allocator.dupe(u8, encoded);
+    }
+
+    fn readAll(context: *anyopaque, arena: std.mem.Allocator) anyerror![]const Auth.Storage.Stored {
+        const self: *OneEntry = @ptrCast(@alignCast(context));
+        const encoded = self.encoded orelse return &.{};
+        const out = try arena.alloc(Auth.Storage.Stored, 1);
+        out[0] = .{ .name = "files", .encoded = try arena.dupe(u8, encoded) };
+        return out;
+    }
+
+    fn read(context: *anyopaque, arena: std.mem.Allocator, _: []const u8) anyerror!?[]const u8 {
+        const self: *OneEntry = @ptrCast(@alignCast(context));
+        return try arena.dupe(u8, self.encoded orelse return null);
+    }
+
+    fn write(context: *anyopaque, _: []const u8, encoded: ?[]const u8) anyerror!void {
+        const self: *OneEntry = @ptrCast(@alignCast(context));
+        try self.put(encoded orelse return error.TestUnexpectedResult);
+    }
+};
+
+/// An authorization server that publishes no metadata, so discovery settles
+/// on `/token` at its origin, and answers that with `reply`. `rotated` lands in
+/// `kept` first, as another process's refresh would.
+const FakeTokenEndpoint = struct {
+    server: std.Io.net.Server,
+    thread: std.Thread = undefined,
+    status: []const u8,
+    reply: []const u8,
+    kept: *OneEntry,
+    rotated: ?[]const u8 = null,
+    url_buffer: [64]u8 = undefined,
+
+    fn start(self: *FakeTokenEndpoint) ![]const u8 {
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return std.fmt.bufPrint(&self.url_buffer, "http://127.0.0.1:{d}/mcp", .{self.server.socket.address.getPort()});
+    }
+
+    fn stop(self: *FakeTokenEndpoint) void {
+        self.thread.join();
+        self.server.deinit(testing.io);
+    }
+
+    fn serve(self: *FakeTokenEndpoint) !void {
+        const io = testing.io;
+        while (true) {
+            const stream = try self.server.accept(io);
+            defer stream.close(io);
+
+            var in_buffer: [4096]u8 = undefined;
+            var in = stream.reader(io, &in_buffer);
+            const request = (try in.interface.takeDelimiter('\n')).?;
+            const wants_token = std.mem.startsWith(u8, request, "POST /token");
+            var length: usize = 0;
+            while (try in.interface.takeDelimiter('\n')) |line| {
+                const header = std.mem.trimEnd(u8, line, "\r");
+                if (header.len == 0) break;
+                if (std.ascii.startsWithIgnoreCase(header, "content-length: ")) length = try std.fmt.parseInt(usize, header["content-length: ".len..], 10);
+            }
+            try in.interface.discardAll(length);
+
+            var out_buffer: [1024]u8 = undefined;
+            var out = stream.writer(io, &out_buffer);
+            if (!wants_token) {
+                try out.interface.writeAll("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                try out.interface.flush();
+                continue;
+            }
+            if (self.rotated) |entry| try self.kept.put(entry);
+            try out.interface.print("HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ self.status, self.reply.len, self.reply });
+            try out.interface.flush();
+            return;
+        }
+    }
+};
+
+fn fakeEndpoint(kept: *OneEntry, status: []const u8, reply: []const u8) !FakeTokenEndpoint {
+    const loopback: std.Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    return .{ .server = try loopback.listen(testing.io, .{}), .status = status, .reply = reply, .kept = kept };
+}
+
+fn signInWithSpentToken(kept: *OneEntry, url: []const u8) !void {
+    var seeding = try Auth.open(testing.allocator, kept.storage());
+    defer seeding.deinit();
+    try seeding.updateTokens("files", .{ .access_token = "A1", .refresh_token = "R1", .expires_at = 1000 }, url);
+    try seeding.updateClientInfo("files", .{ .client_id = "client" }, null);
+    try seeding.save("files");
+}
+
+test "a refreshed token is saved, so the next run holds the one the server still honours" {
+    var kept: OneEntry = .{};
+    defer kept.deinit();
+    var endpoint = try fakeEndpoint(&kept, "200 OK",
+        \\{"access_token":"A2","refresh_token":"R2","expires_in":3600}
+    );
+    const url = try endpoint.start();
+    defer endpoint.stop();
+    try signInWithSpentToken(&kept, url);
+
+    var store = try Auth.open(testing.allocator, kept.storage());
+    defer store.deinit();
+    const token = try accessToken(testing.allocator, testing.io, &store, .{ .name = "files", .server_url = url, .client_name = "test" });
+    try testing.expectEqualStrings("A2", token.?);
+
+    var next_run = try Auth.open(testing.allocator, kept.storage());
+    defer next_run.deinit();
+    try testing.expectEqualStrings("R2", next_run.get("files").?.tokens.?.refresh_token.?);
+}
+
+test "a refused refresh token ends the sign-in, and keeps the registration" {
+    var kept: OneEntry = .{};
+    defer kept.deinit();
+    var endpoint = try fakeEndpoint(&kept, "400 Bad Request",
+        \\{"error":"invalid_grant"}
+    );
+    const url = try endpoint.start();
+    defer endpoint.stop();
+    try signInWithSpentToken(&kept, url);
+
+    var store = try Auth.open(testing.allocator, kept.storage());
+    defer store.deinit();
+    try testing.expectError(Error.SignInExpired, accessToken(testing.allocator, testing.io, &store, .{ .name = "files", .server_url = url, .client_name = "test" }));
+
+    var next_run = try Auth.open(testing.allocator, kept.storage());
+    defer next_run.deinit();
+    try testing.expect(next_run.get("files").?.tokens == null);
+    try testing.expectEqualStrings("client", next_run.get("files").?.client_info.?.client_id);
+}
+
+test "a refusal after another process rotated the token keeps what that process saved" {
+    var kept: OneEntry = .{};
+    defer kept.deinit();
+    var endpoint = try fakeEndpoint(&kept, "400 Bad Request",
+        \\{"error":"invalid_grant"}
+    );
+    const url = try endpoint.start();
+    defer endpoint.stop();
+    try signInWithSpentToken(&kept, url);
+
+    var encoded: [256]u8 = undefined;
+    endpoint.rotated = try std.fmt.bufPrint(&encoded, "{{\"server_url\":\"{s}\",\"tokens\":{{\"access_token\":\"A2\",\"refresh_token\":\"R2\"}},\"client_info\":{{\"client_id\":\"client\"}}}}", .{url});
+
+    var store = try Auth.open(testing.allocator, kept.storage());
+    defer store.deinit();
+    const token = try accessToken(testing.allocator, testing.io, &store, .{ .name = "files", .server_url = url, .client_name = "test" });
+    try testing.expectEqualStrings("A2", token.?);
+
+    var next_run = try Auth.open(testing.allocator, kept.storage());
+    defer next_run.deinit();
+    try testing.expectEqualStrings("R2", next_run.get("files").?.tokens.?.refresh_token.?);
+}
+
+test "a token endpoint that fails for its own reasons leaves the sign-in alone" {
+    var kept: OneEntry = .{};
+    defer kept.deinit();
+    var endpoint = try fakeEndpoint(&kept, "500 Internal Server Error",
+        \\{"error":"server_error"}
+    );
+    const url = try endpoint.start();
+    defer endpoint.stop();
+    try signInWithSpentToken(&kept, url);
+
+    var store = try Auth.open(testing.allocator, kept.storage());
+    defer store.deinit();
+    try testing.expectError(Error.TokenRequestFailed, accessToken(testing.allocator, testing.io, &store, .{ .name = "files", .server_url = url, .client_name = "test" }));
+
+    var next_run = try Auth.open(testing.allocator, kept.storage());
+    defer next_run.deinit();
+    try testing.expectEqualStrings("R1", next_run.get("files").?.tokens.?.refresh_token.?);
 }
 
 test "stored tokens are copied, not borrowed" {

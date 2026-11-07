@@ -268,6 +268,12 @@ pub fn forget(self: *Auth, mcp_name: []const u8) void {
     entry.oauth_state = null;
 }
 
+/// Drop the sign-in alone: the client registration is still good for the next.
+pub fn forgetTokens(self: *Auth, mcp_name: []const u8) void {
+    const entry = self.entries.getPtr(mcp_name) orelse return;
+    entry.tokens = null;
+}
+
 pub fn remove(self: *Auth, mcp_name: []const u8) bool {
     return self.entries.orderedRemove(mcp_name);
 }
