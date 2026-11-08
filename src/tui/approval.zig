@@ -189,7 +189,7 @@ fn consequence(self: *Approval, arena: std.mem.Allocator, args: DrawArgs) !struc
         .always => .{
             .text = try std.fmt.allocPrint(
                 arena,
-                "Allows {s} in {s} from now on. Nothing clears it yet.",
+                "Allows {s} in {s} from now on; /permissions takes it back.",
                 .{ try self.scope(arena, args), if (args.project.len > 0) args.project else "this project" },
             ),
             .style = theme.on_card(theme.warning).cell,

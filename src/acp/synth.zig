@@ -52,6 +52,11 @@ pub const method = struct {
     pub const subagent = "_synth/subagent";
     pub const page_history = "_synth/page_history";
     pub const search = "_synth/search";
+    /// The project's standing allowances. Answered with `[]Allowance`.
+    pub const approvals = "_synth/approvals";
+    /// Drop and add standing allowances. Answered with `[]Allowance`, as they
+    /// then stand.
+    pub const set_approvals = "_synth/set_approvals";
     /// Check the session can be attached to again over its socket, once
     /// this client has gone without leaving.
     pub const detach = "_synth/detach";
@@ -344,6 +349,18 @@ pub const LoadThinking = struct { sessionId: []const u8, seq: u64 };
 pub const Subagent = struct { sessionId: []const u8, seq: u64, call: u32 };
 pub const PageHistory = struct { sessionId: []const u8, before_seq: u64, limit: u32 = 50 };
 pub const Search = struct { sessionId: []const u8, query: []const u8, limit: u32 = 20 };
+
+/// A standing "allow always": the tool, and the pattern it covers.
+pub const Allowance = struct {
+    tool: []const u8,
+    pattern: []const u8,
+};
+
+pub const SetApprovals = struct {
+    sessionId: []const u8,
+    remove: []const Allowance = &.{},
+    add: []const Allowance = &.{},
+};
 
 test "a message survives the wire and comes back owned" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

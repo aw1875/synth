@@ -93,6 +93,11 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (std.mem.eql(u8, line, "/permissions")) {
+        self.permission_picker.requested = true;
+        try self.mirror.listApprovals();
+        return true;
+    }
     if (std.mem.eql(u8, line, "/mcp")) {
         if (self.mirror.status.mcp.len > 0) {
             try self.mcp_picker.show(self.mirror.status.mcp);
@@ -213,6 +218,11 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             try self.models.show(entries, offer.models.recent, self.mirror.status.model);
         },
         .subagent => |transcript| try self.receiveSubagent(transcript.seq, transcript.call, transcript.live, transcript.messages),
+        .approvals => |standing| {
+            defer answer.deinit(self.allocator);
+            try self.permission_picker.receive(standing.allowances);
+            ctx.redraw = true;
+        },
         .providers => |known| {
             defer answer.deinit(self.allocator);
             var arena_state: std.heap.ArenaAllocator = .init(self.allocator);

@@ -272,6 +272,17 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (self.permission_picker.isOpen()) {
+                switch (try self.permission_picker.handleKey(ctx, key)) {
+                    .none => {},
+                    .cancel => self.permission_picker.close(),
+                    .remove => |allowance| try self.mirror.setApprovals(&.{allowance}, &.{}),
+                    .add => |allowance| try self.mirror.setApprovals(&.{}, &.{allowance}),
+                    .amend => |change| try self.mirror.setApprovals(&.{change.old}, &.{change.new}),
+                }
+                return ctx.consumeAndRedraw();
+            }
+
             if (self.mcp_picker.isOpen()) {
                 switch (try self.mcp_picker.handleKey(ctx, key)) {
                     .none => {},

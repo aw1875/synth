@@ -142,6 +142,16 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
         root.cursor = dialog.cursor;
     }
 
+    if (try self.permission_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
+        try children.append(ctx.arena, .{
+            .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
+            .surface = dialog.surface,
+            .z_index = 3,
+        });
+        root.cursor = dialog.cursor;
+    }
+
     if (try self.mcp_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
         dialog_open = true;
         try children.append(ctx.arena, .{

@@ -325,12 +325,25 @@ pub fn attachDatabase(
     self.project_id = try db.resolveProject(self.project_root, "git", project_name);
     self.session_cwd = cwd;
     self.session_model = model;
+    try self.reloadAllowances();
+}
 
-    const remembered = try db.approvals(self.project_id.?, self.allocator);
+/// Replace the allowances held in memory with the ones the database holds,
+/// which another session may have changed.
+pub fn reloadAllowances(self: *Loop) !void {
+    const db = self.db orelse return;
+    const project_id = self.project_id orelse return;
+    const remembered = try db.approvals(project_id, self.allocator);
     defer {
         for (remembered) |approval| approval.deinit(self.allocator);
         self.allocator.free(remembered);
     }
+
+    for (self.allowed.items) |allowance| {
+        self.allocator.free(allowance.tool);
+        self.allocator.free(allowance.pattern);
+    }
+    self.allowed.clearRetainingCapacity();
     for (remembered) |approval| try self.remember(approval.tool, approval.pattern);
 }
 
@@ -1360,6 +1373,8 @@ fn repeating(self: *Loop, calls: []const Conversation.ToolCall) !bool {
 /// Settle every call that needs no decision, then either run what is approved
 /// or stop for the user.
 fn autoApprove(self: *Loop) !void {
+    // Each session is its own process, so another may have changed them.
+    self.reloadAllowances() catch {};
     const message_index = self.pendingIndex() orelse return;
     const calls = self.conversation.messages.items[message_index].tool_calls;
 

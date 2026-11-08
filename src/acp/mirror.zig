@@ -115,6 +115,7 @@ const Awaited = union(enum) {
     models,
     files,
     providers,
+    approvals,
     /// The call whose subagent, by the TUI's own numbering.
     subagent: struct { seq: u64, call: u32 },
     detach,
@@ -130,6 +131,8 @@ pub const Answer = union(enum) {
     subagent: struct { seq: u64, call: u32, live: bool, messages: []Conversation.Message },
     /// Each provider the agent knows, in an arena of their own.
     providers: struct { arena: std.heap.ArenaAllocator, states: []const synth.ProviderState },
+    /// The project's standing allowances, in an arena of their own.
+    approvals: struct { arena: std.heap.ArenaAllocator, allowances: []const synth.Allowance },
     /// The project's files, for `@` mentions.
     files: [][]const u8,
     /// The models the agent's provider offers, in an arena of their own.
@@ -154,6 +157,10 @@ pub const Answer = union(enum) {
             },
             .providers => |known| {
                 var arena = known.arena;
+                arena.deinit();
+            },
+            .approvals => |standing| {
+                var arena = standing.arena;
                 arena.deinit();
             },
             .subagent => |transcript| {
@@ -803,6 +810,7 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             .models => "listing the models",
             .files => "listing the files",
             .providers => "listing the providers",
+            .approvals => "changing the allowances",
             .subagent => "loading the subagent's transcript",
             .detach => "Detaching",
         };
@@ -895,6 +903,13 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             errdefer kept.deinit();
             const states = try rpc.parse([]const synth.ProviderState, kept.allocator(), result);
             self.answers.appendAssumeCapacity(.{ .providers = .{ .arena = kept, .states = states } });
+        },
+        .approvals => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const allowances = try rpc.parse([]const synth.Allowance, kept.allocator(), result);
+            self.answers.appendAssumeCapacity(.{ .approvals = .{ .arena = kept, .allowances = allowances } });
         },
         .files => {
             const paths = try rpc.parse([]const []const u8, arena, result);
@@ -1190,6 +1205,16 @@ pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8, provid
 /// Ask what providers the agent knows. They land on a later poll.
 pub fn listProviders(self: *Mirror) !void {
     try self.send(synth.method.providers, protocol.SessionId{ .sessionId = self.status.handle }, .providers);
+}
+
+/// Ask for the project's standing allowances. They land on a later poll.
+pub fn listApprovals(self: *Mirror) !void {
+    try self.send(synth.method.approvals, protocol.SessionId{ .sessionId = self.status.handle }, .approvals);
+}
+
+/// Drop and add standing allowances. What then stands lands on a later poll.
+pub fn setApprovals(self: *Mirror, remove: []const synth.Allowance, add: []const synth.Allowance) !void {
+    try self.send(synth.method.set_approvals, synth.SetApprovals{ .sessionId = self.status.handle, .remove = remove, .add = add }, .approvals);
 }
 
 /// Point the session at a provider. A ChatGPT sign-in it needs shows up in
@@ -1501,6 +1526,48 @@ test "an always-allow is chosen from the agent's proposals, as wide as asked" {
     try pollUntil(mirror, awaitingApproval);
     try mirror.decide(.deny);
     try pollUntil(mirror, finishedThree);
+}
+
+fn expectAllowances(mirror: *Mirror, wanted: []const []const u8) !void {
+    const reply = try pollForAnswer(mirror);
+    defer reply.deinit(testing.allocator);
+    const allowances = reply.approvals.allowances;
+    try testing.expectEqual(wanted.len, allowances.len);
+    for (wanted, allowances) |pattern, allowance| try testing.expectEqualStrings(pattern, allowance.pattern);
+}
+
+test "allowances changed here, or in another process on the project, hold from the next call" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try mirror.listApprovals();
+    try expectAllowances(mirror, &.{});
+
+    try mirror.submit("run: git notes list", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.{ .always = .subcommand });
+    try pollUntil(mirror, finishedOne);
+
+    try mirror.setApprovals(&.{.{ .tool = "bash", .pattern = "git notes *" }}, &.{.{ .tool = "bash", .pattern = "git log *" }});
+    try expectAllowances(mirror, &.{"git log *"});
+
+    try mirror.submit("run: git notes show", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.deny);
+    try pollUntil(mirror, finishedTwo);
+
+    const project = try fixture.db.resolveProject(fixture.project, "git", "project");
+    try fixture.db.addApproval(project, "bash", "git stash *");
+    try mirror.submit("run: git stash list", .{});
+    try pollUntil(mirror, finishedThree);
+
+    try mirror.setApprovals(&.{}, &.{.{ .tool = "nonsense", .pattern = "x" }});
+    try mirror.listApprovals();
+    try expectAllowances(mirror, &.{ "git log *", "git stash *" });
 }
 
 test "a cancelled turn takes its question back from the mirror" {

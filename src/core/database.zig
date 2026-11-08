@@ -710,7 +710,6 @@ pub fn sessionTitle(self: *Database, session_id: i64, allocator: std.mem.Allocat
     return allocator.dupe(u8, row.text(0));
 }
 
-/// Remember an "always allow" approval, scoped to the project.
 /// The provider in use, or "" when none has been chosen. Caller owns the
 /// result.
 pub fn activeProvider(self: *Database, allocator: std.mem.Allocator) ![]const u8 {
@@ -777,6 +776,7 @@ pub fn rememberEffort(self: *Database, allocator: std.mem.Allocator, provider_id
     try self.setSetting(key, level);
 }
 
+/// Remember an "always allow" approval, scoped to the project.
 pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
     try self.conn.exec(
         \\INSERT INTO approval (project_id, tool, pattern) VALUES (?, ?, ?)
@@ -784,21 +784,11 @@ pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: 
     , .{ project_id, tool, pattern });
 }
 
-/// Whether `tool` is approved for `pattern` (or `*`) in this project.
-pub fn isApproved(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !bool {
-    const row = try self.conn.row(
-        \\SELECT 1 FROM approval
-        \\WHERE project_id = ? AND tool = ?
-        \\  AND (pattern = ?
-        \\       OR pattern = '*'
-        \\       OR (substr(pattern, length(pattern) - 1) = ' *'
-        \\           AND substr(pattern, 1, length(pattern) - 2) = ?))
-    , .{ project_id, tool, pattern, pattern });
-    if (row) |r| {
-        defer r.deinit();
-        return true;
-    }
-    return false;
+pub fn removeApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
+    try self.conn.exec(
+        "DELETE FROM approval WHERE project_id = ? AND tool = ? AND pattern = ?",
+        .{ project_id, tool, pattern },
+    );
 }
 
 /// Base64 image bodies attached to a message, in the order they were pasted.
@@ -872,7 +862,7 @@ pub const Approval = struct {
 /// in-memory "always allow" list at session start.
 pub fn approvals(self: *Database, project_id: i64, allocator: std.mem.Allocator) ![]Approval {
     var rows = try self.conn.rows(
-        "SELECT tool, pattern FROM approval WHERE project_id = ?",
+        "SELECT tool, pattern FROM approval WHERE project_id = ? ORDER BY tool, pattern",
         .{project_id},
     );
     defer rows.deinit();
@@ -1844,20 +1834,33 @@ test "project, session, message and approval round-trip" {
     try std.testing.expectEqual(@as(?i64, 12345), try db.lastRead(session_id, "/repo/x"));
     try std.testing.expectEqual(@as(?i64, null), try db.lastRead(session_id, "/repo/y"));
 
-    try db.addApproval(project_id, "bash", "git status");
-    try std.testing.expect(try db.isApproved(project_id, "bash", "git status"));
-    try std.testing.expect(!try db.isApproved(project_id, "bash", "rm -rf"));
-    try std.testing.expect(!try db.isApproved(project_id, "read", "git status"));
-
-    try db.addApproval(project_id, "bash", "grep *");
-    try std.testing.expect(try db.isApproved(project_id, "bash", "grep"));
-    try std.testing.expect(!try db.isApproved(project_id, "bash", "rm -rf"));
-    try db.addApproval(project_id, "bash", "xargs*");
-    try std.testing.expect(!try db.isApproved(project_id, "bash", "xargs"));
-    try std.testing.expect(try db.isApproved(project_id, "bash", "xargs*"));
-
+    try db.addApproval(project_id, "bash", "git status *");
+    try db.addApproval(project_id, "bash", "git status *");
+    try db.addApproval(project_id, "write", "*");
+    try db.addApproval(project_id, "bash", "cargo build *");
     const other = try db.resolveProject("/other", "git", "other");
-    try std.testing.expect(!try db.isApproved(other, "bash", "git status"));
+    try db.addApproval(other, "bash", "rm -rf build");
+
+    try expectApprovals(&db, project_id, &.{ "bash cargo build *", "bash git status *", "write *" });
+    try db.removeApproval(project_id, "bash", "git status *");
+    try db.removeApproval(project_id, "bash", "never stored");
+    try expectApprovals(&db, project_id, &.{ "bash cargo build *", "write *" });
+    try expectApprovals(&db, other, &.{"bash rm -rf build"});
+}
+
+fn expectApprovals(db: *Database, project_id: i64, wanted: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    const stored = try db.approvals(project_id, allocator);
+    defer {
+        for (stored) |approval| approval.deinit(allocator);
+        allocator.free(stored);
+    }
+    try std.testing.expectEqual(wanted.len, stored.len);
+    for (wanted, stored) |want, approval| {
+        const got = try std.fmt.allocPrint(allocator, "{s} {s}", .{ approval.tool, approval.pattern });
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
 }
 
 test "loadMessages pages older messages back with tool calls and reasoning" {

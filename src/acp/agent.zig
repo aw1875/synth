@@ -396,6 +396,12 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.search)) {
         const asked = try rpc.parse(synth.Search, arena, params);
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
+    } else if (eql(u8, method, m.approvals)) {
+        return connection.reply(id, try session.allowances(arena));
+    } else if (eql(u8, method, m.set_approvals)) {
+        const asked = try rpc.parse(synth.SetApprovals, arena, params);
+        try session.changeAllowances(asked.remove, asked.add);
+        return connection.reply(id, try session.allowances(arena));
     } else return error.MethodNotFound;
     connection.reply(id, protocol.Empty{});
 }
@@ -894,6 +900,9 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownProvider => "no such provider",
         error.NoCredentialStore => "no ChatGPT credential file could be opened",
         error.UnknownServer => "no such MCP server",
+        error.NoProject => "the session has no project to keep allowances for",
+        error.UnknownTool => "no such tool",
+        error.EmptyAllowance => "an allowance needs a pattern",
         error.UnknownAttachment => "no such attachment",
         error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
@@ -2295,6 +2304,26 @@ const Session = struct {
             .providers => |providers| providers.offered(arena, db, provider),
             .provider => Providers.offeredBy(arena, db, "", provider.name, provider),
         };
+    }
+
+    fn allowances(self: *Session, arena: std.mem.Allocator) ![]const synth.Allowance {
+        const project_id = self.stack.loop.project_id orelse return &.{};
+        const stored = try self.agent.options.db.approvals(project_id, arena);
+        const out = try arena.alloc(synth.Allowance, stored.len);
+        for (stored, out) |approval, *allowance| allowance.* = .{ .tool = approval.tool, .pattern = approval.pattern };
+        return out;
+    }
+
+    fn changeAllowances(self: *Session, dropped: []const synth.Allowance, added: []const synth.Allowance) !void {
+        const project_id = self.stack.loop.project_id orelse return error.NoProject;
+        const db = self.agent.options.db;
+        for (added) |allowance| {
+            if (self.stack.registry.get(allowance.tool) == null) return error.UnknownTool;
+            if (std.mem.trim(u8, allowance.pattern, " \t").len == 0) return error.EmptyAllowance;
+        }
+        for (dropped) |allowance| try db.removeApproval(project_id, allowance.tool, allowance.pattern);
+        for (added) |allowance| try db.addApproval(project_id, allowance.tool, std.mem.trim(u8, allowance.pattern, " \t"));
+        try self.stack.loop.reloadAllowances();
     }
 
     fn search(self: *Session, arena: std.mem.Allocator, query: []const u8, limit: u32) ![]const synth.Hit {
