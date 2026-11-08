@@ -160,8 +160,6 @@ const File = struct {
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
     approvals: ?Approvals = null,
-    /// Read as `approvals: "all"`, the setting it became.
-    auto_approve_all: ?bool = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -282,9 +280,6 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.system_prompt) |value| self.system_prompt = value;
     if (parsed.think) |value| self.think = value;
     if (parsed.auto_approve_safe_commands) |value| self.auto_approve_safe_commands = value;
-    if (parsed.auto_approve_all) |value| {
-        if (value) self.approvals = .all;
-    }
     if (parsed.approvals) |value| self.approvals = value;
     if (parsed.debug_log) |value| self.debug_log = value;
     if (parsed.max_turn_ms) |value| self.max_turn_ms = value;
@@ -505,10 +500,6 @@ test "approvals are read from the file, and the old switch still means all" {
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"approvals\":\"auto\"}" });
     try config.applyFile(io, path);
     try testing.expectEqual(Approvals.auto, config.approvals);
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"auto_approve_all\":true}" });
-    try config.applyFile(io, path);
-    try testing.expectEqual(Approvals.all, config.approvals);
 }
 
 test "lifecycle hooks are read from the file" {
