@@ -232,6 +232,7 @@ pub const Runner = struct {
         child.loop.delegate = null;
         // Its calls are not the session's, so they have no card for a terminal to show in.
         child.loop.handoff = .{ .files = parent.handoff.files };
+        child.loop.auto_approve_all = parent.auto_approve_all;
         // A standing allowance is the person's, not something to inherit.
         child.loop.auto_approve_safe = false;
         child.loop.max_turn_ms = parent.max_turn_ms;
