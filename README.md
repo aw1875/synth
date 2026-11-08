@@ -145,6 +145,20 @@ commands - tests, `git diff`, a build - but cannot edit.
 Anything that changes the project or runs a command asks first, and a preset of
 read-only shell commands skips the prompt.
 
+"Allow always" remembers the answer for the project, as narrowly as it can: a
+shell command is allowed by its subcommand (`git commit *` does not cover
+`git push`), and a program without one by the exact command. `↑`/`↓` on the
+prompt widens or narrows that before it is saved. `/permissions` lists what is
+allowed; `enter` edits a pattern, `del` removes it, and typing a command that is
+not there offers to add it. A change holds in every session on the project at
+once.
+
+`/rewind` undoes what turns did to files. Before `write` or `edit` first changes
+a file in a turn, synth keeps what the file held; `/rewind` lists the prompts
+that changed files, shows what going back to before one would put back, flags
+anything changed since by other means, and restores it. Files changed through
+the shell are not tracked, and the transcript stays as it was.
+
 ## Configuration
 
 Three files, split by what they hold.
@@ -254,7 +268,7 @@ a session was last touched:
 ```
 
 `shed_after_days` keeps an old session's transcript but drops the payloads
-behind it. The cards still read: what the model was shown is on the tool call
+behind it, and the file checkpoints `/rewind` would use. The cards still read: what the model was shown is on the tool call
 itself, and only the expanded view loses its full text. This is where nearly
 all the space goes, so 30 days is the default.
 
