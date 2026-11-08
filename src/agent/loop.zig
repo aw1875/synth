@@ -2214,7 +2214,10 @@ fn checkpointBatch(self: *Loop, batch: []const ToolRun.Call) !void {
     for (batch) |call| {
         if (!std.mem.eql(u8, call.name, "write") and !std.mem.eql(u8, call.name, "edit")) continue;
         const path = self.changedPath(arena, call.arguments) orelse continue;
-        const content = readCheckpointed(self.io, arena, path) catch continue;
+        const content = readCheckpointed(self.io, arena, path) catch |err| {
+            self.say("Could not checkpoint {s}, so /rewind cannot put it back: {s}", .{ path, @errorName(err) });
+            continue;
+        };
         try db.saveCheckpoint(try owner.ensureSession(), seq, path, content);
         const owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned);
@@ -3409,6 +3412,36 @@ test "a turn's file changes are kept, and undone back to the prompt that made th
     try testing.expectEqualStrings("one", try fixture.tmp.dir.readFileAlloc(testing.io, "a.txt", arena, .unlimited));
     try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "sub/b.txt", .{}));
     try testing.expectEqual(@as(usize, 0), (try loop.checkpointTurns(arena)).len);
+}
+
+test "a file too large to checkpoint is still changed, and the person told it cannot be put back" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const large = try testing.allocator.alloc(u8, max_checkpoint_bytes + 1);
+    defer testing.allocator.free(large);
+    @memset(large, 'x');
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "big.txt", .data = large });
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"big.txt\",\"content\":\"small\"}";
+    try loop.submit("shrink it", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("small", try fixture.tmp.dir.readFileAlloc(testing.io, "big.txt", arena, .unlimited));
+    const notice = loop.hook_notice orelse return error.TestExpectedNotice;
+    try testing.expect(std.mem.indexOf(u8, notice, "big.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, notice, "/rewind") != null);
 }
 
 test "a session comes back in the mode it was left in" {
