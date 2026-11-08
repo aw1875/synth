@@ -192,7 +192,7 @@ fn consequence(self: *Approval, arena: std.mem.Allocator, args: DrawArgs) !struc
                 "Allows {s} in {s} from now on; /permissions takes it back.",
                 .{ try self.scope(arena, args), if (args.project.len > 0) args.project else "this project" },
             ),
-            .style = theme.on_card(theme.warning).cell,
+            .style = theme.on_card(self.reachColor(args.name, args.proposals)).cell,
         },
         .reject => .{
             .text = try std.fmt.allocPrint(arena, "Tells the model the {s} call was refused.", .{args.name}),
@@ -204,6 +204,16 @@ fn consequence(self: *Approval, arena: std.mem.Allocator, args: DrawArgs) !struc
 /// What the allowance covers, as it reads in a sentence. A pipeline names each
 /// command that needed asking, since approving it allows all of them. A long
 /// pattern is shortened so it cannot push the rest of the line off the panel.
+/// How far "Allow always" reaches, in the colours `/permissions` lists
+/// allowances in: loudest where it reaches furthest.
+fn reachColor(self: *const Approval, tool: []const u8, proposals: []const Loop.Proposal) vaxis.Cell.Color {
+    const chosen = self.proposal(proposals) orelse return theme.warning;
+    if (chosen.patterns.len == 1 and std.mem.eql(u8, chosen.patterns[0], "*")) {
+        return if (std.mem.eql(u8, tool, "bash")) theme.danger else theme.warning;
+    }
+    return if (chosen.breadth == .program) theme.warning else theme.fg_muted;
+}
+
 fn scope(self: *const Approval, arena: std.mem.Allocator, args: DrawArgs) ![]const u8 {
     const patterns = if (self.proposal(args.proposals)) |chosen| chosen.patterns else &.{};
     if (patterns.len == 0 or (patterns.len == 1 and std.mem.eql(u8, patterns[0], "*"))) {
@@ -400,6 +410,23 @@ test "reach starts at the subcommand and moves between the call's proposals" {
     };
     try std.testing.expectEqual(permission.Breadth.command, approval.proposal(exact_only).?.breadth);
     try std.testing.expectEqual(null, approval.proposal(&.{}));
+}
+
+test "the reach shown grows louder the further it goes" {
+    const proposals: []const Loop.Proposal = &.{
+        .{ .breadth = .subcommand, .patterns = &.{"git commit *"} },
+        .{ .breadth = .program, .patterns = &.{"git *"} },
+    };
+    var approval: Approval = .{};
+    approval.sync(1);
+    try std.testing.expectEqual(theme.fg_muted, approval.reachColor("bash", proposals));
+    approval.widen(1, proposals);
+    try std.testing.expectEqual(theme.warning, approval.reachColor("bash", proposals));
+
+    const everything: []const Loop.Proposal = &.{.{ .breadth = .program, .patterns = &.{"*"} }};
+    try std.testing.expectEqual(theme.danger, approval.reachColor("bash", everything));
+    try std.testing.expectEqual(theme.warning, approval.reachColor("write", everything));
+    try std.testing.expectEqual(theme.warning, approval.reachColor("web", &.{}));
 }
 
 test "arguments are labelled, and a long value is capped" {
