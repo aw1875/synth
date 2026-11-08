@@ -6,6 +6,8 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
+const Loop = @import("../agent/loop.zig");
+const permission = @import("../agent/permission.zig");
 const diff = @import("diff.zig");
 const theme = @import("theme.zig");
 const w = @import("widgets.zig");
@@ -50,6 +52,9 @@ pub const Choice = enum {
 const order: []const Choice = &.{ .once, .always, .reject };
 
 selected: Choice = .once,
+/// Which of the call's proposals "allow always" stores, once moved off the
+/// default.
+reach: ?usize = null,
 /// Identifies the call the current selection belongs to, so the next prompt
 /// starts back at "Allow once" instead of inheriting the last answer.
 token: u64 = 0,
@@ -59,6 +64,30 @@ pub fn sync(self: *Approval, token: u64) void {
     if (self.token == token) return;
     self.token = token;
     self.selected = .once;
+    self.reach = null;
+}
+
+/// What "allow always" stores: the proposal picked, or else the widest one
+/// that names no more than a subcommand.
+pub fn proposal(self: *const Approval, proposals: []const Loop.Proposal) ?Loop.Proposal {
+    if (proposals.len == 0) return null;
+    return proposals[self.reachIndex(proposals)];
+}
+
+/// Reach `delta` proposals wider, stopping at either end.
+pub fn widen(self: *Approval, delta: i32, proposals: []const Loop.Proposal) void {
+    if (proposals.len == 0) return;
+    const current: i32 = @intCast(self.reachIndex(proposals));
+    self.reach = @intCast(std.math.clamp(current + delta, 0, @as(i32, @intCast(proposals.len - 1))));
+}
+
+fn reachIndex(self: *const Approval, proposals: []const Loop.Proposal) usize {
+    if (self.reach) |index| return @min(index, proposals.len - 1);
+    var index: usize = 0;
+    for (proposals, 0..) |candidate, i| {
+        if (@intFromEnum(candidate.breadth) <= @intFromEnum(permission.Breadth.subcommand)) index = i;
+    }
+    return index;
 }
 
 /// Move `delta` buttons, stopping at the ends rather than wrapping: the row is
@@ -79,9 +108,8 @@ pub const DrawArgs = struct {
     arguments: []const u8,
     /// Project the allowance would be scoped to, for the "allow always" hint.
     project: []const u8 = "",
-    /// What an "allow always" would cover: one entry per program a shell
-    /// command runs, or a single `*` for a tool scoped to the project.
-    patterns: []const []const u8 = &.{},
+    /// What an "allow always" could store, narrowest first.
+    proposals: []const Loop.Proposal = &.{},
     width: u16,
 };
 
@@ -142,13 +170,13 @@ pub fn draw(self: *Approval, ctx: vxfw.DrawContext, parent: vxfw.Widget, args: D
         consequence_line.style,
     );
 
-    self.drawButtons(surface, height - 1 - pad_bottom);
+    self.drawButtons(surface, height - 1 - pad_bottom, self.selected == .always and args.proposals.len > 1);
     return surface;
 }
 
 /// What the highlighted choice does, and how loudly to say it. "Allow always"
-/// is the dangerous one: it is not "this command again", it is every call to
-/// this tool, so a single `bash` approval covers every future shell command.
+/// is the dangerous one: it reaches past this call, as far as the proposal
+/// picked for it.
 fn consequence(self: *Approval, arena: std.mem.Allocator, args: DrawArgs) !struct {
     text: []const u8,
     style: vaxis.Cell.Style,
@@ -162,7 +190,7 @@ fn consequence(self: *Approval, arena: std.mem.Allocator, args: DrawArgs) !struc
             .text = try std.fmt.allocPrint(
                 arena,
                 "Allows {s} in {s} from now on. Nothing clears it yet.",
-                .{ try scope(arena, args), if (args.project.len > 0) args.project else "this project" },
+                .{ try self.scope(arena, args), if (args.project.len > 0) args.project else "this project" },
             ),
             .style = theme.on_card(theme.warning).cell,
         },
@@ -174,31 +202,31 @@ fn consequence(self: *Approval, arena: std.mem.Allocator, args: DrawArgs) !struc
 }
 
 /// What the allowance covers, as it reads in a sentence. A pipeline names each
-/// of its programs, since approving it allows all of them. A long pattern is
-/// shortened so it cannot push the rest of the line off the panel.
-fn scope(arena: std.mem.Allocator, args: DrawArgs) ![]const u8 {
-    if (args.patterns.len == 0 or
-        (args.patterns.len == 1 and std.mem.eql(u8, args.patterns[0], "*")))
-    {
+/// command that needed asking, since approving it allows all of them. A long
+/// pattern is shortened so it cannot push the rest of the line off the panel.
+fn scope(self: *const Approval, arena: std.mem.Allocator, args: DrawArgs) ![]const u8 {
+    const patterns = if (self.proposal(args.proposals)) |chosen| chosen.patterns else &.{};
+    if (patterns.len == 0 or (patterns.len == 1 and std.mem.eql(u8, patterns[0], "*"))) {
         return std.fmt.allocPrint(arena, "EVERY {s} call, on any file,", .{args.name});
+    }
+    if (!std.mem.eql(u8, args.name, "bash")) {
+        return std.fmt.allocPrint(arena, "{s} on `{s}`", .{ args.name, patterns[0] });
     }
 
     const max_shown = 40;
-    if (args.patterns.len == 1 and args.patterns[0].len > max_shown) {
-        return std.fmt.allocPrint(arena, "this exact `{s}...` command", .{args.patterns[0][0..max_shown]});
-    }
-
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, "every ");
-    for (args.patterns, 0..) |pattern, i| {
-        if (i > 0) try out.appendSlice(arena, if (i == args.patterns.len - 1) " and " else ", ");
-        try out.print(arena, "`{s}`", .{std.mem.trimEnd(u8, pattern, " *")});
+    for (patterns, 0..) |pattern, i| {
+        if (i > 0) try out.appendSlice(arena, if (i == patterns.len - 1) " and " else ", ");
+        if (pattern.len > max_shown) {
+            try out.print(arena, "`{s}...`", .{pattern[0..max_shown]});
+        } else {
+            try out.print(arena, "`{s}`", .{pattern});
+        }
     }
-    try out.appendSlice(arena, if (args.patterns.len > 1) " command" else " command");
     return out.toOwnedSlice(arena);
 }
 
-fn drawButtons(self: *Approval, surface: vxfw.Surface, row: u16) void {
+fn drawButtons(self: *Approval, surface: vxfw.Surface, row: u16, reachable: bool) void {
     var x: u16 = indent;
     for (order) |choice| {
         const style = if (choice == self.selected)
@@ -209,10 +237,16 @@ fn drawButtons(self: *Approval, surface: vxfw.Surface, row: u16) void {
         x += 1;
     }
 
-    var hint = w.textWidth("← → select   enter confirm");
+    const reach = if (reachable) "↑ ↓ reach   " else "";
+    var hint = w.textWidth(reach) + w.textWidth("← → select   enter confirm");
     if (surface.size.width > x + hint + 2) {
         hint = surface.size.width - hint - 2;
-        var h = w.writeText(surface, hint, row, "← →", theme.on_card(theme.fg_muted).bold().cell);
+        var h = hint;
+        if (reachable) {
+            h = w.writeText(surface, h, row, "↑ ↓", theme.on_card(theme.fg_muted).bold().cell);
+            h = w.writeText(surface, h, row, " reach   ", theme.on_card(theme.fg_dim).cell);
+        }
+        h = w.writeText(surface, h, row, "← →", theme.on_card(theme.fg_muted).bold().cell);
         h = w.writeText(surface, h, row, " select   ", theme.on_card(theme.fg_dim).cell);
         h = w.writeText(surface, h, row, "enter", theme.on_card(theme.fg_muted).bold().cell);
         _ = w.writeText(surface, h, row, " confirm", theme.on_card(theme.fg_dim).cell);
@@ -342,6 +376,30 @@ test "selection clamps at both ends and resets for a new call" {
 
     approval.sync(2);
     try std.testing.expectEqual(Choice.once, approval.selected);
+}
+
+test "reach starts at the subcommand and moves between the call's proposals" {
+    const proposals: []const Loop.Proposal = &.{
+        .{ .breadth = .command, .patterns = &.{"git commit -m x"} },
+        .{ .breadth = .subcommand, .patterns = &.{"git commit *"} },
+        .{ .breadth = .program, .patterns = &.{"git *"} },
+    };
+    var approval: Approval = .{};
+    approval.sync(1);
+    try std.testing.expectEqual(permission.Breadth.subcommand, approval.proposal(proposals).?.breadth);
+    approval.widen(1, proposals);
+    approval.widen(1, proposals);
+    try std.testing.expectEqual(permission.Breadth.program, approval.proposal(proposals).?.breadth);
+    approval.widen(-5, proposals);
+    try std.testing.expectEqual(permission.Breadth.command, approval.proposal(proposals).?.breadth);
+
+    approval.sync(2);
+    const exact_only: []const Loop.Proposal = &.{
+        .{ .breadth = .command, .patterns = &.{"rm -rf build"} },
+        .{ .breadth = .program, .patterns = &.{"rm *"} },
+    };
+    try std.testing.expectEqual(permission.Breadth.command, approval.proposal(exact_only).?.breadth);
+    try std.testing.expectEqual(null, approval.proposal(&.{}));
 }
 
 test "arguments are labelled, and a long value is capped" {

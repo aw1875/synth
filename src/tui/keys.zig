@@ -440,10 +440,15 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     self.approval.move(1);
                     return ctx.consumeAndRedraw();
                 }
+                const proposals = self.mirror.status.pending_proposals;
+                if (self.approval.selected == .always and (key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.down, .{}))) {
+                    self.approval.widen(if (key.matches(vaxis.Key.up, .{})) 1 else -1, proposals);
+                    return ctx.consumeAndRedraw();
+                }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     try self.mirror.decide(switch (self.approval.selected) {
                         .once => .once,
-                        .always => .always,
+                        .always => .{ .always = if (self.approval.proposal(proposals)) |chosen| chosen.breadth else .subcommand },
                         .reject => .deny,
                     });
                     return self.afterDecision(ctx);

@@ -728,6 +728,12 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     var kept = status;
     kept.label = try arena.dupe(u8, status.label);
     kept.pending_description = try arena.dupe(u8, status.pending_description);
+    const proposals = try arena.alloc(Loop.Proposal, status.pending_proposals.len);
+    for (status.pending_proposals, proposals) |proposal, *copy| copy.* = .{
+        .breadth = proposal.breadth,
+        .patterns = try dupeAll(arena, proposal.patterns),
+    };
+    kept.pending_proposals = proposals;
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
     kept.root = try arena.dupe(u8, status.root);
@@ -1149,7 +1155,7 @@ pub fn decide(self: *Mirror, decision: Loop.Decision) !void {
         return;
     };
     if (asked.on != .decision) return error.NothingToDecide;
-    try connection.reply(asked.id, .{ .outcome = .{ .outcome = "selected", .optionId = @tagName(decision) } });
+    try connection.reply(asked.id, .{ .outcome = .{ .outcome = "selected", .optionId = updates.optionId(decision) } });
     self.forgetAsked();
 }
 
@@ -1458,6 +1464,43 @@ test "a mirror follows a turn, and its approval is answered from here" {
 
 fn cancelled(mirror: *Mirror) bool {
     return mirror.status.state == .idle and mirror.status.outcome == .cancelled;
+}
+
+fn finishedTwo(mirror: *Mirror) bool {
+    return mirror.status.state == .idle and mirror.status.finished == 2;
+}
+
+fn finishedThree(mirror: *Mirror) bool {
+    return mirror.status.state == .idle and mirror.status.finished == 3;
+}
+
+test "an always-allow is chosen from the agent's proposals, as wide as asked" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try mirror.submit("run: git notes list", .{});
+    try pollUntil(mirror, awaitingApproval);
+    const proposals = mirror.status.pending_proposals;
+    try testing.expectEqual(@as(usize, 3), proposals.len);
+    try testing.expectEqualStrings("git notes list", proposals[0].patterns[0]);
+    try testing.expectEqualStrings("git notes *", proposals[1].patterns[0]);
+    try testing.expectEqualStrings("git *", proposals[2].patterns[0]);
+
+    try mirror.decide(.{ .always = proposals[1].breadth });
+    try pollUntil(mirror, finishedOne);
+
+    try mirror.submit("run: git notes show", .{});
+    try pollUntil(mirror, finishedTwo);
+
+    try mirror.submit("run: git stash list", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.deny);
+    try pollUntil(mirror, finishedThree);
 }
 
 test "a cancelled turn takes its question back from the mirror" {

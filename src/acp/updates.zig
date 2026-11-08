@@ -2,9 +2,46 @@
 //! and the loop, told as `session/update`s.
 
 const std = @import("std");
+/// The option that stands for `decision` in a permission request.
+pub fn optionId(decision: Loop.Decision) []const u8 {
+    return switch (decision) {
+        .once => "once",
+        .deny => "deny",
+        .always => |breadth| switch (breadth) {
+            .command => "always:command",
+            .subcommand => "always:subcommand",
+            .program => "always:program",
+        },
+    };
+}
+
+/// The decision an option stands for.
+pub fn decisionOf(option: []const u8) ?Loop.Decision {
+    if (std.mem.eql(u8, option, "once")) return .once;
+    if (std.mem.eql(u8, option, "deny")) return .deny;
+    const breadth = std.mem.cutPrefix(u8, option, "always:") orelse return null;
+    return .{ .always = std.meta.stringToEnum(permission.Breadth, breadth) orelse return null };
+}
+
+/// A permission request's options: one "always" for each thing it could store,
+/// which an editor can offer as they are.
+pub fn permissionOptions(arena: std.mem.Allocator, proposals: []const Loop.Proposal) ![]const protocol.PermissionOption {
+    const options = try arena.alloc(protocol.PermissionOption, proposals.len + 2);
+    options[0] = .{ .optionId = optionId(.once), .name = "Allow once", .kind = .allow_once };
+    for (proposals, options[1..][0..proposals.len]) |proposal, *option| option.* = .{
+        .optionId = optionId(.{ .always = proposal.breadth }),
+        .name = try std.fmt.allocPrint(arena, "Always allow {s}", .{try std.mem.join(arena, ", ", proposal.patterns)}),
+        .kind = .allow_always,
+    };
+    options[options.len - 1] = .{ .optionId = optionId(.deny), .name = "Deny", .kind = .reject_once };
+    return options;
+}
+
 const testing = std.testing;
 
 const protocol = @import("protocol.zig");
+const Loop = @import("../agent/loop.zig");
+const permission = @import("../agent/permission.zig");
 const Conversation = @import("../core/conversation.zig");
 const todo = @import("../core/todo.zig");
 const ask_user = @import("../tools/ask.zig");
@@ -245,4 +282,19 @@ test "a replay tells the conversation and leaves out what the harness wrote" {
     try testing.expectEqualStrings("a note, then", told[1].agent_thought_chunk.content.text);
     try testing.expectEqualStrings("3.0", told[2].tool_call.toolCallId);
     try testing.expectEqualStrings("done", told[3].agent_message_chunk.content.text);
+}
+
+test "a permission request offers each thing an always could store, and its answer comes back" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const proposals: []const Loop.Proposal = &.{
+        .{ .breadth = .command, .patterns = &.{"git notes list"} },
+        .{ .breadth = .subcommand, .patterns = &.{"git notes *"} },
+    };
+    const options = try permissionOptions(arena_state.allocator(), proposals);
+    try testing.expectEqual(@as(usize, 4), options.len);
+    try testing.expectEqualStrings("Always allow git notes *", options[2].name);
+    for (options) |option| try testing.expectEqualStrings(option.optionId, optionId(decisionOf(option.optionId).?));
+    try testing.expectEqual(permission.Breadth.subcommand, decisionOf(options[2].optionId).?.always);
+    try testing.expect(decisionOf("always") == null);
 }

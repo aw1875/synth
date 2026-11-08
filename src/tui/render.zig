@@ -19,7 +19,6 @@ const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
 const widget_pool = @import("widget_pool.zig");
-const AgentLoop = @import("../agent/loop.zig");
 const recap = @import("../agent/recap.zig");
 const ask_user = @import("../tools/ask.zig");
 const pkg = @import("pkg");
@@ -869,7 +868,7 @@ pub fn drawApproval(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surfa
         .description = self.mirror.status.pending_description,
         .arguments = call.arguments,
         .project = self.projectLabel(),
-        .patterns = AgentLoop.approvalPatterns(ctx.arena, call.name, call.arguments) catch &.{},
+        .proposals = self.mirror.status.pending_proposals,
         .width = width,
     });
 }

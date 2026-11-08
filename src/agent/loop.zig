@@ -23,6 +23,7 @@ const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const Request = @import("request.zig");
 const window = @import("../provider/window.zig");
+const permission = @import("permission.zig");
 const safety = @import("safety.zig");
 const Thought = @import("thought.zig");
 const ToolRun = @import("tool_run.zig");
@@ -109,8 +110,9 @@ pub const State = enum {
 };
 
 /// A remembered "allow always", scoped to the project and to what the call was
-/// doing: `bash` approved for `find *` does not approve `rm`. Every other tool
-/// stores `*`.
+/// doing: `bash` approved for `git commit *` does not approve `git push`
+/// (`permission.zig` has the patterns). Every other tool stores `*`, or the
+/// path of a call that reached outside the project.
 const Allowance = struct {
     tool: []const u8,
     pattern: []const u8,
@@ -1483,7 +1485,15 @@ pub fn pendingCall(self: *Loop) ?*Conversation.ToolCall {
     return &self.conversation.messages.items[message_index].tool_calls[index];
 }
 
-pub const Decision = enum { once, always, deny };
+/// The answer to a call waiting on a decision. `always` says how far the
+/// allowance it leaves behind reaches.
+pub const Decision = union(enum) { once, always: permission.Breadth, deny };
+
+/// What "allow always" would store for a call at one breadth.
+pub const Proposal = struct {
+    breadth: permission.Breadth,
+    patterns: []const []const u8,
+};
 
 /// Record the user's answer for the call currently being asked about.
 pub fn decide(self: *Loop, decision: Decision) !void {
@@ -1493,9 +1503,9 @@ pub fn decide(self: *Loop, decision: Decision) !void {
 
     switch (decision) {
         .once => call.begin(tool.monotonicMilliseconds(self.io)),
-        .always => {
+        .always => |breadth| {
             call.begin(tool.monotonicMilliseconds(self.io));
-            try self.allow(call);
+            try self.allow(call, breadth);
         },
         .deny => {
             call.status = .rejected;
@@ -1672,15 +1682,11 @@ fn resultCeiling(self: *const Loop, name: []const u8) usize {
 }
 
 /// Record an "allow always" for what this call is doing, and persist it.
-fn allow(self: *Loop, call: *const Conversation.ToolCall) !void {
-    const patterns = if (try self.outsidePath(self.allocator, call)) |path| blk: {
-        const out = try self.allocator.alloc([]const u8, 1);
-        out[0] = path;
-        break :blk out;
-    } else try approvalPatterns(self.allocator, call.name, call.arguments);
-    defer freePatterns(self.allocator, patterns);
+fn allow(self: *Loop, call: *const Conversation.ToolCall, breadth: permission.Breadth) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
 
-    for (patterns) |pattern| {
+    for (try self.allowancesFor(arena_state.allocator(), call, breadth)) |pattern| {
         try self.remember(call.name, pattern);
         if (self.db) |db| {
             if (self.project_id) |project_id| {
@@ -1705,73 +1711,69 @@ fn remember(self: *Loop, name: []const u8, pattern: []const u8) !void {
     });
 }
 
-/// What an "allow always" on this call covers, as one pattern per program the
-/// command runs.
-pub fn approvalPatterns(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    arguments: []const u8,
+/// What "allow always" could store for `call`, narrowest first, each reaching
+/// further than the one before.
+pub fn proposals(self: *const Loop, arena: std.mem.Allocator, call: *const Conversation.ToolCall) ![]const Proposal {
+    var out: std.ArrayList(Proposal) = .empty;
+    for (std.enums.values(permission.Breadth)) |breadth| {
+        const patterns = try self.allowancesFor(arena, call, breadth);
+        if (out.items.len > 0 and samePatterns(out.getLast().patterns, patterns)) continue;
+        try out.append(arena, .{ .breadth = breadth, .patterns = patterns });
+    }
+    return out.items;
+}
+
+/// The allowances an "allow always" at `breadth` stores for `call`: the path
+/// of one reaching outside the project, a pattern for each command of a shell
+/// line that is neither safe nor already allowed, or `*`. A line the splitter
+/// will not vouch for is only ever allowed as written.
+fn allowancesFor(
+    self: *const Loop,
+    arena: std.mem.Allocator,
+    call: *const Conversation.ToolCall,
+    breadth: permission.Breadth,
 ) ![]const []const u8 {
-    if (!std.mem.eql(u8, name, "bash")) return onePattern(allocator, "*");
+    if (try self.outsidePath(arena, call)) |path| return onePattern(arena, path);
+    if (!std.mem.eql(u8, call.name, "bash")) return onePattern(arena, "*");
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments, .{}) catch
-        return onePattern(allocator, arguments);
-    defer parsed.deinit();
-    if (parsed.value != .object) return onePattern(allocator, arguments);
+    const command = shellCommand(arena, call.arguments);
+    const parts = try safety.segments(arena, command) orelse return onePattern(arena, command);
+    if (parts.len == 0) return onePattern(arena, command);
 
-    const command = jsonString(parsed.value.object, "command") orelse
-        return onePattern(allocator, arguments);
-    const trimmed = std.mem.trim(u8, command, " \t\r\n");
-
-    var arena_state: std.heap.ArenaAllocator = .init(allocator);
-    defer arena_state.deinit();
-
-    const programs = try shellPrograms(arena_state.allocator(), trimmed) orelse
-        return onePattern(allocator, trimmed);
-    if (programs.len == 0) return onePattern(allocator, trimmed);
-
-    if (programs.len == 1 and std.mem.eql(u8, programs[0], trimmed)) {
-        return onePattern(allocator, trimmed);
-    }
-
-    const out = try allocator.alloc([]const u8, programs.len);
-    var filled: usize = 0;
-    errdefer {
-        for (out[0..filled]) |pattern| allocator.free(pattern);
-        allocator.free(out);
-    }
-    for (programs, out) |program, *pattern| {
-        pattern.* = try std.fmt.allocPrint(allocator, "{s} *", .{program});
-        filled += 1;
-    }
-    return out;
-}
-
-pub fn freePatterns(allocator: std.mem.Allocator, patterns: []const []const u8) void {
-    for (patterns) |pattern| allocator.free(pattern);
-    allocator.free(patterns);
-}
-
-fn onePattern(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, 1);
-    errdefer allocator.free(out);
-    out[0] = try allocator.dupe(u8, pattern);
-    return out;
-}
-
-/// The distinct programs `command` runs, in the order they appear, or null when
-/// the line uses something the splitter will not vouch for.
-fn shellPrograms(arena: std.mem.Allocator, command: []const u8) !?[][]const u8 {
-    const parts = try safety.segments(arena, command) orelse return null;
-
-    var names: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList([]const u8) = .empty;
     next: for (parts) |part| {
-        for (names.items) |existing| {
-            if (std.mem.eql(u8, existing, part.program)) continue :next;
+        if (self.segmentAllowed(part)) continue;
+        const pattern = try permission.pattern(arena, part, breadth);
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, pattern)) continue :next;
         }
-        try names.append(arena, part.program);
+        try out.append(arena, pattern);
     }
-    return names.items;
+    return out.items;
+}
+
+fn onePattern(arena: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, 1);
+    out[0] = try arena.dupe(u8, pattern);
+    return out;
+}
+
+fn samePatterns(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+/// The command a `bash` call runs, trimmed, or its raw arguments when they
+/// name none.
+fn shellCommand(arena: std.mem.Allocator, arguments: []const u8) []const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments, .{}) catch
+        return std.mem.trim(u8, arguments, " \t\r\n");
+    if (parsed != .object) return std.mem.trim(u8, arguments, " \t\r\n");
+    const command = jsonString(parsed.object, "command") orelse return std.mem.trim(u8, arguments, " \t\r\n");
+    return std.mem.trim(u8, command, " \t\r\n");
 }
 
 fn jsonString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1780,13 +1782,29 @@ fn jsonString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 fn isAllowed(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    const patterns = approvalPatterns(self.allocator, call.name, call.arguments) catch return false;
-    defer freePatterns(self.allocator, patterns);
+    if (!std.mem.eql(u8, call.name, "bash")) return self.coversExactly(call.name, "*");
 
-    for (patterns) |pattern| {
-        if (!self.covers(call.name, pattern)) return false;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const command = shellCommand(arena, call.arguments);
+    const parts = (safety.segments(arena, command) catch null) orelse &.{};
+    if (parts.len == 0) return self.coversExactly("bash", command) or self.coversExactly("bash", "*");
+    for (parts) |part| {
+        if (!self.segmentAllowed(part)) return false;
     }
     return true;
+}
+
+/// Whether one command of a shell line may run: it is on the safe list, or an
+/// allowance covers it.
+fn segmentAllowed(self: *const Loop, part: safety.Segment) bool {
+    if (self.auto_approve_safe and safety.isSafeSegment(part)) return true;
+    for (self.allowed.items) |allowance| {
+        if (std.mem.eql(u8, allowance.tool, "bash") and permission.covers(allowance.pattern, part)) return true;
+    }
+    return false;
 }
 
 /// Whether an allowance names this pattern outright, ignoring `*`.
@@ -1794,18 +1812,6 @@ fn coversExactly(self: *const Loop, name: []const u8, pattern: []const u8) bool 
     for (self.allowed.items) |allowance| {
         if (!std.mem.eql(u8, allowance.tool, name)) continue;
         if (std.mem.eql(u8, allowance.pattern, pattern)) return true;
-    }
-    return false;
-}
-
-fn covers(self: *const Loop, name: []const u8, pattern: []const u8) bool {
-    for (self.allowed.items) |allowance| {
-        if (!std.mem.eql(u8, allowance.tool, name)) continue;
-        if (std.mem.eql(u8, allowance.pattern, "*")) return true;
-        if (std.mem.eql(u8, allowance.pattern, pattern)) return true;
-        if (allowance.pattern.len == pattern.len + 2 and
-            std.mem.startsWith(u8, allowance.pattern, pattern) and
-            std.mem.endsWith(u8, allowance.pattern, " *")) return true;
     }
     return false;
 }
@@ -2429,7 +2435,7 @@ test "allow always skips the prompt next time" {
 
     try loop.submit("first", .{});
     try settle(&loop);
-    try loop.decide(.always);
+    try loop.decide(.{ .always = .subcommand });
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
 
@@ -2457,7 +2463,7 @@ test "allow always covers the rest of a same-message batch" {
     try settle(&loop);
     try testing.expectEqual(State.awaiting_approval, loop.state);
 
-    try loop.decide(.always);
+    try loop.decide(.{ .always = .subcommand });
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
 
@@ -2691,63 +2697,92 @@ test "cancelling at approval or during execution leaves complete tool exchanges"
     }
 }
 
-test "an always-allow covers the programs a command runs, not every command" {
-    const allocator = testing.allocator;
+fn expectProposals(loop: *const Loop, command: []const u8, wanted: []const []const []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const expect = struct {
-        fn one(command: []const u8, wanted: []const u8) !void {
-            const arguments = try std.fmt.allocPrint(
-                testing.allocator,
-                "{{\"command\":{f}}}",
-                .{std.json.fmt(command, .{})},
-            );
-            defer testing.allocator.free(arguments);
-            try many(arguments, &.{wanted});
-        }
-
-        fn many(arguments: []const u8, wanted: []const []const u8) !void {
-            const patterns = try approvalPatterns(testing.allocator, "bash", arguments);
-            defer freePatterns(testing.allocator, patterns);
-
-            try testing.expectEqual(wanted.len, patterns.len);
-            for (wanted, patterns) |want, got| try testing.expectEqualStrings(want, got);
-        }
+    const call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "bash",
+        .arguments = try std.fmt.allocPrint(arena, "{{\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     };
+    const got = try loop.proposals(arena, &call);
+    try testing.expectEqual(wanted.len, got.len);
+    for (wanted, got) |want, proposal| {
+        try testing.expectEqual(want.len, proposal.patterns.len);
+        for (want, proposal.patterns) |pattern, actual| try testing.expectEqualStrings(pattern, actual);
+    }
+}
 
-    try expect.one("find . -type f -ls", "find *");
-    try expect.one("find src -name '*.zig'", "find *");
+test "an always-allow proposes the commands that needed asking, narrowest first" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
 
-    try expect.one("find", "find");
+    var loop = fixture.loop();
+    defer loop.deinit();
 
-    try expect.one("cd /home/adam/repo && grep -rn foo", "grep *");
-    try expect.one("cd /tmp;ls", "ls *");
+    try expectProposals(&loop, "git commit -m x", &.{
+        &.{"git commit -m x"}, &.{"git commit *"}, &.{"git *"},
+    });
+    try expectProposals(&loop, "rm -rf build", &.{
+        &.{"rm -rf build"}, &.{"rm *"},
+    });
+    try expectProposals(&loop, "cd /a && zig build test 2>&1 | tail -20; echo done", &.{
+        &.{"zig build test 2>&1"}, &.{"zig build *"}, &.{"zig *"},
+    });
+    try expectProposals(&loop, "find . | xargs rm", &.{
+        &.{"xargs rm"}, &.{"xargs *"},
+    });
+    try expectProposals(&loop, "make && make install", &.{
+        &.{ "make", "make install" }, &.{ "make", "make install *" }, &.{"make *"},
+    });
 
-    try expect.many("{\"command\":\"grep -rn foo src | head -20\"}", &.{ "grep *", "head *" });
-    try expect.many("{\"command\":\"find . | xargs rm\"}", &.{ "find *", "xargs *" });
-    try expect.many(
-        "{\"command\":\"cd /a && zig build test 2>&1 | tail -20; echo done\"}",
-        &.{ "zig *", "tail *", "echo *" },
-    );
+    try expectProposals(&loop, "grep foo > out.txt", &.{&.{"grep foo > out.txt"}});
+    try expectProposals(&loop, "echo $(rm -rf /)", &.{&.{"echo $(rm -rf /)"}});
+    try expectProposals(&loop, "VAR=x grep foo", &.{&.{"VAR=x grep foo"}});
+    try expectProposals(&loop, "cd", &.{&.{"cd"}});
 
-    try expect.one("grep \"a|b\" file", "grep *");
+    try loop.remember("bash", "xargs *");
+    try expectProposals(&loop, "find . -delete | xargs rm", &.{
+        &.{"find . -delete"}, &.{"find *"},
+    });
 
-    try expect.one("grep -rn foo src/ 2>/dev/null", "grep *");
+    loop.auto_approve_safe = false;
+    try expectProposals(&loop, "grep -rn foo src | xargs rm", &.{
+        &.{"grep -rn foo src"}, &.{"grep *"},
+    });
 
-    try expect.one("grep foo > out.txt", "grep foo > out.txt");
-    try expect.one("echo $(rm -rf /)", "echo $(rm -rf /)");
-    try expect.one("sleep 10 & rm x", "sleep 10 & rm x");
-    try expect.one("VAR=x grep foo", "VAR=x grep foo");
-
-    try expect.one("echo \"exit: $?\"", "echo *");
-
-    try expect.one("cd", "cd");
-
-    try expect.one("sudo rm -rf /", "sudo *");
-
-    const written = try approvalPatterns(allocator, "write", "{\"path\":\"src/main.zig\",\"content\":\"x\"}");
-    defer freePatterns(allocator, written);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const write: Conversation.ToolCall = .{ .id = "call_1", .name = "write", .arguments = "{\"path\":\"src/main.zig\",\"content\":\"x\"}" };
+    const written = try loop.proposals(arena_state.allocator(), &write);
     try testing.expectEqual(@as(usize, 1), written.len);
-    try testing.expectEqualStrings("*", written[0]);
+    try testing.expectEqualStrings("*", written[0].patterns[0]);
+}
+
+test "an always-allow on a subcommand does not reach its siblings" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.remember("bash", "git commit *");
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "bash",
+        .arguments = "{\"command\":\"git commit -m wip\"}",
+    };
+    try testing.expect(loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git status && git commit -m wip\"}";
+    try testing.expect(loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git push --force\"}";
+    try testing.expect(!loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git commit -m wip; git push\"}";
+    try testing.expect(!loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git commit -m $(whoami)\"}";
+    try testing.expect(!loop.isAllowed(&call));
 }
 
 test "auto-approval needs every program in a command, not just the first" {
@@ -3472,7 +3507,7 @@ test "saying always to a path outside the project runs the call" {
     try loop.submit("go", .{});
     try settle(&loop);
     try testing.expectEqual(State.awaiting_approval, loop.state);
-    try loop.decide(.always);
+    try loop.decide(.{ .always = .command });
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
     try testing.expectEqual(Conversation.ToolCall.Status.ok, firstCall(&loop).status);
@@ -4043,7 +4078,7 @@ test "saying always to a path outside the project covers that path again" {
     };
 
     try testing.expect(!loop.needsNoDecision(&call));
-    try loop.allow(&call);
+    try loop.allow(&call, .subcommand);
     try testing.expect(loop.needsNoDecision(&call));
 
     call.arguments = "{\"path\":\"/tmp/other.zig\"}";
@@ -4062,7 +4097,7 @@ test "an allowance outside the project is keyed on the resolved path" {
         .name = "read",
         .arguments = "{\"path\":\"/tmp/hooks.zig\"}",
     };
-    try loop.allow(&call);
+    try loop.allow(&call, .subcommand);
 
     call.arguments = "{\"path\":\"/tmp/nested/../hooks.zig\"}";
     try testing.expect(loop.needsNoDecision(&call));

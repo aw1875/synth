@@ -204,6 +204,8 @@ pub const Status = struct {
     pending_call: ?u32 = null,
     /// What the tool waiting on a decision does, for the person deciding.
     pending_description: []const u8 = "",
+    /// What "allow always" on that call could store, narrowest first.
+    pending_proposals: []const Loop.Proposal = &.{},
     /// What each running call last said it was doing, by index into the
     /// pending message's calls.
     notes: []const []const u8 = &.{},

@@ -769,7 +769,7 @@ fn put(self: *Agent, arena: std.mem.Allocator, session: *Session, asked: *Asked,
     const permission: protocol.RequestPermission = .{
         .sessionId = session.handle,
         .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
-        .options = &permission_options,
+        .options = try updates.permissionOptions(arena, try session.pendingProposals(arena)),
     };
     for (fresh.items) |connection| {
         asked.considered.appendAssumeCapacity(connection);
@@ -796,12 +796,6 @@ fn withdraw(self: *Agent) void {
     }
 }
 
-const permission_options = [_]protocol.PermissionOption{
-    .{ .optionId = "once", .name = "Allow once", .kind = .allow_once },
-    .{ .optionId = "always", .name = "Always allow", .kind = .allow_always },
-    .{ .optionId = "deny", .name = "Deny", .kind = .reject_once },
-};
-
 const declined = "The user chose not to answer.";
 const unanswerable = "No one connected can answer questions. Decide for yourself, and say what you assumed.";
 
@@ -826,7 +820,7 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
         return;
     }
     const chosen = protocol.chosenOption(message.result) orelse return;
-    const decision = std.meta.stringToEnum(Loop.Decision, chosen) orelse return;
+    const decision = updates.decisionOf(chosen) orelse return;
     _ = asked.requests.swapRemove(index);
     self.withdraw();
     loop.decide(decision) catch |err| self.noticeFmt(.warning, "Could not decide: {s}", .{@errorName(err)});
@@ -2063,6 +2057,7 @@ const Session = struct {
             .pending_seq = loop.pending_seq,
             .pending_call = if (pending_call) |index| @intCast(index) else null,
             .pending_description = self.pendingDescription(),
+            .pending_proposals = try self.pendingProposals(arena),
             .notes = notes,
             .steering = steering,
             .outcome = loop.outcome,
@@ -2081,6 +2076,13 @@ const Session = struct {
         const waiting = self.pendingTool() orelse return "";
         const definition = self.stack.registry.get(waiting.name) orelse return "";
         return definition.description;
+    }
+
+    fn pendingProposals(self: *Session, arena: std.mem.Allocator) ![]const Loop.Proposal {
+        const loop = &self.stack.loop;
+        if (loop.state != .awaiting_approval) return &.{};
+        const call = loop.pendingCall() orelse return &.{};
+        return loop.proposals(arena, call);
     }
 
     fn pendingTool(self: *Session) ?*const Conversation.ToolCall {
@@ -2452,6 +2454,14 @@ pub const Script = struct {
                 .id = try allocator.dupe(u8, "call-1"),
                 .name = try allocator.dupe(u8, "bash"),
                 .arguments = try allocator.dupe(u8, "{\"command\":\"touch made\"}"),
+            };
+            return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
+        }
+        if (last != null and std.mem.startsWith(u8, last.?.text, "run: ")) {
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call-1"),
+                .name = try allocator.dupe(u8, "bash"),
+                .arguments = try std.fmt.allocPrint(allocator, "{{\"command\":\"{s}\"}}", .{last.?.text["run: ".len..]}),
             };
             return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
         }

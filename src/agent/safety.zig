@@ -20,6 +20,8 @@ pub const Verdict = enum { safe, ask };
 pub const Segment = struct {
     /// The program, without the directory it was invoked through.
     program: []const u8,
+    /// The program as written, directory included.
+    invoked: []const u8 = "",
     /// Everything after it, as written.
     arguments: []const u8,
 };
@@ -130,7 +132,8 @@ pub fn verdict(arena: std.mem.Allocator, command: []const u8) Verdict {
     return .safe;
 }
 
-fn isSafeSegment(part: Segment) bool {
+/// Whether one command of a line may run without asking.
+pub fn isSafeSegment(part: Segment) bool {
     const rule = ruleFor(part.program) orelse return false;
 
     var seen_subcommand = false;
@@ -197,15 +200,15 @@ fn unquote(argument: []const u8) []const u8 {
 }
 
 /// Split a segment's arguments on whitespace, keeping quoted runs whole.
-fn arguments(text: []const u8) ArgumentIterator {
+pub fn arguments(text: []const u8) ArgumentIterator {
     return .{ .text = text };
 }
 
-const ArgumentIterator = struct {
+pub const ArgumentIterator = struct {
     text: []const u8,
     at: usize = 0,
 
-    fn next(self: *ArgumentIterator) ?[]const u8 {
+    pub fn next(self: *ArgumentIterator) ?[]const u8 {
         while (self.at < self.text.len and isSpace(self.text[self.at])) self.at += 1;
         if (self.at >= self.text.len) return null;
 
@@ -283,7 +286,7 @@ fn append(arena: std.mem.Allocator, found: *std.ArrayList(Segment), segment: []c
     const base = if (slash) |at| first[at + 1 ..] else first;
     if (base.len == 0) return false;
 
-    try found.append(arena, .{ .program = base, .arguments = trimmed[end..] });
+    try found.append(arena, .{ .program = base, .invoked = first, .arguments = trimmed[end..] });
     return true;
 }
 
