@@ -1780,12 +1780,20 @@ fn mayReachOutside(self: *const Loop, call: *const Conversation.ToolCall) bool {
 /// read-only tool. Anything unparseable counts as escaping, so a malformed
 /// argument is asked about rather than waved through.
 fn escapesProject(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    const outside = self.outsidePath(self.allocator, call) catch return false;
+    if (call.arguments.len > 0 and !isObject(self.allocator, call.arguments)) return true;
+    const outside = self.outsidePath(self.allocator, call) catch return true;
     if (outside) |path| {
         self.allocator.free(path);
         return true;
     }
     return false;
+}
+
+fn isObject(allocator: std.mem.Allocator, text: []const u8) bool {
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), text, .{}) catch return false;
+    return parsed == .object;
 }
 
 /// The path this call names that lies outside the project, resolved so that an
@@ -3333,6 +3341,20 @@ test "a link inside the project that points out does not make an edit through it
     try settle(&loop);
     try testing.expectEqual(@as(usize, 4), fixture.fake.judged);
     try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "missing.md", .{}));
+}
+
+test "auto mode judges an edit whose arguments cannot be read" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"notes.md\",";
+    try loop.submit("write a note", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
 }
 
 test "auto mode's block is a considered one, and goes back to the model" {
