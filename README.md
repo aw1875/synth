@@ -157,8 +157,11 @@ once.
 decisions to the session's own model instead. Reads, the safe commands, narrow
 allowances and edits inside the project run as before; everything else is
 judged first, by a model shown only what you asked for and the calls the agent
-has made - not what the agent said, and not what any tool returned, so text
-planted in a file cannot talk it round. It blocks what looks destructive,
+has made - not what the agent said, and not what any tool returned. Text
+planted in a file reaches it only inside a call's arguments (a heredoc, a file
+being written), fenced off as data it is told not to follow. The safe commands
+skip it as they skip the prompt, wherever they point: `cat ~/.ssh/id_rsa` runs
+unjudged unless `auto_approve_safe_commands` is off. It blocks what looks destructive,
 reaches outside the project, sends data out, touches credentials, or goes past
 the task, and a block reaches the agent as a refused call with the reason.
 Allowances that would run anything (`python3 *`, `npm run *`) are set aside
