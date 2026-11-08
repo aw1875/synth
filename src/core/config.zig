@@ -481,7 +481,7 @@ test "the bell setting is read from the file" {
     try testing.expectEqual(Bell.always, config.bell);
 }
 
-test "approvals are read from the file, and the old switch still means all" {
+test "approvals are read from the file" {
     const testing = std.testing;
     const io = testing.io;
 
