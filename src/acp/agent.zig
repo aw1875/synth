@@ -396,6 +396,14 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.search)) {
         const asked = try rpc.parse(synth.Search, arena, params);
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
+    } else if (eql(u8, method, m.checkpoints)) {
+        return connection.reply(id, try session.checkpoints(arena));
+    } else if (eql(u8, method, m.rewind)) {
+        const asked = try rpc.parse(synth.Rewind, arena, params);
+        const files = try session.stack.loop.rewind(arena, asked.seq, asked.apply);
+        for (files) |*file| file.path = projectRelative(session.stack.loop.project_root, file.path);
+        if (asked.apply and files.len > 0) self.noticeFmt(.info, "Put back {d} file{s} as before that prompt", .{ files.len, if (files.len == 1) "" else "s" });
+        return connection.reply(id, files);
     } else if (eql(u8, method, m.approvals)) {
         return connection.reply(id, try session.allowances(arena));
     } else if (eql(u8, method, m.set_approvals)) {
@@ -886,6 +894,15 @@ fn isoTime(arena: std.mem.Allocator, ms: i64) ![]const u8 {
 }
 
 /// Why a request failed, for the person who made it.
+/// The first line of `text`, cut short enough to fit a row.
+fn firstLine(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const line = trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len];
+    var end = @min(line.len, 200);
+    while (end < line.len and end > 0 and line[end] & 0xC0 == 0x80) end -= 1;
+    return line[0..end];
+}
+
 fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.UnknownSession => "no such session",
@@ -2304,6 +2321,17 @@ const Session = struct {
             .providers => |providers| providers.offered(arena, db, provider),
             .provider => Providers.offeredBy(arena, db, "", provider.name, provider),
         };
+    }
+
+    fn checkpoints(self: *Session, arena: std.mem.Allocator) ![]const synth.Checkpoint {
+        const turns = try self.stack.loop.checkpointTurns(arena);
+        const out = try arena.alloc(synth.Checkpoint, turns.len);
+        for (turns, 0..) |turn, i| out[turns.len - 1 - i] = .{
+            .seq = turn.seq,
+            .prompt = firstLine(turn.prompt),
+            .files = turn.files,
+        };
+        return out;
     }
 
     fn allowances(self: *Session, arena: std.mem.Allocator) ![]const synth.Allowance {

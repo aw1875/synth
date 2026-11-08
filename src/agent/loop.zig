@@ -138,6 +138,12 @@ project_id: ?i64 = null,
 /// The session's name, owned. Null until one is given.
 session_title: ?[]const u8 = null,
 session_id: ?i64 = null,
+/// The loop whose turns this one's file changes are undone with: a subagent's
+/// parent. Null for a loop that keeps its own.
+checkpoint_owner: ?*Loop = null,
+/// Files the running batch checkpointed, to record what it left in them once
+/// it settles. Owned.
+checkpointed: std.ArrayList([]u8) = .empty,
 /// The cwd and model for the session row, held until the session is actually
 /// created on the first message. A session is not created just for opening the
 /// app.
@@ -603,6 +609,8 @@ pub fn deinit(self: *Loop) void {
         self.allocator.free(allowance.pattern);
     }
     self.allowed.deinit(self.allocator);
+    for (self.checkpointed.items) |path| self.allocator.free(path);
+    self.checkpointed.deinit(self.allocator);
     self.message_ids.deinit(self.allocator);
 }
 
@@ -1152,6 +1160,7 @@ fn pollCancelled(self: *Loop) !bool {
         defer tools.destroy();
         try self.adoptSettled(tools);
         try self.persistReads();
+        self.sealCheckpoints();
     }
     self.clearNotes();
 
@@ -2010,6 +2019,122 @@ fn persistReads(self: *Loop) !void {
     }
 }
 
+/// Largest file a checkpoint keeps. Past this a turn's change to it cannot be
+/// undone, which beats copying a huge file on every edit.
+const max_checkpoint_bytes = 8 * 1024 * 1024;
+
+/// Keep what every file a `write` or `edit` in `batch` is about to change
+/// holds now, under the prompt that began the turn, so the turn can be undone.
+fn checkpointBatch(self: *Loop, batch: []const ToolRun.Call) !void {
+    const owner = self.checkpoint_owner orelse self;
+    const db = owner.db orelse return;
+    const seq = owner.turn_start_seq orelse return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (batch) |call| {
+        if (!std.mem.eql(u8, call.name, "write") and !std.mem.eql(u8, call.name, "edit")) continue;
+        const path = self.changedPath(arena, call.arguments) orelse continue;
+        const content = readCheckpointed(self.io, arena, path) catch continue;
+        try db.saveCheckpoint(try owner.ensureSession(), seq, path, content);
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.checkpointed.append(self.allocator, owned);
+    }
+}
+
+/// Record what the batch left in each file it checkpointed, so a rewind can
+/// tell when someone changed one since.
+fn sealCheckpoints(self: *Loop) void {
+    defer {
+        for (self.checkpointed.items) |path| self.allocator.free(path);
+        self.checkpointed.clearRetainingCapacity();
+    }
+    const owner = self.checkpoint_owner orelse self;
+    const db = owner.db orelse return;
+    const seq = owner.turn_start_seq orelse return;
+    const session_id = owner.session_id orelse return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    for (self.checkpointed.items) |path| {
+        const content = (readCheckpointed(self.io, arena_state.allocator(), path) catch continue) orelse continue;
+        db.sealCheckpoint(session_id, seq, path, std.hash.Wyhash.hash(0, content)) catch |err| {
+            self.say("Could not checkpoint {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
+}
+
+/// The absolute path a file-changing call names, or null when it names none.
+fn changedPath(self: *const Loop, arena: std.mem.Allocator, arguments: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments, .{}) catch return null;
+    if (parsed != .object) return null;
+    const path = jsonString(parsed.object, "path") orelse return null;
+    if (path.len == 0) return null;
+    return self.resolveAgainstProject(arena, path);
+}
+
+/// What `path` holds, or null when it does not exist.
+fn readCheckpointed(io: std.Io, arena: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_checkpoint_bytes)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+/// A file a rewind puts back.
+pub const Rewound = struct {
+    path: []const u8,
+    /// It did not exist before, so going back removes it.
+    removed: bool,
+    /// Something other than synth's tools changed it after they did, and
+    /// putting it back loses that.
+    changed: bool,
+};
+
+/// The session's turns that changed files, oldest first. Allocated in
+/// `arena`.
+pub fn checkpointTurns(self: *Loop, arena: std.mem.Allocator) ![]Database.CheckpointTurn {
+    const db = self.db orelse return &.{};
+    const session_id = self.session_id orelse return &.{};
+    return db.checkpointTurns(session_id, arena);
+}
+
+/// Put every file the turns from `seq` on changed back the way it was before
+/// them, or with `apply` false, only say what that would do. Allocated in
+/// `arena`.
+pub fn rewind(self: *Loop, arena: std.mem.Allocator, seq: u64, apply: bool) ![]Rewound {
+    if (apply and self.isBusy()) return error.Busy;
+    const db = self.db orelse return &.{};
+    const session_id = self.session_id orelse return &.{};
+
+    const restores = try db.checkpointsFrom(session_id, seq, arena);
+    const out = try arena.alloc(Rewound, restores.len);
+    for (restores, out) |restore, *rewound| {
+        const current = readCheckpointed(self.io, arena, restore.path) catch null;
+        const changed = if (restore.after_hash) |hash|
+            current == null or std.hash.Wyhash.hash(0, current.?) != hash
+        else
+            false;
+        rewound.* = .{ .path = restore.path, .removed = restore.content == null, .changed = changed };
+        if (!apply) continue;
+
+        if (restore.content) |content| {
+            if (std.fs.path.dirname(restore.path)) |parent| std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
+            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = restore.path, .data = content });
+        } else {
+            std.Io.Dir.cwd().deleteFile(self.io, restore.path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+    if (apply) try db.dropCheckpointsFrom(session_id, seq);
+    return out;
+}
+
 /// Hand every approved call to a worker. Denials skip straight to their result.
 fn runApproved(self: *Loop) !void {
     const message_index = self.pendingIndex() orelse return;
@@ -2043,6 +2168,7 @@ fn runApproved(self: *Loop) !void {
         return;
     }
 
+    self.checkpointBatch(batch.items) catch |err| self.say("Could not checkpoint the files this changes: {s}", .{@errorName(err)});
     self.tools_adopted = 0;
     self.tools = try ToolRun.start(
         self.allocator,
@@ -2146,6 +2272,7 @@ fn pollTools(self: *Loop) !bool {
     self.clearNotes();
 
     try self.persistReads();
+    self.sealCheckpoints();
 
     try self.finishToolMessages();
     return true;
@@ -2931,6 +3058,63 @@ test "a subagent transcript is stored as a session of its own" {
     const child = try db.subagentSession(call_row) orelse return error.NoSubagentSession;
     try testing.expect(child != parent);
     try testing.expectEqual(@as(u64, 2), try db.countMessages(child));
+}
+
+test "a turn's file changes are kept, and undone back to the prompt that made them" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "one" });
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"a.txt\",\"content\":\"two\"}";
+    try loop.submit("change a", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    fixture.fake.tool_arguments = "{\"path\":\"sub/b.txt\",\"content\":\"new\"}";
+    try loop.submit("make b", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    fixture.fake.tool_arguments = "{\"path\":\"a.txt\",\"content\":\"three\"}";
+    try loop.submit("change a again", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const turns = try loop.checkpointTurns(arena);
+    try testing.expectEqual(@as(usize, 3), turns.len);
+    try testing.expectEqualStrings("make b", turns[1].prompt);
+    try testing.expectEqual(@as(u32, 1), turns[1].files);
+
+    const later = try loop.rewind(arena, turns[1].seq, false);
+    try testing.expectEqual(@as(usize, 2), later.len);
+    try testing.expect(std.mem.endsWith(u8, later[0].path, "a.txt"));
+    try testing.expect(!later[0].removed and !later[0].changed);
+    try testing.expect(std.mem.endsWith(u8, later[1].path, "b.txt"));
+    try testing.expect(later[1].removed);
+
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "by hand" });
+    const preview = try loop.rewind(arena, turns[0].seq, false);
+    try testing.expect(preview[0].changed);
+    try testing.expectEqualStrings("by hand", try fixture.tmp.dir.readFileAlloc(testing.io, "a.txt", arena, .unlimited));
+
+    _ = try loop.rewind(arena, turns[0].seq, true);
+    try testing.expectEqualStrings("one", try fixture.tmp.dir.readFileAlloc(testing.io, "a.txt", arena, .unlimited));
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "sub/b.txt", .{}));
+    try testing.expectEqual(@as(usize, 0), (try loop.checkpointTurns(arena)).len);
 }
 
 test "a session comes back in the mode it was left in" {

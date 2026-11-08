@@ -776,6 +776,90 @@ pub fn rememberEffort(self: *Database, allocator: std.mem.Allocator, provider_id
     try self.setSetting(key, level);
 }
 
+/// Keep what `path` held before the turn that began at `seq` first changed it.
+/// Null `content` says it did not exist. Only the first call for a file in a
+/// turn is kept: that is the state the turn started from.
+pub fn saveCheckpoint(self: *Database, session_id: i64, seq: u64, path: []const u8, content: ?[]const u8) !void {
+    const sql =
+        \\INSERT INTO checkpoint (session_id, seq, path, content) VALUES (?, ?, ?, ?)
+        \\ON CONFLICT(session_id, seq, path) DO NOTHING
+    ;
+    if (content) |bytes| {
+        try self.conn.exec(sql, .{ session_id, @as(i64, @intCast(seq)), path, zqlite.blob(bytes) });
+    } else {
+        try self.conn.exec(sql, .{ session_id, @as(i64, @intCast(seq)), path, null });
+    }
+}
+
+/// Record what the turn's tools left `path` holding, by hash.
+pub fn sealCheckpoint(self: *Database, session_id: i64, seq: u64, path: []const u8, after_hash: u64) !void {
+    try self.conn.exec(
+        "UPDATE checkpoint SET after_hash = ? WHERE session_id = ? AND seq = ? AND path = ?",
+        .{ @as(i64, @bitCast(after_hash)), session_id, @as(i64, @intCast(seq)), path },
+    );
+}
+
+/// A turn that changed files: the prompt that began it, and how many files.
+pub const CheckpointTurn = struct { seq: u64, prompt: []const u8, files: u32 };
+
+/// The session's turns that changed files, oldest first. Allocated in `arena`.
+pub fn checkpointTurns(self: *Database, session_id: i64, arena: std.mem.Allocator) ![]CheckpointTurn {
+    var rows = try self.conn.rows(
+        \\SELECT c.seq, COALESCE(m.text, ''), COUNT(*) FROM checkpoint c
+        \\LEFT JOIN message m ON m.session_id = c.session_id AND m.seq = c.seq
+        \\WHERE c.session_id = ? GROUP BY c.seq ORDER BY c.seq
+    , .{session_id});
+    defer rows.deinit();
+    var out: std.ArrayList(CheckpointTurn) = .empty;
+    while (rows.next()) |row| try out.append(arena, .{
+        .seq = @intCast(row.int(0)),
+        .prompt = try arena.dupe(u8, row.text(1)),
+        .files = @intCast(row.int(2)),
+    });
+    return out.items;
+}
+
+/// A file as it stood before the turns from some seq on changed it.
+pub const Restore = struct {
+    path: []const u8,
+    /// Null where the file did not exist.
+    content: ?[]const u8,
+    /// What the last of those turns left in it, when that is known.
+    after_hash: ?u64,
+};
+
+/// Every file the turns from `seq` on changed, as it stood before the first of
+/// them did. Allocated in `arena`.
+pub fn checkpointsFrom(self: *Database, session_id: i64, seq: u64, arena: std.mem.Allocator) ![]Restore {
+    var rows = try self.conn.rows(
+        \\SELECT c.path, c.content,
+        \\  (SELECT later.after_hash FROM checkpoint later
+        \\   WHERE later.session_id = c.session_id AND later.path = c.path
+        \\   ORDER BY later.seq DESC LIMIT 1)
+        \\FROM checkpoint c
+        \\WHERE c.session_id = ? AND c.seq = (
+        \\  SELECT MIN(first.seq) FROM checkpoint first
+        \\  WHERE first.session_id = c.session_id AND first.path = c.path AND first.seq >= ?)
+        \\ORDER BY c.path
+    , .{ session_id, @as(i64, @intCast(seq)) });
+    defer rows.deinit();
+    var out: std.ArrayList(Restore) = .empty;
+    while (rows.next()) |row| try out.append(arena, .{
+        .path = try arena.dupe(u8, row.text(0)),
+        .content = if (row.nullableBlob(1)) |bytes| try arena.dupe(u8, bytes) else null,
+        .after_hash = if (row.nullableInt(2)) |hash| @bitCast(hash) else null,
+    });
+    return out.items;
+}
+
+/// Forget the checkpoints of the turns from `seq` on, once they are undone.
+pub fn dropCheckpointsFrom(self: *Database, session_id: i64, seq: u64) !void {
+    try self.conn.exec(
+        "DELETE FROM checkpoint WHERE session_id = ? AND seq >= ?",
+        .{ session_id, @as(i64, @intCast(seq)) },
+    );
+}
+
 /// Remember an "always allow" approval, scoped to the project.
 pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
     try self.conn.exec(
@@ -1206,6 +1290,14 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
             out.bytes_freed += @intCast(row.int(1));
         }
         if (apply) try self.conn.exec("DELETE " ++ scope, .{cutoff});
+
+        const checkpoints = "FROM checkpoint WHERE session_id IN (SELECT id FROM session WHERE updated_at < ?)";
+        if (try self.conn.row("SELECT count(*), coalesce(sum(length(content)), 0) " ++ checkpoints, .{cutoff})) |row| {
+            defer row.deinit();
+            out.blobs_dropped += @intCast(row.int(0));
+            out.bytes_freed += @intCast(row.int(1));
+        }
+        if (apply) try self.conn.exec("DELETE " ++ checkpoints, .{cutoff});
     }
 
     return out;
@@ -1228,7 +1320,9 @@ fn sessionPayload(self: *Database, cutoff: i64) !u64 {
         \\+ (SELECT coalesce(sum(length(t.result)), 0) FROM tool_call t
         \\     JOIN message m ON t.message_id = m.id
         \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
-    , .{ cutoff, cutoff, cutoff }) orelse return 0;
+        \\+ (SELECT coalesce(sum(length(c.content)), 0) FROM checkpoint c
+        \\     JOIN session s ON c.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
+    , .{ cutoff, cutoff, cutoff, cutoff }) orelse return 0;
     defer row.deinit();
     return @intCast(row.int(0));
 }
@@ -1534,6 +1628,23 @@ test "shedding drops stored payloads but keeps the transcript" {
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM message"));
     try testing.expectEqual(@as(i64, 4), try countOf(&db, "SELECT count(*) FROM blob"));
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM tool_call"));
+}
+
+test "shedding drops the file checkpoints of old sessions" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{ 1, 100 });
+    defer db.deinit();
+    try db.saveCheckpoint(1, 0, "/repo/a.txt", "what a.txt held");
+    try db.saveCheckpoint(2, 0, "/repo/b.txt", "what b.txt held");
+    try db.saveCheckpoint(2, 0, "/repo/new.txt", null);
+
+    const done = try db.prune(.{ .shed_after_days = 30 }, db.nowMs());
+    try testing.expectEqual(@as(u64, 2 + 2), done.blobs_dropped);
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM checkpoint"));
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT session_id FROM checkpoint"));
 }
 
 test "shedding keeps a pasted image however old the session is" {

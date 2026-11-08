@@ -57,6 +57,12 @@ pub const method = struct {
     /// Drop and add standing allowances. Answered with `[]Allowance`, as they
     /// then stand.
     pub const set_approvals = "_synth/set_approvals";
+    /// The turns whose changes to files can be undone, newest first. Answered
+    /// with `[]Checkpoint`.
+    pub const checkpoints = "_synth/checkpoints";
+    /// Put back every file the turns from `seq` on changed, or with `apply`
+    /// false, only say which. Answered with `[]Loop.Rewound`.
+    pub const rewind = "_synth/rewind";
     /// Check the session can be attached to again over its socket, once
     /// this client has gone without leaving.
     pub const detach = "_synth/detach";
@@ -355,6 +361,16 @@ pub const Allowance = struct {
     tool: []const u8,
     pattern: []const u8,
 };
+
+/// A turn whose changes to files can be undone: the prompt that began it, by
+/// the agent's `seq`, and how many files it changed.
+pub const Checkpoint = struct {
+    seq: u64,
+    prompt: []const u8,
+    files: u32,
+};
+
+pub const Rewind = struct { sessionId: []const u8, seq: u64, apply: bool = false };
 
 pub const SetApprovals = struct {
     sessionId: []const u8,

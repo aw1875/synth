@@ -116,6 +116,9 @@ const Awaited = union(enum) {
     files,
     providers,
     approvals,
+    checkpoints,
+    /// A rewind from the agent's `seq`, done or only asked about.
+    rewind: struct { seq: u64, apply: bool },
     /// The call whose subagent, by the TUI's own numbering.
     subagent: struct { seq: u64, call: u32 },
     detach,
@@ -133,6 +136,12 @@ pub const Answer = union(enum) {
     providers: struct { arena: std.heap.ArenaAllocator, states: []const synth.ProviderState },
     /// The project's standing allowances, in an arena of their own.
     approvals: struct { arena: std.heap.ArenaAllocator, allowances: []const synth.Allowance },
+    /// The turns whose file changes can be undone, newest first, in an arena
+    /// of their own.
+    checkpoints: struct { arena: std.heap.ArenaAllocator, turns: []const synth.Checkpoint },
+    /// What a rewind put back, or with `applied` false would, in an arena of
+    /// their own.
+    rewound: struct { arena: std.heap.ArenaAllocator, seq: u64, applied: bool, files: []const Loop.Rewound },
     /// The project's files, for `@` mentions.
     files: [][]const u8,
     /// The models the agent's provider offers, in an arena of their own.
@@ -161,6 +170,14 @@ pub const Answer = union(enum) {
             },
             .approvals => |standing| {
                 var arena = standing.arena;
+                arena.deinit();
+            },
+            .checkpoints => |listed| {
+                var arena = listed.arena;
+                arena.deinit();
+            },
+            .rewound => |rewound| {
+                var arena = rewound.arena;
                 arena.deinit();
             },
             .subagent => |transcript| {
@@ -811,6 +828,8 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             .files => "listing the files",
             .providers => "listing the providers",
             .approvals => "changing the allowances",
+            .checkpoints => "listing the checkpoints",
+            .rewind => "putting the files back",
             .subagent => "loading the subagent's transcript",
             .detach => "Detaching",
         };
@@ -910,6 +929,20 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             errdefer kept.deinit();
             const allowances = try rpc.parse([]const synth.Allowance, kept.allocator(), result);
             self.answers.appendAssumeCapacity(.{ .approvals = .{ .arena = kept, .allowances = allowances } });
+        },
+        .checkpoints => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const turns = try rpc.parse([]const synth.Checkpoint, kept.allocator(), result);
+            self.answers.appendAssumeCapacity(.{ .checkpoints = .{ .arena = kept, .turns = turns } });
+        },
+        .rewind => |asked| {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const files = try rpc.parse([]const Loop.Rewound, kept.allocator(), result);
+            self.answers.appendAssumeCapacity(.{ .rewound = .{ .arena = kept, .seq = asked.seq, .applied = asked.apply, .files = files } });
         },
         .files => {
             const paths = try rpc.parse([]const []const u8, arena, result);
@@ -1205,6 +1238,17 @@ pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8, provid
 /// Ask what providers the agent knows. They land on a later poll.
 pub fn listProviders(self: *Mirror) !void {
     try self.send(synth.method.providers, protocol.SessionId{ .sessionId = self.status.handle }, .providers);
+}
+
+/// Ask which turns' file changes can be undone. They land on a later poll.
+pub fn listCheckpoints(self: *Mirror) !void {
+    try self.send(synth.method.checkpoints, protocol.SessionId{ .sessionId = self.status.handle }, .checkpoints);
+}
+
+/// Put back every file the turns from the agent's `seq` on changed, or with
+/// `confirmed` false, ask what that would do. The answer lands on a later poll.
+pub fn rewind(self: *Mirror, seq: u64, confirmed: bool) !void {
+    try self.send(synth.method.rewind, synth.Rewind{ .sessionId = self.status.handle, .seq = seq, .apply = confirmed }, .{ .rewind = .{ .seq = seq, .apply = confirmed } });
 }
 
 /// Ask for the project's standing allowances. They land on a later poll.
@@ -1568,6 +1612,47 @@ test "allowances changed here, or in another process on the project, hold from t
     try mirror.setApprovals(&.{}, &.{.{ .tool = "nonsense", .pattern = "x" }});
     try mirror.listApprovals();
     try expectAllowances(mirror, &.{ "git log *", "git stash *" });
+}
+
+test "a turn's file changes are listed and put back from here" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    const note = try std.fs.path.join(testing.allocator, &.{ fixture.project, "note.txt" });
+    defer testing.allocator.free(note);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = note, .data = "before" });
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.once);
+    try pollUntil(mirror, finishedOne);
+
+    try mirror.listCheckpoints();
+    const listed = try pollForAnswer(mirror);
+    defer listed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), listed.checkpoints.turns.len);
+    const turn = listed.checkpoints.turns[0];
+    try testing.expectEqualStrings("make a note", turn.prompt);
+    try testing.expectEqual(@as(u32, 1), turn.files);
+
+    try mirror.rewind(turn.seq, false);
+    const asked = try pollForAnswer(mirror);
+    defer asked.deinit(testing.allocator);
+    try testing.expect(!asked.rewound.applied);
+    try testing.expectEqual(@as(usize, 1), asked.rewound.files.len);
+    try testing.expectEqualStrings("note.txt", asked.rewound.files[0].path);
+
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("acp", try std.Io.Dir.cwd().readFile(testing.io, note, &buffer));
+    try mirror.rewind(turn.seq, true);
+    const done = try pollForAnswer(mirror);
+    defer done.deinit(testing.allocator);
+    try testing.expect(done.rewound.applied);
+    try testing.expectEqualStrings("before", try std.Io.Dir.cwd().readFile(testing.io, note, &buffer));
 }
 
 test "a cancelled turn takes its question back from the mirror" {

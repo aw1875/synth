@@ -41,6 +41,7 @@ const ThemePicker = @import("theme_picker.zig");
 const EffortPicker = @import("effort_picker.zig");
 const McpPicker = @import("mcp_picker.zig");
 const PermissionPicker = @import("permission_picker.zig");
+const RewindPicker = @import("rewind_picker.zig");
 const agents = @import("../agent/agent.zig");
 const themes = @import("themes.zig");
 const ThoughtView = @import("thought_view.zig");
@@ -219,6 +220,7 @@ theme_picker: ThemePicker = undefined,
 effort_picker: EffortPicker = undefined,
 mcp_picker: McpPicker = undefined,
 permission_picker: PermissionPicker = undefined,
+rewind_picker: RewindPicker = undefined,
 /// The toast in the top-right corner.
 notification: Notification = undefined,
 /// The `/` command picker, open while one is being typed.
@@ -544,6 +546,7 @@ pub fn deinit(self: *Model) void {
     self.effort_picker.deinit();
     self.mcp_picker.deinit();
     self.permission_picker.deinit();
+    self.rewind_picker.deinit();
     self.block_heights.deinit(self.allocator);
     self.notification.deinit();
     self.slash.deinit();
@@ -574,6 +577,7 @@ pub fn wire(self: *Model) !void {
     self.effort_picker = .init(self.allocator);
     self.mcp_picker = .init(self.allocator);
     self.permission_picker = .init(self.allocator);
+    self.rewind_picker = .init(self.allocator);
     self.notification = .init(self.allocator, self.io);
     self.slash = .init(self.allocator);
     self.selection = .init(self.allocator);

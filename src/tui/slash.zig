@@ -53,6 +53,7 @@ pub const commands: []const Command = &.{
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = "[name]" },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
+    .{ .name = "rewind", .description = "put back files as they were before an earlier prompt" },
     .{ .name = "permissions", .description = "see, edit and remove what is always allowed here" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = "[name]" },

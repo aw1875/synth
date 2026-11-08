@@ -93,6 +93,11 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
+    if (std.mem.eql(u8, line, "/rewind")) {
+        self.rewind_picker.requested = true;
+        try self.mirror.listCheckpoints();
+        return true;
+    }
     if (std.mem.eql(u8, line, "/permissions")) {
         self.permission_picker.requested = true;
         try self.mirror.listApprovals();
@@ -218,6 +223,26 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             try self.models.show(entries, offer.models.recent, self.mirror.status.model);
         },
         .subagent => |transcript| try self.receiveSubagent(transcript.seq, transcript.call, transcript.live, transcript.messages),
+        .checkpoints => |listed| {
+            defer answer.deinit(self.allocator);
+            if (!self.rewind_picker.requested) return;
+            if (listed.turns.len == 0) {
+                self.rewind_picker.requested = false;
+                try self.notification.show(ctx, .info, "No turn has changed a file yet");
+            } else {
+                try self.rewind_picker.show(listed.turns);
+            }
+            ctx.redraw = true;
+        },
+        .rewound => |rewound| {
+            defer answer.deinit(self.allocator);
+            if (rewound.applied) {
+                self.rewind_picker.close();
+            } else {
+                try self.rewind_picker.preview(rewound.seq, rewound.files);
+            }
+            ctx.redraw = true;
+        },
         .approvals => |standing| {
             defer answer.deinit(self.allocator);
             try self.permission_picker.receive(standing.allowances);

@@ -272,6 +272,16 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (self.rewind_picker.isOpen()) {
+                switch (self.rewind_picker.handleKey(key)) {
+                    .none => {},
+                    .cancel => self.rewind_picker.close(),
+                    .preview => |seq| try self.mirror.rewind(seq, false),
+                    .rewind => |seq| try self.mirror.rewind(seq, true),
+                }
+                return ctx.consumeAndRedraw();
+            }
+
             if (self.permission_picker.isOpen()) {
                 switch (try self.permission_picker.handleKey(ctx, key)) {
                     .none => {},
