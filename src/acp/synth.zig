@@ -18,7 +18,7 @@ const Config = @import("../core/config.zig");
 const Loop = @import("../agent/loop.zig");
 
 /// Bumped only on a breaking change to this extension.
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 /// What a client puts under `_meta.synth` on `initialize` to be sent this
 /// extension, and what the agent answers with.
