@@ -13,6 +13,7 @@ const synth = @import("synth.zig");
 const updates = @import("updates.zig");
 const Connection = @import("connection.zig");
 const sockets = @import("sockets.zig");
+const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const skill = @import("../core/skill.zig");
@@ -1220,6 +1221,11 @@ pub fn runSkill(self: *Mirror, line: []const u8) !void {
     try self.submit(line, .{});
 }
 
+/// Hand decisions on calls to `mode`. The status says when it took.
+pub fn setApprovalMode(self: *Mirror, mode: Config.Approvals) !void {
+    try self.send(synth.method.set_approval_mode, synth.SetApprovalMode{ .sessionId = self.status.handle, .mode = mode }, .{ .command = "Changing approvals" });
+}
+
 pub fn useAgent(self: *Mirror, id: []const u8) !void {
     try self.send(protocol.method.session_set_mode, protocol.SetMode{ .sessionId = self.status.handle, .modeId = id }, .{ .command = "Switching mode" });
 }
@@ -1653,6 +1659,27 @@ test "a turn's file changes are listed and put back from here" {
     defer done.deinit(testing.allocator);
     try testing.expect(done.rewound.applied);
     try testing.expectEqualStrings("before", try std.Io.Dir.cwd().readFile(testing.io, note, &buffer));
+}
+
+fn approvingAll(mirror: *Mirror) bool {
+    return mirror.status.approval_mode == .all;
+}
+
+test "a mirror hands decisions over, and a call then runs without asking" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try testing.expectEqual(Config.Approvals.ask, mirror.status.approval_mode);
+    try mirror.setApprovalMode(.all);
+    try pollUntil(mirror, approvingAll);
+
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, finishedOne);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, convo.messages.items[1].tool_calls[0].status);
 }
 
 test "a cancelled turn takes its question back from the mirror" {

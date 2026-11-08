@@ -396,6 +396,10 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.search)) {
         const asked = try rpc.parse(synth.Search, arena, params);
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
+    } else if (eql(u8, method, m.set_approval_mode)) {
+        const asked = try rpc.parse(synth.SetApprovalMode, arena, params);
+        session.stack.loop.setApprovals(asked.mode);
+        try session.publish(arena, true);
     } else if (eql(u8, method, m.checkpoints)) {
         return connection.reply(id, try session.checkpoints(arena));
     } else if (eql(u8, method, m.rewind)) {
@@ -2084,6 +2088,7 @@ const Session = struct {
             .pending_call = if (pending_call) |index| @intCast(index) else null,
             .pending_description = self.pendingDescription(),
             .pending_proposals = try self.pendingProposals(arena),
+            .approval_mode = loop.approvals,
             .notes = notes,
             .steering = steering,
             .outcome = loop.outcome,

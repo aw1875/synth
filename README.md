@@ -153,6 +153,19 @@ allowed; `enter` edits a pattern, `del` removes it, and typing a command that is
 not there offers to add it. A change holds in every session on the project at
 once.
 
+`/approvals auto` (or `"approvals": "auto"` in `config.json`) hands those
+decisions to the session's own model instead. Reads, the safe commands, narrow
+allowances and edits inside the project run as before; everything else is
+judged first, by a model shown only what you asked for and the calls the agent
+has made - not what the agent said, and not what any tool returned, so text
+planted in a file cannot talk it round. It blocks what looks destructive,
+reaches outside the project, sends data out, touches credentials, or goes past
+the task, and a block reaches the agent as a refused call with the reason.
+Allowances that would run anything (`python3 *`, `npm run *`) are set aside
+while it judges. Three blocks in a row, or twenty in a session, hand decisions
+back to you. `/approvals all` runs everything without asking; `/approvals ask`
+goes back to the prompt.
+
 `/rewind` undoes what turns did to files. Before `write` or `edit` first changes
 a file in a turn, synth keeps what the file held; `/rewind` lists the prompts
 that changed files, shows what going back to before one would put back, flags
@@ -176,7 +189,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
-| `auto_approve_all` | bool | `false` | Run every tool call without a prompt, including reads and writes outside the project. Meant for a machine set aside for the agent. `PreToolUse` hooks still run and can still refuse a call. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
+| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the session's model judge it (see Modes), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |

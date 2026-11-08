@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 
+const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
 const Provider = @import("../provider/provider.zig");
@@ -22,6 +23,7 @@ const tool = @import("../tools/tool.zig");
 const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const Request = @import("request.zig");
+const classifier = @import("classifier.zig");
 const window = @import("../provider/window.zig");
 const permission = @import("permission.zig");
 const safety = @import("safety.zig");
@@ -87,6 +89,8 @@ pub const State = enum {
     awaiting_answer,
     /// Running approved tools.
     running_tools,
+    /// Auto mode is having a call judged.
+    classifying,
     /// Asking the model to summarise the transcript so far.
     compacting,
     /// The user gave up, and the worker has been asked to stop but has not
@@ -103,6 +107,7 @@ pub const State = enum {
             .awaiting_approval => "Awaiting approval",
             .awaiting_answer => "Waiting for your answer",
             .running_tools => "Running tools",
+            .classifying => "Checking a call",
             .compacting => "Compacting",
             .cancelling => "Cancelling",
         };
@@ -138,9 +143,10 @@ project_id: ?i64 = null,
 /// The session's name, owned. Null until one is given.
 session_title: ?[]const u8 = null,
 session_id: ?i64 = null,
-/// The loop whose turns this one's file changes are undone with: a subagent's
-/// parent. Null for a loop that keeps its own.
-checkpoint_owner: ?*Loop = null,
+/// The loop that started this one, for a subagent. Its file changes are
+/// undone with the parent's turns, and auto mode judges its calls by what the
+/// parent's person asked for.
+parent: ?*Loop = null,
 /// Files the running batch checkpointed, to record what it left in them once
 /// it settles. Owned.
 checkpointed: std.ArrayList([]u8) = .empty,
@@ -212,9 +218,13 @@ allowed: std.ArrayList(Allowance) = .empty,
 /// Whether the preset list of read-only shell commands runs without asking.
 /// Off makes every `bash` call a question, however harmless.
 auto_approve_safe: bool = true,
-/// Whether every call the agent allows runs without asking, paths outside the
-/// project included.
-auto_approve_all: bool = false,
+/// Who decides a call that would otherwise stop for the person.
+approvals: Config.Approvals = .ask,
+/// The call auto mode is having judged, while it is.
+judging: ?Judging = null,
+/// Calls auto mode blocked in a row, and in all, toward handing decisions back.
+blocks_in_row: u32 = 0,
+blocks_total: u32 = 0,
 
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
@@ -565,6 +575,7 @@ fn ensureSession(self: *Loop) !i64 {
 /// long the model takes" to a chunk or two.
 pub fn requestStop(self: *Loop) void {
     if (self.request) |request| request.requestStop();
+    if (self.judging) |judging| judging.request.requestStop();
     if (self.tools) |tools| tools.requestStop();
     if (self.hook_dispatch) |dispatch| dispatch.requestStop();
 }
@@ -582,6 +593,11 @@ pub fn deinit(self: *Loop) void {
         request.cancel();
         request.destroy();
         self.request = null;
+    }
+    if (self.judging) |judging| {
+        judging.request.cancel();
+        judging.destroy(self.allocator);
+        self.judging = null;
     }
     if (self.tools) |tools| {
         tools.cancel();
@@ -1121,6 +1137,7 @@ fn startReaping(self: *Loop) void {
 /// Interrupt both workers and wait for them to unwind, off the UI's thread.
 fn reap(self: *Loop) void {
     if (self.request) |request| request.cancel();
+    if (self.judging) |judging| judging.request.cancel();
     if (self.tools) |tools| tools.cancel();
     if (self.hook_dispatch) |dispatch| dispatch.cancel();
     self.reaped.store(true, .release);
@@ -1152,6 +1169,12 @@ fn pollCancelled(self: *Loop) !bool {
         request.join();
         request.destroy();
         self.request = null;
+    }
+
+    if (self.judging) |judging| {
+        judging.request.join();
+        judging.destroy(self.allocator);
+        self.judging = null;
     }
 
     if (self.tools) |tools| {
@@ -1205,6 +1228,7 @@ pub fn poll(self: *Loop) !bool {
         .running_hooks => self.pollPromptHooks(),
         .thinking, .compacting => self.pollRequest(),
         .running_tools => self.pollTools(),
+        .classifying => self.pollJudging(),
         .cancelling => self.pollCancelled(),
     };
 }
@@ -1397,10 +1421,161 @@ fn autoApprove(self: *Loop) !void {
     }
 
     if (self.firstPending() != null) {
+        if (self.approvals == .auto) return self.judgeNext();
         self.state = .awaiting_approval;
         return;
     }
     try self.runApproved();
+}
+
+/// A call auto mode is having judged, and the request judging it.
+const Judging = struct {
+    request: *Request,
+    /// What the request is shown, borrowed by it until it is joined.
+    convo: *Conversation,
+    call: usize,
+    stage: classifier.Stage,
+
+    fn destroy(self: Judging, allocator: std.mem.Allocator) void {
+        self.request.destroy();
+        self.convo.deinit();
+        allocator.destroy(self.convo);
+    }
+};
+
+/// Hand decisions on calls to `mode` from now on, with a clean slate of blocks.
+pub fn setApprovals(self: *Loop, mode: Config.Approvals) void {
+    self.approvals = mode;
+    self.blocks_in_row = 0;
+    self.blocks_total = 0;
+}
+
+/// Blocks in a row, and in a session, after which auto mode hands decisions
+/// back to the person: something is off, with the task or with the judge.
+const max_blocks_in_row = 3;
+const max_blocks_total = 20;
+
+/// Have the next call still waiting on a decision judged, letting an edit
+/// inside the project through on the way; run the batch once none is left.
+fn judgeNext(self: *Loop) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const calls = self.conversation.messages.items[message_index].tool_calls;
+    for (calls, 0..) |*call, index| {
+        if (call.status != .pending) continue;
+        if (self.editsInside(call)) {
+            call.begin(tool.monotonicMilliseconds(self.io));
+            continue;
+        }
+        return self.startJudging(index, .quick);
+    }
+    try self.runApproved();
+}
+
+fn editsInside(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    if (!std.mem.eql(u8, call.name, "write") and !std.mem.eql(u8, call.name, "edit")) return false;
+    return !self.escapesProject(call);
+}
+
+fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const call = self.conversation.messages.items[message_index].tool_calls[call_index];
+    const asker = self.parent orelse self;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const material = try classifier.material(
+        arena_state.allocator(),
+        self.project_root,
+        asker.conversation.messages.items,
+        self.conversation.messages.items,
+        call,
+    );
+
+    const convo = try self.allocator.create(Conversation);
+    errdefer self.allocator.destroy(convo);
+    convo.* = .init(self.allocator);
+    errdefer convo.deinit();
+    _ = try convo.addUser(material, &.{}, &.{});
+
+    const request = try Request.start(self.allocator, self.io, self.provider, convo, .{
+        .system = classifier.system_prompt,
+        .instruction = classifier.instruction(stage),
+    });
+    self.judging = .{ .request = request, .convo = convo, .call = call_index, .stage = stage };
+    self.state = .classifying;
+}
+
+fn pollJudging(self: *Loop) !bool {
+    const judging = self.judging orelse return false;
+    if (!judging.request.isFinished()) return false;
+    judging.request.join();
+    self.judging = null;
+    defer judging.destroy(self.allocator);
+
+    const message_index = self.pendingIndex() orelse return true;
+    const call = &self.conversation.messages.items[message_index].tool_calls[judging.call];
+    const reply = judging.request.reply orelse {
+        const why = if (judging.request.failed) |err| @errorName(err) else "no answer";
+        return self.askInstead(call, why);
+    };
+    self.usage.calls += 1;
+    self.usage.input_tokens += reply.usage.prompt_tokens;
+    self.usage.output_tokens += reply.usage.completion_tokens;
+    self.turn_tokens += reply.usage.prompt_tokens + reply.usage.completion_tokens;
+
+    switch (classifier.verdict(judging.stage, reply.text)) {
+        .allow => {
+            self.blocks_in_row = 0;
+            call.begin(tool.monotonicMilliseconds(self.io));
+            try self.judgeNext();
+        },
+        .block => |reason| switch (judging.stage) {
+            .quick => try self.startJudging(judging.call, .careful),
+            .careful => try self.block(message_index, judging.call, reason),
+        },
+        .unclear => switch (judging.stage) {
+            .quick => try self.startJudging(judging.call, .careful),
+            .careful => return self.askInstead(call, "its answer could not be read"),
+        },
+    }
+    return true;
+}
+
+/// Put a call auto mode could not judge to the person.
+fn askInstead(self: *Loop, call: *const Conversation.ToolCall, why: []const u8) bool {
+    self.say("Auto mode could not judge the {s} call ({s}), so it is asking you", .{ call.name, why });
+    self.state = .awaiting_approval;
+    return true;
+}
+
+/// Turn a call down on auto mode's say-so, telling the model why, and hand
+/// decisions back to the person once that has happened too often.
+fn block(self: *Loop, message_index: usize, call_index: usize, reason: []const u8) !void {
+    const call = &self.conversation.messages.items[message_index].tool_calls[call_index];
+    const text = try std.fmt.allocPrint(
+        self.allocator,
+        "Blocked by auto mode: {s}. Do this another way, or ask the user first.",
+        .{if (reason.len > 0) reason else "it looked unsafe"},
+    );
+    call.status = .rejected;
+    call.result = text;
+    call.result_bytes = text.len;
+    try self.persistToolCall(message_index, call_index);
+
+    self.blocks_in_row += 1;
+    self.blocks_total += 1;
+    if (self.blocks_in_row >= max_blocks_in_row or self.blocks_total >= max_blocks_total) {
+        self.approvals = .ask;
+        self.blocks_in_row = 0;
+        self.blocks_total = 0;
+        self.say("Auto mode blocked too many calls, so decisions are back with you", .{});
+        if (self.firstPending() != null) {
+            self.state = .awaiting_approval;
+            return;
+        }
+        return self.runApproved();
+    }
+    try self.judgeNext();
 }
 
 /// The question the model is waiting on an answer to, or null when it is not.
@@ -1578,7 +1753,7 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
-    if (self.auto_approve_all) return true;
+    if (self.approvals == .all) return true;
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
         defer self.allocator.free(path);
@@ -1593,9 +1768,9 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
 
 /// Whether a call cleared to run may resolve paths outside the project: one
 /// the user was asked about, one naming such a path, which running means was
-/// cleared, or any call once everything is approved.
+/// cleared, or any call when approvals are `all`.
 fn mayReachOutside(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    return self.auto_approve_all or self.escapesProject(call) or !self.needsNoDecision(call);
+    return self.approvals == .all or self.escapesProject(call) or !self.needsNoDecision(call);
 }
 
 /// Whether a call names a path outside the project.
@@ -1814,7 +1989,7 @@ fn isAllowed(self: *const Loop, call: *const Conversation.ToolCall) bool {
 
     const command = shellCommand(arena, call.arguments);
     const parts = (safety.segments(arena, command) catch null) orelse &.{};
-    if (parts.len == 0) return self.coversExactly("bash", command) or self.coversExactly("bash", "*");
+    if (parts.len == 0) return self.coversExactly("bash", command) or (self.approvals != .auto and self.coversExactly("bash", "*"));
     for (parts) |part| {
         if (!self.segmentAllowed(part)) return false;
     }
@@ -1826,7 +2001,9 @@ fn isAllowed(self: *const Loop, call: *const Conversation.ToolCall) bool {
 fn segmentAllowed(self: *const Loop, part: safety.Segment) bool {
     if (self.auto_approve_safe and safety.isSafeSegment(part)) return true;
     for (self.allowed.items) |allowance| {
-        if (std.mem.eql(u8, allowance.tool, "bash") and permission.covers(allowance.pattern, part)) return true;
+        if (!std.mem.eql(u8, allowance.tool, "bash")) continue;
+        if (self.approvals == .auto and permission.runsAnything(allowance.pattern)) continue;
+        if (permission.covers(allowance.pattern, part)) return true;
     }
     return false;
 }
@@ -2026,7 +2203,7 @@ const max_checkpoint_bytes = 8 * 1024 * 1024;
 /// Keep what every file a `write` or `edit` in `batch` is about to change
 /// holds now, under the prompt that began the turn, so the turn can be undone.
 fn checkpointBatch(self: *Loop, batch: []const ToolRun.Call) !void {
-    const owner = self.checkpoint_owner orelse self;
+    const owner = self.parent orelse self;
     const db = owner.db orelse return;
     const seq = owner.turn_start_seq orelse return;
 
@@ -2052,7 +2229,7 @@ fn sealCheckpoints(self: *Loop) void {
         for (self.checkpointed.items) |path| self.allocator.free(path);
         self.checkpointed.clearRetainingCapacity();
     }
-    const owner = self.checkpoint_owner orelse self;
+    const owner = self.parent orelse self;
     const db = owner.db orelse return;
     const seq = owner.turn_start_seq orelse return;
     const session_id = owner.session_id orelse return;
@@ -2347,6 +2524,11 @@ const FakeProvider = struct {
     /// blocked inside a socket read, which is the only case where cancelling
     /// costs real time.
     deaf: bool = false,
+    /// What it answers when asked to judge a call, at each stage, and how
+    /// often it has been.
+    quick: []const u8 = "ALLOW",
+    careful: []const u8 = "VERDICT: ALLOW",
+    judged: usize = 0,
 
     fn provider(self: *FakeProvider) Provider {
         return .{ .name = "fake", .userdata = self, .respond = respond };
@@ -2370,6 +2552,12 @@ const FakeProvider = struct {
         if (sink) |s| {
             if (s.stopped(s.userdata)) return .{};
             s.onThinking(s.userdata, "thinking about it\n");
+        }
+
+        if (std.mem.eql(u8, asked.system, classifier.system_prompt)) {
+            self.judged += 1;
+            const quick = std.mem.eql(u8, asked.instruction, classifier.instruction(.quick));
+            return .{ .text = try allocator.dupe(u8, if (quick) self.quick else self.careful) };
         }
 
         // A one-off instruction is a question, not a turn.
@@ -3060,6 +3248,112 @@ test "a subagent transcript is stored as a session of its own" {
     try testing.expectEqual(@as(u64, 2), try db.countMessages(child));
 }
 
+test "auto mode runs what its judge allows, and lets edits inside the project through unjudged" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    try loop.submit("clear out the build directory", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+    try testing.expect(fixture.convo.messages.items[1].tool_calls[0].status != .rejected);
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"notes.md\",\"content\":\"x\"}";
+    try loop.submit("write a note", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+
+    fixture.fake.tool_arguments = "{\"path\":\"/tmp/elsewhere.md\",\"content\":\"x\"}";
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "Outside the project.\nVERDICT: BLOCK: that path is outside the project";
+    try loop.submit("write it elsewhere", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 3), fixture.fake.judged);
+}
+
+test "auto mode's block is a considered one, and goes back to the model" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "Nobody asked for that.\nVERDICT: BLOCK: deleting the build tree was not asked for";
+    try loop.submit("what is in this project?", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 2), fixture.fake.judged);
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+    try testing.expect(std.mem.indexOf(u8, call.result.?, "deleting the build tree was not asked for") != null);
+    try testing.expectEqual(Config.Approvals.auto, loop.approvals);
+}
+
+test "auto mode hands decisions back after three blocks in a row" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    fixture.fake.parallel_calls = 4;
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "VERDICT: BLOCK: no";
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqual(Config.Approvals.ask, loop.approvals);
+    const calls = fixture.convo.messages.items[1].tool_calls;
+    for (calls[0..3]) |call| try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+    try testing.expectEqual(Conversation.ToolCall.Status.pending, calls[3].status);
+}
+
+test "a call auto mode cannot get a readable verdict on is put to the person" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    fixture.fake.quick = "Let me think.";
+    fixture.fake.careful = "It depends.";
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqual(Config.Approvals.auto, loop.approvals);
+}
+
+test "auto mode does not wave a call through on an allowance that runs anything" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    const call: Conversation.ToolCall = .{ .id = "call_0", .name = "bash", .arguments = "{\"command\":\"python3 cleanup.py\"}" };
+    try loop.remember("bash", "python3 *");
+    try testing.expect(loop.needsNoDecision(&call));
+    loop.approvals = .auto;
+    try testing.expect(!loop.needsNoDecision(&call));
+    try loop.remember("bash", "python3 cleanup.py");
+    try testing.expect(loop.needsNoDecision(&call));
+}
+
 test "a turn's file changes are kept, and undone back to the prompt that made them" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -3643,7 +3937,7 @@ test "approving everything covers commands and paths outside the project" {
     };
     try testing.expect(!loop.needsNoDecision(&call));
 
-    loop.auto_approve_all = true;
+    loop.approvals = .all;
     try testing.expect(loop.needsNoDecision(&call));
 
     call.name = "read";
@@ -3684,7 +3978,7 @@ test "approving everything runs a call outside the project, not just its prompt"
 
     var loop = fixture.loop();
     defer loop.deinit();
-    loop.auto_approve_all = true;
+    loop.approvals = .all;
 
     try loop.submit("go", .{});
     try settle(&loop);

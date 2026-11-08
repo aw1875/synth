@@ -10,6 +10,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const agents = @import("../agent/agent.zig");
+const Config = @import("../core/config.zig");
 const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const catalog = @import("../provider/catalog.zig");
@@ -89,6 +90,19 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
             keepTheme(self, themes.findOrDefault(name).id);
         } else {
             try self.theme_picker.show(themeId(self));
+        }
+        ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.startsWith(u8, line, "/approvals")) {
+        const name = std.mem.trim(u8, line["/approvals".len..], " ");
+        if (name.len == 0) {
+            try self.notification.showFmt(ctx, .info, "Approvals: {s}. /approvals ask, auto or all to change", .{@tagName(self.mirror.status.approval_mode)});
+        } else if (std.meta.stringToEnum(Config.Approvals, name)) |mode| {
+            try self.mirror.setApprovalMode(mode);
+            try self.notification.showFmt(ctx, .info, "{s}", .{approvalsSaying(mode)});
+        } else {
+            try self.notification.showFmt(ctx, .warn, "No approvals mode {s}: use ask, auto or all", .{name});
         }
         ctx.redraw = true;
         return true;
@@ -191,6 +205,14 @@ fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
 /// open the switcher then.
 pub fn showSessions(self: *Model) !void {
     try self.mirror.listSessions(SessionPicker.fetch_limit);
+}
+
+fn approvalsSaying(mode: Config.Approvals) []const u8 {
+    return switch (mode) {
+        .ask => "Calls that need it ask you again",
+        .auto => "Auto mode: the model judges calls, and blocks the risky ones",
+        .all => "Every call runs without asking, outside the project too",
+    };
 }
 
 /// Show what the session's server answered.

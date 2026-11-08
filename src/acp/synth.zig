@@ -14,6 +14,7 @@ const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const todo = @import("../core/todo.zig");
 const mcp_tools = @import("../tools/mcp.zig");
+const Config = @import("../core/config.zig");
 const Loop = @import("../agent/loop.zig");
 
 /// Bumped only on a breaking change to this extension.
@@ -60,6 +61,8 @@ pub const method = struct {
     /// The turns whose changes to files can be undone, newest first. Answered
     /// with `[]Checkpoint`.
     pub const checkpoints = "_synth/checkpoints";
+    /// Who decides calls that would stop for approval, from now on.
+    pub const set_approval_mode = "_synth/set_approval_mode";
     /// Put back every file the turns from `seq` on changed, or with `apply`
     /// false, only say which. Answered with `[]Loop.Rewound`.
     pub const rewind = "_synth/rewind";
@@ -217,6 +220,8 @@ pub const Status = struct {
     pending_description: []const u8 = "",
     /// What "allow always" on that call could store, narrowest first.
     pending_proposals: []const Loop.Proposal = &.{},
+    /// Who decides calls that would stop for approval.
+    approval_mode: Config.Approvals = .ask,
     /// What each running call last said it was doing, by index into the
     /// pending message's calls.
     notes: []const []const u8 = &.{},
@@ -371,6 +376,8 @@ pub const Checkpoint = struct {
 };
 
 pub const Rewind = struct { sessionId: []const u8, seq: u64, apply: bool = false };
+
+pub const SetApprovalMode = struct { sessionId: []const u8, mode: Config.Approvals };
 
 pub const SetApprovals = struct {
     sessionId: []const u8,

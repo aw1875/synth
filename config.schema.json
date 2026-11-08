@@ -24,10 +24,14 @@
             "default": true,
             "description": "Let a preset of read-only shell commands run without a prompt."
         },
-        "auto_approve_all": {
-            "type": "boolean",
-            "default": false,
-            "description": "Run every tool call without a prompt, including reads and writes outside the project. Meant for a machine set aside for the agent. `PreToolUse` hooks still run and can still refuse a call."
+        "approvals": {
+            "enum": [
+                "ask",
+                "auto",
+                "all"
+            ],
+            "default": "ask",
+            "description": "Who decides a call that would otherwise ask. 'ask' puts it to you. 'auto' has the session's model judge it, blocking what looks destructive, outside the project or outside the task, and hands decisions back to you after 3 blocks in a row or 20 in a session. 'all' runs everything, paths outside the project included: for a machine set aside for the agent. `PreToolUse` hooks still run under each."
         },
         "debug_log": {
             "type": "string",

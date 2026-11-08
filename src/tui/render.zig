@@ -994,8 +994,13 @@ fn modeChip(self: *Model, arena: std.mem.Allocator) !Chip {
     }
 
     const id = self.mirror.agentId();
+    const approving = switch (self.mirror.status.approval_mode) {
+        .ask => "",
+        .auto => w.separator ++ "auto approvals",
+        .all => w.separator ++ "approving everything",
+    };
     return .{
-        .text = try std.fmt.allocPrint(arena, "{s} mode{s}tab to switch", .{ id, w.separator }),
+        .text = try std.fmt.allocPrint(arena, "{s} mode{s}{s}tab to switch", .{ id, approving, w.separator }),
         .lead = id,
         .color = if (self.inSubagent()) theme.fg_dim else Model.agentColor(id),
     };

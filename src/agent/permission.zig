@@ -106,6 +106,29 @@ pub fn covers(allowed: []const u8, segment: safety.Segment) bool {
     return given.next() == null;
 }
 
+/// Programs that run whatever they are handed: interpreters, shells, and
+/// runners whose first argument is what they run.
+const interpreters: []const []const u8 = &.{
+    "python", "python3", "node",  "ruby", "perl", "php",  "lua",  "sh",
+    "bash",   "zsh",     "fish",  "deno", "bun",  "npx",  "bunx", "uvx",
+    "pnpx",   "env",     "xargs", "sudo", "ssh",  "eval", "exec",
+};
+
+/// Whether an allowance amounts to running any code at all: every command, a
+/// whole interpreter, or a runner left open as to what it runs (`npm run *`).
+/// Auto mode leaves calls these would cover to its judge.
+pub fn runsAnything(allowed: []const u8) bool {
+    if (std.mem.eql(u8, allowed, "*")) return true;
+    if (!std.mem.endsWith(u8, allowed, " *")) return false;
+
+    var words = safety.arguments(allowed[0 .. allowed.len - 2]);
+    const program = unescape(words.next() orelse return false);
+    const name = program[if (std.mem.lastIndexOfScalar(u8, program, '/')) |slash| slash + 1 else 0..];
+    const second = words.next() orelse return contains(interpreters, name);
+    if (words.next() != null) return false;
+    return contains(with_subcommands, name) and contains(runners, second);
+}
+
 fn unescape(word: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, word, "\\")) word[1..] else word;
 }
@@ -197,6 +220,21 @@ test "an allowance covers what starts with its words, and nothing else" {
     try expectCovers("*", "anything at all", true);
     try expectCovers("", "ls", false);
     try expectCovers("git * commit", "git x commit", false);
+}
+
+test "an allowance that runs anything is told apart from a narrow one" {
+    try testing.expect(runsAnything("*"));
+    try testing.expect(runsAnything("python3 *"));
+    try testing.expect(runsAnything("/usr/bin/bash *"));
+    try testing.expect(runsAnything("npm run *"));
+    try testing.expect(runsAnything("uv run *"));
+    try testing.expect(runsAnything("npx *"));
+
+    try testing.expect(!runsAnything("npm run build *"));
+    try testing.expect(!runsAnything("git commit *"));
+    try testing.expect(!runsAnything("git *"));
+    try testing.expect(!runsAnything("python3 script.py"));
+    try testing.expect(!runsAnything("rm -rf build"));
 }
 
 test "allowances stored before word prefixes keep covering what they did" {
