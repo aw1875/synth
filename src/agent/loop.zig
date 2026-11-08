@@ -1815,7 +1815,7 @@ fn outsidePath(
 
         const resolved = self.resolveAgainstProject(arena, value.string) orelse
             return try allocator.dupe(u8, value.string);
-        if (!self.inside(resolved)) return try allocator.dupe(u8, resolved);
+        if (!self.inside(arena, resolved)) return try allocator.dupe(u8, resolved);
     }
     return null;
 }
@@ -1826,18 +1826,40 @@ fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []co
     else
         std.fs.path.join(arena, &.{ self.project_root, path }) catch return null;
 
-    return std.fs.path.resolve(arena, &.{joined}) catch null;
+    const lexical = std.fs.path.resolve(arena, &.{joined}) catch return null;
+    return self.followLinks(arena, lexical);
 }
 
-fn inside(self: *const Loop, resolved: []const u8) bool {
-    if (!std.mem.startsWith(u8, resolved, self.project_root)) return false;
-    if (resolved.len == self.project_root.len) return true;
-    return resolved[self.project_root.len] == std.fs.path.sep;
+/// `lexical` with the links in the part of it that exists followed, since the
+/// OS follows them when the call runs: `link/x` under a project is outside it
+/// when `link` points out. Null when that cannot be told, a dangling link
+/// included.
+fn followLinks(self: *const Loop, arena: std.mem.Allocator, lexical: []const u8) ?[]const u8 {
+    var existing = lexical;
+    while (true) {
+        if (std.Io.Dir.cwd().realPathFileAlloc(self.io, existing, arena)) |real| {
+            return std.fs.path.join(arena, &.{ real, lexical[existing.len..] }) catch null;
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                if (std.Io.Dir.cwd().readLink(self.io, existing, &buffer)) |_| return null else |_| {}
+            },
+            else => return null,
+        }
+        existing = std.fs.path.dirname(existing) orelse return lexical;
+    }
+}
+
+fn inside(self: *const Loop, arena: std.mem.Allocator, resolved: []const u8) bool {
+    const root = self.followLinks(arena, self.project_root) orelse self.project_root;
+    if (!std.mem.startsWith(u8, resolved, root)) return false;
+    if (resolved.len == root.len) return true;
+    return resolved[root.len] == std.fs.path.sep;
 }
 
 fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
     const resolved = self.resolveAgainstProject(arena, path) orelse return false;
-    return self.inside(resolved);
+    return self.inside(arena, resolved);
 }
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
@@ -3279,6 +3301,38 @@ test "auto mode runs what its judge allows, and lets edits inside the project th
     try loop.submit("write it elsewhere", .{});
     try settle(&loop);
     try testing.expectEqual(@as(usize, 3), fixture.fake.judged);
+}
+
+test "a link inside the project that points out does not make an edit through it inside" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = buf[0..try outside.dir.realPath(testing.io, &buf)];
+    try fixture.tmp.dir.symLink(testing.io, target, "link", .{ .is_directory = true });
+    const missing = try std.fs.path.join(testing.allocator, &.{ target, "missing.md" });
+    defer testing.allocator.free(missing);
+    try fixture.tmp.dir.symLink(testing.io, missing, "dangling.md", .{});
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    fixture.fake.tool_name = "write";
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "Outside the project.\nVERDICT: BLOCK: that path leaves the project";
+
+    fixture.fake.tool_arguments = "{\"path\":\"link/notes.md\",\"content\":\"x\"}";
+    try loop.submit("write a note", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 2), fixture.fake.judged);
+    try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "notes.md", .{}));
+
+    fixture.fake.tool_arguments = "{\"path\":\"dangling.md\",\"content\":\"x\"}";
+    try loop.submit("write another", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 4), fixture.fake.judged);
+    try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "missing.md", .{}));
 }
 
 test "auto mode's block is a considered one, and goes back to the model" {
