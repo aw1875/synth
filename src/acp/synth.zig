@@ -14,10 +14,11 @@ const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const todo = @import("../core/todo.zig");
 const mcp_tools = @import("../tools/mcp.zig");
+const Config = @import("../core/config.zig");
 const Loop = @import("../agent/loop.zig");
 
 /// Bumped only on a breaking change to this extension.
-pub const version: u32 = 1;
+pub const version: u32 = 2;
 
 /// What a client puts under `_meta.synth` on `initialize` to be sent this
 /// extension, and what the agent answers with.
@@ -52,6 +53,19 @@ pub const method = struct {
     pub const subagent = "_synth/subagent";
     pub const page_history = "_synth/page_history";
     pub const search = "_synth/search";
+    /// The project's standing allowances. Answered with `[]Allowance`.
+    pub const approvals = "_synth/approvals";
+    /// Drop and add standing allowances. Answered with `[]Allowance`, as they
+    /// then stand.
+    pub const set_approvals = "_synth/set_approvals";
+    /// The turns whose changes to files can be undone, newest first. Answered
+    /// with `[]Checkpoint`.
+    pub const checkpoints = "_synth/checkpoints";
+    /// Who decides calls that would stop for approval, from now on.
+    pub const set_approval_mode = "_synth/set_approval_mode";
+    /// Put back every file the turns from `seq` on changed, or with `apply`
+    /// false, only say which. Answered with `[]Loop.Rewound`.
+    pub const rewind = "_synth/rewind";
     /// Check the session can be attached to again over its socket, once
     /// this client has gone without leaving.
     pub const detach = "_synth/detach";
@@ -204,6 +218,10 @@ pub const Status = struct {
     pending_call: ?u32 = null,
     /// What the tool waiting on a decision does, for the person deciding.
     pending_description: []const u8 = "",
+    /// What "allow always" on that call could store, narrowest first.
+    pending_proposals: []const Loop.Proposal = &.{},
+    /// Who decides calls that would stop for approval.
+    approval_mode: Config.Approvals = .ask,
     /// What each running call last said it was doing, by index into the
     /// pending message's calls.
     notes: []const []const u8 = &.{},
@@ -342,6 +360,30 @@ pub const LoadThinking = struct { sessionId: []const u8, seq: u64 };
 pub const Subagent = struct { sessionId: []const u8, seq: u64, call: u32 };
 pub const PageHistory = struct { sessionId: []const u8, before_seq: u64, limit: u32 = 50 };
 pub const Search = struct { sessionId: []const u8, query: []const u8, limit: u32 = 20 };
+
+/// A standing "allow always": the tool, and the pattern it covers.
+pub const Allowance = struct {
+    tool: []const u8,
+    pattern: []const u8,
+};
+
+/// A turn whose changes to files can be undone: the prompt that began it, by
+/// the agent's `seq`, and how many files it changed.
+pub const Checkpoint = struct {
+    seq: u64,
+    prompt: []const u8,
+    files: u32,
+};
+
+pub const Rewind = struct { sessionId: []const u8, seq: u64, apply: bool = false };
+
+pub const SetApprovalMode = struct { sessionId: []const u8, mode: Config.Approvals };
+
+pub const SetApprovals = struct {
+    sessionId: []const u8,
+    remove: []const Allowance = &.{},
+    add: []const Allowance = &.{},
+};
 
 test "a message survives the wire and comes back owned" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -145,6 +145,36 @@ commands - tests, `git diff`, a build - but cannot edit.
 Anything that changes the project or runs a command asks first, and a preset of
 read-only shell commands skips the prompt.
 
+"Allow always" remembers the answer for the project, as narrowly as it can: a
+shell command is allowed by its subcommand (`git commit *` does not cover
+`git push`), and a program without one by the exact command. `↑`/`↓` on the
+prompt widens or narrows that before it is saved. `/permissions` lists what is
+allowed; `enter` edits a pattern, `del` removes it, and typing a command that is
+not there offers to add it. A change holds in every session on the project at
+once.
+
+`/approvals auto` (or `"approvals": "auto"` in `config.json`) hands those
+decisions to the session's own model instead. Reads, the safe commands, narrow
+allowances and edits inside the project run as before; everything else is
+judged first, by a model shown only what you asked for and the calls the agent
+has made - not what the agent said, and not what any tool returned. Text
+planted in a file reaches it only inside a call's arguments (a heredoc, a file
+being written), fenced off as data it is told not to follow. The safe commands
+skip it as they skip the prompt, wherever they point: `cat ~/.ssh/id_rsa` runs
+unjudged unless `auto_approve_safe_commands` is off. It blocks what looks destructive,
+reaches outside the project, sends data out, touches credentials, or goes past
+the task, and a block reaches the agent as a refused call with the reason.
+Allowances that would run anything (`python3 *`, `npm run *`) are set aside
+while it judges. Three blocks in a row, or twenty in a session, hand decisions
+back to you. `/approvals all` runs everything without asking; `/approvals ask`
+goes back to the prompt.
+
+`/rewind` undoes what turns did to files. Before `write` or `edit` first changes
+a file in a turn, synth keeps what the file held; `/rewind` lists the prompts
+that changed files, shows what going back to before one would put back, flags
+anything changed since by other means, and restores it. Files changed through
+the shell are not tracked, and the transcript stays as it was.
+
 ## Configuration
 
 Three files, split by what they hold.
@@ -162,10 +192,11 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
+| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the session's model judge it (see Modes), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
-| `max_stall_ms` | number | `120000` | How long the provider may send nothing before the turn is given up on. `0` disables it. |
+| `max_stall_ms` | number | `120000` | How long the provider may send nothing before the turn is given up on. `0` disables it. With all three of these at `0`, the agent's cap on model calls per turn is lifted too. |
 | `skill_paths` | array of strings | `[]` | Extra directories to look for skills in, searched in order. |
 | `database_path` | string | `synth.db` beside the other data | Where sessions live. |
 | `mcp` | object | none | MCP servers. See below. |
@@ -253,7 +284,7 @@ a session was last touched:
 ```
 
 `shed_after_days` keeps an old session's transcript but drops the payloads
-behind it. The cards still read: what the model was shown is on the tool call
+behind it, and the file checkpoints `/rewind` would use. The cards still read: what the model was shown is on the tool call
 itself, and only the expanded view loses its full text. This is where nearly
 all the space goes, so 30 days is the default.
 

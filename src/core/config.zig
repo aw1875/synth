@@ -109,6 +109,8 @@ think: bool = true,
 /// Let the preset list of read-only shell commands run without an approval
 /// prompt. Off makes every command a question, however harmless.
 auto_approve_safe_commands: bool = true,
+/// Who decides a call that would otherwise stop for approval.
+approvals: Approvals = .ask,
 /// How long one turn may run, and what it may spend, before the loop gives up
 /// on it. Zero turns either off. Null means the built-in default: what a
 /// runaway turn costs is the loop's business, not this file's.
@@ -144,6 +146,12 @@ bell: Bell = .unfocused,
 /// one that does not never rings, which is what `always` is for.
 pub const Bell = enum { unfocused, always, never };
 
+/// `ask` puts it to the person. `auto` has a model judge it, blocking what
+/// looks destructive, outside the project or outside the task. `all` runs
+/// everything, paths outside the project included: for a machine set aside
+/// for the agent. Hooks still run under each.
+pub const Approvals = enum { ask, auto, all };
+
 /// The shape `config.json` is parsed into. Every field is optional so an
 /// absent key falls through to whatever the previous layer set.
 const File = struct {
@@ -151,6 +159,7 @@ const File = struct {
     system_prompt: ?[]const u8 = null,
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
+    approvals: ?Approvals = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -271,6 +280,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.system_prompt) |value| self.system_prompt = value;
     if (parsed.think) |value| self.think = value;
     if (parsed.auto_approve_safe_commands) |value| self.auto_approve_safe_commands = value;
+    if (parsed.approvals) |value| self.approvals = value;
     if (parsed.debug_log) |value| self.debug_log = value;
     if (parsed.max_turn_ms) |value| self.max_turn_ms = value;
     if (parsed.max_turn_tokens) |value| self.max_turn_tokens = value;
@@ -469,6 +479,27 @@ test "the bell setting is read from the file" {
 
     try config.applyFile(io, path);
     try testing.expectEqual(Bell.always, config.bell);
+}
+
+test "approvals are read from the file" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try testing.expectEqual(Approvals.ask, config.approvals);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"approvals\":\"auto\"}" });
+    try config.applyFile(io, path);
+    try testing.expectEqual(Approvals.auto, config.approvals);
 }
 
 test "lifecycle hooks are read from the file" {

@@ -91,13 +91,17 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
     const loop = &stack.loop;
     const convo = &stack.convo;
     const runner = &stack.runner;
+    if (!allow_mutating) loop.setApprovals(.ask);
+    const started = loop.approvals;
 
     try out.print("{s}provider{s} {s}  {s}root{s} {s}\n", .{
         dim, reset, loop.provider.name, dim, reset, stack.project.root,
     });
     try out.print("{s}tools{s} {d} registered, mutating tools {s}\n", .{
-        dim,                                                                  reset, stack.registry.tools.count(),
-        if (allow_mutating) "ALLOWED" else "denied (pass --allow to enable)",
+        dim,
+        reset,
+        stack.registry.tools.count(),
+        if (!allow_mutating) "denied (pass --allow to enable)" else if (started == .auto) "judged by auto mode" else "ALLOWED",
     });
 
     const mcp_report = try stack.mcp_host.report(allocator);
@@ -120,13 +124,29 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         _ = try runner.poll();
         _ = try loop.poll();
 
+        if (loop.isBusy()) {
+            if (loop.takeHookNotice()) |notice| {
+                defer allocator.free(notice);
+                try out.print("{s}  ! {s}{s}\n", .{ yellow, notice, reset });
+                try out.flush();
+            }
+        }
+
         if (loop.state == .awaiting_approval) {
             const call = loop.pendingCall().?;
             try out.print("{s}  ? approve {s}{s}{s} {s}\n", .{
                 yellow, bold, call.name, reset, call.arguments,
             });
             try out.flush();
-            try loop.decide(if (allow_mutating) .once else .deny);
+            switch (answer(allow_mutating, started, loop.approvals)) {
+                .approve => try loop.decide(.once),
+                .refuse => try loop.decide(.deny),
+                .stop => {
+                    try out.print("{s}stopping: auto mode blocked too many calls{s}\n", .{ red, reset });
+                    try out.flush();
+                    try loop.cancel();
+                },
+            }
             continue;
         }
 
@@ -143,6 +163,25 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
 
     try out.print("\n{s}{d} messages, {d} model calls{s}\n", .{ dim, convo.messages.items.len, loop.steps, reset });
     try out.flush();
+}
+
+const Answer = enum { approve, refuse, stop };
+
+/// What a run says to a call that waits on a person, of whom there is none.
+/// `--allow` answers for one only in the mode the run started in when that is
+/// asking: under auto mode what the judge passes on is refused, and its
+/// handing decisions back after repeated blocks ends the run.
+fn answer(allow_mutating: bool, started: Config.Approvals, now: Config.Approvals) Answer {
+    if (started == .auto) return if (now == .auto) .refuse else .stop;
+    return if (allow_mutating) .approve else .refuse;
+}
+
+test "a headless run answers for a person only where --allow says it may" {
+    try std.testing.expectEqual(Answer.refuse, answer(false, .ask, .ask));
+    try std.testing.expectEqual(Answer.approve, answer(true, .ask, .ask));
+    try std.testing.expectEqual(Answer.approve, answer(true, .all, .all));
+    try std.testing.expectEqual(Answer.refuse, answer(true, .auto, .auto));
+    try std.testing.expectEqual(Answer.stop, answer(true, .auto, .ask));
 }
 
 /// Print any messages added since last time. Returns the new watermark.

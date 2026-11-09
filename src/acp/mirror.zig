@@ -13,6 +13,7 @@ const synth = @import("synth.zig");
 const updates = @import("updates.zig");
 const Connection = @import("connection.zig");
 const sockets = @import("sockets.zig");
+const Config = @import("../core/config.zig");
 const Conversation = @import("../core/conversation.zig");
 const Database = @import("../core/database.zig");
 const skill = @import("../core/skill.zig");
@@ -115,6 +116,10 @@ const Awaited = union(enum) {
     models,
     files,
     providers,
+    approvals,
+    checkpoints,
+    /// A rewind from the agent's `seq`, done or only asked about.
+    rewind: struct { seq: u64, apply: bool },
     /// The call whose subagent, by the TUI's own numbering.
     subagent: struct { seq: u64, call: u32 },
     detach,
@@ -130,6 +135,14 @@ pub const Answer = union(enum) {
     subagent: struct { seq: u64, call: u32, live: bool, messages: []Conversation.Message },
     /// Each provider the agent knows, in an arena of their own.
     providers: struct { arena: std.heap.ArenaAllocator, states: []const synth.ProviderState },
+    /// The project's standing allowances, in an arena of their own.
+    approvals: struct { arena: std.heap.ArenaAllocator, allowances: []const synth.Allowance },
+    /// The turns whose file changes can be undone, newest first, in an arena
+    /// of their own.
+    checkpoints: struct { arena: std.heap.ArenaAllocator, turns: []const synth.Checkpoint },
+    /// What a rewind put back, or with `applied` false would, in an arena of
+    /// their own.
+    rewound: struct { arena: std.heap.ArenaAllocator, seq: u64, applied: bool, files: []const Loop.Rewound },
     /// The project's files, for `@` mentions.
     files: [][]const u8,
     /// The models the agent's provider offers, in an arena of their own.
@@ -154,6 +167,18 @@ pub const Answer = union(enum) {
             },
             .providers => |known| {
                 var arena = known.arena;
+                arena.deinit();
+            },
+            .approvals => |standing| {
+                var arena = standing.arena;
+                arena.deinit();
+            },
+            .checkpoints => |listed| {
+                var arena = listed.arena;
+                arena.deinit();
+            },
+            .rewound => |rewound| {
+                var arena = rewound.arena;
                 arena.deinit();
             },
             .subagent => |transcript| {
@@ -728,6 +753,12 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     var kept = status;
     kept.label = try arena.dupe(u8, status.label);
     kept.pending_description = try arena.dupe(u8, status.pending_description);
+    const proposals = try arena.alloc(Loop.Proposal, status.pending_proposals.len);
+    for (status.pending_proposals, proposals) |proposal, *copy| copy.* = .{
+        .breadth = proposal.breadth,
+        .patterns = try dupeAll(arena, proposal.patterns),
+    };
+    kept.pending_proposals = proposals;
     kept.title = try arena.dupe(u8, status.title);
     kept.handle = try arena.dupe(u8, status.handle);
     kept.root = try arena.dupe(u8, status.root);
@@ -797,6 +828,9 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             .models => "listing the models",
             .files => "listing the files",
             .providers => "listing the providers",
+            .approvals => "changing the allowances",
+            .checkpoints => "listing the checkpoints",
+            .rewind => "putting the files back",
             .subagent => "loading the subagent's transcript",
             .detach => "Detaching",
         };
@@ -889,6 +923,27 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
             errdefer kept.deinit();
             const states = try rpc.parse([]const synth.ProviderState, kept.allocator(), result);
             self.answers.appendAssumeCapacity(.{ .providers = .{ .arena = kept, .states = states } });
+        },
+        .approvals => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const allowances = try rpc.parse([]const synth.Allowance, kept.allocator(), result);
+            self.answers.appendAssumeCapacity(.{ .approvals = .{ .arena = kept, .allowances = allowances } });
+        },
+        .checkpoints => {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const turns = try rpc.parse([]const synth.Checkpoint, kept.allocator(), result);
+            self.answers.appendAssumeCapacity(.{ .checkpoints = .{ .arena = kept, .turns = turns } });
+        },
+        .rewind => |asked| {
+            try self.answers.ensureUnusedCapacity(self.allocator, 1);
+            var kept: std.heap.ArenaAllocator = .init(self.allocator);
+            errdefer kept.deinit();
+            const files = try rpc.parse([]const Loop.Rewound, kept.allocator(), result);
+            self.answers.appendAssumeCapacity(.{ .rewound = .{ .arena = kept, .seq = asked.seq, .applied = asked.apply, .files = files } });
         },
         .files => {
             const paths = try rpc.parse([]const []const u8, arena, result);
@@ -1149,7 +1204,7 @@ pub fn decide(self: *Mirror, decision: Loop.Decision) !void {
         return;
     };
     if (asked.on != .decision) return error.NothingToDecide;
-    try connection.reply(asked.id, .{ .outcome = .{ .outcome = "selected", .optionId = @tagName(decision) } });
+    try connection.reply(asked.id, .{ .outcome = .{ .outcome = "selected", .optionId = updates.optionId(decision) } });
     self.forgetAsked();
 }
 
@@ -1164,6 +1219,11 @@ pub fn rename(self: *Mirror, name: []const u8) !void {
 /// Start a turn on one of the agent's skills, as typed: `/id args`.
 pub fn runSkill(self: *Mirror, line: []const u8) !void {
     try self.submit(line, .{});
+}
+
+/// Hand decisions on calls to `mode`. The status says when it took.
+pub fn setApprovalMode(self: *Mirror, mode: Config.Approvals) !void {
+    try self.send(synth.method.set_approval_mode, synth.SetApprovalMode{ .sessionId = self.status.handle, .mode = mode }, .{ .command = "Changing approvals" });
 }
 
 pub fn useAgent(self: *Mirror, id: []const u8) !void {
@@ -1184,6 +1244,27 @@ pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8, provid
 /// Ask what providers the agent knows. They land on a later poll.
 pub fn listProviders(self: *Mirror) !void {
     try self.send(synth.method.providers, protocol.SessionId{ .sessionId = self.status.handle }, .providers);
+}
+
+/// Ask which turns' file changes can be undone. They land on a later poll.
+pub fn listCheckpoints(self: *Mirror) !void {
+    try self.send(synth.method.checkpoints, protocol.SessionId{ .sessionId = self.status.handle }, .checkpoints);
+}
+
+/// Put back every file the turns from the agent's `seq` on changed, or with
+/// `confirmed` false, ask what that would do. The answer lands on a later poll.
+pub fn rewind(self: *Mirror, seq: u64, confirmed: bool) !void {
+    try self.send(synth.method.rewind, synth.Rewind{ .sessionId = self.status.handle, .seq = seq, .apply = confirmed }, .{ .rewind = .{ .seq = seq, .apply = confirmed } });
+}
+
+/// Ask for the project's standing allowances. They land on a later poll.
+pub fn listApprovals(self: *Mirror) !void {
+    try self.send(synth.method.approvals, protocol.SessionId{ .sessionId = self.status.handle }, .approvals);
+}
+
+/// Drop and add standing allowances. What then stands lands on a later poll.
+pub fn setApprovals(self: *Mirror, remove: []const synth.Allowance, add: []const synth.Allowance) !void {
+    try self.send(synth.method.set_approvals, synth.SetApprovals{ .sessionId = self.status.handle, .remove = remove, .add = add }, .approvals);
 }
 
 /// Point the session at a provider. A ChatGPT sign-in it needs shows up in
@@ -1458,6 +1539,147 @@ test "a mirror follows a turn, and its approval is answered from here" {
 
 fn cancelled(mirror: *Mirror) bool {
     return mirror.status.state == .idle and mirror.status.outcome == .cancelled;
+}
+
+fn finishedTwo(mirror: *Mirror) bool {
+    return mirror.status.state == .idle and mirror.status.finished == 2;
+}
+
+fn finishedThree(mirror: *Mirror) bool {
+    return mirror.status.state == .idle and mirror.status.finished == 3;
+}
+
+test "an always-allow is chosen from the agent's proposals, as wide as asked" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try mirror.submit("run: git notes list", .{});
+    try pollUntil(mirror, awaitingApproval);
+    const proposals = mirror.status.pending_proposals;
+    try testing.expectEqual(@as(usize, 3), proposals.len);
+    try testing.expectEqualStrings("git notes list", proposals[0].patterns[0]);
+    try testing.expectEqualStrings("git notes *", proposals[1].patterns[0]);
+    try testing.expectEqualStrings("git *", proposals[2].patterns[0]);
+
+    try mirror.decide(.{ .always = proposals[1].breadth });
+    try pollUntil(mirror, finishedOne);
+
+    try mirror.submit("run: git notes show", .{});
+    try pollUntil(mirror, finishedTwo);
+
+    try mirror.submit("run: git stash list", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.deny);
+    try pollUntil(mirror, finishedThree);
+}
+
+fn expectAllowances(mirror: *Mirror, wanted: []const []const u8) !void {
+    const reply = try pollForAnswer(mirror);
+    defer reply.deinit(testing.allocator);
+    const allowances = reply.approvals.allowances;
+    try testing.expectEqual(wanted.len, allowances.len);
+    for (wanted, allowances) |pattern, allowance| try testing.expectEqualStrings(pattern, allowance.pattern);
+}
+
+test "allowances changed here, or in another process on the project, hold from the next call" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try mirror.listApprovals();
+    try expectAllowances(mirror, &.{});
+
+    try mirror.submit("run: git notes list", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.{ .always = .subcommand });
+    try pollUntil(mirror, finishedOne);
+
+    try mirror.setApprovals(&.{.{ .tool = "bash", .pattern = "git notes *" }}, &.{.{ .tool = "bash", .pattern = "git log *" }});
+    try expectAllowances(mirror, &.{"git log *"});
+
+    try mirror.submit("run: git notes show", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.deny);
+    try pollUntil(mirror, finishedTwo);
+
+    const project = try fixture.db.resolveProject(fixture.project, "git", "project");
+    try fixture.db.addApproval(project, "bash", "git stash *");
+    try mirror.submit("run: git stash list", .{});
+    try pollUntil(mirror, finishedThree);
+
+    try mirror.setApprovals(&.{}, &.{.{ .tool = "nonsense", .pattern = "x" }});
+    try mirror.listApprovals();
+    try expectAllowances(mirror, &.{ "git log *", "git stash *" });
+}
+
+test "a turn's file changes are listed and put back from here" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    const note = try std.fs.path.join(testing.allocator, &.{ fixture.project, "note.txt" });
+    defer testing.allocator.free(note);
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = note, .data = "before" });
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, awaitingApproval);
+    try mirror.decide(.once);
+    try pollUntil(mirror, finishedOne);
+
+    try mirror.listCheckpoints();
+    const listed = try pollForAnswer(mirror);
+    defer listed.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), listed.checkpoints.turns.len);
+    const turn = listed.checkpoints.turns[0];
+    try testing.expectEqualStrings("make a note", turn.prompt);
+    try testing.expectEqual(@as(u32, 1), turn.files);
+
+    try mirror.rewind(turn.seq, false);
+    const asked = try pollForAnswer(mirror);
+    defer asked.deinit(testing.allocator);
+    try testing.expect(!asked.rewound.applied);
+    try testing.expectEqual(@as(usize, 1), asked.rewound.files.len);
+    try testing.expectEqualStrings("note.txt", asked.rewound.files[0].path);
+
+    var buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("acp", try std.Io.Dir.cwd().readFile(testing.io, note, &buffer));
+    try mirror.rewind(turn.seq, true);
+    const done = try pollForAnswer(mirror);
+    defer done.deinit(testing.allocator);
+    try testing.expect(done.rewound.applied);
+    try testing.expectEqualStrings("before", try std.Io.Dir.cwd().readFile(testing.io, note, &buffer));
+}
+
+fn approvingAll(mirror: *Mirror) bool {
+    return mirror.status.approval_mode == .all;
+}
+
+test "a mirror hands decisions over, and a call then runs without asking" {
+    const fixture = try Agent.Fixture.create();
+    defer fixture.destroy();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try openFresh(fixture, &convo);
+    defer mirror.close();
+
+    try testing.expectEqual(Config.Approvals.ask, mirror.status.approval_mode);
+    try mirror.setApprovalMode(.all);
+    try pollUntil(mirror, approvingAll);
+
+    try mirror.submit("make a note", .{});
+    try pollUntil(mirror, finishedOne);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, convo.messages.items[1].tool_calls[0].status);
 }
 
 test "a cancelled turn takes its question back from the mirror" {

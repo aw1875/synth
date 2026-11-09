@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 
+const Config = @import("../core/config.zig");
 const Database = @import("../core/database.zig");
 const Hooks = @import("../core/hooks.zig");
 const Provider = @import("../provider/provider.zig");
@@ -22,7 +23,9 @@ const tool = @import("../tools/tool.zig");
 const Conversation = @import("../core/conversation.zig");
 const mention = @import("../core/mention.zig");
 const Request = @import("request.zig");
+const classifier = @import("classifier.zig");
 const window = @import("../provider/window.zig");
+const permission = @import("permission.zig");
 const safety = @import("safety.zig");
 const Thought = @import("thought.zig");
 const ToolRun = @import("tool_run.zig");
@@ -86,6 +89,8 @@ pub const State = enum {
     awaiting_answer,
     /// Running approved tools.
     running_tools,
+    /// Auto mode is having a call judged.
+    classifying,
     /// Asking the model to summarise the transcript so far.
     compacting,
     /// The user gave up, and the worker has been asked to stop but has not
@@ -102,6 +107,7 @@ pub const State = enum {
             .awaiting_approval => "Awaiting approval",
             .awaiting_answer => "Waiting for your answer",
             .running_tools => "Running tools",
+            .classifying => "Checking a call",
             .compacting => "Compacting",
             .cancelling => "Cancelling",
         };
@@ -109,8 +115,9 @@ pub const State = enum {
 };
 
 /// A remembered "allow always", scoped to the project and to what the call was
-/// doing: `bash` approved for `find *` does not approve `rm`. Every other tool
-/// stores `*`.
+/// doing: `bash` approved for `git commit *` does not approve `git push`
+/// (`permission.zig` has the patterns). Every other tool stores `*`, or the
+/// path of a call that reached outside the project.
 const Allowance = struct {
     tool: []const u8,
     pattern: []const u8,
@@ -136,6 +143,13 @@ project_id: ?i64 = null,
 /// The session's name, owned. Null until one is given.
 session_title: ?[]const u8 = null,
 session_id: ?i64 = null,
+/// The loop that started this one, for a subagent. Its file changes are
+/// undone with the parent's turns, and auto mode judges its calls by what the
+/// parent's person asked for.
+parent: ?*Loop = null,
+/// Files the running batch checkpointed, to record what it left in them once
+/// it settles. Owned.
+checkpointed: std.ArrayList([]u8) = .empty,
 /// The cwd and model for the session row, held until the session is actually
 /// created on the first message. A session is not created just for opening the
 /// app.
@@ -204,6 +218,13 @@ allowed: std.ArrayList(Allowance) = .empty,
 /// Whether the preset list of read-only shell commands runs without asking.
 /// Off makes every `bash` call a question, however harmless.
 auto_approve_safe: bool = true,
+/// Who decides a call that would otherwise stop for the person.
+approvals: Config.Approvals = .ask,
+/// The call auto mode is having judged, while it is.
+judging: ?Judging = null,
+/// Calls auto mode blocked in a row, and in all, toward handing decisions back.
+blocks_in_row: u32 = 0,
+blocks_total: u32 = 0,
 
 /// How a tool call starts a subagent. Installed by whoever assembled the loop,
 /// because the implementation needs a loop and the loop must not need it.
@@ -320,12 +341,25 @@ pub fn attachDatabase(
     self.project_id = try db.resolveProject(self.project_root, "git", project_name);
     self.session_cwd = cwd;
     self.session_model = model;
+    try self.reloadAllowances();
+}
 
-    const remembered = try db.approvals(self.project_id.?, self.allocator);
+/// Replace the allowances held in memory with the ones the database holds,
+/// which another session may have changed.
+pub fn reloadAllowances(self: *Loop) !void {
+    const db = self.db orelse return;
+    const project_id = self.project_id orelse return;
+    const remembered = try db.approvals(project_id, self.allocator);
     defer {
         for (remembered) |approval| approval.deinit(self.allocator);
         self.allocator.free(remembered);
     }
+
+    for (self.allowed.items) |allowance| {
+        self.allocator.free(allowance.tool);
+        self.allocator.free(allowance.pattern);
+    }
+    self.allowed.clearRetainingCapacity();
     for (remembered) |approval| try self.remember(approval.tool, approval.pattern);
 }
 
@@ -541,6 +575,7 @@ fn ensureSession(self: *Loop) !i64 {
 /// long the model takes" to a chunk or two.
 pub fn requestStop(self: *Loop) void {
     if (self.request) |request| request.requestStop();
+    if (self.judging) |judging| judging.request.requestStop();
     if (self.tools) |tools| tools.requestStop();
     if (self.hook_dispatch) |dispatch| dispatch.requestStop();
 }
@@ -558,6 +593,11 @@ pub fn deinit(self: *Loop) void {
         request.cancel();
         request.destroy();
         self.request = null;
+    }
+    if (self.judging) |judging| {
+        judging.request.cancel();
+        judging.destroy(self.allocator);
+        self.judging = null;
     }
     if (self.tools) |tools| {
         tools.cancel();
@@ -585,6 +625,8 @@ pub fn deinit(self: *Loop) void {
         self.allocator.free(allowance.pattern);
     }
     self.allowed.deinit(self.allocator);
+    for (self.checkpointed.items) |path| self.allocator.free(path);
+    self.checkpointed.deinit(self.allocator);
     self.message_ids.deinit(self.allocator);
 }
 
@@ -964,7 +1006,7 @@ fn ask(self: *Loop) !void {
         return self.startCompaction(true);
     }
     self.steps += 1;
-    if (self.steps > self.agent.steps) {
+    if (self.steps > self.agent.steps and !self.isRunningWithoutLimit()) {
         return self.stop("Stopped: too many tool calls in one turn.");
     }
     self.request = try Request.start(
@@ -1095,6 +1137,7 @@ fn startReaping(self: *Loop) void {
 /// Interrupt both workers and wait for them to unwind, off the UI's thread.
 fn reap(self: *Loop) void {
     if (self.request) |request| request.cancel();
+    if (self.judging) |judging| judging.request.cancel();
     if (self.tools) |tools| tools.cancel();
     if (self.hook_dispatch) |dispatch| dispatch.cancel();
     self.reaped.store(true, .release);
@@ -1128,12 +1171,19 @@ fn pollCancelled(self: *Loop) !bool {
         self.request = null;
     }
 
+    if (self.judging) |judging| {
+        judging.request.join();
+        judging.destroy(self.allocator);
+        self.judging = null;
+    }
+
     if (self.tools) |tools| {
         tools.join();
         self.tools = null;
         defer tools.destroy();
         try self.adoptSettled(tools);
         try self.persistReads();
+        self.sealCheckpoints();
     }
     self.clearNotes();
 
@@ -1178,6 +1228,7 @@ pub fn poll(self: *Loop) !bool {
         .running_hooks => self.pollPromptHooks(),
         .thinking, .compacting => self.pollRequest(),
         .running_tools => self.pollTools(),
+        .classifying => self.pollJudging(),
         .cancelling => self.pollCancelled(),
     };
 }
@@ -1355,6 +1406,8 @@ fn repeating(self: *Loop, calls: []const Conversation.ToolCall) !bool {
 /// Settle every call that needs no decision, then either run what is approved
 /// or stop for the user.
 fn autoApprove(self: *Loop) !void {
+    // Each session is its own process, so another may have changed them.
+    self.reloadAllowances() catch {};
     const message_index = self.pendingIndex() orelse return;
     const calls = self.conversation.messages.items[message_index].tool_calls;
 
@@ -1368,10 +1421,161 @@ fn autoApprove(self: *Loop) !void {
     }
 
     if (self.firstPending() != null) {
+        if (self.approvals == .auto) return self.judgeNext();
         self.state = .awaiting_approval;
         return;
     }
     try self.runApproved();
+}
+
+/// A call auto mode is having judged, and the request judging it.
+const Judging = struct {
+    request: *Request,
+    /// What the request is shown, borrowed by it until it is joined.
+    convo: *Conversation,
+    call: usize,
+    stage: classifier.Stage,
+
+    fn destroy(self: Judging, allocator: std.mem.Allocator) void {
+        self.request.destroy();
+        self.convo.deinit();
+        allocator.destroy(self.convo);
+    }
+};
+
+/// Hand decisions on calls to `mode` from now on, with a clean slate of blocks.
+pub fn setApprovals(self: *Loop, mode: Config.Approvals) void {
+    self.approvals = mode;
+    self.blocks_in_row = 0;
+    self.blocks_total = 0;
+}
+
+/// Blocks in a row, and in a session, after which auto mode hands decisions
+/// back to the person: something is off, with the task or with the judge.
+const max_blocks_in_row = 3;
+const max_blocks_total = 20;
+
+/// Have the next call still waiting on a decision judged, letting an edit
+/// inside the project through on the way; run the batch once none is left.
+fn judgeNext(self: *Loop) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const calls = self.conversation.messages.items[message_index].tool_calls;
+    for (calls, 0..) |*call, index| {
+        if (call.status != .pending) continue;
+        if (self.editsInside(call)) {
+            call.begin(tool.monotonicMilliseconds(self.io));
+            continue;
+        }
+        return self.startJudging(index, .quick);
+    }
+    try self.runApproved();
+}
+
+fn editsInside(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    if (!std.mem.eql(u8, call.name, "write") and !std.mem.eql(u8, call.name, "edit")) return false;
+    return !self.escapesProject(call);
+}
+
+fn startJudging(self: *Loop, call_index: usize, stage: classifier.Stage) !void {
+    const message_index = self.pendingIndex() orelse return;
+    const call = self.conversation.messages.items[message_index].tool_calls[call_index];
+    const asker = self.parent orelse self;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const material = try classifier.material(
+        arena_state.allocator(),
+        self.project_root,
+        asker.conversation.messages.items,
+        self.conversation.messages.items,
+        call,
+    );
+
+    const convo = try self.allocator.create(Conversation);
+    errdefer self.allocator.destroy(convo);
+    convo.* = .init(self.allocator);
+    errdefer convo.deinit();
+    _ = try convo.addUser(material, &.{}, &.{});
+
+    const request = try Request.start(self.allocator, self.io, self.provider, convo, .{
+        .system = classifier.system_prompt,
+        .instruction = classifier.instruction(stage),
+    });
+    self.judging = .{ .request = request, .convo = convo, .call = call_index, .stage = stage };
+    self.state = .classifying;
+}
+
+fn pollJudging(self: *Loop) !bool {
+    const judging = self.judging orelse return false;
+    if (!judging.request.isFinished()) return false;
+    judging.request.join();
+    self.judging = null;
+    defer judging.destroy(self.allocator);
+
+    const message_index = self.pendingIndex() orelse return true;
+    const call = &self.conversation.messages.items[message_index].tool_calls[judging.call];
+    const reply = judging.request.reply orelse {
+        const why = if (judging.request.failed) |err| @errorName(err) else "no answer";
+        return self.askInstead(call, why);
+    };
+    self.usage.calls += 1;
+    self.usage.input_tokens += reply.usage.prompt_tokens;
+    self.usage.output_tokens += reply.usage.completion_tokens;
+    self.turn_tokens += reply.usage.prompt_tokens + reply.usage.completion_tokens;
+
+    switch (classifier.verdict(judging.stage, reply.text)) {
+        .allow => {
+            self.blocks_in_row = 0;
+            call.begin(tool.monotonicMilliseconds(self.io));
+            try self.judgeNext();
+        },
+        .block => |reason| switch (judging.stage) {
+            .quick => try self.startJudging(judging.call, .careful),
+            .careful => try self.block(message_index, judging.call, reason),
+        },
+        .unclear => switch (judging.stage) {
+            .quick => try self.startJudging(judging.call, .careful),
+            .careful => return self.askInstead(call, "its answer could not be read"),
+        },
+    }
+    return true;
+}
+
+/// Put a call auto mode could not judge to the person.
+fn askInstead(self: *Loop, call: *const Conversation.ToolCall, why: []const u8) bool {
+    self.say("Auto mode could not judge the {s} call ({s}), so it is asking you", .{ call.name, why });
+    self.state = .awaiting_approval;
+    return true;
+}
+
+/// Turn a call down on auto mode's say-so, telling the model why, and hand
+/// decisions back to the person once that has happened too often.
+fn block(self: *Loop, message_index: usize, call_index: usize, reason: []const u8) !void {
+    const call = &self.conversation.messages.items[message_index].tool_calls[call_index];
+    const text = try std.fmt.allocPrint(
+        self.allocator,
+        "Blocked by auto mode: {s}. Do this another way, or ask the user first.",
+        .{if (reason.len > 0) reason else "it looked unsafe"},
+    );
+    call.status = .rejected;
+    call.result = text;
+    call.result_bytes = text.len;
+    try self.persistToolCall(message_index, call_index);
+
+    self.blocks_in_row += 1;
+    self.blocks_total += 1;
+    if (self.blocks_in_row >= max_blocks_in_row or self.blocks_total >= max_blocks_total) {
+        self.approvals = .ask;
+        self.blocks_in_row = 0;
+        self.blocks_total = 0;
+        self.say("Auto mode blocked too many calls, so decisions are back with you", .{});
+        if (self.firstPending() != null) {
+            self.state = .awaiting_approval;
+            return;
+        }
+        return self.runApproved();
+    }
+    try self.judgeNext();
 }
 
 /// The question the model is waiting on an answer to, or null when it is not.
@@ -1480,7 +1684,15 @@ pub fn pendingCall(self: *Loop) ?*Conversation.ToolCall {
     return &self.conversation.messages.items[message_index].tool_calls[index];
 }
 
-pub const Decision = enum { once, always, deny };
+/// The answer to a call waiting on a decision. `always` says how far the
+/// allowance it leaves behind reaches.
+pub const Decision = union(enum) { once, always: permission.Breadth, deny };
+
+/// What "allow always" would store for a call at one breadth.
+pub const Proposal = struct {
+    breadth: permission.Breadth,
+    patterns: []const []const u8,
+};
 
 /// Record the user's answer for the call currently being asked about.
 pub fn decide(self: *Loop, decision: Decision) !void {
@@ -1490,9 +1702,9 @@ pub fn decide(self: *Loop, decision: Decision) !void {
 
     switch (decision) {
         .once => call.begin(tool.monotonicMilliseconds(self.io)),
-        .always => {
+        .always => |breadth| {
             call.begin(tool.monotonicMilliseconds(self.io));
-            try self.allow(call);
+            try self.allow(call, breadth);
         },
         .deny => {
             call.status = .rejected;
@@ -1541,6 +1753,7 @@ fn refuse(self: *Loop, message_index: usize, call_index: usize) !void {
 /// has already said always to allow.
 fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     if (!self.agent.allows(call.name)) return false;
+    if (self.approvals == .all) return true;
 
     if (self.outsidePath(self.allocator, call) catch null) |path| {
         defer self.allocator.free(path);
@@ -1553,6 +1766,13 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
     return self.isAllowed(call);
 }
 
+/// Whether a call cleared to run may resolve paths outside the project: one
+/// the user was asked about, one naming such a path, which running means was
+/// cleared, or any call when approvals are `all`.
+fn mayReachOutside(self: *const Loop, call: *const Conversation.ToolCall) bool {
+    return self.approvals == .all or self.escapesProject(call) or !self.needsNoDecision(call);
+}
+
 /// Whether a call names a path outside the project.
 ///
 /// Such a call never skips the gate, whatever the tool says about being
@@ -1560,12 +1780,20 @@ fn needsNoDecision(self: *const Loop, call: *const Conversation.ToolCall) bool {
 /// read-only tool. Anything unparseable counts as escaping, so a malformed
 /// argument is asked about rather than waved through.
 fn escapesProject(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    const outside = self.outsidePath(self.allocator, call) catch return false;
+    if (call.arguments.len > 0 and !isObject(self.allocator, call.arguments)) return true;
+    const outside = self.outsidePath(self.allocator, call) catch return true;
     if (outside) |path| {
         self.allocator.free(path);
         return true;
     }
     return false;
+}
+
+fn isObject(allocator: std.mem.Allocator, text: []const u8) bool {
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), text, .{}) catch return false;
+    return parsed == .object;
 }
 
 /// The path this call names that lies outside the project, resolved so that an
@@ -1595,7 +1823,7 @@ fn outsidePath(
 
         const resolved = self.resolveAgainstProject(arena, value.string) orelse
             return try allocator.dupe(u8, value.string);
-        if (!self.inside(resolved)) return try allocator.dupe(u8, resolved);
+        if (!self.inside(arena, resolved)) return try allocator.dupe(u8, resolved);
     }
     return null;
 }
@@ -1606,18 +1834,40 @@ fn resolveAgainstProject(self: *const Loop, arena: std.mem.Allocator, path: []co
     else
         std.fs.path.join(arena, &.{ self.project_root, path }) catch return null;
 
-    return std.fs.path.resolve(arena, &.{joined}) catch null;
+    const lexical = std.fs.path.resolve(arena, &.{joined}) catch return null;
+    return self.followLinks(arena, lexical);
 }
 
-fn inside(self: *const Loop, resolved: []const u8) bool {
-    if (!std.mem.startsWith(u8, resolved, self.project_root)) return false;
-    if (resolved.len == self.project_root.len) return true;
-    return resolved[self.project_root.len] == std.fs.path.sep;
+/// `lexical` with the links in the part of it that exists followed, since the
+/// OS follows them when the call runs: `link/x` under a project is outside it
+/// when `link` points out. Null when that cannot be told, a dangling link
+/// included.
+fn followLinks(self: *const Loop, arena: std.mem.Allocator, lexical: []const u8) ?[]const u8 {
+    var existing = lexical;
+    while (true) {
+        if (std.Io.Dir.cwd().realPathFileAlloc(self.io, existing, arena)) |real| {
+            return std.fs.path.join(arena, &.{ real, lexical[existing.len..] }) catch null;
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                if (std.Io.Dir.cwd().readLink(self.io, existing, &buffer)) |_| return null else |_| {}
+            },
+            else => return null,
+        }
+        existing = std.fs.path.dirname(existing) orelse return lexical;
+    }
+}
+
+fn inside(self: *const Loop, arena: std.mem.Allocator, resolved: []const u8) bool {
+    const root = self.followLinks(arena, self.project_root) orelse self.project_root;
+    if (!std.mem.startsWith(u8, resolved, root)) return false;
+    if (resolved.len == root.len) return true;
+    return resolved[root.len] == std.fs.path.sep;
 }
 
 fn withinProject(self: *const Loop, arena: std.mem.Allocator, path: []const u8) bool {
     const resolved = self.resolveAgainstProject(arena, path) orelse return false;
-    return self.inside(resolved);
+    return self.inside(arena, resolved);
 }
 
 /// Whether the preset list of read-only commands covers this call. Only `bash`
@@ -1661,15 +1911,11 @@ fn resultCeiling(self: *const Loop, name: []const u8) usize {
 }
 
 /// Record an "allow always" for what this call is doing, and persist it.
-fn allow(self: *Loop, call: *const Conversation.ToolCall) !void {
-    const patterns = if (try self.outsidePath(self.allocator, call)) |path| blk: {
-        const out = try self.allocator.alloc([]const u8, 1);
-        out[0] = path;
-        break :blk out;
-    } else try approvalPatterns(self.allocator, call.name, call.arguments);
-    defer freePatterns(self.allocator, patterns);
+fn allow(self: *Loop, call: *const Conversation.ToolCall, breadth: permission.Breadth) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
 
-    for (patterns) |pattern| {
+    for (try self.allowancesFor(arena_state.allocator(), call, breadth)) |pattern| {
         try self.remember(call.name, pattern);
         if (self.db) |db| {
             if (self.project_id) |project_id| {
@@ -1694,73 +1940,69 @@ fn remember(self: *Loop, name: []const u8, pattern: []const u8) !void {
     });
 }
 
-/// What an "allow always" on this call covers, as one pattern per program the
-/// command runs.
-pub fn approvalPatterns(
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    arguments: []const u8,
+/// What "allow always" could store for `call`, narrowest first, each reaching
+/// further than the one before.
+pub fn proposals(self: *const Loop, arena: std.mem.Allocator, call: *const Conversation.ToolCall) ![]const Proposal {
+    var out: std.ArrayList(Proposal) = .empty;
+    for (std.enums.values(permission.Breadth)) |breadth| {
+        const patterns = try self.allowancesFor(arena, call, breadth);
+        if (out.items.len > 0 and samePatterns(out.getLast().patterns, patterns)) continue;
+        try out.append(arena, .{ .breadth = breadth, .patterns = patterns });
+    }
+    return out.items;
+}
+
+/// The allowances an "allow always" at `breadth` stores for `call`: the path
+/// of one reaching outside the project, a pattern for each command of a shell
+/// line that is neither safe nor already allowed, or `*`. A line the splitter
+/// will not vouch for is only ever allowed as written.
+fn allowancesFor(
+    self: *const Loop,
+    arena: std.mem.Allocator,
+    call: *const Conversation.ToolCall,
+    breadth: permission.Breadth,
 ) ![]const []const u8 {
-    if (!std.mem.eql(u8, name, "bash")) return onePattern(allocator, "*");
+    if (try self.outsidePath(arena, call)) |path| return onePattern(arena, path);
+    if (!std.mem.eql(u8, call.name, "bash")) return onePattern(arena, "*");
 
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arguments, .{}) catch
-        return onePattern(allocator, arguments);
-    defer parsed.deinit();
-    if (parsed.value != .object) return onePattern(allocator, arguments);
+    const command = shellCommand(arena, call.arguments);
+    const parts = try safety.segments(arena, command) orelse return onePattern(arena, command);
+    if (parts.len == 0) return onePattern(arena, command);
 
-    const command = jsonString(parsed.value.object, "command") orelse
-        return onePattern(allocator, arguments);
-    const trimmed = std.mem.trim(u8, command, " \t\r\n");
-
-    var arena_state: std.heap.ArenaAllocator = .init(allocator);
-    defer arena_state.deinit();
-
-    const programs = try shellPrograms(arena_state.allocator(), trimmed) orelse
-        return onePattern(allocator, trimmed);
-    if (programs.len == 0) return onePattern(allocator, trimmed);
-
-    if (programs.len == 1 and std.mem.eql(u8, programs[0], trimmed)) {
-        return onePattern(allocator, trimmed);
-    }
-
-    const out = try allocator.alloc([]const u8, programs.len);
-    var filled: usize = 0;
-    errdefer {
-        for (out[0..filled]) |pattern| allocator.free(pattern);
-        allocator.free(out);
-    }
-    for (programs, out) |program, *pattern| {
-        pattern.* = try std.fmt.allocPrint(allocator, "{s} *", .{program});
-        filled += 1;
-    }
-    return out;
-}
-
-pub fn freePatterns(allocator: std.mem.Allocator, patterns: []const []const u8) void {
-    for (patterns) |pattern| allocator.free(pattern);
-    allocator.free(patterns);
-}
-
-fn onePattern(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
-    const out = try allocator.alloc([]const u8, 1);
-    errdefer allocator.free(out);
-    out[0] = try allocator.dupe(u8, pattern);
-    return out;
-}
-
-/// The distinct programs `command` runs, in the order they appear, or null when
-/// the line uses something the splitter will not vouch for.
-fn shellPrograms(arena: std.mem.Allocator, command: []const u8) !?[][]const u8 {
-    const parts = try safety.segments(arena, command) orelse return null;
-
-    var names: std.ArrayList([]const u8) = .empty;
+    var out: std.ArrayList([]const u8) = .empty;
     next: for (parts) |part| {
-        for (names.items) |existing| {
-            if (std.mem.eql(u8, existing, part.program)) continue :next;
+        if (self.segmentAllowed(part)) continue;
+        const pattern = try permission.pattern(arena, part, breadth);
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, pattern)) continue :next;
         }
-        try names.append(arena, part.program);
+        try out.append(arena, pattern);
     }
-    return names.items;
+    return out.items;
+}
+
+fn onePattern(arena: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, 1);
+    out[0] = try arena.dupe(u8, pattern);
+    return out;
+}
+
+fn samePatterns(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+/// The command a `bash` call runs, trimmed, or its raw arguments when they
+/// name none.
+fn shellCommand(arena: std.mem.Allocator, arguments: []const u8) []const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments, .{}) catch
+        return std.mem.trim(u8, arguments, " \t\r\n");
+    if (parsed != .object) return std.mem.trim(u8, arguments, " \t\r\n");
+    const command = jsonString(parsed.object, "command") orelse return std.mem.trim(u8, arguments, " \t\r\n");
+    return std.mem.trim(u8, command, " \t\r\n");
 }
 
 fn jsonString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1769,13 +2011,31 @@ fn jsonString(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
 }
 
 fn isAllowed(self: *const Loop, call: *const Conversation.ToolCall) bool {
-    const patterns = approvalPatterns(self.allocator, call.name, call.arguments) catch return false;
-    defer freePatterns(self.allocator, patterns);
+    if (!std.mem.eql(u8, call.name, "bash")) return self.coversExactly(call.name, "*");
 
-    for (patterns) |pattern| {
-        if (!self.covers(call.name, pattern)) return false;
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const command = shellCommand(arena, call.arguments);
+    const parts = (safety.segments(arena, command) catch null) orelse &.{};
+    if (parts.len == 0) return self.coversExactly("bash", command) or (self.approvals != .auto and self.coversExactly("bash", "*"));
+    for (parts) |part| {
+        if (!self.segmentAllowed(part)) return false;
     }
     return true;
+}
+
+/// Whether one command of a shell line may run: it is on the safe list, or an
+/// allowance covers it.
+fn segmentAllowed(self: *const Loop, part: safety.Segment) bool {
+    if (self.auto_approve_safe and safety.isSafeSegment(part)) return true;
+    for (self.allowed.items) |allowance| {
+        if (!std.mem.eql(u8, allowance.tool, "bash")) continue;
+        if (self.approvals == .auto and permission.runsAnything(allowance.pattern)) continue;
+        if (permission.covers(allowance.pattern, part)) return true;
+    }
+    return false;
 }
 
 /// Whether an allowance names this pattern outright, ignoring `*`.
@@ -1783,18 +2043,6 @@ fn coversExactly(self: *const Loop, name: []const u8, pattern: []const u8) bool 
     for (self.allowed.items) |allowance| {
         if (!std.mem.eql(u8, allowance.tool, name)) continue;
         if (std.mem.eql(u8, allowance.pattern, pattern)) return true;
-    }
-    return false;
-}
-
-fn covers(self: *const Loop, name: []const u8, pattern: []const u8) bool {
-    for (self.allowed.items) |allowance| {
-        if (!std.mem.eql(u8, allowance.tool, name)) continue;
-        if (std.mem.eql(u8, allowance.pattern, "*")) return true;
-        if (std.mem.eql(u8, allowance.pattern, pattern)) return true;
-        if (allowance.pattern.len == pattern.len + 2 and
-            std.mem.startsWith(u8, allowance.pattern, pattern) and
-            std.mem.endsWith(u8, allowance.pattern, " *")) return true;
     }
     return false;
 }
@@ -1978,6 +2226,125 @@ fn persistReads(self: *Loop) !void {
     }
 }
 
+/// Largest file a checkpoint keeps. Past this a turn's change to it cannot be
+/// undone, which beats copying a huge file on every edit.
+const max_checkpoint_bytes = 8 * 1024 * 1024;
+
+/// Keep what every file a `write` or `edit` in `batch` is about to change
+/// holds now, under the prompt that began the turn, so the turn can be undone.
+fn checkpointBatch(self: *Loop, batch: []const ToolRun.Call) !void {
+    const owner = self.parent orelse self;
+    const db = owner.db orelse return;
+    const seq = owner.turn_start_seq orelse return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    for (batch) |call| {
+        if (!std.mem.eql(u8, call.name, "write") and !std.mem.eql(u8, call.name, "edit")) continue;
+        const path = self.changedPath(arena, call.arguments) orelse continue;
+        const content = readCheckpointed(self.io, arena, path) catch |err| {
+            self.say("Could not checkpoint {s}, so /rewind cannot put it back: {s}", .{ path, @errorName(err) });
+            continue;
+        };
+        try db.saveCheckpoint(try owner.ensureSession(), seq, path, content);
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.checkpointed.append(self.allocator, owned);
+    }
+}
+
+/// Record what the batch left in each file it checkpointed, so a rewind can
+/// tell when someone changed one since.
+fn sealCheckpoints(self: *Loop) void {
+    defer {
+        for (self.checkpointed.items) |path| self.allocator.free(path);
+        self.checkpointed.clearRetainingCapacity();
+    }
+    const owner = self.parent orelse self;
+    const db = owner.db orelse return;
+    const seq = owner.turn_start_seq orelse return;
+    const session_id = owner.session_id orelse return;
+
+    var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+    defer arena_state.deinit();
+    for (self.checkpointed.items) |path| {
+        const content = (readCheckpointed(self.io, arena_state.allocator(), path) catch continue) orelse continue;
+        db.sealCheckpoint(session_id, seq, path, std.hash.Wyhash.hash(0, content)) catch |err| {
+            self.say("Could not checkpoint {s}: {s}", .{ path, @errorName(err) });
+        };
+    }
+}
+
+/// The absolute path a file-changing call names, or null when it names none.
+fn changedPath(self: *const Loop, arena: std.mem.Allocator, arguments: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, arguments, .{}) catch return null;
+    if (parsed != .object) return null;
+    const path = jsonString(parsed.object, "path") orelse return null;
+    if (path.len == 0) return null;
+    return self.resolveAgainstProject(arena, path);
+}
+
+/// What `path` holds, or null when it does not exist.
+fn readCheckpointed(io: std.Io, arena: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(max_checkpoint_bytes)) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => err,
+    };
+}
+
+/// A file a rewind puts back.
+pub const Rewound = struct {
+    path: []const u8,
+    /// It did not exist before, so going back removes it.
+    removed: bool,
+    /// Something other than synth's tools changed it after they did, and
+    /// putting it back loses that.
+    changed: bool,
+};
+
+/// The session's turns that changed files, oldest first. Allocated in
+/// `arena`.
+pub fn checkpointTurns(self: *Loop, arena: std.mem.Allocator) ![]Database.CheckpointTurn {
+    const db = self.db orelse return &.{};
+    const session_id = self.session_id orelse return &.{};
+    return db.checkpointTurns(session_id, arena);
+}
+
+/// Put every file the turns from `seq` on changed back the way it was before
+/// them, or with `apply` false, only say what that would do. Allocated in
+/// `arena`.
+pub fn rewind(self: *Loop, arena: std.mem.Allocator, seq: u64, apply: bool) ![]Rewound {
+    if (apply and self.isBusy()) return error.Busy;
+    const db = self.db orelse return &.{};
+    const session_id = self.session_id orelse return &.{};
+
+    const restores = try db.checkpointsFrom(session_id, seq, arena);
+    const out = try arena.alloc(Rewound, restores.len);
+    for (restores, out) |restore, *rewound| {
+        const current = readCheckpointed(self.io, arena, restore.path) catch null;
+        const changed = if (restore.after_hash) |hash|
+            current == null or std.hash.Wyhash.hash(0, current.?) != hash
+        else
+            false;
+        rewound.* = .{ .path = restore.path, .removed = restore.content == null, .changed = changed };
+        if (!apply) continue;
+
+        if (restore.content) |content| {
+            if (std.fs.path.dirname(restore.path)) |parent| std.Io.Dir.cwd().createDirPath(self.io, parent) catch {};
+            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = restore.path, .data = content });
+        } else {
+            std.Io.Dir.cwd().deleteFile(self.io, restore.path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+    if (apply) try db.dropCheckpointsFrom(session_id, seq);
+    return out;
+}
+
 /// Hand every approved call to a worker. Denials skip straight to their result.
 fn runApproved(self: *Loop) !void {
     const message_index = self.pendingIndex() orelse return;
@@ -1996,7 +2363,7 @@ fn runApproved(self: *Loop) !void {
             .index = i,
             .name = call.name,
             .arguments = call.arguments,
-            .allow_outside = !self.needsNoDecision(&call),
+            .allow_outside = self.mayReachOutside(&call),
         });
     }
 
@@ -2011,6 +2378,7 @@ fn runApproved(self: *Loop) !void {
         return;
     }
 
+    self.checkpointBatch(batch.items) catch |err| self.say("Could not checkpoint the files this changes: {s}", .{@errorName(err)});
     self.tools_adopted = 0;
     self.tools = try ToolRun.start(
         self.allocator,
@@ -2114,6 +2482,7 @@ fn pollTools(self: *Loop) !bool {
     self.clearNotes();
 
     try self.persistReads();
+    self.sealCheckpoints();
 
     try self.finishToolMessages();
     return true;
@@ -2160,6 +2529,10 @@ fn appendToolResults(self: *Loop) !void {
     self.pending_index = 0;
 }
 
+fn isRunningWithoutLimit(self: *const Loop) bool {
+    return self.max_stall_ms == 0 and self.max_turn_ms == 0 and self.max_turn_tokens == 0;
+}
+
 /// A provider that asks for `list` on its first turn and answers on its
 /// second, so the whole approve/execute/resume path is exercisable with no
 /// model attached.
@@ -2184,6 +2557,11 @@ const FakeProvider = struct {
     /// blocked inside a socket read, which is the only case where cancelling
     /// costs real time.
     deaf: bool = false,
+    /// What it answers when asked to judge a call, at each stage, and how
+    /// often it has been.
+    quick: []const u8 = "ALLOW",
+    careful: []const u8 = "VERDICT: ALLOW",
+    judged: usize = 0,
 
     fn provider(self: *FakeProvider) Provider {
         return .{ .name = "fake", .userdata = self, .respond = respond };
@@ -2207,6 +2585,12 @@ const FakeProvider = struct {
         if (sink) |s| {
             if (s.stopped(s.userdata)) return .{};
             s.onThinking(s.userdata, "thinking about it\n");
+        }
+
+        if (std.mem.eql(u8, asked.system, classifier.system_prompt)) {
+            self.judged += 1;
+            const quick = std.mem.eql(u8, asked.instruction, classifier.instruction(.quick));
+            return .{ .text = try allocator.dupe(u8, if (quick) self.quick else self.careful) };
         }
 
         // A one-off instruction is a question, not a turn.
@@ -2414,7 +2798,7 @@ test "allow always skips the prompt next time" {
 
     try loop.submit("first", .{});
     try settle(&loop);
-    try loop.decide(.always);
+    try loop.decide(.{ .always = .subcommand });
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
 
@@ -2442,7 +2826,7 @@ test "allow always covers the rest of a same-message batch" {
     try settle(&loop);
     try testing.expectEqual(State.awaiting_approval, loop.state);
 
-    try loop.decide(.always);
+    try loop.decide(.{ .always = .subcommand });
     try settle(&loop);
     try testing.expectEqual(State.idle, loop.state);
 
@@ -2676,63 +3060,92 @@ test "cancelling at approval or during execution leaves complete tool exchanges"
     }
 }
 
-test "an always-allow covers the programs a command runs, not every command" {
-    const allocator = testing.allocator;
+fn expectProposals(loop: *const Loop, command: []const u8, wanted: []const []const []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    const expect = struct {
-        fn one(command: []const u8, wanted: []const u8) !void {
-            const arguments = try std.fmt.allocPrint(
-                testing.allocator,
-                "{{\"command\":{f}}}",
-                .{std.json.fmt(command, .{})},
-            );
-            defer testing.allocator.free(arguments);
-            try many(arguments, &.{wanted});
-        }
-
-        fn many(arguments: []const u8, wanted: []const []const u8) !void {
-            const patterns = try approvalPatterns(testing.allocator, "bash", arguments);
-            defer freePatterns(testing.allocator, patterns);
-
-            try testing.expectEqual(wanted.len, patterns.len);
-            for (wanted, patterns) |want, got| try testing.expectEqualStrings(want, got);
-        }
+    const call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "bash",
+        .arguments = try std.fmt.allocPrint(arena, "{{\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     };
+    const got = try loop.proposals(arena, &call);
+    try testing.expectEqual(wanted.len, got.len);
+    for (wanted, got) |want, proposal| {
+        try testing.expectEqual(want.len, proposal.patterns.len);
+        for (want, proposal.patterns) |pattern, actual| try testing.expectEqualStrings(pattern, actual);
+    }
+}
 
-    try expect.one("find . -type f -ls", "find *");
-    try expect.one("find src -name '*.zig'", "find *");
+test "an always-allow proposes the commands that needed asking, narrowest first" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
 
-    try expect.one("find", "find");
+    var loop = fixture.loop();
+    defer loop.deinit();
 
-    try expect.one("cd /home/adam/repo && grep -rn foo", "grep *");
-    try expect.one("cd /tmp;ls", "ls *");
+    try expectProposals(&loop, "git commit -m x", &.{
+        &.{"git commit -m x"}, &.{"git commit *"}, &.{"git *"},
+    });
+    try expectProposals(&loop, "rm -rf build", &.{
+        &.{"rm -rf build"}, &.{"rm *"},
+    });
+    try expectProposals(&loop, "cd /a && zig build test 2>&1 | tail -20; echo done", &.{
+        &.{"zig build test 2>&1"}, &.{"zig build *"}, &.{"zig *"},
+    });
+    try expectProposals(&loop, "find . | xargs rm", &.{
+        &.{"xargs rm"}, &.{"xargs *"},
+    });
+    try expectProposals(&loop, "make && make install", &.{
+        &.{ "make", "make install" }, &.{ "make", "make install *" }, &.{"make *"},
+    });
 
-    try expect.many("{\"command\":\"grep -rn foo src | head -20\"}", &.{ "grep *", "head *" });
-    try expect.many("{\"command\":\"find . | xargs rm\"}", &.{ "find *", "xargs *" });
-    try expect.many(
-        "{\"command\":\"cd /a && zig build test 2>&1 | tail -20; echo done\"}",
-        &.{ "zig *", "tail *", "echo *" },
-    );
+    try expectProposals(&loop, "grep foo > out.txt", &.{&.{"grep foo > out.txt"}});
+    try expectProposals(&loop, "echo $(rm -rf /)", &.{&.{"echo $(rm -rf /)"}});
+    try expectProposals(&loop, "VAR=x grep foo", &.{&.{"VAR=x grep foo"}});
+    try expectProposals(&loop, "cd", &.{&.{"cd"}});
 
-    try expect.one("grep \"a|b\" file", "grep *");
+    try loop.remember("bash", "xargs *");
+    try expectProposals(&loop, "find . -delete | xargs rm", &.{
+        &.{"find . -delete"}, &.{"find *"},
+    });
 
-    try expect.one("grep -rn foo src/ 2>/dev/null", "grep *");
+    loop.auto_approve_safe = false;
+    try expectProposals(&loop, "grep -rn foo src | xargs rm", &.{
+        &.{"grep -rn foo src"}, &.{"grep *"},
+    });
 
-    try expect.one("grep foo > out.txt", "grep foo > out.txt");
-    try expect.one("echo $(rm -rf /)", "echo $(rm -rf /)");
-    try expect.one("sleep 10 & rm x", "sleep 10 & rm x");
-    try expect.one("VAR=x grep foo", "VAR=x grep foo");
-
-    try expect.one("echo \"exit: $?\"", "echo *");
-
-    try expect.one("cd", "cd");
-
-    try expect.one("sudo rm -rf /", "sudo *");
-
-    const written = try approvalPatterns(allocator, "write", "{\"path\":\"src/main.zig\",\"content\":\"x\"}");
-    defer freePatterns(allocator, written);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const write: Conversation.ToolCall = .{ .id = "call_1", .name = "write", .arguments = "{\"path\":\"src/main.zig\",\"content\":\"x\"}" };
+    const written = try loop.proposals(arena_state.allocator(), &write);
     try testing.expectEqual(@as(usize, 1), written.len);
-    try testing.expectEqualStrings("*", written[0]);
+    try testing.expectEqualStrings("*", written[0].patterns[0]);
+}
+
+test "an always-allow on a subcommand does not reach its siblings" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.remember("bash", "git commit *");
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "bash",
+        .arguments = "{\"command\":\"git commit -m wip\"}",
+    };
+    try testing.expect(loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git status && git commit -m wip\"}";
+    try testing.expect(loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git push --force\"}";
+    try testing.expect(!loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git commit -m wip; git push\"}";
+    try testing.expect(!loop.isAllowed(&call));
+    call.arguments = "{\"command\":\"git commit -m $(whoami)\"}";
+    try testing.expect(!loop.isAllowed(&call));
 }
 
 test "auto-approval needs every program in a command, not just the first" {
@@ -2866,6 +3279,245 @@ test "a subagent transcript is stored as a session of its own" {
     const child = try db.subagentSession(call_row) orelse return error.NoSubagentSession;
     try testing.expect(child != parent);
     try testing.expectEqual(@as(u64, 2), try db.countMessages(child));
+}
+
+test "auto mode runs what its judge allows, and lets edits inside the project through unjudged" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    try loop.submit("clear out the build directory", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+    try testing.expect(fixture.convo.messages.items[1].tool_calls[0].status != .rejected);
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"notes.md\",\"content\":\"x\"}";
+    try loop.submit("write a note", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+
+    fixture.fake.tool_arguments = "{\"path\":\"/tmp/elsewhere.md\",\"content\":\"x\"}";
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "Outside the project.\nVERDICT: BLOCK: that path is outside the project";
+    try loop.submit("write it elsewhere", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 3), fixture.fake.judged);
+}
+
+test "a link inside the project that points out does not make an edit through it inside" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const target = buf[0..try outside.dir.realPath(testing.io, &buf)];
+    try fixture.tmp.dir.symLink(testing.io, target, "link", .{ .is_directory = true });
+    const missing = try std.fs.path.join(testing.allocator, &.{ target, "missing.md" });
+    defer testing.allocator.free(missing);
+    try fixture.tmp.dir.symLink(testing.io, missing, "dangling.md", .{});
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+    fixture.fake.tool_name = "write";
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "Outside the project.\nVERDICT: BLOCK: that path leaves the project";
+
+    fixture.fake.tool_arguments = "{\"path\":\"link/notes.md\",\"content\":\"x\"}";
+    try loop.submit("write a note", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 2), fixture.fake.judged);
+    try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "notes.md", .{}));
+
+    fixture.fake.tool_arguments = "{\"path\":\"dangling.md\",\"content\":\"x\"}";
+    try loop.submit("write another", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 4), fixture.fake.judged);
+    try testing.expectError(error.FileNotFound, outside.dir.access(testing.io, "missing.md", .{}));
+}
+
+test "auto mode judges an edit whose arguments cannot be read" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"notes.md\",";
+    try loop.submit("write a note", .{});
+    try settle(&loop);
+    try testing.expectEqual(@as(usize, 1), fixture.fake.judged);
+}
+
+test "auto mode's block is a considered one, and goes back to the model" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "Nobody asked for that.\nVERDICT: BLOCK: deleting the build tree was not asked for";
+    try loop.submit("what is in this project?", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(@as(usize, 2), fixture.fake.judged);
+    const call = fixture.convo.messages.items[1].tool_calls[0];
+    try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+    try testing.expect(std.mem.indexOf(u8, call.result.?, "deleting the build tree was not asked for") != null);
+    try testing.expectEqual(Config.Approvals.auto, loop.approvals);
+}
+
+test "auto mode hands decisions back after three blocks in a row" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    fixture.fake.parallel_calls = 4;
+    fixture.fake.quick = "BLOCK";
+    fixture.fake.careful = "VERDICT: BLOCK: no";
+    try loop.submit("go", .{});
+    try settle(&loop);
+
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqual(Config.Approvals.ask, loop.approvals);
+    const calls = fixture.convo.messages.items[1].tool_calls;
+    for (calls[0..3]) |call| try testing.expectEqual(Conversation.ToolCall.Status.rejected, call.status);
+    try testing.expectEqual(Conversation.ToolCall.Status.pending, calls[3].status);
+}
+
+test "a call auto mode cannot get a readable verdict on is put to the person" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .auto;
+
+    fixture.fake.tool_name = "bash";
+    fixture.fake.tool_arguments = "{\"command\":\"rm -rf build\"}";
+    fixture.fake.quick = "Let me think.";
+    fixture.fake.careful = "It depends.";
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try testing.expectEqual(Config.Approvals.auto, loop.approvals);
+}
+
+test "auto mode does not wave a call through on an allowance that runs anything" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    const call: Conversation.ToolCall = .{ .id = "call_0", .name = "bash", .arguments = "{\"command\":\"python3 cleanup.py\"}" };
+    try loop.remember("bash", "python3 *");
+    try testing.expect(loop.needsNoDecision(&call));
+    loop.approvals = .auto;
+    try testing.expect(!loop.needsNoDecision(&call));
+    try loop.remember("bash", "python3 cleanup.py");
+    try testing.expect(loop.needsNoDecision(&call));
+}
+
+test "a turn's file changes are kept, and undone back to the prompt that made them" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "one" });
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"a.txt\",\"content\":\"two\"}";
+    try loop.submit("change a", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    fixture.fake.tool_arguments = "{\"path\":\"sub/b.txt\",\"content\":\"new\"}";
+    try loop.submit("make b", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    fixture.fake.tool_arguments = "{\"path\":\"a.txt\",\"content\":\"three\"}";
+    try loop.submit("change a again", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const turns = try loop.checkpointTurns(arena);
+    try testing.expectEqual(@as(usize, 3), turns.len);
+    try testing.expectEqualStrings("make b", turns[1].prompt);
+    try testing.expectEqual(@as(u32, 1), turns[1].files);
+
+    const later = try loop.rewind(arena, turns[1].seq, false);
+    try testing.expectEqual(@as(usize, 2), later.len);
+    try testing.expect(std.mem.endsWith(u8, later[0].path, "a.txt"));
+    try testing.expect(!later[0].removed and !later[0].changed);
+    try testing.expect(std.mem.endsWith(u8, later[1].path, "b.txt"));
+    try testing.expect(later[1].removed);
+
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "a.txt", .data = "by hand" });
+    const preview = try loop.rewind(arena, turns[0].seq, false);
+    try testing.expect(preview[0].changed);
+    try testing.expectEqualStrings("by hand", try fixture.tmp.dir.readFileAlloc(testing.io, "a.txt", arena, .unlimited));
+
+    _ = try loop.rewind(arena, turns[0].seq, true);
+    try testing.expectEqualStrings("one", try fixture.tmp.dir.readFileAlloc(testing.io, "a.txt", arena, .unlimited));
+    try testing.expectError(error.FileNotFound, fixture.tmp.dir.access(testing.io, "sub/b.txt", .{}));
+    try testing.expectEqual(@as(usize, 0), (try loop.checkpointTurns(arena)).len);
+}
+
+test "a file too large to checkpoint is still changed, and the person told it cannot be put back" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const large = try testing.allocator.alloc(u8, max_checkpoint_bytes + 1);
+    defer testing.allocator.free(large);
+    @memset(large, 'x');
+    try fixture.tmp.dir.writeFile(testing.io, .{ .sub_path = "big.txt", .data = large });
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"big.txt\",\"content\":\"small\"}";
+    try loop.submit("shrink it", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("small", try fixture.tmp.dir.readFileAlloc(testing.io, "big.txt", arena, .unlimited));
+    const notice = loop.hook_notice orelse return error.TestExpectedNotice;
+    try testing.expect(std.mem.indexOf(u8, notice, "big.txt") != null);
+    try testing.expect(std.mem.indexOf(u8, notice, "/rewind") != null);
 }
 
 test "a session comes back in the mode it was left in" {
@@ -3378,6 +4030,89 @@ test "a standing allowance does not extend outside the project" {
 
     call.arguments = "{\"path\":\"/tmp/notes.md\"}";
     try testing.expect(!loop.needsNoDecision(&call));
+}
+
+test "approving everything covers commands and paths outside the project" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    var call: Conversation.ToolCall = .{
+        .id = "call_0",
+        .name = "bash",
+        .arguments = "{\"command\":\"rm -rf build\"}",
+    };
+    try testing.expect(!loop.needsNoDecision(&call));
+
+    loop.approvals = .all;
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.name = "read";
+    call.arguments = "{\"path\":\"/etc/passwd\"}";
+    try testing.expect(loop.needsNoDecision(&call));
+
+    call.name = "write";
+    call.arguments = "{\"path\":\"/tmp/notes.md\"}";
+    try testing.expect(loop.needsNoDecision(&call));
+    try testing.expectEqual(@as(usize, 0), loop.allowed.items.len);
+}
+
+/// A file outside `fixture`'s project, and a `read` of it for the fake to ask for.
+fn readOutside(fixture: *Fixture, outside: *testing.TmpDir) ![]u8 {
+    try outside.dir.writeFile(testing.io, .{ .sub_path = "notes.md", .data = "outside" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try outside.dir.realPath(testing.io, &buf)];
+    const arguments = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}/notes.md\"}}", .{dir});
+    fixture.fake.tool_name = "read";
+    fixture.fake.tool_arguments = arguments;
+    return arguments;
+}
+
+fn firstCall(loop: *const Loop) Conversation.ToolCall {
+    for (loop.conversation.messages.items) |msg| {
+        if (msg.tool_calls.len > 0) return msg.tool_calls[0];
+    }
+    unreachable;
+}
+
+test "approving everything runs a call outside the project, not just its prompt" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    const arguments = try readOutside(fixture, &outside);
+    defer testing.allocator.free(arguments);
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+    loop.approvals = .all;
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, firstCall(&loop).status);
+}
+
+test "saying always to a path outside the project runs the call" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var outside = testing.tmpDir(.{});
+    defer outside.cleanup();
+    const arguments = try readOutside(fixture, &outside);
+    defer testing.allocator.free(arguments);
+
+    var loop = fixture.loop();
+    defer loop.deinit();
+
+    try loop.submit("go", .{});
+    try settle(&loop);
+    try testing.expectEqual(State.awaiting_approval, loop.state);
+    try loop.decide(.{ .always = .command });
+    try settle(&loop);
+    try testing.expectEqual(State.idle, loop.state);
+    try testing.expectEqual(Conversation.ToolCall.Status.ok, firstCall(&loop).status);
 }
 
 test "a question stops the turn and its answer becomes the result" {
@@ -3945,7 +4680,7 @@ test "saying always to a path outside the project covers that path again" {
     };
 
     try testing.expect(!loop.needsNoDecision(&call));
-    try loop.allow(&call);
+    try loop.allow(&call, .subcommand);
     try testing.expect(loop.needsNoDecision(&call));
 
     call.arguments = "{\"path\":\"/tmp/other.zig\"}";
@@ -3964,7 +4699,7 @@ test "an allowance outside the project is keyed on the resolved path" {
         .name = "read",
         .arguments = "{\"path\":\"/tmp/hooks.zig\"}",
     };
-    try loop.allow(&call);
+    try loop.allow(&call, .subcommand);
 
     call.arguments = "{\"path\":\"/tmp/nested/../hooks.zig\"}";
     try testing.expect(loop.needsNoDecision(&call));

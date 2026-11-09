@@ -272,6 +272,27 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                 return ctx.consumeAndRedraw();
             }
 
+            if (self.rewind_picker.isOpen()) {
+                switch (self.rewind_picker.handleKey(key)) {
+                    .none => {},
+                    .cancel => self.rewind_picker.close(),
+                    .preview => |seq| try self.mirror.rewind(seq, false),
+                    .rewind => |seq| try self.mirror.rewind(seq, true),
+                }
+                return ctx.consumeAndRedraw();
+            }
+
+            if (self.permission_picker.isOpen()) {
+                switch (try self.permission_picker.handleKey(ctx, key)) {
+                    .none => {},
+                    .cancel => self.permission_picker.close(),
+                    .remove => |allowance| try self.mirror.setApprovals(&.{allowance}, &.{}),
+                    .add => |allowance| try self.mirror.setApprovals(&.{}, &.{allowance}),
+                    .amend => |change| try self.mirror.setApprovals(&.{change.old}, &.{change.new}),
+                }
+                return ctx.consumeAndRedraw();
+            }
+
             if (self.mcp_picker.isOpen()) {
                 switch (try self.mcp_picker.handleKey(ctx, key)) {
                     .none => {},
@@ -440,10 +461,15 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
                     self.approval.move(1);
                     return ctx.consumeAndRedraw();
                 }
+                const proposals = self.mirror.status.pending_proposals;
+                if (self.approval.selected == .always and (key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.down, .{}))) {
+                    self.approval.widen(if (key.matches(vaxis.Key.up, .{})) 1 else -1, proposals);
+                    return ctx.consumeAndRedraw();
+                }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     try self.mirror.decide(switch (self.approval.selected) {
                         .once => .once,
-                        .always => .always,
+                        .always => .{ .always = if (self.approval.proposal(proposals)) |chosen| chosen.breadth else .subcommand },
                         .reject => .deny,
                     });
                     return self.afterDecision(ctx);

@@ -396,6 +396,24 @@ fn performSynth(self: *Agent, connection: *Connection, id: rpc.Id, method: []con
     } else if (eql(u8, method, m.search)) {
         const asked = try rpc.parse(synth.Search, arena, params);
         return connection.reply(id, try session.search(arena, asked.query, asked.limit));
+    } else if (eql(u8, method, m.set_approval_mode)) {
+        const asked = try rpc.parse(synth.SetApprovalMode, arena, params);
+        session.stack.loop.setApprovals(asked.mode);
+        try session.publish(arena, true);
+    } else if (eql(u8, method, m.checkpoints)) {
+        return connection.reply(id, try session.checkpoints(arena));
+    } else if (eql(u8, method, m.rewind)) {
+        const asked = try rpc.parse(synth.Rewind, arena, params);
+        const files = try session.stack.loop.rewind(arena, asked.seq, asked.apply);
+        for (files) |*file| file.path = projectRelative(session.stack.loop.project_root, file.path);
+        if (asked.apply and files.len > 0) self.noticeFmt(.info, "Put back {d} file{s} as before that prompt", .{ files.len, if (files.len == 1) "" else "s" });
+        return connection.reply(id, files);
+    } else if (eql(u8, method, m.approvals)) {
+        return connection.reply(id, try session.allowances(arena));
+    } else if (eql(u8, method, m.set_approvals)) {
+        const asked = try rpc.parse(synth.SetApprovals, arena, params);
+        try session.changeAllowances(asked.remove, asked.add);
+        return connection.reply(id, try session.allowances(arena));
     } else return error.MethodNotFound;
     connection.reply(id, protocol.Empty{});
 }
@@ -769,7 +787,7 @@ fn put(self: *Agent, arena: std.mem.Allocator, session: *Session, asked: *Asked,
     const permission: protocol.RequestPermission = .{
         .sessionId = session.handle,
         .toolCall = try updates.toolCall(arena, session.stack.project.root, waiting.seq, waiting.call, waiting.tool),
-        .options = &permission_options,
+        .options = try updates.permissionOptions(arena, try session.pendingProposals(arena)),
     };
     for (fresh.items) |connection| {
         asked.considered.appendAssumeCapacity(connection);
@@ -796,12 +814,6 @@ fn withdraw(self: *Agent) void {
     }
 }
 
-const permission_options = [_]protocol.PermissionOption{
-    .{ .optionId = "once", .name = "Allow once", .kind = .allow_once },
-    .{ .optionId = "always", .name = "Always allow", .kind = .allow_always },
-    .{ .optionId = "deny", .name = "Deny", .kind = .reject_once },
-};
-
 const declined = "The user chose not to answer.";
 const unanswerable = "No one connected can answer questions. Decide for yourself, and say what you assumed.";
 
@@ -826,7 +838,7 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
         return;
     }
     const chosen = protocol.chosenOption(message.result) orelse return;
-    const decision = std.meta.stringToEnum(Loop.Decision, chosen) orelse return;
+    const decision = updates.decisionOf(chosen) orelse return;
     _ = asked.requests.swapRemove(index);
     self.withdraw();
     loop.decide(decision) catch |err| self.noticeFmt(.warning, "Could not decide: {s}", .{@errorName(err)});
@@ -886,6 +898,15 @@ fn isoTime(arena: std.mem.Allocator, ms: i64) ![]const u8 {
 }
 
 /// Why a request failed, for the person who made it.
+/// The first line of `text`, cut short enough to fit a row.
+fn firstLine(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const line = trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len];
+    var end = @min(line.len, 200);
+    while (end < line.len and end > 0 and line[end] & 0xC0 == 0x80) end -= 1;
+    return line[0..end];
+}
+
 fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.UnknownSession => "no such session",
@@ -900,6 +921,9 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownProvider => "no such provider",
         error.NoCredentialStore => "no ChatGPT credential file could be opened",
         error.UnknownServer => "no such MCP server",
+        error.NoProject => "the session has no project to keep allowances for",
+        error.UnknownTool => "no such tool",
+        error.EmptyAllowance => "an allowance needs a pattern",
         error.UnknownAttachment => "no such attachment",
         error.NoTranscript => "that call left no transcript",
         error.StillConnecting => "still connecting - try again in a moment",
@@ -2063,6 +2087,8 @@ const Session = struct {
             .pending_seq = loop.pending_seq,
             .pending_call = if (pending_call) |index| @intCast(index) else null,
             .pending_description = self.pendingDescription(),
+            .pending_proposals = try self.pendingProposals(arena),
+            .approval_mode = loop.approvals,
             .notes = notes,
             .steering = steering,
             .outcome = loop.outcome,
@@ -2081,6 +2107,13 @@ const Session = struct {
         const waiting = self.pendingTool() orelse return "";
         const definition = self.stack.registry.get(waiting.name) orelse return "";
         return definition.description;
+    }
+
+    fn pendingProposals(self: *Session, arena: std.mem.Allocator) ![]const Loop.Proposal {
+        const loop = &self.stack.loop;
+        if (loop.state != .awaiting_approval) return &.{};
+        const call = loop.pendingCall() orelse return &.{};
+        return loop.proposals(arena, call);
     }
 
     fn pendingTool(self: *Session) ?*const Conversation.ToolCall {
@@ -2295,6 +2328,37 @@ const Session = struct {
         };
     }
 
+    fn checkpoints(self: *Session, arena: std.mem.Allocator) ![]const synth.Checkpoint {
+        const turns = try self.stack.loop.checkpointTurns(arena);
+        const out = try arena.alloc(synth.Checkpoint, turns.len);
+        for (turns, 0..) |turn, i| out[turns.len - 1 - i] = .{
+            .seq = turn.seq,
+            .prompt = firstLine(turn.prompt),
+            .files = turn.files,
+        };
+        return out;
+    }
+
+    fn allowances(self: *Session, arena: std.mem.Allocator) ![]const synth.Allowance {
+        const project_id = self.stack.loop.project_id orelse return &.{};
+        const stored = try self.agent.options.db.approvals(project_id, arena);
+        const out = try arena.alloc(synth.Allowance, stored.len);
+        for (stored, out) |approval, *allowance| allowance.* = .{ .tool = approval.tool, .pattern = approval.pattern };
+        return out;
+    }
+
+    fn changeAllowances(self: *Session, dropped: []const synth.Allowance, added: []const synth.Allowance) !void {
+        const project_id = self.stack.loop.project_id orelse return error.NoProject;
+        const db = self.agent.options.db;
+        for (added) |allowance| {
+            if (self.stack.registry.get(allowance.tool) == null) return error.UnknownTool;
+            if (std.mem.trim(u8, allowance.pattern, " \t").len == 0) return error.EmptyAllowance;
+        }
+        for (dropped) |allowance| try db.removeApproval(project_id, allowance.tool, allowance.pattern);
+        for (added) |allowance| try db.addApproval(project_id, allowance.tool, std.mem.trim(u8, allowance.pattern, " \t"));
+        try self.stack.loop.reloadAllowances();
+    }
+
     fn search(self: *Session, arena: std.mem.Allocator, query: []const u8, limit: u32) ![]const synth.Hit {
         const project_id = self.stack.loop.project_id orelse return &.{};
         const hits = try self.agent.options.db.search(arena, project_id, query, limit);
@@ -2452,6 +2516,14 @@ pub const Script = struct {
                 .id = try allocator.dupe(u8, "call-1"),
                 .name = try allocator.dupe(u8, "bash"),
                 .arguments = try allocator.dupe(u8, "{\"command\":\"touch made\"}"),
+            };
+            return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
+        }
+        if (last != null and std.mem.startsWith(u8, last.?.text, "run: ")) {
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call-1"),
+                .name = try allocator.dupe(u8, "bash"),
+                .arguments = try std.fmt.allocPrint(allocator, "{{\"command\":\"{s}\"}}", .{last.?.text["run: ".len..]}),
             };
             return .{ .text = try allocator.dupe(u8, ""), .tool_calls = calls };
         }

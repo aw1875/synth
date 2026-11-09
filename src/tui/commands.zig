@@ -10,6 +10,7 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const agents = @import("../agent/agent.zig");
+const Config = @import("../core/config.zig");
 const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const catalog = @import("../provider/catalog.zig");
@@ -91,6 +92,29 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
             try self.theme_picker.show(themeId(self));
         }
         ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.startsWith(u8, line, "/approvals")) {
+        const name = std.mem.trim(u8, line["/approvals".len..], " ");
+        if (name.len == 0) {
+            try self.notification.showFmt(ctx, .info, "Approvals: {s}. /approvals ask, auto or all to change", .{@tagName(self.mirror.status.approval_mode)});
+        } else if (std.meta.stringToEnum(Config.Approvals, name)) |mode| {
+            try self.mirror.setApprovalMode(mode);
+            try self.notification.showFmt(ctx, .info, "{s}", .{approvalsSaying(mode)});
+        } else {
+            try self.notification.showFmt(ctx, .warn, "No approvals mode {s}: use ask, auto or all", .{name});
+        }
+        ctx.redraw = true;
+        return true;
+    }
+    if (std.mem.eql(u8, line, "/rewind")) {
+        self.rewind_picker.requested = true;
+        try self.mirror.listCheckpoints();
+        return true;
+    }
+    if (std.mem.eql(u8, line, "/permissions")) {
+        self.permission_picker.requested = true;
+        try self.mirror.listApprovals();
         return true;
     }
     if (std.mem.eql(u8, line, "/mcp")) {
@@ -183,6 +207,14 @@ pub fn showSessions(self: *Model) !void {
     try self.mirror.listSessions(SessionPicker.fetch_limit);
 }
 
+fn approvalsSaying(mode: Config.Approvals) []const u8 {
+    return switch (mode) {
+        .ask => "Calls that need it ask you again",
+        .auto => "Auto mode: the model judges calls, and blocks the risky ones",
+        .all => "Every call runs without asking, outside the project too",
+    };
+}
+
 /// Show what the session's server answered.
 pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) !void {
     switch (answer) {
@@ -213,6 +245,31 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
             try self.models.show(entries, offer.models.recent, self.mirror.status.model);
         },
         .subagent => |transcript| try self.receiveSubagent(transcript.seq, transcript.call, transcript.live, transcript.messages),
+        .checkpoints => |listed| {
+            defer answer.deinit(self.allocator);
+            if (!self.rewind_picker.requested) return;
+            if (listed.turns.len == 0) {
+                self.rewind_picker.requested = false;
+                try self.notification.show(ctx, .info, "No turn has changed a file yet");
+            } else {
+                try self.rewind_picker.show(listed.turns);
+            }
+            ctx.redraw = true;
+        },
+        .rewound => |rewound| {
+            defer answer.deinit(self.allocator);
+            if (rewound.applied) {
+                self.rewind_picker.close();
+            } else {
+                try self.rewind_picker.preview(rewound.seq, rewound.files);
+            }
+            ctx.redraw = true;
+        },
+        .approvals => |standing| {
+            defer answer.deinit(self.allocator);
+            try self.permission_picker.receive(standing.allowances);
+            ctx.redraw = true;
+        },
         .providers => |known| {
             defer answer.deinit(self.allocator);
             var arena_state: std.heap.ArenaAllocator = .init(self.allocator);

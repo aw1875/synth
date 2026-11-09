@@ -19,7 +19,6 @@ const mention = @import("../core/mention.zig");
 const skill = @import("../core/skill.zig");
 const todo = @import("../core/todo.zig");
 const widget_pool = @import("widget_pool.zig");
-const AgentLoop = @import("../agent/loop.zig");
 const recap = @import("../agent/recap.zig");
 const ask_user = @import("../tools/ask.zig");
 const pkg = @import("pkg");
@@ -134,6 +133,25 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
     }
 
     if (try self.models.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
+        try children.append(ctx.arena, .{
+            .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
+            .surface = dialog.surface,
+            .z_index = 3,
+        });
+        root.cursor = dialog.cursor;
+    }
+
+    if (try self.rewind_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
+        dialog_open = true;
+        try children.append(ctx.arena, .{
+            .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
+            .surface = dialog.surface,
+            .z_index = 3,
+        });
+    }
+
+    if (try self.permission_picker.draw(ctx, self.plainWidget(), max)) |dialog| {
         dialog_open = true;
         try children.append(ctx.arena, .{
             .origin = .{ .row = dialog.origin.row, .col = dialog.origin.col },
@@ -869,7 +887,7 @@ pub fn drawApproval(self: *Model, ctx: vxfw.DrawContext, width: u16) !vxfw.Surfa
         .description = self.mirror.status.pending_description,
         .arguments = call.arguments,
         .project = self.projectLabel(),
-        .patterns = AgentLoop.approvalPatterns(ctx.arena, call.name, call.arguments) catch &.{},
+        .proposals = self.mirror.status.pending_proposals,
         .width = width,
     });
 }
@@ -976,8 +994,13 @@ fn modeChip(self: *Model, arena: std.mem.Allocator) !Chip {
     }
 
     const id = self.mirror.agentId();
+    const approving = switch (self.mirror.status.approval_mode) {
+        .ask => "",
+        .auto => w.separator ++ "auto approvals",
+        .all => w.separator ++ "approving everything",
+    };
     return .{
-        .text = try std.fmt.allocPrint(arena, "{s} mode{s}tab to switch", .{ id, w.separator }),
+        .text = try std.fmt.allocPrint(arena, "{s} mode{s}{s}tab to switch", .{ id, approving, w.separator }),
         .lead = id,
         .color = if (self.inSubagent()) theme.fg_dim else Model.agentColor(id),
     };

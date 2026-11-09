@@ -24,6 +24,15 @@
             "default": true,
             "description": "Let a preset of read-only shell commands run without a prompt."
         },
+        "approvals": {
+            "enum": [
+                "ask",
+                "auto",
+                "all"
+            ],
+            "default": "ask",
+            "description": "Who decides a call that would otherwise ask. 'ask' puts it to you. 'auto' has the session's model judge it, blocking what looks destructive, outside the project or outside the task, and hands decisions back to you after 3 blocks in a row or 20 in a session. 'all' runs everything, paths outside the project included: for a machine set aside for the agent. `PreToolUse` hooks still run under each."
+        },
         "debug_log": {
             "type": "string",
             "description": "Append every request and reply to this file."
@@ -171,7 +180,11 @@
             "description": "What a prune throws away, on startup and on /prune. Ages are in days since a session was last touched."
         },
         "bell": {
-            "enum": ["unfocused", "always", "never"],
+            "enum": [
+                "unfocused",
+                "always",
+                "never"
+            ],
             "default": "unfocused",
             "description": "When a finished turn says so, by desktop notification and BEL. 'unfocused' needs the terminal to report focus; one that does not never rings, so use 'always' there. Under tmux both need focus-events and allow-passthrough on."
         }
