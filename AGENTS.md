@@ -4,7 +4,7 @@
 
 synth is a terminal coding agent, written in Zig 0.16. It talks to a model
 server (ollama, or anything speaking the OpenAI chat API), runs tools, and
-renders a TUI. Commandline options and keys are documented in `README.md`.
+renders a TUI. Commandline options and keys are documented in `README.md` and `docs/cli.md`.
 
 Layout worth knowing before you dig in:
 
