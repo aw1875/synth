@@ -457,7 +457,7 @@ fn respond(
         const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
         const uri = std.Uri.parse(responses_url) catch return error.InvalidHost;
 
-        const extra_headers = [_]std.http.Header{.{ .name = "Accept", .value = "text/event-stream" }};
+        const extra_headers = self.requestHeaders();
         var request = try self.client.request(.POST, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
@@ -545,6 +545,16 @@ fn waitAndRetry(
 fn stopped(sink: ?Provider.Sink) bool {
     const s = sink orelse return false;
     return s.stopped(s.userdata);
+}
+
+/// ChatGPT routes a request to the servers holding its cache by the
+/// `session-id` header, not by `prompt_cache_key` alone, as Codex notes:
+/// https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs
+fn requestHeaders(self: *const ChatGPTProvider) [2]std.http.Header {
+    return .{
+        .{ .name = "Accept", .value = "text/event-stream" },
+        .{ .name = "session-id", .value = &self.cache_key.? },
+    };
 }
 
 /// Stable for as long as the history only grows, so the prompt prefix keeps
@@ -1245,6 +1255,28 @@ test "instructions go first as a cached developer message, never a system one, a
     const tool = root.get("tools").?.array.items[0].object;
     try testing.expectEqualStrings("function", tool.get("type").?.string);
     try testing.expectEqualStrings("read", tool.get("name").?.string);
+}
+
+test "a request names its cache key as its session, so it is routed to its cache" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "hi");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try chat.buildRequest(arena_state.allocator(), &convo, .{ .system = "s" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+
+    const headers = chat.requestHeaders();
+    try testing.expectEqualStrings("session-id", headers[1].name);
+    try testing.expectEqualStrings(parsed.object.get("prompt_cache_key").?.string, headers[1].value);
 }
 
 test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
