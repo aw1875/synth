@@ -4,7 +4,8 @@
 
 synth is a terminal coding agent, written in Zig 0.16. It talks to a model
 server (ollama, or anything speaking the OpenAI chat API), runs tools, and
-renders a TUI. Commandline options and keys are documented in `README.md`.
+renders a TUI. Commandline subcommands are documented in `README.md` and
+`docs/cli.md`, keys and modes in `docs/usage.md`.
 
 Layout worth knowing before you dig in:
 
@@ -22,7 +23,7 @@ For fast iterations during development:
 `zig build`
 
 When you believe you are done, run the test suite. It is offline and takes
-about two seconds, and one command covers this repo and the `mcp` package:
+about ten seconds, and one command covers this repo and the `mcp` package:
 
 `zig build test`
 
