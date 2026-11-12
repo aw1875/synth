@@ -9,6 +9,7 @@ const std = @import("std");
 
 const catalog = @import("catalog.zig");
 const ChatGPTProvider = @import("chatgpt.zig");
+const CopilotProvider = @import("copilot.zig");
 const chatgpt_auth = @import("chatgpt_auth.zig");
 const OllamaProvider = @import("ollama.zig");
 const OpenAIProvider = @import("openai.zig");
@@ -37,6 +38,7 @@ pub const Options = struct {
     debug_log: ?[]const u8 = null,
     /// Borrowed for the life of the backend.
     chatgpt: ?*chatgpt_auth.Store = null,
+    copilot_integration_id: []const u8 = @import("copilot_auth.zig").default_integration_id,
 };
 
 options: Options,
@@ -46,6 +48,7 @@ pub const Client = union(catalog.Kind) {
     ollama: OllamaProvider,
     openai: OpenAIProvider,
     chatgpt: ChatGPTProvider,
+    copilot: CopilotProvider,
 };
 
 pub fn init(kind: catalog.Kind, options: Options) Backend {
@@ -69,6 +72,18 @@ fn build(kind: catalog.Kind, options: Options) Client {
         },
         .openai => .{
             .openai = .{
+                .allocator = options.allocator,
+                .io = options.io,
+                .host = options.host,
+                .label = options.label,
+                .model = options.model,
+                .api_key = options.api_key,
+                .debug_log = options.debug_log,
+            },
+        },
+        .copilot => .{
+            .copilot = .{
+                .integration_id = options.copilot_integration_id,
                 .allocator = options.allocator,
                 .io = options.io,
                 .host = options.host,
@@ -138,16 +153,18 @@ pub fn spawn(self: *Backend, allocator: std.mem.Allocator) !*Spawned {
     const arena = child.arena.allocator();
 
     var options = self.options;
+    options.copilot_integration_id = try arena.dupe(u8, self.options.copilot_integration_id);
     options.host = try arena.dupe(u8, self.currentHost());
-    options.label = try arena.dupe(u8, self.options.label);
+    options.label = try arena.dupe(u8, self.current().name);
     options.model = try arena.dupe(u8, self.model());
-    if (self.currentKey()) |value| options.api_key = try arena.dupe(u8, value);
+    options.api_key = if (self.currentKey()) |value| try arena.dupe(u8, value) else null;
 
     child.backend = .init(std.meta.activeTag(self.client), options);
     switch (child.backend.client) {
         .ollama => |*client| try client.startLike(&self.client.ollama),
         .openai => |*client| try client.startLike(&self.client.openai),
         .chatgpt => |*client| try client.startLike(&self.client.chatgpt),
+        .copilot => |*client| try client.startLike(&self.client.copilot),
     }
     return child;
 }
@@ -164,6 +181,7 @@ fn currentKey(self: *Backend) ?[]const u8 {
         .ollama => |*client| client.api_key,
         .openai => |*client| client.api_key,
         .chatgpt => null,
+        .copilot => |*client| client.api_key,
     };
 }
 
@@ -207,7 +225,7 @@ pub fn describeError(self: *Backend, err: anyerror, allocator: std.mem.Allocator
 pub fn sameModel(self: *Backend, listed: []const u8, wanted: []const u8) bool {
     return switch (self.client) {
         .ollama => OllamaProvider.sameModel(listed, wanted),
-        .openai, .chatgpt => std.mem.eql(u8, listed, wanted),
+        .openai, .chatgpt, .copilot => std.mem.eql(u8, listed, wanted),
     };
 }
 
@@ -229,6 +247,21 @@ pub fn connect(
         .api_key = api_key,
     };
 
+    if (entry.kind == .copilot and std.meta.activeTag(self.client) != .copilot) {
+        var replacement: CopilotProvider = .{
+            .integration_id = self.options.copilot_integration_id,
+            .allocator = self.options.allocator,
+            .io = self.options.io,
+            .debug_log = self.options.debug_log,
+        };
+        errdefer replacement.deinit();
+        try replacement.reconnect(connection);
+        self.deinit();
+        self.client = .{ .copilot = replacement };
+        self.client.copilot.relocate();
+        return self.provider();
+    }
+
     if (entry.kind != std.meta.activeTag(self.client)) {
         self.deinit();
         // Built empty then reconnected: only `reconnect` copies the strings.
@@ -241,6 +274,7 @@ pub fn connect(
             .num_ctx = self.options.num_ctx,
             .debug_log = self.options.debug_log,
             .chatgpt = self.options.chatgpt,
+            .copilot_integration_id = self.options.copilot_integration_id,
         });
     }
 
@@ -334,6 +368,62 @@ test "a spawned ollama backend carries the window its parent probed" {
     try testing.expectEqual(@as(u32, 8192), child.backend.client.ollama.context_limit);
     try testing.expect(!child.backend.client.ollama.think);
     try testing.expectEqualStrings("qwen3", child.backend.model());
+}
+
+test "a failed Copilot switch leaves the existing provider usable" {
+    const testing = std.testing;
+    var backend: Backend = .init(.openai, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "http://localhost:1/v1",
+        .label = "Existing",
+        .model = "existing-model",
+    });
+    defer backend.deinit();
+    const before = backend.provider();
+    const entry = catalog.find(catalog.copilot_id).?;
+    try testing.expectError(error.NotSignedIn, backend.connect(entry, entry.host, null));
+    try testing.expectEqual(catalog.Kind.openai, std.meta.activeTag(backend.client));
+    try testing.expectEqualStrings("existing-model", before.current().model);
+    try testing.expectEqualStrings("Existing", before.current().name);
+}
+
+test "a Copilot child owns its configured integration profile" {
+    const testing = std.testing;
+    var parent: Backend = .init(.copilot, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "https://api.githubcopilot.com",
+        .label = "GitHub Copilot",
+        .copilot_integration_id = "my-product-agent",
+    });
+    defer parent.deinit();
+    try parent.start();
+    const child = try parent.spawn(testing.allocator);
+    defer child.deinit();
+    try testing.expectEqualStrings("my-product-agent", child.backend.client.copilot.integration_id);
+    try testing.expectEqualStrings("my-product-agent", child.backend.client.copilot.inner.extra_headers[1].value);
+    try testing.expect(child.backend.client.copilot.integration_id.ptr != parent.client.copilot.integration_id.ptr);
+    parent.client.copilot.signOut();
+    try testing.expectEqualStrings("my-product-agent", child.backend.client.copilot.inner.extra_headers[1].value);
+}
+
+test "a signed-out Copilot child cannot inherit an old configured credential" {
+    const testing = std.testing;
+    var backend: Backend = .init(.copilot, .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "https://api.githubcopilot.com",
+        .label = "GitHub Copilot",
+        .api_key = "example",
+    });
+    defer backend.deinit();
+    try backend.start();
+    backend.client.copilot.signOut();
+    const child = try backend.spawn(testing.allocator);
+    defer child.deinit();
+    try testing.expect(child.backend.client.copilot.api_key == null);
+    try testing.expectEqualStrings("", child.backend.client.copilot.inner.auth_value);
 }
 
 test "an ollama tag matches loosely, an openai id exactly" {

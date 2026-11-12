@@ -71,6 +71,7 @@ pub fn run(init: std.process.Init, prompt: []const u8, allow_mutating: bool) !vo
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
         .chatgpt = chatgpt,
+        .copilot_integration_id = config.copilot_integration_id,
     });
     defer backend.deinit();
 

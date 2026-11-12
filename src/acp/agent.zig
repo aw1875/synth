@@ -33,7 +33,7 @@ const Loop = @import("../agent/loop.zig");
 const Stack = @import("../agent/stack.zig");
 const catalog = @import("../provider/catalog.zig");
 const chatgpt_auth = @import("../provider/chatgpt_auth.zig");
-const SignInTask = @import("../provider/chatgpt_sign_in.zig");
+const SignInTask = @import("../provider/sign_in.zig");
 const SignOutTask = @import("../provider/chatgpt_sign_out.zig");
 const Provider = @import("../provider/provider.zig");
 const mcp_tools = @import("../tools/mcp.zig");
@@ -2074,7 +2074,10 @@ const Session = struct {
             .provider = loop.provider.name,
             .provider_id = self.providerId(),
             .provider_missing = if (self.providerSource()) |providers| providers.isMissing() else |_| false,
-            .sign_in = if (self.sign_in) |task| .{ .url = task.sign_in.url, .port = task.sign_in.callbackPort() } else null,
+            .sign_in = if (self.sign_in) |task| blk: {
+                const status = task.status();
+                break :blk .{ .url = status.url, .port = status.port, .user_code = status.user_code };
+            } else null,
             .chatgpt_signed_in = self.chatgptSignedIn(),
             .context_limit = loop.provider.context_limit,
             .vision = loop.provider.vision,
@@ -2169,7 +2172,7 @@ const Session = struct {
         const providers = try self.providerSource();
         if (self.stack.loop.isBusy()) return error.Busy;
         const entry = catalog.find(id) orelse return error.UnknownProvider;
-        if (entry.key == .oauth and !entry.ready(providers.auth, providers.chatgpt)) return self.beginSignIn(providers);
+        if (entry.key == .oauth and !entry.ready(providers.auth, providers.chatgpt)) return self.beginSignIn(providers, entry.id);
         try self.useProvider(entry, at, key);
         self.announceProvider();
     }
@@ -2199,10 +2202,9 @@ const Session = struct {
         self.notice(.info, "Connected {s} at {s}, running {s}.", .{ entry.label, providers.backend.currentHost(), model });
     }
 
-    fn beginSignIn(self: *Session, providers: *Providers) !void {
+    fn beginSignIn(self: *Session, providers: *Providers, id: []const u8) !void {
         if (self.sign_in != null) return;
-        const store = providers.chatgpt orelse return error.NoCredentialStore;
-        self.sign_in = SignInTask.start(self.allocator, self.io, store) catch |err| {
+        self.sign_in = SignInTask.start(self.allocator, self.io, id, providers.chatgpt) catch |err| {
             return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
         };
     }
@@ -2212,14 +2214,14 @@ const Session = struct {
         const task = self.sign_in orelse return;
         if (!task.isFinished()) return;
         self.sign_in = null;
-        task.finish() catch |err| return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
-
-        const entry = catalog.find(catalog.chatgpt_id).?;
-        self.useProvider(entry, entry.host, null) catch |err| {
+        const entry = catalog.find(task.id).?;
+        const token = task.finish(self.allocator) catch |err| return self.notice(.warning, "{s}", .{SignInTask.explain(err)});
+        defer if (token) |value| self.allocator.free(value);
+        self.useProvider(entry, entry.host, token) catch |err| {
             return self.notice(.warning, "Could not reach {s}: {s}", .{ entry.label, @errorName(err) });
         };
         self.announceProvider();
-        self.welcomeToPlanUsage();
+        if (std.mem.eql(u8, entry.id, catalog.chatgpt_id)) self.welcomeToPlanUsage();
     }
 
     /// Said once, the first time this installation signs in.
@@ -2236,6 +2238,16 @@ const Session = struct {
 
     fn signOut(self: *Session) !void {
         const providers = try self.providerSource();
+        if (std.mem.eql(u8, providers.active_id, catalog.copilot_id)) {
+            if (self.busy()) return error.Busy;
+            try providers.auth.set(catalog.copilot_id, "");
+            try providers.auth.save(self.io, providers.auth.path);
+            providers.backend.client.copilot.signOut();
+            self.stack.loop.provider = providers.backend.provider();
+            providers.missing = true;
+            try self.agent.options.db.setActiveProvider("");
+            return self.notice(.info, "Signed out of GitHub Copilot here. Revoke the OAuth application's access in GitHub settings if needed.", .{});
+        }
         const store = providers.chatgpt orelse return error.NoCredentialStore;
         if (self.sign_out != null) return;
         if (!store.isSignedIn()) return self.notice(.info, "Not signed in to ChatGPT.", .{});

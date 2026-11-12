@@ -768,7 +768,11 @@ fn keepStatus(self: *Mirror, status: synth.Status) !void {
     kept.model = try arena.dupe(u8, status.model);
     kept.provider = try arena.dupe(u8, status.provider);
     kept.provider_id = try arena.dupe(u8, status.provider_id);
-    if (status.sign_in) |sign_in| kept.sign_in = .{ .url = try arena.dupe(u8, sign_in.url), .port = sign_in.port };
+    if (status.sign_in) |sign_in| kept.sign_in = .{
+        .url = try arena.dupe(u8, sign_in.url),
+        .port = sign_in.port,
+        .user_code = try arena.dupe(u8, sign_in.user_code),
+    };
     kept.effort = try arena.dupe(u8, status.effort);
     kept.efforts = try dupeAll(arena, status.efforts);
     kept.todos = &.{};
@@ -1444,6 +1448,20 @@ test "a question is answered from here, whether or not its request has arrived y
     try testing.expectEqual(@as(?Loop.Outcome, .done), mirror.status.outcome);
     try testing.expectEqualStrings("green", convo.messages.items[1].tool_calls[0].result.?);
     try testing.expect(mirror.asked == null and mirror.early == null);
+}
+
+test "device sign-in status retains its code after the incoming buffer is reused" {
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    const mirror = try offline(testing.allocator, testing.io, &convo, "here");
+    defer mirror.close();
+    var code = "ABCD-EFGH".*;
+    var status = mirror.status;
+    status.sign_in = .{ .url = "https://github.com/login/device", .port = 0, .user_code = &code };
+    try mirror.keepStatus(status);
+    @memset(&code, 'x');
+    try testing.expectEqualStrings("ABCD-EFGH", mirror.status.sign_in.?.user_code);
+    try testing.expectEqual(@as(u16, 0), mirror.status.sign_in.?.port);
 }
 
 test "only a message added at the end moves the view down" {

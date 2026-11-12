@@ -417,7 +417,7 @@ pub fn copySignInLink(self: *Model, ctx: *vxfw.EventContext) !void {
 
 fn signInUrl(self: *Model) ?[]const u8 {
     const sign_in = self.mirror.status.sign_in orelse return null;
-    return sign_in.url;
+    return if (sign_in.url.len > 0) sign_in.url else null;
 }
 
 /// Called each tick: show the server's sign-in while one waits on a browser,
@@ -428,10 +428,12 @@ pub fn followSignIn(self: *Model) !void {
         if (self.connect.isSigningIn()) self.connect.close();
         return;
     };
-    if (self.connect.isSigningIn() and std.mem.eql(u8, self.connect.sign_in_url, sign_in.url)) return;
+    if (self.connect.isSigningIn() and std.mem.eql(u8, self.connect.sign_in_url, sign_in.url) and
+        std.mem.eql(u8, self.connect.sign_in_code, sign_in.user_code)) return;
     const elsewhere = !std.mem.eql(u8, self.mirror.host, client.here) or isOverSsh(self);
     try self.connect.showSignIn(sign_in.url, sign_in.port, elsewhere);
-    keys.openUrl(self, sign_in.url);
+    try self.connect.setSignInCode(sign_in.user_code);
+    if (sign_in.url.len > 0) keys.openUrl(self, sign_in.url);
 }
 
 /// Revoking is a network round trip, so the server does it off the session's

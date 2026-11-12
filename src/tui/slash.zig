@@ -29,6 +29,7 @@ pub const Command = struct {
     is_skill: bool = false,
     /// Only offered while signed in to ChatGPT.
     needs_chatgpt: bool = false,
+    needs_oauth: bool = false,
 };
 
 /// Ranked fuzzy matches kept when nothing matched by prefix. A ceiling on the
@@ -49,7 +50,7 @@ pub const commands: []const Command = &.{
     .{ .name = "sessions", .description = "switch to another session" },
     .{ .name = "detach", .description = "leave this session running, to come back to later" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
-    .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true },
+    .{ .name = "logout", .description = "sign out of Copilot or ChatGPT", .needs_oauth = true },
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = "[name]" },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
@@ -70,6 +71,7 @@ skills: []const skill.Skill = &.{},
 /// Set by the owner before each `update`; hides the ChatGPT-only commands
 /// while there is no ChatGPT sign-in for them to act on.
 chatgpt_signed_in: bool = false,
+copilot_signed_in: bool = false,
 
 /// Indices into everything on offer, matching what has been typed, best first.
 matches: std.ArrayList(usize) = .empty,
@@ -158,7 +160,8 @@ fn filter(self: *Slash, query: []const u8) !void {
 }
 
 fn isOffered(self: *const Slash, command: Command) bool {
-    return !command.needs_chatgpt or self.chatgpt_signed_in;
+    if (command.needs_chatgpt and !self.chatgpt_signed_in) return false;
+    return !command.needs_oauth or self.chatgpt_signed_in or self.copilot_signed_in;
 }
 
 pub fn moveSelection(self: *Slash, delta: i32) void {

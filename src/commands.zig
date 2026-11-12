@@ -356,6 +356,7 @@ pub fn models(init_process: std.process.Init) !void {
         .model = active.model,
         .api_key = active.api_key,
         .chatgpt = chatgpt,
+        .copilot_integration_id = ctx.config.copilot_integration_id,
     });
     defer backend.deinit();
 

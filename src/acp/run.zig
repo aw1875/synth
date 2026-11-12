@@ -42,6 +42,7 @@ pub fn run(init: std.process.Init, editor: bool) !void {
         .num_ctx = config.num_ctx,
         .debug_log = config.debug_log,
         .chatgpt = chatgpt,
+        .copilot_integration_id = config.copilot_integration_id,
     });
     defer backend.deinit();
     var providers: Providers = .init(io, &config, &auth, chatgpt, &backend, active);

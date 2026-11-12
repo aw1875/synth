@@ -545,6 +545,8 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             _ = try self.input.handleEvent(ctx, event);
             try self.refreshMentions();
             self.slash.chatgpt_signed_in = self.mirror.status.chatgpt_signed_in;
+            self.slash.copilot_signed_in = std.mem.eql(u8, self.mirror.status.provider_id, @import("../provider/catalog.zig").copilot_id) and
+                !self.mirror.status.provider_missing;
             try self.slash.update(self.input.text.items, self.input.cursor);
             if (ctx.consume_event) return;
         },
