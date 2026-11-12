@@ -13,9 +13,10 @@ pub fn append(io: std.Io, path: []const u8, entry: []const u8) !void {
 }
 
 pub fn writeUsage(w: *std.Io.Writer, usage: Provider.Usage) !void {
-    try w.print("usage: input {d} (cached {d}), output {d} (reasoning {d})\n", .{
+    try w.print("usage: input {d} (cached {d}, cache written {d}), output {d} (reasoning {d})\n", .{
         usage.prompt_tokens,
         usage.cached_tokens,
+        usage.cache_write_tokens,
         usage.completion_tokens,
         usage.reasoning_tokens,
     });

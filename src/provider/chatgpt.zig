@@ -570,13 +570,12 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try writeString(w, self.model);
-    try w.writeAll(",\"instructions\":");
-    try writeString(w, instructions);
     try w.writeAll(",\"input\":[");
-    var input: InputWriter = .{ .writer = w, .supports_vision = self.supports_vision };
-    for (kept) |msg| {
+    var input: InputWriter = .{ .writer = w, .supports_vision = self.supports_vision, .breakpoints = cacheBreakpoints(kept) };
+    try input.developer(instructions);
+    for (kept, 0..) |msg, index| {
         if (msg.role == .system or msg.role == .summary) continue;
-        try input.message(arena, msg, kept);
+        try input.message(arena, msg, kept, index);
     }
     if (turn.instruction.len > 0) try input.text("user", Item.input_text, turn.instruction);
     try w.writeByte(']');
@@ -604,11 +603,35 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
     return out.toOwnedSlice();
 }
 
+/// The messages to put cache breakpoints on: the newest user message or tool
+/// output, and the one the request before this ended on, so this request reads
+/// what that one wrote. GPT-6 models look the cache up only at breakpoints and
+/// a few message endings, and never inside top-level `instructions`:
+/// https://developers.openai.com/api/docs/guides/prompt-caching
+fn cacheBreakpoints(kept: []const Conversation.Message) [2]?usize {
+    const newest = lastAnswerable(kept, kept.len) orelse return .{ null, null };
+    var reply = newest;
+    while (reply > 0 and kept[reply].role != .assistant) reply -= 1;
+    return .{ newest, if (kept[reply].role == .assistant) lastAnswerable(kept, reply) else null };
+}
+
+fn lastAnswerable(kept: []const Conversation.Message, before: usize) ?usize {
+    var index = before;
+    while (index > 0) {
+        index -= 1;
+        if (kept[index].role == .user or kept[index].role == .tool) return index;
+    }
+    return null;
+}
+
+const breakpoint = ",\"prompt_cache_breakpoint\":{\"mode\":\"explicit\"}";
+
 /// Writes the transcript as Responses input items, keeping each tool output
 /// next to the call it answers.
 const InputWriter = struct {
     writer: *std.Io.Writer,
     supports_vision: bool,
+    breakpoints: [2]?usize = .{ null, null },
     first: bool = true,
     /// Whether an assistant turn since the last user message made calls for
     /// tool messages to answer. An output with no call before it is refused.
@@ -621,13 +644,29 @@ const InputWriter = struct {
         self.first = false;
     }
 
-    fn message(self: *InputWriter, arena: std.mem.Allocator, msg: Conversation.Message, all: []const Conversation.Message) !void {
+    fn isBreakpoint(self: *const InputWriter, index: usize) bool {
+        for (self.breakpoints) |marked| {
+            if (marked == index) return true;
+        }
+        return false;
+    }
+
+    fn developer(self: *InputWriter, instructions: []const u8) !void {
+        try self.separator();
+        const w = self.writer;
+        try w.writeAll("{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":");
+        try writeString(w, instructions);
+        try w.writeAll(breakpoint ++ "}]}");
+    }
+
+    fn message(self: *InputWriter, arena: std.mem.Allocator, msg: Conversation.Message, all: []const Conversation.Message, index: usize) !void {
         const content = try OpenAI.messageContent(arena, msg, self.supports_vision);
+        const marked = self.isBreakpoint(index);
         switch (msg.role) {
             .system, .summary => unreachable,
             .user => {
                 self.open_calls = false;
-                try self.user(content, msg.images);
+                try self.user(content, msg.images, marked);
             },
             .assistant => {
                 const made_calls = try self.assistant(arena, msg, content);
@@ -637,20 +676,28 @@ const InputWriter = struct {
             .tool => {
                 if (!self.open_calls) return;
                 try self.separator();
-                try std.json.Stringify.value(.{
-                    .type = Item.function_call_output,
-                    .call_id = msg.tool_call_id orelse "",
-                    .output = content,
-                }, .{}, self.writer);
+                const w = self.writer;
+                try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
+                try writeString(w, msg.tool_call_id orelse "");
+                if (marked) {
+                    try w.writeAll(",\"output\":[{\"type\":\"input_text\",\"text\":");
+                    try writeString(w, content);
+                    try w.writeAll(breakpoint ++ "}]}");
+                } else {
+                    try w.writeAll(",\"output\":");
+                    try writeString(w, content);
+                    try w.writeByte('}');
+                }
             },
         }
     }
 
-    fn user(self: *InputWriter, content: []const u8, images: []const []const u8) !void {
+    fn user(self: *InputWriter, content: []const u8, images: []const []const u8, marked: bool) !void {
         try self.separator();
         const w = self.writer;
         try w.writeAll("{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":");
         try writeString(w, content);
+        if (marked) try w.writeAll(breakpoint);
         try w.writeByte('}');
         if (self.supports_vision) {
             for (images) |image| {
@@ -1066,7 +1113,10 @@ const ResponseStream = struct {
         const usage = objectField(response, "usage") orelse return;
         self.usage.prompt_tokens = unsignedField(usage, "input_tokens");
         self.usage.completion_tokens = unsignedField(usage, "output_tokens");
-        if (objectField(usage, "input_tokens_details")) |details| self.usage.cached_tokens = unsignedField(details, "cached_tokens");
+        if (objectField(usage, "input_tokens_details")) |details| {
+            self.usage.cached_tokens = unsignedField(details, "cached_tokens");
+            self.usage.cache_write_tokens = unsignedField(details, "cache_write_tokens");
+        }
         if (objectField(usage, "output_tokens_details")) |details| self.usage.reasoning_tokens = unsignedField(details, "reasoning_tokens");
     }
 
@@ -1191,7 +1241,7 @@ test "the catalog keeps what a picker should show, in the server's order" {
     try testing.expect(!models[1].vision);
 }
 
-test "a request carries instructions, never a system message, and keeps nothing server-side" {
+test "instructions go first as a cached developer message, never a system one, and nothing is kept server-side" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const store = try testStore(&tmp);
@@ -1214,7 +1264,7 @@ test "a request carries instructions, never a system message, and keeps nothing 
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const root = parsed.object;
-    try testing.expectEqualStrings("You are synth.", root.get("instructions").?.string);
+    try testing.expect(root.get("instructions") == null);
     try testing.expectEqual(false, root.get("store").?.bool);
     try testing.expectEqual(true, root.get("stream").?.bool);
     try testing.expect(root.get("temperature") == null);
@@ -1222,8 +1272,12 @@ test "a request carries instructions, never a system message, and keeps nothing 
     try testing.expect(root.get("previous_response_id") == null);
 
     const input = root.get("input").?.array.items;
-    try testing.expectEqual(@as(usize, 1), input.len);
-    try testing.expectEqualStrings("user", input[0].object.get("role").?.string);
+    try testing.expectEqual(@as(usize, 2), input.len);
+    try testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const brief = input[0].object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("You are synth.", brief.get("text").?.string);
+    try testing.expect(brief.get("prompt_cache_breakpoint") != null);
+    try testing.expectEqualStrings("user", input[1].object.get("role").?.string);
 
     const tool = root.get("tools").?.array.items[0].object;
     try testing.expectEqualStrings("function", tool.get("type").?.string);
@@ -1266,12 +1320,49 @@ test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const input = parsed.object.get("input").?.array.items;
 
-    const expected = [_][]const u8{ "message", "reasoning", "message", "function_call", "function_call", "function_call_output", "function_call_output" };
+    const expected = [_][]const u8{ "message", "message", "reasoning", "message", "function_call", "function_call", "function_call_output", "function_call_output" };
     try testing.expectEqual(expected.len, input.len);
     for (expected, input) |kind, item| try testing.expectEqualStrings(kind, item.object.get("type").?.string);
-    try testing.expectEqualStrings("opaque", input[1].object.get("encrypted_content").?.string);
-    try testing.expectEqualStrings("commentary", input[2].object.get("phase").?.string);
-    try testing.expectEqualStrings("call_2", input[6].object.get("call_id").?.string);
+    try testing.expectEqualStrings("opaque", input[2].object.get("encrypted_content").?.string);
+    try testing.expectEqualStrings("commentary", input[3].object.get("phase").?.string);
+    try testing.expectEqualStrings("call_2", input[7].object.get("call_id").?.string);
+
+    try testing.expect(input[1].object.get("content").?.array.items[0].object.get("prompt_cache_breakpoint") != null);
+    try testing.expectEqualStrings("contents of a", input[6].object.get("output").?.string);
+    const newest = input[7].object.get("output").?.array.items[0].object;
+    try testing.expectEqualStrings("contents of b", newest.get("text").?.string);
+    try testing.expect(newest.get("prompt_cache_breakpoint") != null);
+}
+
+test "a request marks where the one before it ended, so it reads that one's cache write" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "read a, then b");
+    var first = [_]Conversation.ToolCall{.{ .id = "call_1", .name = "read", .arguments = "{}" }};
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &first });
+    _ = try convo.addToolResult("read", "call_1", "contents of a");
+    var second = [_]Conversation.ToolCall{.{ .id = "call_2", .name = "read", .arguments = "{}" }};
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &second });
+    _ = try convo.addToolResult("read", "call_2", "contents of b");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try chat.buildRequest(arena_state.allocator(), &convo, .{ .system = "s" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+    const input = parsed.object.get("input").?.array.items;
+
+    try testing.expectEqual(@as(usize, 6), input.len);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "prompt_cache_breakpoint"));
+    try testing.expect(input[1].object.get("content").?.array.items[0].object.get("prompt_cache_breakpoint") == null);
+    try testing.expect(input[3].object.get("output").?.array.items[0].object.get("prompt_cache_breakpoint") != null);
+    try testing.expect(input[5].object.get("output").?.array.items[0].object.get("prompt_cache_breakpoint") != null);
 }
 
 test "a turn another provider answered is rebuilt, and an unanswered call is closed" {
@@ -1295,11 +1386,11 @@ test "a turn another provider answered is rebuilt, and an unanswered call is clo
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const input = parsed.object.get("input").?.array.items;
 
-    try testing.expectEqual(@as(usize, 4), input.len);
-    try testing.expectEqualStrings("function_call", input[1].object.get("type").?.string);
-    try testing.expectEqualStrings("{}", input[1].object.get("arguments").?.string);
-    try testing.expectEqualStrings("function_call_output", input[2].object.get("type").?.string);
-    try testing.expectEqualStrings(aborted_call_output, input[2].object.get("output").?.string);
+    try testing.expectEqual(@as(usize, 5), input.len);
+    try testing.expectEqualStrings("function_call", input[2].object.get("type").?.string);
+    try testing.expectEqualStrings("{}", input[2].object.get("arguments").?.string);
+    try testing.expectEqualStrings("function_call_output", input[3].object.get("type").?.string);
+    try testing.expectEqualStrings(aborted_call_output, input[3].object.get("output").?.string);
 }
 
 fn feed(stream: *ResponseStream, events: []const u8) !void {
@@ -1518,5 +1609,5 @@ test "a note posted mid-turn does not cut a tool call off from its result" {
     const input = parsed.object.get("input").?.array.items;
     const last = input[input.len - 1].object;
     try testing.expectEqualStrings("function_call_output", last.get("type").?.string);
-    try testing.expectEqualStrings("a b c", last.get("output").?.string);
+    try testing.expectEqualStrings("a b c", last.get("output").?.array.items[0].object.get("text").?.string);
 }
