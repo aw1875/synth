@@ -31,7 +31,7 @@ fn append(arena: std.mem.Allocator, messages: *std.ArrayList(Message), role: []c
 pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversation, turn: Provider.Turn) ![]u8 {
     const kept = try window.completeMessages(convo, arena, window.requestBudgetForOutput(options.context_limit, turn, @max(@as(u32, 1), options.max_output_tokens)), options.vision);
     var messages: std.ArrayList(Message) = .empty;
-    for (kept) |msg| {
+    for (kept, 0..) |msg, i| {
         if (msg.role == .system or msg.role == .summary or msg.role == .tool) continue;
         const role = if (msg.role == .assistant) "assistant" else "user";
         const text = try OpenAI.messageContent(arena, msg, options.vision);
@@ -49,11 +49,8 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
         }
         for (msg.tool_calls) |call| {
             var result: []const u8 = call.result orelse "aborted";
-            for (kept) |candidate| {
-                if (candidate.role == .tool and std.mem.eql(u8, candidate.tool_call_id orelse "", call.id)) {
-                    result = try OpenAI.messageContent(arena, candidate, false);
-                    break;
-                }
+            if (window.toolResult(kept[i + 1 ..], call.id)) |candidate| {
+                result = try OpenAI.messageContent(arena, candidate, false);
             }
             try append(arena, &messages, "user", try object(arena, .{ .type = "tool_result", .tool_use_id = call.id, .content = result }));
         }
@@ -298,6 +295,35 @@ test "Messages requests pair tool batches with their results and translate schem
     try testing.expectEqualStrings("contents of a", results[0].object.get("content").?.string);
     try testing.expectEqualStrings("aborted", results[1].object.get("content").?.string);
     try testing.expect(value.object.get("tools").?.array.items[0].object.contains("input_schema"));
+}
+
+test "Messages keeps reused call ids paired with their own results" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    var calls = [_]Conversation.ToolCall{.{ .id = "0", .name = "read", .arguments = "{}" }};
+    for ([_][]const u8{ "first result", "second result" }) |result| {
+        try convo.add(.user, "read");
+        _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+        _ = try convo.append(.{ .role = .tool, .text = result, .tool_call_id = "0" });
+    }
+    try convo.add(.user, "interrupted");
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const body = try buildRequest(.{ .model = "claude-fable-5.1" }, arena.allocator(), &convo, .{ .system = "s" });
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+    const expected = [_][]const u8{ "first result", "second result", "aborted" };
+    var results: usize = 0;
+    for (root.object.get("messages").?.array.items) |message| {
+        for (message.object.get("content").?.array.items) |block| {
+            if (!std.mem.eql(u8, block.object.get("type").?.string, "tool_result")) continue;
+            try testing.expect(results < expected.len);
+            try testing.expectEqualStrings(expected[results], block.object.get("content").?.string);
+            results += 1;
+        }
+    }
+    try testing.expectEqual(expected.len, results);
 }
 
 test "Messages streams collect fragmented tool calls, text and cached token usage" {

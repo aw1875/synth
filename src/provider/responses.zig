@@ -37,9 +37,9 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     try w.writeAll(",\"input\":[");
     var input: InputWriter = .{ .writer = w, .supports_vision = options.supports_vision, .provider_tag = options.provider_tag };
     try input.text("developer", Item.input_text, instructions);
-    for (kept) |msg| {
+    for (kept, 0..) |msg, i| {
         if (msg.role == .system or msg.role == .summary) continue;
-        try input.message(arena, msg, kept);
+        try input.message(arena, msg, kept[i + 1 ..]);
     }
     if (turn.instruction.len > 0) try input.text("user", Item.input_text, turn.instruction);
     try w.writeByte(']');
@@ -174,7 +174,7 @@ const InputWriter = struct {
     /// ran - still needs an output, or the next request is refused.
     fn closeUnansweredCalls(self: *InputWriter, msg: Conversation.Message, all: []const Conversation.Message) !void {
         for (msg.tool_calls) |call| {
-            if (hasResult(all, call.id)) continue;
+            if (window.toolResult(all, call.id) != null) continue;
             try self.separator();
             try std.json.Stringify.value(.{
                 .type = Item.function_call_output,
@@ -196,15 +196,6 @@ const InputWriter = struct {
         try w.writeAll("}]}");
     }
 };
-
-fn hasResult(all: []const Conversation.Message, call_id: []const u8) bool {
-    for (all) |msg| {
-        if (msg.role != .tool) continue;
-        const answered = msg.tool_call_id orelse continue;
-        if (std.mem.eql(u8, answered, call_id)) return true;
-    }
-    return false;
-}
 
 /// The registry's definitions are chat-completions shaped; Responses wants
 /// the function's fields at the top level.
@@ -587,6 +578,29 @@ test "Copilot Responses retains developer instructions and stable tool-result se
     try testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
     try testing.expectEqualStrings("You are synth.", input[0].object.get("content").?.array.items[0].object.get("text").?.string);
     try testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call_output\",\"call_id\":\"call_a\",\"output\":\"line one\\n\\\"quoted\\\"\"}") != null);
+}
+
+test "Responses closes an unanswered reused call id within its own exchange" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    var calls = [_]Conversation.ToolCall{.{ .id = "0", .name = "read", .arguments = "{}" }};
+    try convo.add(.user, "first");
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    _ = try convo.append(.{ .role = .tool, .text = "first result", .tool_call_id = "0" });
+    try convo.add(.user, "second");
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const body = try buildRequest(.{ .model = "gpt-6.1-sol", .provider_tag = "copilot" }, arena.allocator(), &convo, .{ .system = "s" });
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+    var outputs: usize = 0;
+    for (root.object.get("input").?.array.items) |item| {
+        if (!std.mem.eql(u8, item.object.get("type").?.string, "function_call_output")) continue;
+        try testing.expectEqualStrings(if (outputs == 0) "first result" else "aborted", item.object.get("output").?.string);
+        outputs += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), outputs);
 }
 
 test "Copilot Responses preserves cache and reasoning usage with its own replay tag" {
