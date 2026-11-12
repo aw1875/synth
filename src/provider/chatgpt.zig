@@ -10,6 +10,7 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const auth = @import("chatgpt_auth.zig");
+const log_file = @import("log_file.zig");
 const OpenAI = @import("openai.zig");
 const Provider = @import("provider.zig");
 const retry = @import("retry.zig");
@@ -1063,6 +1064,8 @@ const ResponseStream = struct {
         const usage = objectField(response, "usage") orelse return;
         self.usage.prompt_tokens = unsignedField(usage, "input_tokens");
         self.usage.completion_tokens = unsignedField(usage, "output_tokens");
+        if (objectField(usage, "input_tokens_details")) |details| self.usage.cached_tokens = unsignedField(details, "cached_tokens");
+        if (objectField(usage, "output_tokens_details")) |details| self.usage.reasoning_tokens = unsignedField(details, "reasoning_tokens");
     }
 
     /// A completed response with neither text nor a call is the model
@@ -1102,10 +1105,9 @@ fn writeString(w: *std.Io.Writer, value: []const u8) !void {
 fn log(self: *ChatGPTProvider, arena: std.mem.Allocator, body: []const u8, reply: Provider.Reply) !void {
     const path = self.debug_log orelse return;
     var out: std.Io.Writer.Allocating = .init(arena);
-    const existing = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(1024 * 1024)) catch "";
-    try out.writer.writeAll(existing);
     try out.writer.print("\n=== request ===\n{s}\n=== reply ===\ntext: {s}\ncalls: {d}\n", .{ body, reply.text, reply.tool_calls.len });
-    try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out.written() });
+    try log_file.writeUsage(&out.writer, reply.usage);
+    try log_file.append(self.io, path, out.written());
 }
 
 fn captureRejection(self: *ChatGPTProvider, status: std.http.Status, body: []const u8) void {
@@ -1315,7 +1317,7 @@ test "a stream folds into text, calls, and a replay record" {
         \\
         \\data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}}
         \\
-        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}
+        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":10},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":2}}}}
         \\
     );
     var reply = try stream.intoReply();
@@ -1324,6 +1326,8 @@ test "a stream folds into text, calls, and a replay record" {
     try testing.expectEqual(@as(usize, 1), reply.tool_calls.len);
     try testing.expectEqualStrings("call_1", reply.tool_calls[0].id);
     try testing.expectEqual(@as(u32, 12), reply.usage.prompt_tokens);
+    try testing.expectEqual(@as(u32, 10), reply.usage.cached_tokens);
+    try testing.expectEqual(@as(u32, 2), reply.usage.reasoning_tokens);
     try testing.expect(std.mem.indexOf(u8, reply.provider_state.?, "\"fc_1\"") != null);
 }
 

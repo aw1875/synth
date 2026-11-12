@@ -10,6 +10,7 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
 const window = @import("window.zig");
 
@@ -644,7 +645,9 @@ const Collector = struct {
         if (chunk.usage) |usage| {
             self.usage = .{
                 .prompt_tokens = usage.prompt_tokens,
+                .cached_tokens = if (usage.prompt_tokens_details) |details| details.cached_tokens else 0,
                 .completion_tokens = usage.completion_tokens,
+                .reasoning_tokens = if (usage.completion_tokens_details) |details| details.reasoning_tokens else 0,
             };
         }
 
@@ -785,6 +788,8 @@ const Chunk = struct {
     const Usage = struct {
         prompt_tokens: u32 = 0,
         completion_tokens: u32 = 0,
+        prompt_tokens_details: ?struct { cached_tokens: u32 = 0 } = null,
+        completion_tokens_details: ?struct { reasoning_tokens: u32 = 0 } = null,
     };
 };
 
@@ -998,14 +1003,8 @@ fn log(self: *OpenAIProvider, arena: std.mem.Allocator, body: []const u8, reply:
         reply.text,
         reply.tool_calls.len,
     });
-
-    const existing = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(1024 * 1024)) catch "";
-
-    var combined: std.Io.Writer.Allocating = .init(arena);
-    try combined.writer.writeAll(existing);
-    try combined.writer.writeAll(out.written());
-
-    try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = combined.written() });
+    try log_file.writeUsage(&out.writer, reply.usage);
+    try log_file.append(self.io, path, out.written());
 }
 
 /// Keep what the server said about a rejected request, reduced to the sentence
@@ -1386,7 +1385,7 @@ test "a stream of deltas folds back into one reply" {
         \\
         \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         \\
-        \\data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":8}}
+        \\data: {"choices":[],"usage":{"prompt_tokens":120,"prompt_tokens_details":{"cached_tokens":96},"completion_tokens":8,"completion_tokens_details":null}}
         \\
         \\data: [DONE]
         \\
@@ -1407,6 +1406,8 @@ test "a stream of deltas folds back into one reply" {
     try testing.expectEqualStrings("{\"path\":\"build.zig\"}", reply.tool_calls[0].arguments);
     try testing.expectEqual(@as(u32, 120), reply.usage.prompt_tokens);
     try testing.expectEqual(@as(u32, 8), reply.usage.completion_tokens);
+    try testing.expectEqual(@as(u32, 96), reply.usage.cached_tokens);
+    try testing.expectEqual(@as(u32, 0), reply.usage.reasoning_tokens);
 }
 
 test "a server that ignores `stream` is understood anyway" {
