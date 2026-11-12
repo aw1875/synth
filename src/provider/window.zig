@@ -10,10 +10,25 @@ const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
 
 pub fn requestBudget(limit: u32, turn: Provider.Turn) usize {
+    return requestBudgetForOutput(limit, turn, 0);
+}
+
+pub fn requestBudgetForOutput(limit: u32, turn: Provider.Turn, output_tokens: u32) usize {
     const summarising_known_window = turn.compacting and limit > 0;
     const available = if (summarising_known_window) @as(usize, limit) * 9 / 10 else budgetFor(limit);
     const instruction_tokens = (turn.system.len + turn.tools_json.len + turn.instruction.len) / 4;
-    return available -| instruction_tokens;
+    const input_limit = if (limit > 0) @min(available, limit -| output_tokens) else available;
+    return input_limit -| instruction_tokens;
+}
+
+test "explicit output tokens reserve context for ordinary and compacting requests" {
+    const testing = std.testing;
+    const turn: Provider.Turn = .{ .system = "s" ** 40 };
+    try testing.expectEqual(@as(usize, 590), requestBudgetForOutput(1000, turn, 400));
+    try testing.expectEqual(@as(usize, 590), requestBudgetForOutput(1000, .{ .system = turn.system, .compacting = true }, 400));
+    try testing.expectEqual(@as(usize, 0), requestBudgetForOutput(1000, turn, 1000));
+    try testing.expectEqual(requestBudget(0, turn), requestBudgetForOutput(0, turn, 400));
+    try testing.expectEqual(requestBudget(1000, turn), requestBudgetForOutput(1000, turn, 0));
 }
 
 pub fn contextTokens(convo: *const Conversation, with_images: bool) usize {

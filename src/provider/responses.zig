@@ -26,7 +26,7 @@ const Item = struct {
 };
 
 pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversation, turn: Provider.Turn) ![]u8 {
-    const budget = window.requestBudget(options.context_limit, turn);
+    const budget = window.requestBudgetForOutput(options.context_limit, turn, options.max_output_tokens);
     const kept = try window.completeMessages(convo, arena, budget, options.supports_vision);
     const instructions = try window.systemText(arena, turn.system, kept, 0);
 
@@ -565,6 +565,51 @@ fn readFailure(fields: std.json.ObjectMap) Failure {
 
 fn writeString(w: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.encodeJsonString(value, .{}, w);
+}
+
+test "Copilot Responses retains developer instructions and stable tool-result serialization" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "read a file");
+    var calls = [_]Conversation.ToolCall{.{ .id = "call_a", .name = "read", .arguments = "{}" }};
+    _ = try convo.append(.{ .role = .assistant, .text = "", .tool_calls = &calls });
+    _ = try convo.addToolResult("read", "call_a", "line one\n\"quoted\"");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const body = try buildRequest(.{ .model = "gpt-6.1-sol", .provider_tag = "copilot" }, arena.allocator(), &convo, .{ .system = "You are synth." });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+    const root = parsed.object;
+    try testing.expect(!root.contains("instructions"));
+    try testing.expect(!root.contains("prompt_cache_key"));
+    try testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+    const input = root.get("input").?.array.items;
+    try testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    try testing.expectEqualStrings("You are synth.", input[0].object.get("content").?.array.items[0].object.get("text").?.string);
+    try testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"function_call_output\",\"call_id\":\"call_a\",\"output\":\"line one\\n\\\"quoted\\\"\"}") != null);
+}
+
+test "Copilot Responses preserves cache and reasoning usage with its own replay tag" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var stream: ResponseStream = .init(testing.allocator, null);
+    defer stream.deinit();
+    stream.provider_tag = "copilot";
+    var reader: std.Io.Reader = .fixed(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"OK\"}\n\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":5},\"output_tokens\":10,\"output_tokens_details\":{\"reasoning_tokens\":4}}}}\n\n",
+    );
+    try stream.readEvents(arena.allocator(), &reader);
+    var reply = try stream.intoReply();
+    defer reply.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 100), reply.usage.prompt_tokens);
+    try testing.expectEqual(@as(u32, 80), reply.usage.cached_tokens);
+    try testing.expectEqual(@as(u32, 5), reply.usage.cache_write_tokens);
+    try testing.expectEqual(@as(u32, 10), reply.usage.completion_tokens);
+    try testing.expectEqual(@as(u32, 4), reply.usage.reasoning_tokens);
+    const record = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), reply.provider_state.?, .{});
+    try testing.expectEqualStrings("copilot", record.object.get("provider").?.string);
 }
 
 fn stopped(sink: ?Provider.Sink) bool {
