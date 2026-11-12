@@ -459,6 +459,8 @@ fn respond(
     var attempt: usize = 1;
     while (true) {
         const body = try self.buildRequest(arena, convo, turn);
+        // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
+        const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
 
         var request = try self.client.request(.POST, uri, .{
             .headers = self.requestHeaders(true),
@@ -505,7 +507,7 @@ fn respond(
         }
 
         const reply = try collector.finish();
-        self.log(arena, body, reply) catch {};
+        self.log(arena, logged, reply) catch {};
         return reply;
     }
 }

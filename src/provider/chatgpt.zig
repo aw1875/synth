@@ -453,6 +453,8 @@ fn respond(
         const token = try store.accessToken(arena);
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
         const body = try self.buildRequest(arena, convo, turn);
+        // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
+        const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
         const uri = std.Uri.parse(responses_url) catch return error.InvalidHost;
 
         const extra_headers = [_]std.http.Header{.{ .name = "Accept", .value = "text/event-stream" }};
@@ -517,7 +519,7 @@ fn respond(
         }
 
         const reply = try stream.intoReply();
-        self.log(arena, body, reply) catch {};
+        self.log(arena, logged, reply) catch {};
         return reply;
     }
 }
