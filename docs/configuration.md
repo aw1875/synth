@@ -17,7 +17,7 @@ Every `config.json` key is optional. An absent one keeps the built-in default.
 | `system_prompt` | string | the built-in brief | Replaces the base instructions entirely. |
 | `think` | bool | `true` | Ask for reasoning output. Turn off for models that do not support it. |
 | `auto_approve_safe_commands` | bool | `true` | Let a preset of read-only shell commands run without a prompt. Off makes every command a question, however harmless. |
-| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the session's model judge it (see [Modes](usage.md#modes)), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
+| `approvals` | string | `"ask"` | Who decides a call that would otherwise ask: `ask` puts it to you, `auto` has the session's model judge it (see [Auto approvals](usage.md#auto-approvals)), `all` runs everything, paths outside the project included - for a machine set aside for the agent. `PreToolUse` hooks still run under each. Turns still stop at their limits; to let one run until the work is done, set the three below to `0` as well. |
 | `debug_log` | string | none | Append every request and reply to this file. |
 | `max_turn_ms` | number | `1800000` | How long one turn may run. `0` disables it. |
 | `max_turn_tokens` | number | `2000000` | Tokens one turn may spend, prompt and completion together. `0` disables it. |
