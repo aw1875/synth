@@ -1914,8 +1914,8 @@ test "a mirror loads the transcript a subagent call left" {
     const call = (try db.toolCallId(message, 0)).?;
     const project = try db.resolveProject(fixture.project, "git", "project");
     const child = try db.createSubagentSession(project, fixture.project, "scripted", session, call);
-    _ = try db.appendMessage(child, 0, "user", "look around", null, 0);
-    _ = try db.appendMessage(child, 1, "assistant", "found it", null, 0);
+    _ = try db.appendMessage(child, 0, "user", "look around", null, 0, null);
+    _ = try db.appendMessage(child, 1, "assistant", "found it", null, 0, null);
 
     try mirror.loadSubagent(asking.seq, 0);
     const loaded = try pollForAnswer(mirror);

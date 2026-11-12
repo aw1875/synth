@@ -2065,6 +2065,7 @@ fn persistMessage(self: *Loop, index: usize) !void {
         msg.text,
         thinking_ms,
         thinking_bytes,
+        .of(msg.*),
     );
     try self.message_ids.put(self.allocator, msg.seq, message_id);
 
@@ -2150,6 +2151,7 @@ fn persistSubagent(
             child.text,
             if (child.thinking_ms) |ms| @intCast(ms) else null,
             thinking_bytes,
+            .of(child),
         );
         if (child.thinking) |thinking| {
             try db.appendBlob(message_id, 0, "reasoning", thinking);
@@ -3520,6 +3522,40 @@ test "a file too large to checkpoint is still changed, and the person told it ca
     try testing.expect(std.mem.indexOf(u8, notice, "/rewind") != null);
 }
 
+test "a resumed session's tool results still name the calls they answer" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    var db = try Database.init(testing.allocator, testing.io, ":memory:");
+    defer db.deinit();
+    var loop = fixture.loop();
+    defer loop.deinit();
+    try loop.attachDatabase(&db, "project", fixture.root, "model");
+
+    fixture.fake.tool_name = "write";
+    fixture.fake.tool_arguments = "{\"path\":\"a.txt\",\"content\":\"x\"}";
+    try loop.submit("write a", .{});
+    try settle(&loop);
+    try loop.decide(.once);
+    try settle(&loop);
+    const call_id = try testing.allocator.dupe(u8, firstCall(&loop).id);
+    defer testing.allocator.free(call_id);
+
+    var resumed = fixture.loop();
+    defer resumed.deinit();
+    try resumed.attachDatabase(&db, "project", fixture.root, "model");
+    try resumed.resumeSession(loop.session_id.?, 50);
+
+    var results: usize = 0;
+    for (resumed.conversation.messages.items) |msg| {
+        if (msg.role != .tool) continue;
+        results += 1;
+        try testing.expectEqualStrings(call_id, msg.tool_call_id.?);
+        try testing.expectEqualStrings("write", msg.tool_name.?);
+    }
+    try testing.expectEqual(@as(usize, 1), results);
+}
+
 test "a session comes back in the mode it was left in" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
@@ -3849,13 +3885,13 @@ test "resuming loads the task beyond the display page, or its latest checkpoint"
     defer loop.deinit();
     try loop.attachDatabase(&db, "project", fixture.root, "model");
     const session = try db.createSession(loop.project_id.?, fixture.root, "model");
-    _ = try db.appendMessage(session, 0, "user", "original task", null, 0);
-    _ = try db.appendMessage(session, 1, "assistant", "progress", null, 0);
-    _ = try db.appendMessage(session, 2, "user", "continue", null, 0);
+    _ = try db.appendMessage(session, 0, "user", "original task", null, 0, null);
+    _ = try db.appendMessage(session, 1, "assistant", "progress", null, 0, null);
+    _ = try db.appendMessage(session, 2, "user", "continue", null, 0, null);
     try loop.resumeSession(session, 1);
     try testing.expectEqualStrings("original task", fixture.convo.messages.items[0].text);
-    _ = try db.appendMessage(session, 3, "system", "task and progress checkpoint", null, 0);
-    _ = try db.appendMessage(session, 4, "user", "next step", null, 0);
+    _ = try db.appendMessage(session, 3, "system", "task and progress checkpoint", null, 0, null);
+    _ = try db.appendMessage(session, 4, "user", "next step", null, 0, null);
     try loop.resumeSession(session, 1);
     try testing.expectEqual(@as(usize, 2), fixture.convo.messages.items.len);
     try testing.expectEqualStrings("task and progress checkpoint", fixture.convo.messages.items[0].text);
