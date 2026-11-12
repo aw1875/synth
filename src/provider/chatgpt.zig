@@ -10,6 +10,7 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const auth = @import("chatgpt_auth.zig");
+const log_file = @import("log_file.zig");
 const OpenAI = @import("openai.zig");
 const Provider = @import("provider.zig");
 const retry = @import("retry.zig");
@@ -452,9 +453,11 @@ fn respond(
         const token = try store.accessToken(arena);
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
         const body = try self.buildRequest(arena, convo, turn);
+        // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
+        const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
         const uri = std.Uri.parse(responses_url) catch return error.InvalidHost;
 
-        const extra_headers = [_]std.http.Header{.{ .name = "Accept", .value = "text/event-stream" }};
+        const extra_headers = self.requestHeaders();
         var request = try self.client.request(.POST, uri, .{
             .redirect_behavior = .not_allowed,
             .keep_alive = false,
@@ -516,7 +519,7 @@ fn respond(
         }
 
         const reply = try stream.intoReply();
-        self.log(arena, body, reply) catch {};
+        self.log(arena, logged, reply) catch {};
         return reply;
     }
 }
@@ -544,6 +547,16 @@ fn stopped(sink: ?Provider.Sink) bool {
     return s.stopped(s.userdata);
 }
 
+/// ChatGPT routes a request to the servers holding its cache by the
+/// `session-id` header, not by `prompt_cache_key` alone, as Codex notes:
+/// https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs
+fn requestHeaders(self: *const ChatGPTProvider) [2]std.http.Header {
+    return .{
+        .{ .name = "Accept", .value = "text/event-stream" },
+        .{ .name = "session-id", .value = &self.cache_key.? },
+    };
+}
+
 /// Stable for as long as the history only grows, so the prompt prefix keeps
 /// hitting the cache across turns, model switches and subagents.
 fn cacheKey(self: *ChatGPTProvider, convo: *Conversation) []const u8 {
@@ -567,10 +580,9 @@ fn buildRequest(self: *ChatGPTProvider, arena: std.mem.Allocator, convo: *Conver
     const w = &out.writer;
     try w.writeAll("{\"model\":");
     try writeString(w, self.model);
-    try w.writeAll(",\"instructions\":");
-    try writeString(w, instructions);
     try w.writeAll(",\"input\":[");
     var input: InputWriter = .{ .writer = w, .supports_vision = self.supports_vision };
+    try input.developer(instructions);
     for (kept) |msg| {
         if (msg.role == .system or msg.role == .summary) continue;
         try input.message(arena, msg, kept);
@@ -618,6 +630,17 @@ const InputWriter = struct {
         self.first = false;
     }
 
+    /// The instructions go in as a developer message rather than top-level
+    /// `instructions`, which GPT-6 models never look the cache up inside:
+    /// https://developers.openai.com/api/docs/guides/prompt-caching
+    fn developer(self: *InputWriter, instructions: []const u8) !void {
+        try self.separator();
+        const w = self.writer;
+        try w.writeAll("{\"type\":\"message\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":");
+        try writeString(w, instructions);
+        try w.writeAll("}]}");
+    }
+
     fn message(self: *InputWriter, arena: std.mem.Allocator, msg: Conversation.Message, all: []const Conversation.Message) !void {
         const content = try OpenAI.messageContent(arena, msg, self.supports_vision);
         switch (msg.role) {
@@ -634,11 +657,12 @@ const InputWriter = struct {
             .tool => {
                 if (!self.open_calls) return;
                 try self.separator();
-                try std.json.Stringify.value(.{
-                    .type = Item.function_call_output,
-                    .call_id = msg.tool_call_id orelse "",
-                    .output = content,
-                }, .{}, self.writer);
+                const w = self.writer;
+                try w.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
+                try writeString(w, msg.tool_call_id orelse "");
+                try w.writeAll(",\"output\":");
+                try writeString(w, content);
+                try w.writeByte('}');
             },
         }
     }
@@ -1063,6 +1087,11 @@ const ResponseStream = struct {
         const usage = objectField(response, "usage") orelse return;
         self.usage.prompt_tokens = unsignedField(usage, "input_tokens");
         self.usage.completion_tokens = unsignedField(usage, "output_tokens");
+        if (objectField(usage, "input_tokens_details")) |details| {
+            self.usage.cached_tokens = unsignedField(details, "cached_tokens");
+            self.usage.cache_write_tokens = unsignedField(details, "cache_write_tokens");
+        }
+        if (objectField(usage, "output_tokens_details")) |details| self.usage.reasoning_tokens = unsignedField(details, "reasoning_tokens");
     }
 
     /// A completed response with neither text nor a call is the model
@@ -1102,10 +1131,9 @@ fn writeString(w: *std.Io.Writer, value: []const u8) !void {
 fn log(self: *ChatGPTProvider, arena: std.mem.Allocator, body: []const u8, reply: Provider.Reply) !void {
     const path = self.debug_log orelse return;
     var out: std.Io.Writer.Allocating = .init(arena);
-    const existing = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(1024 * 1024)) catch "";
-    try out.writer.writeAll(existing);
     try out.writer.print("\n=== request ===\n{s}\n=== reply ===\ntext: {s}\ncalls: {d}\n", .{ body, reply.text, reply.tool_calls.len });
-    try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out.written() });
+    try log_file.writeUsage(&out.writer, reply.usage);
+    try log_file.append(self.io, path, out.written());
 }
 
 fn captureRejection(self: *ChatGPTProvider, status: std.http.Status, body: []const u8) void {
@@ -1187,7 +1215,7 @@ test "the catalog keeps what a picker should show, in the server's order" {
     try testing.expect(!models[1].vision);
 }
 
-test "a request carries instructions, never a system message, and keeps nothing server-side" {
+test "instructions go first as a cached developer message, never a system one, and nothing is kept server-side" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const store = try testStore(&tmp);
@@ -1210,7 +1238,7 @@ test "a request carries instructions, never a system message, and keeps nothing 
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const root = parsed.object;
-    try testing.expectEqualStrings("You are synth.", root.get("instructions").?.string);
+    try testing.expect(root.get("instructions") == null);
     try testing.expectEqual(false, root.get("store").?.bool);
     try testing.expectEqual(true, root.get("stream").?.bool);
     try testing.expect(root.get("temperature") == null);
@@ -1218,12 +1246,37 @@ test "a request carries instructions, never a system message, and keeps nothing 
     try testing.expect(root.get("previous_response_id") == null);
 
     const input = root.get("input").?.array.items;
-    try testing.expectEqual(@as(usize, 1), input.len);
-    try testing.expectEqualStrings("user", input[0].object.get("role").?.string);
+    try testing.expectEqual(@as(usize, 2), input.len);
+    try testing.expectEqualStrings("developer", input[0].object.get("role").?.string);
+    const brief = input[0].object.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("You are synth.", brief.get("text").?.string);
+    try testing.expectEqualStrings("user", input[1].object.get("role").?.string);
 
     const tool = root.get("tools").?.array.items[0].object;
     try testing.expectEqualStrings("function", tool.get("type").?.string);
     try testing.expectEqualStrings("read", tool.get("name").?.string);
+}
+
+test "a request names its cache key as its session, so it is routed to its cache" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const store = try testStore(&tmp);
+    defer store.destroy();
+    var chat = testProvider(store);
+    defer chat.deinit();
+
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "hi");
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const body = try chat.buildRequest(arena_state.allocator(), &convo, .{ .system = "s" });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+
+    const headers = chat.requestHeaders();
+    try testing.expectEqualStrings("session-id", headers[1].name);
+    try testing.expectEqualStrings(parsed.object.get("prompt_cache_key").?.string, headers[1].value);
 }
 
 test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
@@ -1262,12 +1315,14 @@ test "a recorded turn is replayed verbatim, in order, ahead of its outputs" {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const input = parsed.object.get("input").?.array.items;
 
-    const expected = [_][]const u8{ "message", "reasoning", "message", "function_call", "function_call", "function_call_output", "function_call_output" };
+    const expected = [_][]const u8{ "message", "message", "reasoning", "message", "function_call", "function_call", "function_call_output", "function_call_output" };
     try testing.expectEqual(expected.len, input.len);
     for (expected, input) |kind, item| try testing.expectEqualStrings(kind, item.object.get("type").?.string);
-    try testing.expectEqualStrings("opaque", input[1].object.get("encrypted_content").?.string);
-    try testing.expectEqualStrings("commentary", input[2].object.get("phase").?.string);
-    try testing.expectEqualStrings("call_2", input[6].object.get("call_id").?.string);
+    try testing.expectEqualStrings("opaque", input[2].object.get("encrypted_content").?.string);
+    try testing.expectEqualStrings("commentary", input[3].object.get("phase").?.string);
+    try testing.expectEqualStrings("call_2", input[7].object.get("call_id").?.string);
+    try testing.expectEqualStrings("contents of a", input[6].object.get("output").?.string);
+    try testing.expectEqualStrings("contents of b", input[7].object.get("output").?.string);
 }
 
 test "a turn another provider answered is rebuilt, and an unanswered call is closed" {
@@ -1291,11 +1346,11 @@ test "a turn another provider answered is rebuilt, and an unanswered call is clo
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
     const input = parsed.object.get("input").?.array.items;
 
-    try testing.expectEqual(@as(usize, 4), input.len);
-    try testing.expectEqualStrings("function_call", input[1].object.get("type").?.string);
-    try testing.expectEqualStrings("{}", input[1].object.get("arguments").?.string);
-    try testing.expectEqualStrings("function_call_output", input[2].object.get("type").?.string);
-    try testing.expectEqualStrings(aborted_call_output, input[2].object.get("output").?.string);
+    try testing.expectEqual(@as(usize, 5), input.len);
+    try testing.expectEqualStrings("function_call", input[2].object.get("type").?.string);
+    try testing.expectEqualStrings("{}", input[2].object.get("arguments").?.string);
+    try testing.expectEqualStrings("function_call_output", input[3].object.get("type").?.string);
+    try testing.expectEqualStrings(aborted_call_output, input[3].object.get("output").?.string);
 }
 
 fn feed(stream: *ResponseStream, events: []const u8) !void {
@@ -1315,7 +1370,7 @@ test "a stream folds into text, calls, and a replay record" {
         \\
         \\data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}}
         \\
-        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"output_tokens":3}}}
+        \\data: {"type":"response.completed","response":{"usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":10},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":2}}}}
         \\
     );
     var reply = try stream.intoReply();
@@ -1324,6 +1379,8 @@ test "a stream folds into text, calls, and a replay record" {
     try testing.expectEqual(@as(usize, 1), reply.tool_calls.len);
     try testing.expectEqualStrings("call_1", reply.tool_calls[0].id);
     try testing.expectEqual(@as(u32, 12), reply.usage.prompt_tokens);
+    try testing.expectEqual(@as(u32, 10), reply.usage.cached_tokens);
+    try testing.expectEqual(@as(u32, 2), reply.usage.reasoning_tokens);
     try testing.expect(std.mem.indexOf(u8, reply.provider_state.?, "\"fc_1\"") != null);
 }
 

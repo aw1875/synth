@@ -78,11 +78,12 @@ pub const supersede_floor: usize = 256;
 /// first. The newest message is always kept even if it alone exceeds the
 /// budget, so the model always sees the prompt it is answering.
 ///
-/// A tool result that a later identical call has already answered is replaced
-/// by a note as the window is chosen, not after: the room it gives back is what
-/// lets an older message stay. Ten reads of one file otherwise cost ten copies
-/// of it in every request from then on, which is context spent on nine answers
-/// that are already known to be stale.
+/// When the whole transcript does not fit, a tool result that a later identical
+/// call has already answered is replaced by a note as the window is chosen, not
+/// after: the room it gives back is what lets an older message stay. While it
+/// all fits, nothing is rewritten, because changing an earlier message changes
+/// the start of every request after it and loses the provider's prompt cache,
+/// which costs far more than the stale copy.
 fn messages(
     convo: *Conversation,
     allocator: std.mem.Allocator,
@@ -96,6 +97,7 @@ fn messages(
 
     const stale = try supersededResults(allocator, all);
     defer allocator.free(stale);
+    if (contextTokens(convo, with_images) <= budget) @memset(stale, false);
 
     var used: usize = 0;
     var first: usize = all.len;
@@ -380,7 +382,7 @@ test "an identical call later on makes the earlier result redundant" {
     try addRead(&convo, "2", "b.zig", body);
     try addRead(&convo, "3", "a.zig", body);
 
-    const kept = try messages(&convo, std.testing.allocator, 10_000, true);
+    const kept = try messages(&convo, std.testing.allocator, contextTokens(&convo, true) - 1, true);
     defer std.testing.allocator.free(kept);
 
     try std.testing.expectEqual(@as(usize, 7), kept.len);
@@ -400,9 +402,28 @@ test "a provider that reuses call ids does not collapse the whole transcript" {
     try addRead(&convo, "call_0", "b.zig", body);
     try addRead(&convo, "call_0", "c.zig", body);
 
-    const kept = try messages(&convo, std.testing.allocator, 10_000, true);
+    const kept = try messages(&convo, std.testing.allocator, contextTokens(&convo, true) - 1, true);
     defer std.testing.allocator.free(kept);
 
+    for (kept) |msg| {
+        try std.testing.expect(!std.mem.eql(u8, msg.text, superseded_note));
+    }
+}
+
+test "a repeated call is left as it was while everything fits, so the request's start never changes" {
+    var convo: Conversation = .init(std.testing.allocator);
+    defer convo.deinit();
+
+    const body = "x" ** (supersede_floor * 2);
+
+    try convo.add(.user, "go");
+    try addRead(&convo, "1", "a.zig", body);
+    try addRead(&convo, "2", "a.zig", body);
+
+    const kept = try messages(&convo, std.testing.allocator, contextTokens(&convo, true), true);
+    defer std.testing.allocator.free(kept);
+
+    try std.testing.expectEqual(@as(usize, 5), kept.len);
     for (kept) |msg| {
         try std.testing.expect(!std.mem.eql(u8, msg.text, superseded_note));
     }
@@ -438,7 +459,7 @@ test "a different call, or a short result, is left alone" {
     try addRead(&convo, "3", "a.zig", "short");
     try addRead(&convo, "4", "a.zig", "short");
 
-    const kept = try messages(&convo, std.testing.allocator, 100_000, true);
+    const kept = try messages(&convo, std.testing.allocator, contextTokens(&convo, true) - 1, true);
     defer std.testing.allocator.free(kept);
 
     for (kept) |msg| {
@@ -456,7 +477,7 @@ test "a result with no call to match is never collapsed" {
     _ = try convo.append(.{ .role = .tool, .text = body, .tool_call_id = "missing" });
     _ = try convo.append(.{ .role = .tool, .text = body, .tool_call_id = "missing" });
 
-    const kept = try messages(&convo, std.testing.allocator, 100_000, true);
+    const kept = try messages(&convo, std.testing.allocator, contextTokens(&convo, true) - 1, true);
     defer std.testing.allocator.free(kept);
 
     for (kept) |msg| {
