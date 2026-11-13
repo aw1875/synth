@@ -7,10 +7,14 @@ struct ProjectSidebar: View {
     var body: some View {
         List {
             Section {
-                Button("New Conversation", systemImage: "square.and.pencil") {
+                Button {
                     Task { await model.open() }
+                } label: {
+                    sidebarAction("New Conversation", symbol: "square.and.pencil")
                 }
-                Button("Open Project…", systemImage: "folder.badge.plus", action: model.chooseProject)
+                Button(action: model.chooseProject) {
+                    sidebarAction("Open Project…", symbol: "folder.badge.plus")
+                }
             }
             .buttonStyle(.borderless)
             .disabled(!model.canSwitch)
@@ -36,13 +40,24 @@ struct ProjectSidebar: View {
                         }
                     }
                     .font(.body.weight(.semibold))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(SynthPalette.foreground)
                     .textCase(nil)
                 }
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(SynthPalette.surface)
+        .foregroundStyle(SynthPalette.foreground)
         .navigationSplitViewColumnWidth(min: 200, ideal: 235, max: 340)
+    }
+
+    private func sidebarAction(_ title: String, symbol: String) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(SynthPalette.accent)
+        }
     }
 
     private func projectHeading(_ folder: URL) -> some View {
@@ -70,7 +85,7 @@ struct ProjectSidebar: View {
         if group.loading {
             ProgressView().controlSize(.small)
         } else if let error = group.failure {
-            Text(error).font(.caption).foregroundStyle(.secondary)
+            Text(error).font(.caption).foregroundStyle(SynthPalette.danger)
             Button("Retry") { Task { await model.loadGroup(group.folder, refresh: true) } }
         } else if group.cursor != nil {
             Button("More Conversations") { Task { await model.loadGroup(group.folder, refresh: false) } }
@@ -80,6 +95,7 @@ struct ProjectSidebar: View {
     private func conversation(_ row: ConversationRow, in group: ConversationGroup) -> some View {
         let current = model.activity[row.id]
         let title = [current?.title, row.stored?.title].compactMap { $0 }.first { !$0.isEmpty }
+        let selected = row.id == model.sessionID
         return Button {
             Task { await model.open(in: group.folder, stored: row.stored, identifier: row.id) }
         } label: {
@@ -88,26 +104,31 @@ struct ProjectSidebar: View {
                 Spacer()
                 if current?.awaitingInput == true {
                     Image(systemName: "exclamationmark.bubble.fill")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(SynthPalette.accent)
                         .accessibilityLabel("Waiting for input")
                 } else if current?.busy == true {
                     ProgressView().controlSize(.mini).accessibilityLabel("Running")
                 } else if model.completed.contains(row.id) {
-                    Image(systemName: "checkmark.circle").accessibilityLabel("Completed")
+                    Image(systemName: "checkmark.circle")
+                        .foregroundStyle(SynthPalette.success)
+                        .accessibilityLabel("Completed")
                 } else if current?.failed == true {
-                    Image(systemName: "exclamationmark.circle").accessibilityLabel("Disconnected")
+                    Image(systemName: "exclamationmark.circle")
+                        .foregroundStyle(SynthPalette.danger)
+                        .accessibilityLabel("Disconnected")
                 }
             }
-            .padding(.vertical, 4)
-            .padding(.horizontal, 5)
+            .padding(.vertical, 7)
+            .padding(.horizontal, 9)
             .contentShape(Rectangle())
+            .foregroundStyle(selected ? SynthPalette.accent : SynthPalette.foreground)
             .background(
-                row.id == model.sessionID ? Color.accentColor.opacity(0.18) : .clear,
-                in: .rect(cornerRadius: 5)
+                selected ? SynthPalette.alternateSurface : .clear,
+                in: .rect(cornerRadius: 7)
             )
         }
         .buttonStyle(.plain)
         .disabled(!model.canSwitch)
-        .accessibilityAddTraits(row.id == model.sessionID ? .isSelected : [])
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

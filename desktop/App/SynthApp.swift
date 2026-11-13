@@ -9,6 +9,8 @@ struct SynthApp: App {
         Window("Synth", id: "conversation") {
             ConversationView(model: delegate.model)
                 .frame(minWidth: 640, minHeight: 500)
+                .preferredColorScheme(.dark)
+                .tint(SynthPalette.accent)
         }
         .defaultSize(width: 900, height: 720)
         .commands {

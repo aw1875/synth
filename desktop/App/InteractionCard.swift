@@ -20,12 +20,15 @@ struct InteractionCard: View {
         .disabled(responding)
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .background(SynthPalette.surface, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(SynthPalette.border))
     }
 
     private func permissionBody(_ permission: Interaction.Permission) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Permission required", systemImage: "hand.raised").font(.headline)
+            Label("Permission required", systemImage: "hand.raised")
+                .font(.headline)
+                .foregroundStyle(SynthPalette.accent)
             Text(permission.toolCall.title ?? permission.toolCall.toolCallId).textSelection(.enabled)
             if let input = permission.toolCall.rawInput,
                let data = try? prettyEncoder.encode(input),
@@ -44,7 +47,7 @@ struct InteractionCard: View {
             Button(option.name) {
                 respond { await model.decide(interaction.id, option: option.optionId) }
             }
-            .tint(option.kind == "reject_once" ? .secondary : .accentColor)
+            .tint(option.kind.hasPrefix("reject_") ? SynthPalette.danger : SynthPalette.accent)
         }
     }
 

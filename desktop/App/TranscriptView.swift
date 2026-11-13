@@ -108,7 +108,7 @@ struct TranscriptNotices: View {
         ForEach(notices.indices, id: \.self) { index in
             Label(notices[index], systemImage: "info.circle")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(SynthPalette.muted)
                 .textSelection(.enabled)
         }
     }
@@ -123,17 +123,17 @@ private struct TranscriptRow: View {
         switch message.role {
         case "user":
             VStack(alignment: .leading, spacing: 6) {
-                Text("You").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                Text("You").font(.caption.weight(.semibold)).foregroundStyle(SynthPalette.muted)
                 Text(message.text).textSelection(.enabled)
             }
             .padding(13)
-            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+            .background(SynthPalette.surface, in: RoundedRectangle(cornerRadius: 12))
             .frame(maxWidth: 490, alignment: .trailing)
             .frame(maxWidth: .infinity, alignment: .trailing)
         case "assistant":
             assistant
         case "summary":
-            Text(message.text).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            Text(message.text).font(.caption).foregroundStyle(SynthPalette.muted).textSelection(.enabled)
         default:
             EmptyView()
         }
@@ -186,7 +186,7 @@ private struct ReasoningText: View {
                 .padding(.vertical, 5)
         }
         .font(.callout)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(SynthPalette.muted)
     }
 }
 
@@ -214,11 +214,11 @@ private struct ToolRow: View {
                 Spacer()
                 Text(tool.status.replacingOccurrences(of: "_", with: " ").capitalized)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(SynthPalette.muted)
             }
         }
         .padding(10)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+        .background(SynthPalette.surface, in: RoundedRectangle(cornerRadius: 8))
     }
 }
 
@@ -234,7 +234,7 @@ private struct ExpandableBody: View {
             Text(full ?? preview)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-            if let error { Text(error).foregroundStyle(.secondary) }
+            if let error { Text(error).foregroundStyle(SynthPalette.danger) }
             if let load, full == nil {
                 Button(loading ? "Loading…" : "Load Full Text") {
                     Task {
