@@ -9,60 +9,78 @@ extension ConversationModel {
         for path in preferences.stringArray(forKey: "projectFolders") ?? [] {
             register(URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL)
         }
-        guard !projects.isEmpty else { return }
         let rememberedFolder = preferences.string(forKey: "selectedProject")
         let rememberedChat = preferences.string(forKey: "selectedConversation")
-        do {
-            _ = try await connectedClient()
-        } catch {
-            self.error = error.localizedDescription
-            return
-        }
-        for folder in projects.map(\.folder) {
-            await loadProject(folder, refresh: true)
-        }
-        if let folder = projects.first(where: { $0.folder.path == rememberedFolder })?.folder {
+        let folder = groups.compactMap(\.folder).first { $0.path == rememberedFolder }
+        let hasStandaloneHistory = FileManager.default.fileExists(atPath: standaloneDirectory.path)
+        guard rememberedChat != nil || groups.count > 1 || hasStandaloneHistory else { return }
+        if let rememberedChat, rememberedFolder == nil || folder != nil {
             await open(in: folder, identifier: rememberedChat)
-            if sessionID == nil, rememberedChat != nil { await open(in: folder) }
+            if sessionID == nil, pendingSelection?.sessionID == nil, canSwitch {
+                await open(in: folder)
+            }
+        } else if canSwitch {
+            isOpening = true
+            defer { isOpening = false }
+            do {
+                _ = try await connectedClient()
+            } catch {
+                self.error = error.localizedDescription
+                return
+            }
+        }
+        for folder in groups.map(\.folder) where sessionID == nil || folder != project {
+            await loadGroup(folder, refresh: true)
         }
     }
 
     func register(_ folder: URL) {
-        if !projects.contains(where: { $0.folder == folder }) {
-            projects.append(ProjectGroup(folder: folder))
+        if !groups.contains(where: { $0.folder == folder }) {
+            groups.append(ConversationGroup(folder: folder))
         }
     }
 
     func persist() {
         let preferences = UserDefaults.standard
-        preferences.set(projects.map(\.folder.path), forKey: "projectFolders")
+        preferences.set(groups.compactMap { $0.folder?.path }, forKey: "projectFolders")
         preferences.set(project?.path, forKey: "selectedProject")
         preferences.set(sessionID, forKey: "selectedConversation")
     }
 
-    func loadProject(_ folder: URL, refresh: Bool) async {
-        guard let index = projects.firstIndex(where: { $0.folder == folder }),
-              !projects[index].loading, refresh || projects[index].cursor != nil else { return }
-        projects[index].loading = true
-        projects[index].failure = nil
-        defer { projects[index].loading = false }
+    private var standaloneDirectory: URL {
+        URL.applicationSupportDirectory.appending(path: "Synth/Conversations", directoryHint: .isDirectory)
+    }
+
+    func workingDirectory(for folder: URL?) throws -> String {
+        if let folder { return folder.path }
+        let directory = standaloneDirectory
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.path
+    }
+
+    func loadGroup(_ folder: URL?, refresh: Bool) async {
+        guard let index = groups.firstIndex(where: { $0.folder == folder }),
+              !groups[index].loading, refresh || groups[index].cursor != nil else { return }
+        groups[index].loading = true
+        groups[index].failure = nil
+        defer { groups[index].loading = false }
         do {
             guard let client, await client.connectionState == .connected else { return }
-            let oldCursor = projects[index].cursor
+            let oldCursor = groups[index].cursor
             let cursor = refresh ? nil : oldCursor
-            let page = try await client.listSessions(cwd: folder.path, cursor: cursor)
+            let page = try await client.listSessions(cwd: folder?.path ?? standaloneDirectory.path, cursor: cursor)
             let updated = Set(page.sessions.map(\.id))
-            let remaining = projects[index].sessions.filter { !updated.contains($0.id) }
-            projects[index].sessions = refresh ? page.sessions + remaining : remaining + page.sessions
+            let remaining = groups[index].sessions.filter { !updated.contains($0.id) }
+            groups[index].sessions = refresh ? page.sessions + remaining : remaining + page.sessions
             if !refresh || oldCursor == nil || remaining.isEmpty {
-                projects[index].cursor = page.nextCursor
+                groups[index].cursor = page.nextCursor
             }
         } catch {
-            projects[index].failure = error.localizedDescription
+            groups[index].failure = error.localizedDescription
         }
     }
 
-    func rows(for group: ProjectGroup) -> [ConversationRow] {
+    func rows(for group: ConversationGroup) -> [ConversationRow] {
         let stored = Set(group.sessions.map(\.id))
         let opened = openedSessions.values
             .filter { $0.folder == group.folder && !stored.contains($0.id) }
@@ -87,11 +105,12 @@ extension ConversationModel {
     }
 
     func rename(_ title: String) async {
-        guard let sessionID, let client, let folder = project else { return }
+        guard let sessionID, let client else { return }
+        let folder = project
         do {
             try await client.rename(title, in: sessionID)
             await refresh(from: client)
-            await loadProject(folder, refresh: true)
+            await loadGroup(folder, refresh: true)
         } catch {
             if self.sessionID == sessionID { self.error = error.localizedDescription }
         }

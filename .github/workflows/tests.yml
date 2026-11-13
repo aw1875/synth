@@ -28,3 +28,28 @@ jobs:
 
       - name: Run Tests
         run: zig build test
+
+  desktop:
+    runs-on: macos-26
+    name: Build and Test macOS App
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Lint Swift
+        working-directory: desktop
+        run: |
+          command -v swiftlint >/dev/null || brew install swiftlint
+          swiftlint lint --strict
+
+      - name: Build App
+        run: desktop/Scripts/build-app.sh
+
+      - name: Test with Bundled Engine
+        run: python3 desktop/Tests/Fixtures/fake_provider.py desktop/DerivedData/Build/Products/Release/Synth.app/Contents/Helpers/synth

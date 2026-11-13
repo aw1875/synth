@@ -20,12 +20,12 @@ struct ConversationView: View {
 
     private var detail: some View {
         Group {
-            if model.project == nil {
-                welcome
-            } else if model.sessionID == nil {
+            if model.sessionID != nil {
+                conversation
+            } else if model.isOpening || model.error != nil {
                 opening
             } else {
-                conversation
+                welcome
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -47,19 +47,18 @@ struct ConversationView: View {
 
     private var welcome: some View {
         ContentUnavailableView {
-            Label("Open a project", systemImage: "folder")
-        } description: {
-            Text("Choose the folder you want to work in with Synth.")
+            Label("Start a conversation", systemImage: "bubble.left.and.bubble.right")
         } actions: {
-            Button("Open Project…", action: model.chooseProject)
+            Button("New Conversation") { Task { await model.open() } }
                 .buttonStyle(.borderedProminent)
+            Button("Open Project…", action: model.chooseProject)
         }
     }
 
     private var opening: some View {
         Group {
             if model.isOpening {
-                ProgressView("Opening project…")
+                ProgressView("Connecting to Synth…")
             } else {
                 ContentUnavailableView {
                     Label("Couldn't open a conversation", systemImage: "exclamationmark.circle")
@@ -196,12 +195,10 @@ private extension ConversationView {
             Button("Open Project", systemImage: "folder") { model.chooseProject() }
                 .disabled(!model.canSwitch)
 
-            if model.project != nil {
-                Button("New Conversation", systemImage: "square.and.pencil") {
-                    Task { await model.open() }
-                }
-                .disabled(!model.canSwitch)
+            Button("New Conversation", systemImage: "square.and.pencil") {
+                Task { await model.open() }
             }
+            .disabled(!model.canSwitch)
         }
         if model.sessionID != nil {
             ToolbarItemGroup(placement: .primaryAction) {

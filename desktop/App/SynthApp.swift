@@ -17,7 +17,7 @@ struct SynthApp: App {
                     Task { await delegate.model.open() }
                 }
                 .keyboardShortcut("n")
-                .disabled(delegate.model.project == nil || !delegate.model.canSwitch)
+                .disabled(!delegate.model.canSwitch)
 
                 Button("Open Project…", systemImage: "folder") {
                     delegate.model.chooseProject()

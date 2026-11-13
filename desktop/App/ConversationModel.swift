@@ -10,7 +10,8 @@ final class ConversationModel {
     private(set) var sessionID: String?
     private(set) var state: SessionState?
     private(set) var interactions: [Interaction] = []
-    var projects: [ProjectGroup] = []
+    var groups = [ConversationGroup(folder: nil)]
+    private(set) var pendingSelection: ConversationSelection?
     var activity: [String: SynthClient.Activity] = [:]
     var completed: Set<String> = []
     var loadingHistory: Set<String> = []
@@ -21,7 +22,7 @@ final class ConversationModel {
     var didRestore = false
     private(set) var modes: [ACP.Mode] = []
     private(set) var connection: SynthClient.ConnectionState = .disconnected
-    private(set) var isOpening = false
+    var isOpening = false
     private(set) var isShuttingDown = false
     private(set) var isUpdatingConfiguration = false
     private(set) var modelError: String?
@@ -40,7 +41,7 @@ final class ConversationModel {
     private var submitting: Int { sessionID.flatMap { submissions[$0] } ?? 0 }
     private var stopRequested: Bool { sessionID.map(stopping.contains) ?? false }
     var anyBusy: Bool { submissions.values.contains { $0 > 0 } || activity.values.contains(where: \.busy) }
-    var recentSessions: [ACP.SessionInfo] { projects.first(where: { $0.folder == project })?.sessions ?? [] }
+    var recentSessions: [ACP.SessionInfo] { groups.first(where: { $0.folder == project })?.sessions ?? [] }
     var olderMessages: [Synth.Message] {
         guard let sessionID, let first = state?.messages.first?.seq else { return [] }
         return historyBySession[sessionID, default: []].filter { $0.seq < first }
@@ -95,36 +96,34 @@ final class ConversationModel {
         await open(in: folder)
     }
 
-    func open() async {
-        guard let project else { return }
-        await open(in: project)
-    }
-
-    func open(in folder: URL, stored: ACP.SessionInfo? = nil, identifier: String? = nil) async {
+    func open(in folder: URL? = nil, stored: ACP.SessionInfo? = nil, identifier: String? = nil) async {
         guard canSwitch else { return }
+        let target = stored?.id ?? identifier
+        pendingSelection = ConversationSelection(folder: folder, sessionID: target)
         isOpening = true
         defer { isOpening = false }
-        let target = stored?.id ?? identifier
         do {
             let client = try await connectedClient()
             let opened = try await obtainSession(target, in: folder, stored: stored, client: client)
             select(opened)
             await refresh(from: client)
-            await loadProject(folder, refresh: true)
+            await loadGroup(folder, refresh: true)
         } catch {
             self.error = error.localizedDescription
-            if project == nil { project = folder }
+            if let rpcError = error as? RPCError, rpcError.message == "no such session" {
+                pendingSelection = ConversationSelection(folder: folder, sessionID: nil)
+            }
         }
     }
 
     private func obtainSession(
-        _ identifier: String?, in folder: URL, stored: ACP.SessionInfo?, client: SynthClient
+        _ identifier: String?, in folder: URL?, stored: ACP.SessionInfo?, client: SynthClient
     ) async throws -> OpenedConversation {
         if let identifier, let opened = openedSessions[identifier],
            let state = await client.sessions[identifier], state.failure == nil {
             return opened
         }
-        let cwd = stored?.cwd ?? identifier.flatMap { openedSessions[$0]?.cwd } ?? folder.path
+        let cwd = try stored?.cwd ?? identifier.flatMap { openedSessions[$0]?.cwd } ?? workingDirectory(for: folder)
         let setup: ACP.SessionOpened
         let openedID: String
         if let identifier {
@@ -140,13 +139,14 @@ final class ConversationModel {
         let modes = setup.modes?.availableModes ?? []
         let opened = OpenedConversation(id: openedID, folder: folder, cwd: cwd, modes: modes)
         openedSessions[openedID] = opened
-        register(folder)
+        if let folder { register(folder) }
         return opened
     }
 
     private func select(_ opened: OpenedConversation) {
         project = opened.folder
         sessionID = opened.id
+        pendingSelection = nil
         modes = opened.modes
         completed.remove(opened.id)
         error = failures[opened.id]
@@ -156,14 +156,16 @@ final class ConversationModel {
     }
 
     func refreshHistory() async {
-        guard let project else { return }
-        await loadProject(project, refresh: true)
+        await loadGroup(project, refresh: true)
     }
 
     func reconnect() async {
         guard !isOpening else { return }
         guard let client, let sessionID else {
-            await open()
+            await open(in: pendingSelection?.folder, identifier: pendingSelection?.sessionID)
+            for folder in groups.compactMap(\.folder) {
+                await loadGroup(folder, refresh: true)
+            }
             return
         }
         isOpening = true
@@ -264,7 +266,6 @@ final class ConversationModel {
             openedSessions.removeValue(forKey: previous)
         }
         isOpening = false
-        guard let project else { return }
         await open(in: project, stored: stored)
         if let previous, let sessionID, previous != sessionID {
             drafts[sessionID] = drafts.removeValue(forKey: previous)
@@ -296,8 +297,8 @@ extension ConversationModel {
             if self.sessionID == sessionID { self.error = error.localizedDescription }
         }
         await refresh(from: client)
-        if let folder = openedSessions[sessionID]?.folder {
-            await loadProject(folder, refresh: true)
+        if let opened = openedSessions[sessionID] {
+            await loadGroup(opened.folder, refresh: true)
         }
     }
 
@@ -316,18 +317,23 @@ extension ConversationModel {
 
 struct OpenedConversation: Identifiable {
     let id: String
-    let folder: URL
+    let folder: URL?
     let cwd: String
     let modes: [ACP.Mode]
 }
 
-struct ProjectGroup: Identifiable {
-    let folder: URL
+struct ConversationSelection {
+    let folder: URL?
+    let sessionID: String?
+}
+
+struct ConversationGroup: Identifiable {
+    let folder: URL?
     var sessions: [ACP.SessionInfo] = []
     var cursor: String?
     var loading = false
     var failure: String?
-    var id: URL { folder }
+    var id: URL? { folder }
 }
 
 extension ConversationModel {

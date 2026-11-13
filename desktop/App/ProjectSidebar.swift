@@ -5,7 +5,7 @@ struct ProjectSidebar: View {
 
     var body: some View {
         List {
-            ForEach(model.projects) { group in
+            ForEach(model.groups) { group in
                 Section {
                     ForEach(model.rows(for: group)) { row in
                         conversation(row, in: group)
@@ -14,15 +14,17 @@ struct ProjectSidebar: View {
                         ProgressView().controlSize(.small)
                     } else if let error = group.failure {
                         Text(error).font(.caption).foregroundStyle(.secondary)
-                        Button("Retry") { Task { await model.loadProject(group.folder, refresh: true) } }
+                        Button("Retry") { Task { await model.loadGroup(group.folder, refresh: true) } }
                     } else if group.cursor != nil {
-                        Button("More Conversations") { Task { await model.loadProject(group.folder, refresh: false) } }
+                        Button("More Conversations") { Task { await model.loadGroup(group.folder, refresh: false) } }
                     }
                 } header: {
                     HStack {
-                        Text(group.folder.lastPathComponent)
-                            .help(group.folder.path)
-                            .lineLimit(1)
+                        if let folder = group.folder {
+                            Text(folder.lastPathComponent).help(folder.path).lineLimit(1)
+                        } else {
+                            Text("Conversations")
+                        }
                         Spacer()
                         Button("New Conversation", systemImage: "plus") {
                             Task { await model.open(in: group.folder) }
@@ -45,7 +47,7 @@ struct ProjectSidebar: View {
         }
     }
 
-    private func conversation(_ row: ConversationRow, in group: ProjectGroup) -> some View {
+    private func conversation(_ row: ConversationRow, in group: ConversationGroup) -> some View {
         let current = model.activity[row.id]
         let title = [current?.title, row.stored?.title].compactMap { $0 }.first { !$0.isEmpty }
         return Button {
