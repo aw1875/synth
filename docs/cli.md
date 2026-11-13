@@ -37,6 +37,9 @@ terminals runs commands in them, shown in the call as they run. MCP servers
 the editor brings connect beside those in `config.json`, which wins a clash of
 names; skills and `/compact` are offered as its slash commands.
 
+The [desktop ACP contract](desktop-acp.md) documents Synth's optional session
+notifications and the native Swift client's handshake.
+
 Quitting stops the session, a turn in progress included, unless another
 terminal is attached to it. `/detach` leaves it running instead, and so does
 losing the terminal without quitting, a closed window or a crash:

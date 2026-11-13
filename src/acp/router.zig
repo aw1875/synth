@@ -99,6 +99,9 @@ const End = struct {
     /// The id of the `initialize` the router sent it, owned, whose answer
     /// the client does not see.
     swallow: ?[]u8 = null,
+    greeting_version: u32 = protocol.version,
+    greeting_synth: ?u32 = null,
+    greeting_error: ?[]u8 = null,
     thread: std.Thread = undefined,
     writer: std.Io.File.Writer = undefined,
     buffer: [64 * 1024]u8 = undefined,
@@ -334,6 +337,8 @@ fn greet(self: *Router, end: *End, hello: []const u8) !void {
     end.swallow = id;
     const params = try std.json.parseFromSlice(std.json.Value, self.allocator, hello, .{});
     defer params.deinit();
+    end.greeting_version = greetingVersion(fieldOf(params.value, "protocolVersion")) orelse protocol.version;
+    end.greeting_synth = synthVersion(params.value);
     try rpc.request(&end.writer.interface, .{ .string = id }, protocol.method.initialize, params.value);
     try end.writer.interface.flush();
 }
@@ -410,6 +415,7 @@ fn drop(self: *Router, end: *End) void {
     closePipe(self.io, &end.pipe);
     if (end.handle) |handle| self.allocator.free(handle);
     if (end.swallow) |id| self.allocator.free(id);
+    if (end.greeting_error) |err| self.allocator.free(err);
     self.allocator.destroy(end);
 }
 
@@ -582,7 +588,9 @@ fn pump(end: *End) void {
 /// answer to a greeting dropped (empty), the rest as it is. Answers that
 /// open or close a session say which session the end now hosts.
 fn outbound(self: *Router, arena: std.mem.Allocator, end: *End, line: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, line, "\"id\"") == null and std.mem.indexOf(u8, line, protocol.method.cancel_request) == null) return line;
+    if (std.mem.indexOf(u8, line, "\"id\"") == null and std.mem.indexOf(u8, line, protocol.method.cancel_request) == null) {
+        return if (end.greeting_error != null) "" else line;
+    }
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return line;
     if (parsed != .object) return line;
     var message = parsed;
@@ -590,6 +598,7 @@ fn outbound(self: *Router, arena: std.mem.Allocator, end: *End, line: []const u8
     const id = message.object.get("id");
 
     if (method) |name| {
+        if (end.greeting_error != null) return "";
         if (id) |asking| {
             const original = try self.allocator.dupe(u8, try std.json.Stringify.valueAlloc(arena, asking, .{}));
             errdefer self.allocator.free(original);
@@ -615,10 +624,39 @@ fn outbound(self: *Router, arena: std.mem.Allocator, end: *End, line: []const u8
     if (end.swallow) |swallowed| if (answered == .string and std.mem.eql(u8, answered.string, swallowed)) {
         self.allocator.free(swallowed);
         end.swallow = null;
+        if (message.object.get("error")) |failure| {
+            end.greeting_error = try std.json.Stringify.valueAlloc(self.allocator, failure, .{});
+        } else if (!compatibleGreeting(end, message.object.get("result"))) {
+            end.greeting_error = try std.json.Stringify.valueAlloc(self.allocator, .{
+                .code = rpc.code.invalid_params,
+                .message = "the session's agent speaks a different ACP or Synth extension version; reopen it with a compatible Synth binary",
+            }, .{});
+        }
         return "";
     };
+    if (end.greeting_error) |failure| {
+        _ = message.object.swapRemove("result");
+        try message.object.put(arena, "error", try std.json.parseFromSliceLeaky(std.json.Value, arena, failure, .{}));
+        self.settle(end, key, message);
+        return std.json.Stringify.valueAlloc(arena, message, .{});
+    }
     self.settle(end, key, message);
     return line;
+}
+
+fn greetingVersion(value: ?std.json.Value) ?u32 {
+    const given = value orelse return null;
+    return if (given == .integer) std.math.cast(u32, given.integer) else null;
+}
+
+fn synthVersion(value: ?std.json.Value) ?u32 {
+    return greetingVersion(fieldOf(fieldOf(fieldOf(value, "_meta"), "synth"), "protocol"));
+}
+
+fn compatibleGreeting(end: *const End, result: ?std.json.Value) bool {
+    const expected = end.greeting_synth orelse return true;
+    return greetingVersion(fieldOf(result, "protocolVersion")) == end.greeting_version and
+        synthVersion(result) == expected;
 }
 
 /// The id the client was shown for `end`'s request `original`, forgotten
@@ -652,7 +690,7 @@ fn settle(self: *Router, end: *End, key: []const u8, message: std.json.Value) vo
             if (failed) {
                 if (end.handle) |handle| self.allocator.free(handle);
                 end.handle = null;
-                if (end.attached) dismiss(end);
+                if (end.attached or end.greeting_error != null) dismiss(end);
                 return;
             }
             const opened = stringOf(fieldOf(message.object.get("result"), "sessionId")) orelse return;
@@ -967,4 +1005,34 @@ test "sessions opened on one connection each get a child, and answers find their
 
     _ = try client.open(project);
     try testing.expectEqual(2, children.items.len);
+}
+
+test "a failed routed handshake preserves the agent's error on session load" {
+    const arena = testing.allocator;
+    var router: Router = .init(arena, testing.io, undefined, undefined, null, undefined, .{});
+    defer router.deinit();
+
+    var end: End = .{ .router = &router, .pipe = undefined, .attached = true, .opening = true };
+    end.handle = try arena.dupe(u8, "ses_elsewhere");
+    end.swallow = try arena.dupe(u8, "hello");
+    defer if (end.handle) |handle| arena.free(handle);
+    defer if (end.swallow) |id| arena.free(id);
+    defer if (end.greeting_error) |failure| arena.free(failure);
+
+    var memory: std.heap.ArenaAllocator = .init(arena);
+    defer memory.deinit();
+    const temporary = memory.allocator();
+    try router.expect(temporary, .{ .integer = 42 }, &end, protocol.method.session_load);
+    const greeting = try router.outbound(temporary, &end,
+        \\{"jsonrpc":"2.0","id":"hello","error":{"code":-32602,"message":"Synth extension version mismatch"}}
+    );
+    try testing.expectEqualStrings("", greeting);
+    const routed = try router.outbound(temporary, &end,
+        \\{"jsonrpc":"2.0","id":42,"error":{"code":-32600,"message":"initialize first"}}
+    );
+    const reply = try std.json.parseFromSliceLeaky(std.json.Value, temporary, routed, .{});
+    const failure = reply.object.get("error");
+    try testing.expectEqual(@as(i64, -32602), fieldOf(failure, "code").?.integer);
+    try testing.expectEqualStrings("Synth extension version mismatch", stringOf(fieldOf(failure, "message")).?);
+    try testing.expect(end.retired.load(.acquire));
 }
