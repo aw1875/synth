@@ -22,9 +22,10 @@ as the terminal client. If you need to configure a provider, run `synth` in
 Terminal first. For Xcode builds, set the `SYNTH_ENGINE` build setting to a
 ReleaseSafe executable built from this checkout.
 
-Choose a project folder to start chatting. Use **Conversations** in the toolbar
-to reopen a saved chat from the current project. Press **Command–Return** to
-send or steer, or click **Stop** to cancel the current turn.
+Choose a project folder to start chatting. The sidebar groups conversations
+by project and shows when a background conversation is running or needs
+input. Select **More Conversations** to load older chats. Press
+**Command–Return** to send or steer, or click **Stop** to cancel the current turn.
 
 ## Development
 

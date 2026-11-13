@@ -10,29 +10,51 @@ final class ConversationModel {
     private(set) var sessionID: String?
     private(set) var state: SessionState?
     private(set) var interactions: [Interaction] = []
-    private(set) var recentSessions: [ACP.SessionInfo] = []
+    var projects: [ProjectGroup] = []
+    var activity: [String: SynthClient.Activity] = [:]
+    var completed: Set<String> = []
+    var loadingHistory: Set<String> = []
+    var openedSessions: [String: OpenedConversation] = [:]
+    var historyBySession: [String: [Synth.Message]] = [:]
+    var drafts: [String: String] = [:]
+    var failures: [String: String] = [:]
+    var didRestore = false
     private(set) var modes: [ACP.Mode] = []
     private(set) var connection: SynthClient.ConnectionState = .disconnected
     private(set) var isOpening = false
+    private(set) var isShuttingDown = false
     private(set) var isUpdatingConfiguration = false
     private(set) var modelError: String?
     private(set) var isFetchingModels = false
     private var modelsRequested = false
-    private var submitting = 0
-    private var stopRequested = false
-    private var client: SynthClient?
+    private var submissions: [String: Int] = [:]
+    private var stopping: Set<String> = []
+    var client: SynthClient?
     private var observing: Task<Void, Never>?
-    private var ownedSession: String?
 
-    var draft = ""
+    var draft: String {
+        get { sessionID.flatMap { drafts[$0] } ?? "" }
+        set { if let sessionID { drafts[sessionID] = newValue } }
+    }
+
+    private var submitting: Int { sessionID.flatMap { submissions[$0] } ?? 0 }
+    private var stopRequested: Bool { sessionID.map(stopping.contains) ?? false }
+    var anyBusy: Bool { submissions.values.contains { $0 > 0 } || activity.values.contains(where: \.busy) }
+    var recentSessions: [ACP.SessionInfo] { projects.first(where: { $0.folder == project })?.sessions ?? [] }
+    var olderMessages: [Synth.Message] {
+        guard let sessionID, let first = state?.messages.first?.seq else { return [] }
+        return historyBySession[sessionID, default: []].filter { $0.seq < first }
+    }
+    var hasOlderMessages: Bool { (state?.dropped ?? 0) > UInt64(olderMessages.count) }
+    var messages: [Synth.Message] { olderMessages + (state?.messages ?? []) }
     var error: String?
 
     var busy: Bool {
         submitting > 0 || (connection == .connected && state?.failure == nil && state?.status?.isBusy == true)
     }
-    var canSwitch: Bool { !busy && !isOpening && !isUpdatingConfiguration && !isFetchingModels }
+    var canSwitch: Bool { !isOpening && !isShuttingDown }
     var canSend: Bool {
-        connection == .connected && sessionID != nil && !isOpening &&
+        connection == .connected && sessionID != nil && !isOpening && !isShuttingDown &&
             !isUpdatingConfiguration && state?.failure == nil &&
             state?.status?.providerMissing == false && !stopRequested &&
             !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -40,7 +62,10 @@ final class ConversationModel {
     var canStop: Bool {
         connection == .connected && sessionID != nil && busy && !stopRequested && state?.failure == nil
     }
-    var canConfigure: Bool { sessionID != nil && connection == .connected && canSwitch && state?.failure == nil }
+    var canConfigure: Bool {
+        sessionID != nil && connection == .connected && !busy && !isOpening &&
+            !isUpdatingConfiguration && !isFetchingModels && state?.failure == nil
+    }
     var loadingModels: Bool { isFetchingModels || (state?.models?.pending ?? 0) > 0 }
 
     func chooseProject() {
@@ -65,62 +90,74 @@ final class ConversationModel {
 
     private func openProject(_ directory: URL) async {
         guard canSwitch else { return }
-        let folder = directory.resolvingSymlinksInPath()
+        let folder = directory.resolvingSymlinksInPath().standardizedFileURL
+        register(folder)
         await open(in: folder)
     }
 
-    func open(_ stored: ACP.SessionInfo? = nil) async {
+    func open() async {
         guard let project else { return }
-        await open(in: project, stored: stored)
+        await open(in: project)
     }
 
-    private func open(in project: URL, stored: ACP.SessionInfo? = nil) async {
+    func open(in folder: URL, stored: ACP.SessionInfo? = nil, identifier: String? = nil) async {
         guard canSwitch else { return }
         isOpening = true
-        error = nil
         defer { isOpening = false }
+        let target = stored?.id ?? identifier
         do {
             let client = try await connectedClient()
-            let setup: ACP.SessionOpened
-            let openedID: String
-            if let stored {
-                setup = try await client.loadSession(stored.id, cwd: stored.cwd)
-                openedID = stored.id
-            } else {
-                setup = try await client.newSession(cwd: project.path)
-                guard let identifier = setup.sessionId else {
-                    throw SynthClient.Failure.invalidResponse("missing session ID")
-                }
-                openedID = identifier
-            }
-            let previous = ownedSession
-            let closePrevious = state?.messages.isEmpty == true
-            if self.project != project { recentSessions = [] }
-            self.project = project
-            sessionID = openedID
-            ownedSession = stored == nil ? openedID : nil
-            modes = setup.modes?.availableModes ?? []
-            draft = ""
-            modelError = nil
-            modelsRequested = false
+            let opened = try await obtainSession(target, in: folder, stored: stored, client: client)
+            select(opened)
             await refresh(from: client)
-            await refreshHistory()
-            if let previous, previous != openedID, closePrevious {
-                try await client.closeSession(previous)
-            }
+            await loadProject(folder, refresh: true)
         } catch {
             self.error = error.localizedDescription
-            if self.project == nil { self.project = project }
+            if project == nil { project = folder }
         }
+    }
+
+    private func obtainSession(
+        _ identifier: String?, in folder: URL, stored: ACP.SessionInfo?, client: SynthClient
+    ) async throws -> OpenedConversation {
+        if let identifier, let opened = openedSessions[identifier],
+           let state = await client.sessions[identifier], state.failure == nil {
+            return opened
+        }
+        let cwd = stored?.cwd ?? identifier.flatMap { openedSessions[$0]?.cwd } ?? folder.path
+        let setup: ACP.SessionOpened
+        let openedID: String
+        if let identifier {
+            setup = try await client.loadSession(identifier, cwd: cwd)
+            openedID = identifier
+        } else {
+            setup = try await client.newSession(cwd: cwd)
+            guard let identifier = setup.sessionId else {
+                throw SynthClient.Failure.invalidResponse("missing session ID")
+            }
+            openedID = identifier
+        }
+        let modes = setup.modes?.availableModes ?? []
+        let opened = OpenedConversation(id: openedID, folder: folder, cwd: cwd, modes: modes)
+        openedSessions[openedID] = opened
+        register(folder)
+        return opened
+    }
+
+    private func select(_ opened: OpenedConversation) {
+        project = opened.folder
+        sessionID = opened.id
+        modes = opened.modes
+        completed.remove(opened.id)
+        error = failures[opened.id]
+        modelError = nil
+        modelsRequested = false
+        persist()
     }
 
     func refreshHistory() async {
-        guard let project, let client, connection == .connected else { return }
-        do {
-            recentSessions = try await client.listSessions(cwd: project.path).sessions
-        } catch {
-            self.error = error.localizedDescription
-        }
+        guard let project else { return }
+        await loadProject(project, refresh: true)
     }
 
     func reconnect() async {
@@ -134,8 +171,8 @@ final class ConversationModel {
         defer { isOpening = false }
         do {
             let setup: ACP.SessionOpened?
-            if await client.connectionState == .connected, let project {
-                setup = try await client.loadSession(sessionID, cwd: project.path)
+            if await client.connectionState == .connected, let opened = openedSessions[sessionID] {
+                setup = try await client.loadSession(sessionID, cwd: opened.cwd)
             } else {
                 let failures = try await client.reconnect()
                 error = failures[sessionID]
@@ -151,7 +188,8 @@ final class ConversationModel {
         }
     }
 
-    private func connectedClient() async throws -> SynthClient {
+    func connectedClient() async throws -> SynthClient {
+        guard !isShuttingDown else { throw SynthClient.Failure.disconnected }
         let engine: SynthClient
         if let client {
             engine = client
@@ -161,6 +199,7 @@ final class ConversationModel {
                 throw SynthClient.Failure.invalidResponse("the bundled Synth engine is missing")
             }
             let environment = await LoginEnvironment.load()
+            guard !isShuttingDown else { throw SynthClient.Failure.disconnected }
             engine = SynthClient(
                 executable: executable,
                 directory: FileManager.default.homeDirectoryForCurrentUser,
@@ -169,7 +208,13 @@ final class ConversationModel {
             client = engine
             observe(engine)
         }
-        if await engine.connectionState != .connected { try await engine.connect() }
+        if await engine.connectionState != .connected {
+            if openedSessions.isEmpty {
+                try await engine.connect()
+            } else {
+                _ = try await engine.reconnect()
+            }
+        }
         connection = .connected
         return engine
     }
@@ -184,65 +229,105 @@ final class ConversationModel {
         }
     }
 
-    private func refresh(from client: SynthClient) async {
+    func refresh(from client: SynthClient) async {
         let identifier = sessionID
         let snapshot = await client.viewState(for: identifier)
         guard self.client === client, sessionID == identifier else { return }
         connection = snapshot.connection
         state = snapshot.session
         interactions = snapshot.interactions
-        if state?.status?.isBusy != true && submitting == 0 { stopRequested = false }
+        for (key, status) in snapshot.activity where key != identifier {
+            if let old = activity[key], status.finished > old.finished { completed.insert(key) }
+        }
+        activity = snapshot.activity
+        if let identifier, state?.status?.isBusy != true && submitting == 0 {
+            stopping.remove(identifier)
+        }
     }
 
     func shutdown() async {
+        isShuttingDown = true
         observing?.cancel()
         await client?.disconnect()
     }
 
     func retryProvider() async {
-        guard canSwitch, let client else { return }
+        guard canSwitch, !anyBusy, let client else { return }
         isOpening = true
         await client.disconnect()
         self.client = nil
         observing?.cancel()
         observing = nil
-        let savedDraft = draft
-        let stored = recentSessions.first { $0.id == sessionID }
+        let previous = sessionID
+        let stored = recentSessions.first { $0.id == previous }
+        if let previous, stored == nil {
+            openedSessions.removeValue(forKey: previous)
+        }
         isOpening = false
-        await open(stored)
-        draft = savedDraft
+        guard let project else { return }
+        await open(in: project, stored: stored)
+        if let previous, let sessionID, previous != sessionID {
+            drafts[sessionID] = drafts.removeValue(forKey: previous)
+        }
     }
 
+}
+
+extension ConversationModel {
     func send() async {
         guard canSend, let client, let sessionID else { return }
         let text = draft
-        draft = ""
+        drafts[sessionID] = ""
+        failures.removeValue(forKey: sessionID)
         error = nil
-        submitting += 1
+        submissions[sessionID, default: 0] += 1
         defer {
-            submitting -= 1
-            if submitting == 0 { stopRequested = false }
+            submissions[sessionID, default: 1] -= 1
+            if submissions[sessionID] == 0 {
+                submissions.removeValue(forKey: sessionID)
+                stopping.remove(sessionID)
+            }
         }
         do {
             _ = try await client.prompt(text, in: sessionID)
         } catch {
-            if draft.isEmpty { draft = text }
-            self.error = error.localizedDescription
+            if drafts[sessionID, default: ""].isEmpty { drafts[sessionID] = text }
+            failures[sessionID] = error.localizedDescription
+            if self.sessionID == sessionID { self.error = error.localizedDescription }
         }
         await refresh(from: client)
-        await refreshHistory()
+        if let folder = openedSessions[sessionID]?.folder {
+            await loadProject(folder, refresh: true)
+        }
     }
 
     func stop() async {
         guard canStop, let client, let sessionID else { return }
-        stopRequested = true
+        stopping.insert(sessionID)
         do {
             try await client.cancelTurn(in: sessionID)
         } catch {
-            stopRequested = false
-            self.error = error.localizedDescription
+            stopping.remove(sessionID)
+            if self.sessionID == sessionID { self.error = error.localizedDescription }
         }
     }
+
+}
+
+struct OpenedConversation: Identifiable {
+    let id: String
+    let folder: URL
+    let cwd: String
+    let modes: [ACP.Mode]
+}
+
+struct ProjectGroup: Identifiable {
+    let folder: URL
+    var sessions: [ACP.SessionInfo] = []
+    var cursor: String?
+    var loading = false
+    var failure: String?
+    var id: URL { folder }
 }
 
 extension ConversationModel {

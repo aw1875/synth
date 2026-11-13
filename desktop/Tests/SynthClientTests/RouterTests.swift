@@ -190,8 +190,14 @@ private func verifyConfiguration(in sessionID: String, client: SynthClient) asyn
 }
 
 private func verifyHistory(_ fixture: Fixture, client: SynthClient, first: String, second: String) async throws {
+    try await client.rename("Saved fixture", in: first)
     let listed = try await client.listSessions().sessions
     #expect(Set(listed.map(\.sessionId)) == [first, second])
+    #expect(listed.first { $0.sessionId == first }?.title == "Saved fixture")
+    let firstMessages = await client.sessions[first]?.messages ?? []
+    let last = try #require(firstMessages.last)
+    let previous = try await client.history(before: last.seq, in: first)
+    #expect(previous.map(\.seq) == firstMessages.dropLast().map(\.seq))
     let alias = fixture.root.appending(path: "Project Alias")
     try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.first)
     #expect(try await client.listSessions(cwd: alias.path).sessions.map(\.sessionId) == [first])

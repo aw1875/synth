@@ -236,15 +236,43 @@ pub const RecentSession = struct {
 /// Sessions with anything in them, across every project, most recently
 /// touched first.
 pub fn recentSessions(self: *Database, allocator: std.mem.Allocator, limit: usize) ![]RecentSession {
+    return self.pageSessions(allocator, null, null, limit);
+}
+
+pub const SessionCursor = struct {
+    updated_at: i64,
+    public_id: []const u8,
+};
+
+pub fn projectByRoot(self: *Database, root: []const u8) !?i64 {
+    const row = try self.conn.row("SELECT id FROM project WHERE root = ?", .{root}) orelse return null;
+    defer row.deinit();
+    return row.int(0);
+}
+
+pub fn pageSessions(
+    self: *Database,
+    allocator: std.mem.Allocator,
+    project_id: ?i64,
+    before: ?SessionCursor,
+    limit: usize,
+) ![]RecentSession {
     var rows = try self.conn.rows(
         \\SELECT s.public_id, s.title, s.cwd, s.updated_at, COUNT(m.id) AS messages
         \\FROM session s
         \\JOIN message m ON m.session_id = s.id
         \\WHERE s.parent_tool_call IS NULL
+        \\  AND (?1 IS NULL OR s.project_id = ?1)
+        \\  AND (?2 IS NULL OR (s.updated_at, s.public_id) < (?2, ?3))
         \\GROUP BY s.id
-        \\ORDER BY s.updated_at DESC
-        \\LIMIT ?
-    , .{@as(i64, @intCast(limit))});
+        \\ORDER BY s.updated_at DESC, s.public_id DESC
+        \\LIMIT ?4
+    , .{
+        project_id,
+        if (before) |cursor| @as(?i64, cursor.updated_at) else null,
+        if (before) |cursor| @as(?[]const u8, cursor.public_id) else null,
+        @as(i64, @intCast(limit)),
+    });
     defer rows.deinit();
 
     var list: std.ArrayList(RecentSession) = .empty;

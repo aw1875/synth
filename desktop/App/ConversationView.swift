@@ -4,10 +4,21 @@ import SynthProtocol
 
 struct ConversationView: View {
     @Bindable var model: ConversationModel
-    @State private var showHistory = false
+    @State private var renamePresented = false
+    @State private var renameText = ""
+    @State private var scrollAnchors: [String: TranscriptAnchor] = [:]
     @FocusState private var composerFocused: Bool
 
     var body: some View {
+        NavigationSplitView {
+            ProjectSidebar(model: model)
+        } detail: {
+            detail
+        }
+        .task { await model.restore() }
+    }
+
+    private var detail: some View {
         Group {
             if model.project == nil {
                 welcome
@@ -21,6 +32,14 @@ struct ConversationView: View {
         .navigationTitle(model.project?.lastPathComponent ?? "Synth")
         .navigationSubtitle(model.state?.status?.title ?? "")
         .toolbar { toolbar }
+        .alert("Rename Conversation", isPresented: $renamePresented) {
+            TextField("Name", text: $renameText)
+            Button("Cancel", role: .cancel) {}
+            Button("Rename") {
+                Task { await model.rename(renameText.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            }
+            .disabled(renameText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
         .onChange(of: model.sessionID) {
             if model.sessionID != nil { composerFocused = true }
         }
@@ -57,14 +76,21 @@ struct ConversationView: View {
     private var conversation: some View {
         VStack(spacing: 0) {
             banners
-            TranscriptView(
-                messages: model.state?.messages ?? [],
-                stream: model.state?.stream,
-                notices: model.state?.notices ?? [],
-                interactions: model.interactions,
-                model: model
-            )
-            .id(model.sessionID)
+            if let identifier = model.sessionID {
+                TranscriptView(
+                    sessionID: identifier,
+                    messages: model.messages,
+                    stream: model.state?.stream,
+                    notices: model.state?.notices ?? [],
+                    interactions: model.interactions,
+                    model: model,
+                    anchor: Binding(
+                        get: { scrollAnchors[identifier] },
+                        set: { scrollAnchors[identifier] = $0 }
+                    )
+                )
+                .id(identifier)
+            }
             composer
         }
     }
@@ -171,13 +197,6 @@ private extension ConversationView {
                 .disabled(!model.canSwitch)
 
             if model.project != nil {
-                Button("Conversations", systemImage: "clock.arrow.circlepath") {
-                    showHistory = true
-                    Task { await model.refreshHistory() }
-                }
-                .disabled(!model.canSwitch || model.connection != .connected)
-                .popover(isPresented: $showHistory, arrowEdge: .bottom) { history }
-
                 Button("New Conversation", systemImage: "square.and.pencil") {
                     Task { await model.open() }
                 }
@@ -186,43 +205,17 @@ private extension ConversationView {
         }
         if model.sessionID != nil {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button("Rename Conversation", systemImage: "pencil") {
+                    renameText = model.state?.status?.title ?? ""
+                    renamePresented = true
+                }
+                .disabled(!model.canConfigure)
                 ConfigurationControls(model: model)
                     .disabled(!model.canConfigure)
             }
         }
     }
 
-    var history: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Conversations").font(.headline)
-            if model.recentSessions.isEmpty {
-                Text("No saved conversations in this project.").foregroundStyle(.secondary)
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(model.recentSessions) { session in
-                        Button {
-                            showHistory = false
-                            Task { await model.open(session) }
-                        } label: {
-                            Label(
-                                session.title.flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled conversation",
-                                systemImage: session.id == model.sessionID ? "checkmark.circle.fill" : "bubble"
-                            )
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(5)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(session.id == model.sessionID)
-                    }
-                }
-            }
-            .frame(maxHeight: 310)
-        }
-        .padding(14)
-        .frame(width: 310)
-    }
 }
 
 private struct ConfigurationControls: View {

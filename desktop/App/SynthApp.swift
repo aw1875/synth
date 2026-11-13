@@ -42,11 +42,11 @@ final class SynthAppDelegate: NSObject, NSApplicationDelegate {
         guard !terminating else { return .terminateLater }
         terminating = true
         Task {
-            if model.busy {
+            if model.anyBusy {
                 let confirmation = NSAlert()
                 confirmation.messageText = "Quit Synth?"
                 confirmation.informativeText =
-                    "Quitting will stop work in this conversation unless another client is attached."
+                    "Quitting will stop active work unless another client is attached."
                 confirmation.addButton(withTitle: "Keep Working")
                 confirmation.addButton(withTitle: "Quit Synth")
                 guard confirmation.runModal() == .alertSecondButtonReturn else {

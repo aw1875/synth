@@ -128,7 +128,6 @@ public actor SynthClient {
         guard connectionState != .disconnecting else { return }
         await finish(.disconnected, cause: Failure.disconnected)
     }
-
 }
 
 extension SynthClient {
@@ -280,7 +279,6 @@ extension SynthClient {
             }
         }
     }
-
 }
 
 extension SynthClient {
@@ -347,6 +345,10 @@ extension SynthClient {
         case "_synth/notice":
             let event = try envelope.parameters(Synth.Notice.self)
             sessions[event.sessionId, default: .init()].notice(event.text)
+        case "_synth/session_stopped":
+            let event = try envelope.parameters(ACP.SessionRef.self)
+            markSessionFailed(event.sessionId, error: RPCError(code: -32603, message: "The session's engine stopped."))
+            return
         default:
             return
         }

@@ -195,12 +195,10 @@ fn route(self: *Router, line: []const u8) !void {
 fn endFor(self: *Router, arena: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !*End {
     const eql = std.mem.eql;
     if (eql(u8, method, protocol.method.initialize)) {
-        const first = self.ends.items.len == 0;
-        const end = if (first) try self.start(null, false) else try self.anyEnd();
         const kept = try std.json.Stringify.valueAlloc(self.allocator, params orelse .null, .{});
         if (self.hello) |old| self.allocator.free(old);
         self.hello = kept;
-        return end;
+        return if (self.ends.items.len == 0) self.start(null, false) else self.anyEnd();
     }
     if (eql(u8, method, protocol.method.session_new)) return self.forNew();
     if (eql(u8, method, protocol.method.session_load) or eql(u8, method, protocol.method.session_resume)) {
@@ -312,7 +310,13 @@ fn start(self: *Router, given: ?Pipe, hello_again: bool) !*End {
     end.writer = pipe.input.writerStreaming(self.io, &end.buffer);
     errdefer self.drop(end);
 
-    if (hello_again) if (self.hello) |hello| try self.greet(end, hello);
+    if (self.hello) |hello| {
+        const params = try std.json.parseFromSlice(std.json.Value, self.allocator, hello, .{});
+        defer params.deinit();
+        end.greeting_version = greetingVersion(fieldOf(params.value, "protocolVersion")) orelse protocol.version;
+        end.greeting_synth = synthVersion(params.value);
+        if (hello_again) try self.greet(end, params.value);
+    }
     {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -327,7 +331,7 @@ fn start(self: *Router, given: ?Pipe, hello_again: bool) !*End {
     return end;
 }
 
-fn greet(self: *Router, end: *End, hello: []const u8) !void {
+fn greet(self: *Router, end: *End, params: std.json.Value) !void {
     const id = blk: {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -335,11 +339,7 @@ fn greet(self: *Router, end: *End, hello: []const u8) !void {
         break :blk try std.fmt.allocPrint(self.allocator, "_synth/router/{d}", .{self.next_id});
     };
     end.swallow = id;
-    const params = try std.json.parseFromSlice(std.json.Value, self.allocator, hello, .{});
-    defer params.deinit();
-    end.greeting_version = greetingVersion(fieldOf(params.value, "protocolVersion")) orelse protocol.version;
-    end.greeting_synth = synthVersion(params.value);
-    try rpc.request(&end.writer.interface, .{ .string = id }, protocol.method.initialize, params.value);
+    try rpc.request(&end.writer.interface, .{ .string = id }, protocol.method.initialize, params);
     try end.writer.interface.flush();
 }
 
@@ -576,6 +576,9 @@ fn pump(end: *End) void {
     end.gone = true;
     self.mutex.unlock(self.io);
     self.failPending(end);
+    if (!self.options.exclusive and end.greeting_synth != null) {
+        if (end.handle) |handle| self.toClient(Stopped{ .session = handle });
+    }
     if (!self.options.exclusive) return;
     self.client_mutex.lockUncancelable(self.io);
     defer self.client_mutex.unlock(self.io);
@@ -583,6 +586,14 @@ fn pump(end: *End) void {
     _ = std.posix.system.shutdown(self.client_out.handle, std.posix.SHUT.WR);
     self.client_out.close(self.io);
 }
+
+const Stopped = struct {
+    session: []const u8,
+
+    fn write(self: Stopped, writer: *std.Io.Writer) !void {
+        try rpc.notify(writer, synth.method.session_stopped, protocol.SessionId{ .sessionId = self.session });
+    }
+};
 
 /// `line` as the client is to see it: an end's request renumbered, the
 /// answer to a greeting dropped (empty), the rest as it is. Answers that
@@ -1035,4 +1046,25 @@ test "a failed routed handshake preserves the agent's error on session load" {
     try testing.expectEqual(@as(i64, -32602), fieldOf(failure, "code").?.integer);
     try testing.expectEqualStrings("Synth extension version mismatch", stringOf(fieldOf(failure, "message")).?);
     try testing.expect(end.retired.load(.acquire));
+}
+
+test "the first routed session reports a stopped engine without closing the router" {
+    var rig: Rig = .{};
+    try rig.start(null, .{});
+    defer rig.stop();
+    const client = rig.client;
+    try client.initialize(true);
+    const project = rig.children.fixtures.items[0].project;
+    const session = (try client.open(project)).sessionId;
+
+    rig.router.mutex.lockUncancelable(testing.io);
+    const first = rig.router.ends.items[0];
+    _ = std.posix.system.shutdown(first.pipe.input.handle, std.posix.SHUT.RDWR);
+    rig.router.mutex.unlock(testing.io);
+
+    const event = try client.awaitMethod(synth.method.session_stopped);
+    const params = try rpc.parse(protocol.SessionId, client.arena.allocator(), event.params);
+    try testing.expectEqualStrings(session, params.sessionId);
+    const replacement = try client.open(project);
+    try testing.expect(!std.mem.eql(u8, session, replacement.sessionId));
 }

@@ -17,7 +17,7 @@ are in flight.
 | --- | --- |
 | `session/new` | Absolute `cwd` and `mcpServers: []`. Returns a `sessionId`. |
 | `session/load` | `sessionId`, absolute `cwd`, and `mcpServers: []`. Attaches to an existing host when one is listening. |
-| `session/list` | Optional `cwd` for the project. Currently returns up to 50 persisted sessions and no next cursor. Empty sessions are not persisted in the list. |
+| `session/list` | Optional `cwd` for the project. Returns up to 50 persisted sessions. Pass `nextCursor` back as `cursor` with the same project scope to get the next page. Empty sessions are omitted. |
 | `session/prompt` | `sessionId` and `prompt`, an array of content blocks. The Swift client sends `{"type":"text","text":"…"}`. A second prompt during a busy turn is steering. Prompt replies arrive when the turn settles. |
 | `session/cancel` | Notification with `sessionId`. Stops the turn. |
 | `session/set_mode` | `sessionId` and a `modeId` from the open or load reply. |
@@ -37,6 +37,9 @@ to a request number. Show the stream when that number matches the latest
 The router can host multiple sessions on the same connection. Replies can
 arrive out of order. An incompatible attached endpoint can reject its
 handshake. The router reports that error on the corresponding session request.
+
+The router sends `_synth/session_stopped` with a session ID when an individual
+engine process exits unexpectedly. Other sessions on the connection can continue.
 
 Synth sends `session/request_permission` with a session, tool call and
 available options. Reply with
