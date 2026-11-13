@@ -1,19 +1,19 @@
 class Synth < Formula
   desc "Terminal coding agent for local and hosted models"
   homepage "https://github.com/aw1875/synth"
-  version "0.1.1"
+  version "0.2.0"
   license "MIT"
 
   if OS.mac?
     depends_on arch: :arm64
 
-    url "https://github.com/aw1875/synth/releases/download/v0.1.1/synth-0.1.1-aarch64-macos.tar.gz"
-    sha256 "cb7ab278bf28f771849b433814745950d56ec0f6c961008a6ce6baf9ffad12de"
+    url "https://github.com/aw1875/synth/releases/download/v0.2.0/synth-0.2.0-aarch64-macos.tar.gz"
+    sha256 "d84bd40a7b1944d220e0669df8cbc2613ff4c5e93cff108a4c20a8708622f9c7"
   else
     depends_on arch: :x86_64
 
-    url "https://github.com/aw1875/synth/releases/download/v0.1.1/synth-0.1.1-x86_64-linux-musl.tar.gz"
-    sha256 "9f6828700acd83c4698fa744f307ed43342e638484f285bee75c2e284ebeac87"
+    url "https://github.com/aw1875/synth/releases/download/v0.2.0/synth-0.2.0-x86_64-linux-musl.tar.gz"
+    sha256 "3f59e4e8befd7411c2cf62941ea22e154e3d9ecbfa0e275e6bdd659db92d3bc5"
   end
 
   def install
