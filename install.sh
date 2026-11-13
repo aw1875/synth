@@ -30,6 +30,7 @@ triple() {
     case "$os/$arch" in
         Darwin/arm64) echo aarch64-macos ;;
         Linux/x86_64 | Linux/amd64) echo x86_64-linux-musl ;;
+        Linux/aarch64 | Linux/arm64) echo aarch64-linux-musl ;;
         *) fail "no build for $os $arch yet; build from source: https://github.com/$repo#build-from-source" ;;
     esac
 }

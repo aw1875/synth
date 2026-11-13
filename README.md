@@ -43,7 +43,7 @@ brew upgrade aw1875/synth/synth
 zig build              # build synth
 zig build run          # build and launch the TUI
 zig build test         # the test suite, offline and network-free, ~10s
-zig build release      # macOS arm64 and Linux x86-64 into zig-out/<triple>
+zig build release      # macOS arm64 and Linux x86-64/arm64 into zig-out/<triple>
 ```
 
 The musl build is static and runs anywhere. There is nothing to install: the
