@@ -9,7 +9,7 @@ const Input = tool.Input;
 const Output = tool.Output;
 
 /// Cap on captured output, so a runaway command cannot flood the context.
-const output_limit: std.Io.Limit = .limited(64 * 1024);
+pub const output_limit: std.Io.Limit = .limited(64 * 1024);
 
 /// How long one wait for output lasts before the loop looks up to see whether
 /// it has been cancelled or run out of time.
@@ -34,6 +34,14 @@ fn bash(ctx: Context, input: Input) !Output {
     const command = input.string("command") orelse
         return Output.err(try ctx.allocator.dupe(u8, "bash: 'command' is required"));
 
+    if (ctx.terminal) |through| {
+        const ran = through.run(through.context, ctx, command) catch |err| return failed(ctx, err);
+        if (ran) |done| {
+            defer ctx.allocator.free(done.output);
+            return report(ctx, done.output, "", done.exit_code orelse 1, done.truncated);
+        }
+    }
+
     var dir = std.Io.Dir.cwd().openDir(ctx.io, ctx.project_root, .{}) catch |err| {
         return Output.err(try std.fmt.allocPrint(
             ctx.allocator,
@@ -43,38 +51,46 @@ fn bash(ctx: Context, input: Input) !Output {
     };
     defer dir.close(ctx.io);
 
-    const result = run(ctx, dir, command) catch |err| switch (err) {
-        error.Timeout => return Output.err(try ctx.allocator.dupe(
+    const result = run(ctx, dir, command) catch |err| return failed(ctx, err);
+    defer ctx.allocator.free(result.stdout);
+    defer ctx.allocator.free(result.stderr);
+
+    const code: u32 = switch (result.term) {
+        .exited => |c| c,
+        else => 1,
+    };
+    return report(ctx, result.stdout, result.stderr, code, false);
+}
+
+fn failed(ctx: Context, err: anyerror) !Output {
+    return switch (err) {
+        error.Timeout => Output.err(try ctx.allocator.dupe(
             u8,
             "bash: timed out and was killed, along with anything it started. " ++
                 "Long-running work belongs in the background, or split into steps that finish.",
         )),
-        error.Canceled => return Output.err(try ctx.allocator.dupe(
+        error.Canceled => Output.err(try ctx.allocator.dupe(
             u8,
             "bash: cancelled, and the command was killed",
         )),
-        else => return Output.err(try std.fmt.allocPrint(
+        else => Output.err(try std.fmt.allocPrint(
             ctx.allocator,
             "bash: {s}",
             .{@errorName(err)},
         )),
     };
-    defer ctx.allocator.free(result.stdout);
-    defer ctx.allocator.free(result.stderr);
+}
 
+fn report(ctx: Context, stdout: []const u8, stderr: []const u8, code: u32, truncated: bool) !Output {
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     errdefer out.deinit();
 
-    if (result.stdout.len > 0) try out.writer.writeAll(result.stdout);
-    if (result.stderr.len > 0) {
-        if (result.stdout.len > 0) try out.writer.writeAll("\n");
-        try out.writer.writeAll(result.stderr);
+    if (truncated) try out.writer.writeAll("(the start of the output was cut)\n");
+    if (stdout.len > 0) try out.writer.writeAll(stdout);
+    if (stderr.len > 0) {
+        if (stdout.len > 0) try out.writer.writeAll("\n");
+        try out.writer.writeAll(stderr);
     }
-
-    const code: u8 = switch (result.term) {
-        .exited => |c| c,
-        else => 1,
-    };
     if (code != 0) {
         try out.writer.print("\n(exit code {d})", .{code});
     }

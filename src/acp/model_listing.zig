@@ -21,6 +21,7 @@ pub const Reach = struct {
     host: []const u8,
     api_key: ?[]const u8,
     chatgpt: ?*chatgpt_auth.Store,
+    copilot_integration_id: []const u8 = "",
 };
 
 allocator: std.mem.Allocator,
@@ -47,6 +48,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, entry: catalog.Entry, rea
         .host = try arena.dupe(u8, reach.host),
         .api_key = if (reach.api_key) |key| try arena.dupe(u8, key) else null,
         .chatgpt = reach.chatgpt,
+        .copilot_integration_id = try arena.dupe(u8, reach.copilot_integration_id),
     };
     self.future = try io.concurrent(run, .{self});
     return self;
@@ -66,6 +68,7 @@ fn list(self: *ModelListing) ![]const Offered {
         .label = self.entry.label,
         .api_key = self.reach.api_key,
         .chatgpt = self.reach.chatgpt,
+        .copilot_integration_id = self.reach.copilot_integration_id,
     });
     defer backend.deinit();
     try backend.start();

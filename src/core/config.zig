@@ -58,9 +58,8 @@ pub fn privateDataPath(allocator: std.mem.Allocator, env: *std.process.Environ.M
 /// `$XDG_DATA_HOME/<name>/mcp-auth.json`, or `~/.local/share/<name>/...`. A
 /// debug build keeps it in the working directory. Owned by the caller.
 ///
-/// Beside the database rather than the config: this is state the program
-/// writes - OAuth tokens and client registrations - not anything a person
-/// edits.
+/// Where MCP sign-ins were kept before the database, read once to bring them
+/// in.
 pub fn defaultMcpAuthPath(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
     return dataPath(allocator, env, mcp_auth_file);
 }
@@ -68,7 +67,7 @@ pub fn defaultMcpAuthPath(allocator: std.mem.Allocator, env: *std.process.Enviro
 /// What the database is called, wherever it ends up living.
 const database_file = pkg.name ++ ".db";
 
-/// Where per-server OAuth state is kept.
+/// Where per-server OAuth state was kept.
 const mcp_auth_file = "mcp-auth.json";
 
 /// Largest config file we will read.
@@ -96,6 +95,7 @@ api_key: ?[]const u8 = null,
 /// settings.
 openai_host: []const u8 = "",
 openai_api_key: ?[]const u8 = null,
+copilot_integration_id: []const u8 = "copilot-sdk",
 /// Brave Search key for `web_search`, from the `web` block or `BRAVE_API_KEY`.
 /// Without one the tool reads DuckDuckGo's HTML results page instead, which
 /// needs no key but is throttled after a handful of searches.
@@ -110,6 +110,8 @@ think: bool = true,
 /// Let the preset list of read-only shell commands run without an approval
 /// prompt. Off makes every command a question, however harmless.
 auto_approve_safe_commands: bool = true,
+/// Who decides a call that would otherwise stop for approval.
+approvals: Approvals = .ask,
 /// How long one turn may run, and what it may spend, before the loop gives up
 /// on it. Zero turns either off. Null means the built-in default: what a
 /// runaway turn costs is the loop's business, not this file's.
@@ -145,6 +147,12 @@ bell: Bell = .unfocused,
 /// one that does not never rings, which is what `always` is for.
 pub const Bell = enum { unfocused, always, never };
 
+/// `ask` puts it to the person. `auto` has a model judge it, blocking what
+/// looks destructive, outside the project or outside the task. `all` runs
+/// everything, paths outside the project included: for a machine set aside
+/// for the agent. Hooks still run under each.
+pub const Approvals = enum { ask, auto, all };
+
 /// The shape `config.json` is parsed into. Every field is optional so an
 /// absent key falls through to whatever the previous layer set.
 const File = struct {
@@ -152,6 +160,7 @@ const File = struct {
     system_prompt: ?[]const u8 = null,
     think: ?bool = null,
     auto_approve_safe_commands: ?bool = null,
+    approvals: ?Approvals = null,
     debug_log: ?[]const u8 = null,
     max_turn_ms: ?i64 = null,
     max_turn_tokens: ?u64 = null,
@@ -272,6 +281,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
     if (parsed.system_prompt) |value| self.system_prompt = value;
     if (parsed.think) |value| self.think = value;
     if (parsed.auto_approve_safe_commands) |value| self.auto_approve_safe_commands = value;
+    if (parsed.approvals) |value| self.approvals = value;
     if (parsed.debug_log) |value| self.debug_log = value;
     if (parsed.max_turn_ms) |value| self.max_turn_ms = value;
     if (parsed.max_turn_tokens) |value| self.max_turn_tokens = value;
@@ -304,6 +314,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
 
 fn applyEnv(self: *Config, env: *std.process.Environ.Map) !void {
     if (env.get("SYNTH_PROVIDER")) |name| self.provider_override = name;
+    if (env.get("SYNTH_COPILOT_INTEGRATION_ID")) |value| self.copilot_integration_id = value;
     if (env.get("SYNTH_DB")) |value| self.database_path = value;
     if (env.get("OLLAMA_HOST")) |value| self.host_override = value;
     if (env.get("OLLAMA_MODEL")) |value| self.model_override = value;
@@ -319,6 +330,18 @@ fn applyEnv(self: *Config, env: *std.process.Environ.Map) !void {
     if (env.get("OLLAMA_THINK")) |value| {
         self.think = !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
     }
+}
+
+test "Copilot integration profile defaults and environment override" {
+    var config: Config = .{ .arena = .init(std.testing.allocator) };
+    defer config.deinit();
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try config.applyEnv(&env);
+    try std.testing.expectEqualStrings("copilot-sdk", config.copilot_integration_id);
+    try env.put("SYNTH_COPILOT_INTEGRATION_ID", "my-product-agent");
+    try config.applyEnv(&env);
+    try std.testing.expectEqualStrings("my-product-agent", config.copilot_integration_id);
 }
 
 test "defaults survive a missing config file" {
@@ -470,6 +493,27 @@ test "the bell setting is read from the file" {
 
     try config.applyFile(io, path);
     try testing.expectEqual(Bell.always, config.bell);
+}
+
+test "approvals are read from the file" {
+    const testing = std.testing;
+    const io = testing.io;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buffer[0..try tmp.dir.realPath(io, &root_buffer)];
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "config.json" });
+    defer testing.allocator.free(path);
+
+    var config: Config = .{ .arena = .init(testing.allocator) };
+    defer config.deinit();
+    try testing.expectEqual(Approvals.ask, config.approvals);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"approvals\":\"auto\"}" });
+    try config.applyFile(io, path);
+    try testing.expectEqual(Approvals.auto, config.approvals);
 }
 
 test "lifecycle hooks are read from the file" {

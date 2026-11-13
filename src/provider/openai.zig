@@ -10,10 +10,27 @@ const std = @import("std");
 
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
 const window = @import("window.zig");
+const responses = @import("responses.zig");
+const anthropic = @import("messages.zig");
 
 const OpenAIProvider = @This();
+
+pub const Wire = enum {
+    chat,
+    responses,
+    messages,
+
+    pub fn path(self: Wire) []const u8 {
+        return switch (self) {
+            .chat => "/chat/completions",
+            .responses => "/responses",
+            .messages => "/v1/messages",
+        };
+    }
+};
 
 allocator: std.mem.Allocator,
 io: std.Io,
@@ -50,11 +67,17 @@ send_stream_options: bool = true,
 /// Storage for the Authorization header value. The request borrows this slice,
 /// so it has to outlive the call that builds it.
 auth_value: []const u8 = "",
+extra_headers: []const std.http.Header = &.{},
+versioned_paths: bool = true,
+wire: Wire = .chat,
+state_tag: []const u8 = "openai",
+max_output_tokens: u32 = 0,
 
 client: std.http.Client = undefined,
 started: bool = false,
 /// Set at start when OpenAI's own API does not list the model in use.
 is_model_unlisted: bool = false,
+model_listing: ?[]u8 = null,
 /// The socket the turn in flight is reading. Guarded rather than atomic: the
 /// shutdown has to happen while the handle is still owned. See `abort`.
 live_socket: std.posix.fd_t = -1,
@@ -98,7 +121,7 @@ pub fn start(self: *OpenAIProvider) !void {
 /// Build the client without asking the server about the configured model. What
 /// a listing needs: the context window does not matter, and a model the server
 /// has never heard of should not fail the command.
-fn startWithoutProbe(self: *OpenAIProvider) !void {
+pub fn startWithoutProbe(self: *OpenAIProvider) !void {
     if (self.api_key) |key| {
         if (key.len > 0) {
             self.auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{key});
@@ -126,7 +149,9 @@ fn probe(self: *OpenAIProvider) void {
     const arena = arena_state.allocator();
 
     const listing = self.get(arena, models_path) catch null;
-    self.is_model_unlisted = self.isRefused(arena, listing, self.model);
+    if (self.model_listing) |old| self.allocator.free(old);
+    self.model_listing = if (isOfficialHost(self.host) and listing != null) self.allocator.dupe(u8, listing.?) catch null else null;
+    self.is_model_unlisted = self.isRefused(arena, self.model_listing, self.model);
     self.learnWindow(arena, listing);
 }
 
@@ -140,6 +165,7 @@ fn learnWindow(self: *OpenAIProvider, arena: std.mem.Allocator, listing: ?[]cons
 }
 
 pub fn deinit(self: *OpenAIProvider) void {
+    if (self.model_listing) |listing| self.allocator.free(listing);
     if (self.rejection) |rejection| self.allocator.free(rejection);
     if (self.started) self.client.deinit();
     if (self.auth_value.len > 0) self.allocator.free(self.auth_value);
@@ -291,6 +317,8 @@ pub fn reconnect(self: *OpenAIProvider, connection: Provider.Connection) !void {
     self.api_key = key_copy;
 
     self.clearRejection();
+    if (self.model_listing) |listing| self.allocator.free(listing);
+    self.model_listing = null;
     try self.start();
 }
 
@@ -305,10 +333,11 @@ pub fn setModel(self: *OpenAIProvider, name: []const u8) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const listing = self.get(arena, models_path) catch null;
+    const listing = self.model_listing;
     if (self.isRefused(arena, listing, name)) return error.UnknownModel;
     try self.adoptModel(name);
     self.learnWindow(arena, listing);
+    self.is_model_unlisted = false;
 }
 
 fn adoptModel(self: *OpenAIProvider, name: []const u8) !void {
@@ -380,6 +409,11 @@ pub fn listModels(self: *OpenAIProvider, allocator: std.mem.Allocator) ![][]cons
     const arena = arena_state.allocator();
 
     const body = try self.get(arena, models_path);
+    if (isOfficialHost(self.host)) {
+        const kept = try self.allocator.dupe(u8, body);
+        if (self.model_listing) |old| self.allocator.free(old);
+        self.model_listing = kept;
+    }
 
     const Listing = struct {
         data: []const struct { id: []const u8 = "" } = &.{},
@@ -432,7 +466,7 @@ fn isChatModel(id: []const u8) bool {
 /// the reason a request 404s.
 fn endpoint(self: *const OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]const u8 {
     const base = std.mem.trimEnd(u8, self.host, "/");
-    if (std.mem.endsWith(u8, base, "/v1")) {
+    if (!self.versioned_paths or std.mem.endsWith(u8, base, "/v1")) {
         return std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
     }
     return std.fmt.allocPrint(arena, "{s}/v1{s}", .{ base, path });
@@ -461,6 +495,8 @@ fn get(self: *OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]u8 
 
     var request = try self.client.request(.GET, uri, .{
         .headers = self.requestHeaders(false),
+        .extra_headers = self.extra_headers,
+        .redirect_behavior = .unhandled,
         .keep_alive = false,
     });
     defer request.deinit();
@@ -468,6 +504,7 @@ fn get(self: *OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]u8 
 
     var redirect_buffer: [4096]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
+    try self.refuseRedirect(response.head);
 
     const transfer = try arena.alloc(u8, 64 * 1024);
     const reader = response.reader(transfer);
@@ -497,7 +534,7 @@ fn respond(
 
     self.clearRejection();
 
-    const url = try self.endpoint(arena, "/chat/completions");
+    const url = try self.endpoint(arena, self.wire.path());
     const uri = std.Uri.parse(url) catch return error.InvalidHost;
 
     self.armSocket();
@@ -505,9 +542,13 @@ fn respond(
     var attempt: usize = 1;
     while (true) {
         const body = try self.buildRequest(arena, convo, turn);
+        // `sendBodyComplete` uses the body as its write buffer, so it does not survive the send.
+        const logged = if (self.debug_log != null) try arena.dupe(u8, body) else "";
 
         var request = try self.client.request(.POST, uri, .{
             .headers = self.requestHeaders(true),
+            .extra_headers = self.extra_headers,
+            .redirect_behavior = .unhandled,
             .keep_alive = false,
         });
         defer {
@@ -519,6 +560,7 @@ fn respond(
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
+        try self.refuseRedirect(response.head);
 
         // Read before the body reader is built, which invalidates the head.
         const sse = streamed(response.head.content_type);
@@ -540,6 +582,41 @@ fn respond(
             return error.HttpError;
         }
 
+        if (self.wire == .responses) {
+            var stream: responses.ResponseStream = .init(allocator, sink);
+            defer stream.deinit();
+            stream.provider_tag = self.state_tag;
+            if (!sse) return error.UnexpectedResponse;
+            try stream.readEvents(arena, reader);
+            if (stream.failure) |failure| {
+                const detail = failure.refusal.message;
+                self.captureRejection(.ok, detail);
+                return failure.toError();
+            }
+            const reply = try stream.intoReply();
+            self.log(arena, logged, reply) catch {};
+            return reply;
+        }
+        if (self.wire == .messages) {
+            var stream: anthropic.Stream = .init(allocator, sink);
+            defer stream.deinit();
+            if (sse) {
+                stream.readEvents(arena, reader) catch |err| {
+                    if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
+                    return err;
+                };
+            } else {
+                const whole = try reader.allocRemaining(arena, .limited(max_listing_bytes));
+                stream.readWhole(arena, whole) catch |err| {
+                    if (stream.rejection.len > 0) self.captureRejection(.ok, stream.rejection);
+                    return err;
+                };
+            }
+            const reply = try stream.intoReply();
+            self.log(arena, logged, reply) catch {};
+            return reply;
+        }
+
         var collector: Collector = .init(allocator, sink);
         errdefer collector.deinit();
 
@@ -551,7 +628,7 @@ fn respond(
         }
 
         const reply = try collector.finish();
-        self.log(arena, body, reply) catch {};
+        self.log(arena, logged, reply) catch {};
         return reply;
     }
 }
@@ -691,7 +768,9 @@ const Collector = struct {
         if (chunk.usage) |usage| {
             self.usage = .{
                 .prompt_tokens = usage.prompt_tokens,
+                .cached_tokens = if (usage.prompt_tokens_details) |details| details.cached_tokens else 0,
                 .completion_tokens = usage.completion_tokens,
+                .reasoning_tokens = if (usage.completion_tokens_details) |details| details.reasoning_tokens else 0,
             };
         }
 
@@ -832,6 +911,8 @@ const Chunk = struct {
     const Usage = struct {
         prompt_tokens: u32 = 0,
         completion_tokens: u32 = 0,
+        prompt_tokens_details: ?struct { cached_tokens: u32 = 0 } = null,
+        completion_tokens_details: ?struct { reasoning_tokens: u32 = 0 } = null,
     };
 };
 
@@ -844,6 +925,22 @@ fn buildRequest(
     convo: *Conversation,
     turn: Provider.Turn,
 ) ![]u8 {
+    switch (self.wire) {
+        .responses => return responses.buildRequest(.{
+            .model = self.model,
+            .context_limit = self.context_limit,
+            .supports_vision = self.supports_vision,
+            .provider_tag = self.state_tag,
+            .max_output_tokens = self.max_output_tokens,
+        }, arena, convo, turn),
+        .messages => return anthropic.buildRequest(.{
+            .model = self.model,
+            .context_limit = self.context_limit,
+            .vision = self.supports_vision,
+            .max_output_tokens = if (self.max_output_tokens > 0) self.max_output_tokens else 4096,
+        }, arena, convo, turn),
+        .chat => {},
+    }
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
 
@@ -1045,14 +1142,21 @@ fn log(self: *OpenAIProvider, arena: std.mem.Allocator, body: []const u8, reply:
         reply.text,
         reply.tool_calls.len,
     });
+    try log_file.writeUsage(&out.writer, reply.usage);
+    try log_file.append(self.io, path, out.written());
+}
 
-    const existing = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(1024 * 1024)) catch "";
-
-    var combined: std.Io.Writer.Allocating = .init(arena);
-    try combined.writer.writeAll(existing);
-    try combined.writer.writeAll(out.written());
-
-    try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = combined.written() });
+/// A redirect is reported rather than followed: the client carries
+/// `Headers.authorization` and the extra headers to wherever one leads, and
+/// `privileged_headers`, which it would strip, it never sends at all.
+fn refuseRedirect(self: *OpenAIProvider, head: std.http.Client.Response.Head) error{Redirected}!void {
+    if (head.status.class() != .redirect) return;
+    self.clearRejection();
+    self.rejection = std.fmt.allocPrint(self.allocator, "{d} to {s}", .{
+        @intFromEnum(head.status),
+        headerValue(head, "location") orelse "nowhere it named",
+    }) catch null;
+    return error.Redirected;
 }
 
 /// Keep what the server said about a rejected request, reduced to the sentence
@@ -1156,6 +1260,11 @@ pub fn describeError(
                 advice(why),
             });
         },
+        error.Redirected => return std.fmt.allocPrint(
+            allocator,
+            "{s} at {s} redirected the request ({s}). Redirects are not followed, so the key never reaches another server: set the host to where it points.",
+            .{ self.label, self.host, self.rejection orelse "no location" },
+        ),
         error.TlsInitializationFailed, error.CertificateBundleLoadFailure => return std.fmt.allocPrint(
             allocator,
             "TLS to {s} failed. If this is a local server, use `http://` rather than `https://`.",
@@ -1212,11 +1321,21 @@ test "only OpenAI's own API judges a name by its listing" {
     const arena = arena_state.allocator();
     const listing = "{\"data\":[{\"id\":\"gpt-5\"}]}";
 
-    const official: OpenAIProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = "https://api.openai.com/v1/", .model = "" };
+    var official: OpenAIProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = "https://api.openai.com/v1/", .model = "" };
     try std.testing.expect(!official.isRefused(arena, listing, "gpt-5"));
     try std.testing.expect(official.isRefused(arena, listing, "asdf"));
     try std.testing.expect(!official.isRefused(arena, "not json", "asdf"));
     try std.testing.expect(!official.isRefused(arena, null, "asdf"));
+
+    official.started = true;
+    official.model_listing = try std.testing.allocator.dupe(u8, listing);
+    defer {
+        official.started = false;
+        official.deinit();
+    }
+    try std.testing.expectError(error.UnknownModel, official.setModel("asdf"));
+    try official.setModel("gpt-5");
+    try std.testing.expectEqualStrings("gpt-5", official.model);
 
     const gateway: OpenAIProvider = .{ .allocator = std.testing.allocator, .io = std.testing.io, .host = "https://openrouter.ai/api/v1", .model = "" };
     try std.testing.expect(!gateway.isRefused(arena, listing, "asdf"));
@@ -1300,6 +1419,46 @@ test "a host is completed to an API root however it was written" {
             .model = "gpt-4o",
         };
         try testing.expectEqualStrings(case.want, try backend.endpoint(arena, "/models"));
+    }
+}
+
+test "rooted transports use the advertised API path and request schema" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "hello");
+    var backend: OpenAIProvider = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = "https://api.business.githubcopilot.com/",
+        .model = "org-model",
+        .versioned_paths = false,
+        .state_tag = "copilot",
+        .max_output_tokens = 16000,
+    };
+    for ([_]Wire{ .chat, .responses, .messages }) |wire| {
+        backend.wire = wire;
+        const url = try backend.endpoint(arena, wire.path());
+        const expected = try std.fmt.allocPrint(arena, "https://api.business.githubcopilot.com{s}", .{wire.path()});
+        try testing.expectEqualStrings(expected, url);
+        const body = try backend.buildRequest(arena, &convo, .{ .system = "s" });
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        const root = value.object;
+        try testing.expectEqualStrings("org-model", root.get("model").?.string);
+        switch (wire) {
+            .chat => try testing.expect(root.contains("messages")),
+            .responses => {
+                try testing.expect(root.contains("input"));
+                try testing.expect(!root.get("store").?.bool);
+                try testing.expectEqual(@as(i64, 16000), root.get("max_output_tokens").?.integer);
+            },
+            .messages => {
+                try testing.expect(root.contains("system"));
+                try testing.expectEqual(@as(i64, 16000), root.get("max_tokens").?.integer);
+            },
+        }
     }
 }
 
@@ -1449,7 +1608,7 @@ test "a stream of deltas folds back into one reply" {
         \\
         \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
         \\
-        \\data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":8}}
+        \\data: {"choices":[],"usage":{"prompt_tokens":120,"prompt_tokens_details":{"cached_tokens":96},"completion_tokens":8,"completion_tokens_details":null}}
         \\
         \\data: [DONE]
         \\
@@ -1470,6 +1629,8 @@ test "a stream of deltas folds back into one reply" {
     try testing.expectEqualStrings("{\"path\":\"build.zig\"}", reply.tool_calls[0].arguments);
     try testing.expectEqual(@as(u32, 120), reply.usage.prompt_tokens);
     try testing.expectEqual(@as(u32, 8), reply.usage.completion_tokens);
+    try testing.expectEqual(@as(u32, 96), reply.usage.cached_tokens);
+    try testing.expectEqual(@as(u32, 0), reply.usage.reasoning_tokens);
 }
 
 test "a server that ignores `stream` is understood anyway" {
@@ -1595,6 +1756,69 @@ test "a server that rejects `stream_options` gets the same request without it" {
     const quiet = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
     try testing.expect(std.mem.indexOf(u8, quiet, "stream_options") == null);
     try testing.expect(std.mem.indexOf(u8, quiet, "\"stream\":true") != null);
+}
+
+/// Answers one request with a redirect to `location`.
+const RedirectingServer = struct {
+    server: std.Io.net.Server,
+    thread: std.Thread = undefined,
+    location: []const u8,
+    host_buffer: [32]u8 = undefined,
+
+    fn start(self: *RedirectingServer) ![]const u8 {
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return std.fmt.bufPrint(&self.host_buffer, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn stop(self: *RedirectingServer) void {
+        self.thread.join();
+        self.server.deinit(testing.io);
+    }
+
+    fn serve(self: *RedirectingServer) !void {
+        const io = testing.io;
+        const stream = try self.server.accept(io);
+        defer stream.close(io);
+
+        var in_buffer: [4096]u8 = undefined;
+        var in = stream.reader(io, &in_buffer);
+        while (try in.interface.takeDelimiter('\n')) |line| {
+            if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+        }
+
+        var out_buffer: [1024]u8 = undefined;
+        var out = stream.writer(io, &out_buffer);
+        try out.interface.print("HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{self.location});
+        try out.interface.flush();
+    }
+};
+
+test "a redirect is reported with where it leads, never followed with the key" {
+    const loopback: std.Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server: RedirectingServer = .{
+        .server = try loopback.listen(testing.io, .{}),
+        .location = "https://elsewhere.example/v1/models",
+    };
+    const host = try server.start();
+
+    var backend: OpenAIProvider = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = host,
+        .model = "local-model",
+        .api_key = "secret",
+    };
+    try backend.startWithoutProbe();
+    defer backend.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.Redirected, backend.get(arena, "/models"));
+    server.stop();
+
+    const said = try backend.describeError(error.Redirected, arena);
+    try testing.expect(std.mem.indexOf(u8, said, "301 to https://elsewhere.example/v1/models") != null);
 }
 
 /// A sink that reports the turn as given up on, for the retry tests.

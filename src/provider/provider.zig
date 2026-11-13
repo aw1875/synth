@@ -113,6 +113,14 @@ pub const Efforts = struct {
     /// Mildest first.
     levels: []const []const u8 = &.{},
     default: []const u8 = "",
+
+    /// `wanted` when it is on offer, else the default.
+    pub fn pick(self: Efforts, wanted: []const u8) []const u8 {
+        for (self.levels) |level| {
+            if (std.mem.eql(u8, level, wanted)) return level;
+        }
+        return self.default;
+    }
 };
 
 pub fn effortsFor(self: Provider, model: []const u8) Efforts {
@@ -167,7 +175,15 @@ pub const Usage = struct {
     /// Tokens in the request. Doubles as "how full is the context", since the
     /// whole conversation is resent each turn.
     prompt_tokens: u32 = 0,
+    /// The part of `prompt_tokens` served from the provider's prompt cache,
+    /// where it says.
+    cached_tokens: u32 = 0,
+    /// The part of `prompt_tokens` written to the prompt cache, where the
+    /// provider says.
+    cache_write_tokens: u32 = 0,
     completion_tokens: u32 = 0,
+    /// The part of `completion_tokens` spent reasoning, where the provider says.
+    reasoning_tokens: u32 = 0,
     /// Time spent generating, for a tokens-per-second figure.
     eval_duration_ns: u64 = 0,
 };

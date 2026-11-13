@@ -9,8 +9,8 @@
 //! load-bearing rather than belt-and-braces: the code challenge is the only
 //! thing tying the redirect back to the program that started the flow.
 //!
-//! Registration is a once-per-server event. The id it produces is stored in
-//! `mcp-auth.json` and reused; re-registering on every run would litter the
+//! Registration is a once-per-server event. The id it produces is stored with
+//! the server's entry and reused; re-registering on every run would litter the
 //! authorization server with dead clients.
 
 const std = @import("std");

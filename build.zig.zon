@@ -1,6 +1,6 @@
 .{
     .name = .synth,
-    .version = "0.0.1",
+    .version = "0.2.0",
     .fingerprint = 0x241431a6bf4a78b3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -9,8 +9,8 @@
             .hash = "vaxis-0.6.0-BWNV_LbDCwCd5p5hUe6qnaFqM7Obi2qvRT5CL3ScKAI-",
         },
         .ollama = .{
-            .url = "git+https://github.com/aw1875/ollama.zig#2ffba4a86ef8e77c3c4e95bed5a8323c5257a218",
-            .hash = "ollama-1.0.2-sOWbqaGkAADnxqFuXIR53qQE_bDQxV5xvxO9VZa7yOsX",
+            .url = "git+https://github.com/aw1875/ollama.zig#1b2f38470d32240994c0adee18d6d91e3b34495f",
+            .hash = "ollama-1.0.3-sOWbqdWuAABJYJYVWafY5D_KNnxCR3ATqb3g20UZfKy6",
         },
         .zqlite = .{
             .url = "git+https://github.com/karlseguin/zqlite.zig#b519eea9b1a2b5fcad68af6d0629e717e8746684",

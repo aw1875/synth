@@ -63,9 +63,9 @@ cursor: usize = 0,
 /// First visible row.
 scroll: usize = 0,
 search: Input,
-/// The model in use, marked in the list.
+/// The model in use, marked in the list. Owned.
 current: []const u8 = "",
-/// Providers still being asked that have nothing listed yet.
+/// Providers still being asked.
 asking: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) Picker {
@@ -82,6 +82,8 @@ pub fn deinit(self: *Picker) void {
 fn release(self: *Picker) void {
     freeEntries(self.allocator, self.entries);
     self.entries = &.{};
+    self.allocator.free(self.current);
+    self.current = "";
 }
 
 fn freeEntries(allocator: std.mem.Allocator, entries: []Entry) void {
@@ -143,12 +145,23 @@ pub fn show(
     self.release();
     self.entries = try copyEntries(self.allocator, models, recent, &.{});
 
-    self.current = current;
+    self.current = try self.allocator.dupe(u8, current);
     self.search.clear();
     self.cursor = 0;
     self.scroll = 0;
     try self.filter();
     self.open = true;
+}
+
+pub fn reopen(self: *Picker, current: []const u8) !void {
+    self.allocator.free(self.current);
+    self.current = try self.allocator.dupe(u8, current);
+    self.search.clear();
+    self.cursor = 0;
+    self.scroll = 0;
+    try self.filter();
+    self.open = true;
+    self.asking = 1;
 }
 
 /// Show `models` in place of the list, as a provider answers again, keeping the
@@ -247,9 +260,13 @@ fn isRecent(name: []const u8, recent: []const []const u8) bool {
 pub fn close(self: *Picker) void {
     self.open = false;
     self.search.clear();
-    self.release();
     self.matches.clearRetainingCapacity();
     self.rows.clearRetainingCapacity();
+}
+
+pub fn clear(self: *Picker) void {
+    self.close();
+    self.release();
 }
 
 /// The highlighted model, or null when nothing matches the search.
@@ -549,6 +566,18 @@ test "a fresh answer keeps an effort level stepped before it" {
 
     try std.testing.expectEqualStrings("high", picker.selected().?.effort);
     try std.testing.expect(picker.selected().?.effort_changed);
+}
+
+test "closing keeps the last list for an immediate reopen" {
+    var picker: Picker = .init(std.testing.allocator);
+    defer picker.deinit();
+
+    try picker.show(&.{.{ .name = "qwen3", .provider = "Ollama" }}, &.{}, "qwen3");
+    picker.close();
+    try picker.reopen("qwen3");
+
+    try std.testing.expectEqualStrings("qwen3", picker.selected().?.name);
+    try std.testing.expectEqual(@as(usize, 1), picker.asking);
 }
 
 test "a model remembers which provider offers it" {

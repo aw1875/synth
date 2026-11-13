@@ -57,6 +57,7 @@ host: Input,
 key: Input,
 /// The page a browser sign-in is waiting on, while one is. Owned.
 sign_in_url: []const u8 = "",
+sign_in_code: []const u8 = "",
 /// The loopback port the sign-in listener actually bound.
 sign_in_port: u16 = 0,
 /// Whether to tell the person how to reach the callback from another machine.
@@ -85,6 +86,18 @@ fn release(self: *Connect) void {
 
 pub fn isOpen(self: *const Connect) bool {
     return self.stage != .closed;
+}
+
+/// Whether the list showed provider `id` as having what it needs.
+pub fn isConnected(self: *const Connect, id: []const u8) bool {
+    for (self.rows.items) |row| {
+        if (std.mem.eql(u8, row.entry.id, id)) return row.connected;
+    }
+    return false;
+}
+
+pub fn isSigningIn(self: *const Connect) bool {
+    return self.stage == .signing_in;
 }
 
 /// Open on the provider list. `states` is borrowed for the length of the call;
@@ -168,11 +181,19 @@ pub fn showSignIn(self: *Connect, url: []const u8, port: u16, over_ssh: bool) !v
     self.forgetSignIn();
     self.sign_in_url = try self.allocator.dupe(u8, url);
     self.sign_in_port = port;
-    self.sign_in_over_ssh = over_ssh;
+    self.sign_in_over_ssh = over_ssh and port != 0;
     self.stage = .signing_in;
 }
 
+pub fn setSignInCode(self: *Connect, code: []const u8) !void {
+    const owned = try self.allocator.dupe(u8, code);
+    self.allocator.free(self.sign_in_code);
+    self.sign_in_code = owned;
+}
+
 fn forgetSignIn(self: *Connect) void {
+    self.allocator.free(self.sign_in_code);
+    self.sign_in_code = "";
     if (self.sign_in_url.len > 0) self.allocator.free(self.sign_in_url);
     self.sign_in_url = "";
     self.sign_in_port = 0;
@@ -409,7 +430,8 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
     const url_rows: u16 = @intCast(@min(max_url_rows, std.math.divCeil(usize, self.sign_in_url.len, inner) catch 0));
     const ssh_rows: u16 = if (self.sign_in_over_ssh) 3 else 0;
     const fixed_rows: u16 = 10;
-    const height: u16 = fixed_rows + url_rows + ssh_rows;
+    const code_rows: u16 = if (self.sign_in_code.len > 0) 2 else 0;
+    const height: u16 = fixed_rows + url_rows + ssh_rows + code_rows;
     if (size.height < height) return null;
 
     const origin_row = (size.height -| height) / 2;
@@ -418,9 +440,9 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
     const surface = try w.surfaceClamped(ctx.arena, parent, .{ .width = width, .height = height });
     w.fill(surface, theme.card.cell);
 
-    _ = w.writeText(surface, pad, 1, "Sign in with ChatGPT", theme.on_card(theme.fg).bold().cell);
+    _ = w.writeText(surface, pad, 1, if (self.sign_in_port == 0) "Sign in with GitHub Copilot" else "Sign in with ChatGPT", theme.on_card(theme.fg).bold().cell);
     w.writeTextRight(surface, 1, pad, "esc", theme.on_card(theme.fg_dim).cell);
-    _ = w.writeText(surface, pad, 3, "Finish in your browser. If it did not open, visit:", theme.on_card(theme.fg_muted).cell);
+    _ = w.writeText(surface, pad, 3, if (self.sign_in_url.len == 0) "Requesting a sign-in code from GitHub…" else "Finish in your browser. If it did not open, visit:", theme.on_card(theme.fg_muted).cell);
 
     var remaining = self.sign_in_url;
     var row: u16 = 5;
@@ -431,6 +453,13 @@ fn drawSignIn(self: *Connect, ctx: vxfw.DrawContext, parent: vxfw.Widget, size: 
         const shown = if (is_cut) try std.fmt.allocPrint(ctx.arena, "{s}…", .{remaining[0..take]}) else remaining[0..take];
         _ = w.writeLinked(surface, pad, row, shown, theme.on_card(theme.accent_alt).cell, self.sign_in_url);
         remaining = remaining[take..];
+    }
+
+    if (self.sign_in_code.len > 0) {
+        row += 1;
+        const code = try std.fmt.allocPrint(ctx.arena, "Enter code: {s}", .{self.sign_in_code});
+        _ = w.writeText(surface, pad, row, code, theme.on_card(theme.accent_alt).bold().cell);
+        row += 1;
     }
 
     if (self.sign_in_over_ssh) {
@@ -611,6 +640,22 @@ test "a browser sign-in row connects on Enter, whatever was left in the key fiel
     const action = try connect.press(.{ .codepoint = vaxis.Key.enter });
     try testing.expectEqualStrings(catalog.chatgpt_id, action.connect.id);
     try testing.expect(action.connect.key == null);
+}
+
+test "Copilot device sign-in owns its code and never asks for an SSH callback" {
+    var connect: Connect = .init(testing.allocator);
+    defer connect.deinit();
+    try connect.showSignIn("", 0, true);
+    try testing.expectEqual(Stage.signing_in, connect.stage);
+    try testing.expect(!connect.sign_in_over_ssh);
+    try connect.showSignIn("https://github.com/login/device", 0, true);
+    var code = "ABCD-EFGH".*;
+    try connect.setSignInCode(&code);
+    @memset(&code, 'x');
+    try testing.expectEqualStrings("ABCD-EFGH", connect.sign_in_code);
+    try testing.expectEqual(Action.cancel_sign_in, try connect.press(.{ .codepoint = vaxis.Key.escape }));
+    connect.close();
+    try testing.expectEqualStrings("", connect.sign_in_code);
 }
 
 test "escape while waiting on the browser cancels the sign-in" {

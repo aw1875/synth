@@ -22,7 +22,7 @@ pub const Key = enum {
 
 /// Which client answers for a provider: the wire protocol, not the vendor.
 /// `openai` covers every server imitating that API, which is most of them.
-pub const Kind = enum { ollama, openai, chatgpt };
+pub const Kind = enum { ollama, openai, chatgpt, copilot };
 
 pub const Entry = struct {
     /// Stable id: the key in `auth.json` and in the config. Never shown.
@@ -45,7 +45,10 @@ pub const Entry = struct {
         return switch (self.key) {
             .optional => true,
             .required => (auth.key(self.id) orelse @as([]const u8, "")).len > 0,
-            .oauth => if (chatgpt) |store| store.isUsable() else false,
+            .oauth => if (std.mem.eql(u8, self.id, chatgpt_id))
+                (if (chatgpt) |store| store.isUsable() else false)
+            else
+                (auth.key(self.id) orelse @as([]const u8, "")).len > 0,
         };
     }
 };
@@ -90,6 +93,15 @@ pub const all: []const Entry = &.{
         .kind = .openai,
     },
     .{
+        .id = copilot_id,
+        .label = "GitHub Copilot",
+        .summary = "use your Copilot subscription or organization seat",
+        .host = "https://api.githubcopilot.com",
+        .host_editable = false,
+        .key = .oauth,
+        .kind = .copilot,
+    },
+    .{
         .id = chatgpt_id,
         .label = "ChatGPT plan",
         .summary = "use your ChatGPT plan",
@@ -101,6 +113,7 @@ pub const all: []const Entry = &.{
 };
 
 pub const chatgpt_id = "chatgpt";
+pub const copilot_id = "copilot";
 
 /// The entry with this id, or null. An id from a config file written by a newer
 /// harness lands here, which is why callers fall back rather than fail.
@@ -140,7 +153,7 @@ pub fn resolve(
     const from_env: struct { host: []const u8, key: ?[]const u8 } = switch (entry.kind) {
         .ollama => .{ .host = config.host_override, .key = config.api_key },
         .openai => .{ .host = config.openai_host, .key = config.openai_api_key },
-        .chatgpt => .{ .host = "", .key = null },
+        .chatgpt, .copilot => .{ .host = "", .key = null },
     };
 
     var host = entry.host;

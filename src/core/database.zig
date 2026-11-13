@@ -9,11 +9,16 @@ const Conversation = @import("conversation.zig");
 const Todo = @import("todo.zig");
 const Config = @import("config.zig");
 const migrations = @import("migrations.zig");
+const SessionLock = @import("session_lock.zig");
 
 const Database = @This();
 
 conn: zqlite.Conn,
 io: std.Io,
+allocator: std.mem.Allocator,
+/// Where the locks saying which process hosts a live session are kept.
+/// Null in memory. Owned.
+locks_dir: ?[]u8 = null,
 
 /// The blob kind a provider's replay record is stored under.
 pub const provider_state_blob = "provider_state";
@@ -29,17 +34,20 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
     defer allocator.free(path);
 
     try Config.ensureDir(io, db_path);
+    if (!std.mem.eql(u8, db_path, ":memory:")) try keepPrivate(io, db_path);
 
     // NoMutex: this connection is the UI thread's. A worker opens its own.
     var conn = try zqlite.open(path, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.NoMutex);
     errdefer conn.close();
 
-    var db = Database{ .conn = conn, .io = io };
+    var db = Database{ .conn = conn, .io = io, .allocator = allocator };
     errdefer db.deinit();
+    db.locks_dir = try SessionLock.dirFor(allocator, db_path);
 
+    // First, so that switching a new database to WAL waits out another process creating it.
+    conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
     conn.execNoArgs("PRAGMA journal_mode = WAL") catch {};
     conn.execNoArgs("PRAGMA synchronous = NORMAL") catch {};
-    conn.execNoArgs("PRAGMA busy_timeout = 2000") catch {};
     conn.execNoArgs("PRAGMA foreign_keys = ON") catch {};
 
     try db.migrate();
@@ -49,6 +57,27 @@ pub fn init(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8) !Data
 
 pub fn deinit(self: *Database) void {
     self.conn.close();
+    if (self.locks_dir) |dir| self.allocator.free(dir);
+}
+
+const owner_only: std.Io.File.Permissions = .fromMode(0o600);
+
+/// Let only the owner read the database and its WAL files: transcripts hold
+/// whatever a tool printed, and sign-ins are kept here. Created here when
+/// missing, empty, which SQLite takes for a new database, because SQLite
+/// gives the WAL files it creates the database file's mode.
+fn keepPrivate(io: std.Io, db_path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.createFile(io, db_path, .{ .permissions = owner_only, .truncate = false });
+    file.close(io);
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+        const path = try std.fmt.bufPrint(&buffer, "{s}{s}", .{ db_path, suffix });
+        cwd.setFilePermissions(io, path, owner_only, .{}) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn migrate(self: *Database) !void {
@@ -97,10 +126,19 @@ pub fn createSession(
     cwd: []const u8,
     model: []const u8,
 ) !i64 {
-    const now = self.nowMs();
-    var buffer: [public_id_chars + 4]u8 = undefined;
-    const public_id = self.newPublicId(&buffer);
+    var buffer: [public_id_bytes]u8 = undefined;
+    return self.createSessionAs(project_id, cwd, model, self.newPublicId(&buffer));
+}
 
+/// A session row under a handle given out before it existed.
+pub fn createSessionAs(
+    self: *Database,
+    project_id: i64,
+    cwd: []const u8,
+    model: []const u8,
+    public_id: []const u8,
+) !i64 {
+    const now = self.nowMs();
     try self.conn.exec(
         \\INSERT INTO session (project_id, created_at, updated_at, cwd, model, public_id)
         \\VALUES (?, ?, ?, ?, ?, ?)
@@ -143,7 +181,10 @@ pub fn subagentSession(self: *Database, tool_call_id: i64) !?i64 {
 
 /// A fresh `ses_xxxxxxxx` handle, written into `buffer`. Randomness comes from
 /// `Io` in 0.16, which is also what makes it testable.
-fn newPublicId(self: *Database, buffer: []u8) []const u8 {
+pub const public_id_bytes = public_id_chars + 4;
+
+/// A fresh session handle, in `buffer`.
+pub fn newPublicId(self: *Database, buffer: []u8) []const u8 {
     @memcpy(buffer[0..4], "ses_");
 
     const body = buffer[4 .. 4 + public_id_chars];
@@ -168,12 +209,65 @@ pub const SessionInfo = struct {
     title: []const u8,
     updated_at: i64,
     messages: u64,
+    /// Hosted by a process right now: see `heldSessions`.
+    live: bool = false,
 
     pub fn deinit(self: *const SessionInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.public_id);
         allocator.free(self.title);
     }
 };
+
+/// A stored session anywhere on this machine, with where it ran.
+pub const RecentSession = struct {
+    public_id: []const u8,
+    title: []const u8,
+    cwd: []const u8,
+    updated_at: i64,
+    messages: u64,
+
+    pub fn deinit(self: *const RecentSession, allocator: std.mem.Allocator) void {
+        allocator.free(self.public_id);
+        allocator.free(self.title);
+        allocator.free(self.cwd);
+    }
+};
+
+/// Sessions with anything in them, across every project, most recently
+/// touched first.
+pub fn recentSessions(self: *Database, allocator: std.mem.Allocator, limit: usize) ![]RecentSession {
+    var rows = try self.conn.rows(
+        \\SELECT s.public_id, s.title, s.cwd, s.updated_at, COUNT(m.id) AS messages
+        \\FROM session s
+        \\JOIN message m ON m.session_id = s.id
+        \\WHERE s.parent_tool_call IS NULL
+        \\GROUP BY s.id
+        \\ORDER BY s.updated_at DESC
+        \\LIMIT ?
+    , .{@as(i64, @intCast(limit))});
+    defer rows.deinit();
+
+    var list: std.ArrayList(RecentSession) = .empty;
+    errdefer {
+        for (list.items) |info| info.deinit(allocator);
+        list.deinit(allocator);
+    }
+    while (rows.next()) |row| {
+        try list.ensureUnusedCapacity(allocator, 1);
+        const public_id = try allocator.dupe(u8, row.text(0));
+        errdefer allocator.free(public_id);
+        const title = try allocator.dupe(u8, row.text(1));
+        errdefer allocator.free(title);
+        list.appendAssumeCapacity(.{
+            .public_id = public_id,
+            .title = title,
+            .cwd = try allocator.dupe(u8, row.text(2)),
+            .updated_at = row.int(3),
+            .messages = @intCast(row.int(4)),
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
 
 /// Models this project has actually used, most recently first.
 pub fn recentModels(
@@ -384,6 +478,24 @@ pub fn findSession(self: *Database, project_id: i64, public_id: []const u8) !?i6
     return row.int(0);
 }
 
+/// The top-level session a handle names, in any project.
+pub fn sessionByHandle(self: *Database, public_id: []const u8) !?i64 {
+    const row = try self.conn.row(
+        "SELECT id FROM session WHERE public_id = ? AND parent_tool_call IS NULL",
+        .{public_id},
+    ) orelse return null;
+    defer row.deinit();
+    return row.int(0);
+}
+
+/// Where a session ran. Caller owns the result.
+pub fn sessionCwd(self: *Database, session_id: i64, allocator: std.mem.Allocator) ![]const u8 {
+    const row = try self.conn.row("SELECT cwd FROM session WHERE id = ?", .{session_id}) orelse
+        return error.UnknownSession;
+    defer row.deinit();
+    return allocator.dupe(u8, row.text(0));
+}
+
 /// The most recently touched session with anything in it, for `--continue`.
 pub fn latestSession(self: *Database, project_id: i64) !?i64 {
     const row = try self.conn.row(
@@ -412,6 +524,68 @@ pub fn deleteSession(self: *Database, session_id: i64) !void {
     try self.conn.exec("DELETE FROM session WHERE id = ?", .{session_id});
 }
 
+/// Host session `public_id` from this process until the lock is released.
+/// `error.SessionHeld` when another process hosts it.
+pub fn lockSession(self: *Database, public_id: []const u8) !SessionLock {
+    const dir = self.locks_dir orelse return .{ .file = null };
+    return SessionLock.take(self.io, dir, public_id);
+}
+
+/// Whether some process hosts session `public_id` right now.
+pub fn isSessionHeld(self: *Database, public_id: []const u8) bool {
+    const dir = self.locks_dir orelse return false;
+    return SessionLock.isHeld(self.io, dir, public_id);
+}
+
+/// Delete a session, and its lock with it. The caller holds the lock.
+pub fn deleteLockedSession(self: *Database, session_id: i64, public_id: []const u8) !void {
+    try self.deleteSession(session_id);
+    if (self.locks_dir) |dir| SessionLock.forget(self.io, dir, public_id);
+}
+
+/// One MCP server's stored entry, as the `mcp` package encodes it.
+pub const McpAuthEntry = struct { name: []const u8, entry: []const u8 };
+
+/// Every MCP server's stored entry, in `arena`.
+pub fn mcpAuthEntries(self: *Database, arena: std.mem.Allocator) ![]McpAuthEntry {
+    var rows = try self.conn.rows("SELECT name, entry FROM mcp_auth", .{});
+    defer rows.deinit();
+    var list: std.ArrayList(McpAuthEntry) = .empty;
+    while (rows.next()) |row| {
+        try list.append(arena, .{ .name = try arena.dupe(u8, row.text(0)), .entry = try arena.dupe(u8, row.text(1)) });
+    }
+    return list.items;
+}
+
+/// One MCP server's stored entry, in `arena`, or null when there is none.
+pub fn mcpAuthEntry(self: *Database, arena: std.mem.Allocator, name: []const u8) !?[]const u8 {
+    const row = try self.conn.row("SELECT entry FROM mcp_auth WHERE name = ?", .{name}) orelse return null;
+    defer row.deinit();
+    return try arena.dupe(u8, row.text(0));
+}
+
+/// Replace one MCP server's entry, or remove it when `entry` is null.
+pub fn setMcpAuthEntry(self: *Database, name: []const u8, entry: ?[]const u8) !void {
+    const kept = entry orelse return self.conn.exec("DELETE FROM mcp_auth WHERE name = ?", .{name});
+    try self.conn.exec(
+        \\INSERT INTO mcp_auth (name, entry) VALUES (?, ?)
+        \\ON CONFLICT(name) DO UPDATE SET entry = excluded.entry
+    , .{ name, kept });
+}
+
+/// The call a tool result answers.
+pub const Answers = struct {
+    call_id: []const u8,
+    tool_name: []const u8,
+
+    pub fn of(msg: Conversation.Message) ?Answers {
+        return .{
+            .call_id = msg.tool_call_id orelse return null,
+            .tool_name = msg.tool_name orelse "",
+        };
+    }
+};
+
 /// Append a message row and return its id. Heavy bodies (reasoning, tool
 /// results) are written separately via `appendBlob` so a transcript load never
 /// drags them in.
@@ -423,11 +597,14 @@ pub fn appendMessage(
     text: []const u8,
     thinking_ms: ?i64,
     thinking_bytes: i64,
+    answers: ?Answers,
 ) !i64 {
+    const call_id: ?[]const u8 = if (answers) |a| a.call_id else null;
+    const tool_name: ?[]const u8 = if (answers) |a| a.tool_name else null;
     try self.conn.exec(
-        \\INSERT INTO message (session_id, seq, role, created_at, text, thinking_ms, thinking_bytes)
-        \\VALUES (?, ?, ?, ?, ?, ?, ?)
-    , .{ session_id, seq, role, self.nowMs(), text, thinking_ms, thinking_bytes });
+        \\INSERT INTO message (session_id, seq, role, created_at, text, thinking_ms, thinking_bytes, tool_call_id, tool_name)
+        \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    , .{ session_id, seq, role, self.nowMs(), text, thinking_ms, thinking_bytes, call_id, tool_name });
     return self.conn.lastInsertedRowId();
 }
 
@@ -549,7 +726,6 @@ pub fn sessionTitle(self: *Database, session_id: i64, allocator: std.mem.Allocat
     return allocator.dupe(u8, row.text(0));
 }
 
-/// Remember an "always allow" approval, scoped to the project.
 /// The provider in use, or "" when none has been chosen. Caller owns the
 /// result.
 pub fn activeProvider(self: *Database, allocator: std.mem.Allocator) ![]const u8 {
@@ -598,6 +774,109 @@ pub fn setSetting(self: *Database, key: []const u8, value: []const u8) !void {
     );
 }
 
+fn effortKey(allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "effort:{s}:{s}", .{ provider_id, model });
+}
+
+/// The reasoning effort last chosen for a provider's model, or "" when none
+/// was. Caller owns the result.
+pub fn rememberedEffort(self: *Database, allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8) ![]const u8 {
+    const key = try effortKey(allocator, provider_id, model);
+    defer allocator.free(key);
+    return self.setting(allocator, key);
+}
+
+pub fn rememberEffort(self: *Database, allocator: std.mem.Allocator, provider_id: []const u8, model: []const u8, level: []const u8) !void {
+    const key = try effortKey(allocator, provider_id, model);
+    defer allocator.free(key);
+    try self.setSetting(key, level);
+}
+
+/// Keep what `path` held before the turn that began at `seq` first changed it.
+/// Null `content` says it did not exist. Only the first call for a file in a
+/// turn is kept: that is the state the turn started from.
+pub fn saveCheckpoint(self: *Database, session_id: i64, seq: u64, path: []const u8, content: ?[]const u8) !void {
+    const sql =
+        \\INSERT INTO checkpoint (session_id, seq, path, content) VALUES (?, ?, ?, ?)
+        \\ON CONFLICT(session_id, seq, path) DO NOTHING
+    ;
+    if (content) |bytes| {
+        try self.conn.exec(sql, .{ session_id, @as(i64, @intCast(seq)), path, zqlite.blob(bytes) });
+    } else {
+        try self.conn.exec(sql, .{ session_id, @as(i64, @intCast(seq)), path, null });
+    }
+}
+
+/// Record what the turn's tools left `path` holding, by hash.
+pub fn sealCheckpoint(self: *Database, session_id: i64, seq: u64, path: []const u8, after_hash: u64) !void {
+    try self.conn.exec(
+        "UPDATE checkpoint SET after_hash = ? WHERE session_id = ? AND seq = ? AND path = ?",
+        .{ @as(i64, @bitCast(after_hash)), session_id, @as(i64, @intCast(seq)), path },
+    );
+}
+
+/// A turn that changed files: the prompt that began it, and how many files.
+pub const CheckpointTurn = struct { seq: u64, prompt: []const u8, files: u32 };
+
+/// The session's turns that changed files, oldest first. Allocated in `arena`.
+pub fn checkpointTurns(self: *Database, session_id: i64, arena: std.mem.Allocator) ![]CheckpointTurn {
+    var rows = try self.conn.rows(
+        \\SELECT c.seq, COALESCE(m.text, ''), COUNT(*) FROM checkpoint c
+        \\LEFT JOIN message m ON m.session_id = c.session_id AND m.seq = c.seq
+        \\WHERE c.session_id = ? GROUP BY c.seq ORDER BY c.seq
+    , .{session_id});
+    defer rows.deinit();
+    var out: std.ArrayList(CheckpointTurn) = .empty;
+    while (rows.next()) |row| try out.append(arena, .{
+        .seq = @intCast(row.int(0)),
+        .prompt = try arena.dupe(u8, row.text(1)),
+        .files = @intCast(row.int(2)),
+    });
+    return out.items;
+}
+
+/// A file as it stood before the turns from some seq on changed it.
+pub const Restore = struct {
+    path: []const u8,
+    /// Null where the file did not exist.
+    content: ?[]const u8,
+    /// What the last of those turns left in it, when that is known.
+    after_hash: ?u64,
+};
+
+/// Every file the turns from `seq` on changed, as it stood before the first of
+/// them did. Allocated in `arena`.
+pub fn checkpointsFrom(self: *Database, session_id: i64, seq: u64, arena: std.mem.Allocator) ![]Restore {
+    var rows = try self.conn.rows(
+        \\SELECT c.path, c.content,
+        \\  (SELECT later.after_hash FROM checkpoint later
+        \\   WHERE later.session_id = c.session_id AND later.path = c.path
+        \\   ORDER BY later.seq DESC LIMIT 1)
+        \\FROM checkpoint c
+        \\WHERE c.session_id = ? AND c.seq = (
+        \\  SELECT MIN(first.seq) FROM checkpoint first
+        \\  WHERE first.session_id = c.session_id AND first.path = c.path AND first.seq >= ?)
+        \\ORDER BY c.path
+    , .{ session_id, @as(i64, @intCast(seq)) });
+    defer rows.deinit();
+    var out: std.ArrayList(Restore) = .empty;
+    while (rows.next()) |row| try out.append(arena, .{
+        .path = try arena.dupe(u8, row.text(0)),
+        .content = if (row.nullableBlob(1)) |bytes| try arena.dupe(u8, bytes) else null,
+        .after_hash = if (row.nullableInt(2)) |hash| @bitCast(hash) else null,
+    });
+    return out.items;
+}
+
+/// Forget the checkpoints of the turns from `seq` on, once they are undone.
+pub fn dropCheckpointsFrom(self: *Database, session_id: i64, seq: u64) !void {
+    try self.conn.exec(
+        "DELETE FROM checkpoint WHERE session_id = ? AND seq >= ?",
+        .{ session_id, @as(i64, @intCast(seq)) },
+    );
+}
+
+/// Remember an "always allow" approval, scoped to the project.
 pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
     try self.conn.exec(
         \\INSERT INTO approval (project_id, tool, pattern) VALUES (?, ?, ?)
@@ -605,21 +884,11 @@ pub fn addApproval(self: *Database, project_id: i64, tool: []const u8, pattern: 
     , .{ project_id, tool, pattern });
 }
 
-/// Whether `tool` is approved for `pattern` (or `*`) in this project.
-pub fn isApproved(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !bool {
-    const row = try self.conn.row(
-        \\SELECT 1 FROM approval
-        \\WHERE project_id = ? AND tool = ?
-        \\  AND (pattern = ?
-        \\       OR pattern = '*'
-        \\       OR (substr(pattern, length(pattern) - 1) = ' *'
-        \\           AND substr(pattern, 1, length(pattern) - 2) = ?))
-    , .{ project_id, tool, pattern, pattern });
-    if (row) |r| {
-        defer r.deinit();
-        return true;
-    }
-    return false;
+pub fn removeApproval(self: *Database, project_id: i64, tool: []const u8, pattern: []const u8) !void {
+    try self.conn.exec(
+        "DELETE FROM approval WHERE project_id = ? AND tool = ? AND pattern = ?",
+        .{ project_id, tool, pattern },
+    );
 }
 
 /// Base64 image bodies attached to a message, in the order they were pasted.
@@ -693,7 +962,7 @@ pub const Approval = struct {
 /// in-memory "always allow" list at session start.
 pub fn approvals(self: *Database, project_id: i64, allocator: std.mem.Allocator) ![]Approval {
     var rows = try self.conn.rows(
-        "SELECT tool, pattern FROM approval WHERE project_id = ?",
+        "SELECT tool, pattern FROM approval WHERE project_id = ? ORDER BY tool, pattern",
         .{project_id},
     );
     defer rows.deinit();
@@ -770,7 +1039,7 @@ pub fn loadMessages(
     limit: usize,
 ) ![]Conversation.Message {
     var rows = try self.conn.rows(
-        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes
+        \\SELECT id, seq, role, text, thinking_ms, thinking_bytes, tool_call_id, tool_name
         \\FROM message
         \\WHERE session_id = ? AND seq < ?
         \\ORDER BY seq DESC
@@ -802,6 +1071,8 @@ pub fn loadMessages(
             .thinking_bytes = thinking_bytes,
         };
         errdefer msg.deinit(allocator);
+        if (row.nullableText(6)) |call_id| msg.tool_call_id = try allocator.dupe(u8, call_id);
+        if (row.nullableText(7)) |name| msg.tool_name = try allocator.dupe(u8, name);
 
         if (try self.loadBlob(allocator, id, 0, "reasoning")) |full| {
             const preview = try Conversation.preview(allocator, full);
@@ -830,7 +1101,37 @@ pub fn loadMessages(
         try messages.append(allocator, msg);
     }
 
+    try linkUnlinkedResults(allocator, messages.items);
     return messages.toOwnedSlice(allocator);
+}
+
+/// Give results stored before their call was the calls they answer: those of
+/// the assistant message before them, settled ones in order, which is how
+/// the loop writes them. `newest_first` is in the order loading returns it.
+fn linkUnlinkedResults(allocator: std.mem.Allocator, newest_first: []Conversation.Message) !void {
+    var calls: []const Conversation.ToolCall = &.{};
+    var next: usize = 0;
+    var index = newest_first.len;
+    while (index > 0) {
+        index -= 1;
+        const msg = &newest_first[index];
+        switch (msg.role) {
+            .assistant => if (msg.tool_calls.len > 0) {
+                calls = msg.tool_calls;
+                next = 0;
+            },
+            .tool => {
+                while (next < calls.len and !calls[next].status.isSettled()) next += 1;
+                if (next == calls.len) continue;
+                const call = calls[next];
+                next += 1;
+                if (msg.tool_call_id != null) continue;
+                msg.tool_call_id = try allocator.dupe(u8, call.id);
+                if (msg.tool_name == null) msg.tool_name = try allocator.dupe(u8, call.name);
+            },
+            else => {},
+        }
+    }
 }
 
 /// Replace a session's steps with `items`. The list is rewritten whole, the
@@ -1037,6 +1338,14 @@ fn pruneInner(self: *Database, policy: Policy, now_ms: i64, apply: bool) !Pruned
             out.bytes_freed += @intCast(row.int(1));
         }
         if (apply) try self.conn.exec("DELETE " ++ scope, .{cutoff});
+
+        const checkpoints = "FROM checkpoint WHERE session_id IN (SELECT id FROM session WHERE updated_at < ?)";
+        if (try self.conn.row("SELECT count(*), coalesce(sum(length(content)), 0) " ++ checkpoints, .{cutoff})) |row| {
+            defer row.deinit();
+            out.blobs_dropped += @intCast(row.int(0));
+            out.bytes_freed += @intCast(row.int(1));
+        }
+        if (apply) try self.conn.exec("DELETE " ++ checkpoints, .{cutoff});
     }
 
     return out;
@@ -1059,7 +1368,9 @@ fn sessionPayload(self: *Database, cutoff: i64) !u64 {
         \\+ (SELECT coalesce(sum(length(t.result)), 0) FROM tool_call t
         \\     JOIN message m ON t.message_id = m.id
         \\     JOIN session s ON m.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
-    , .{ cutoff, cutoff, cutoff }) orelse return 0;
+        \\+ (SELECT coalesce(sum(length(c.content)), 0) FROM checkpoint c
+        \\     JOIN session s ON c.session_id = s.id WHERE s.updated_at < ? AND s.parent_tool_call IS NULL)
+    , .{ cutoff, cutoff, cutoff, cutoff }) orelse return 0;
     defer row.deinit();
     return @intCast(row.int(0));
 }
@@ -1151,7 +1462,7 @@ fn agedFixture(dir: *std.testing.TmpDir, ages: []const u32) !Database {
     const project_id = try db.resolveProject("/repo", "git", "repo");
     for (ages) |days| {
         const session_id = try db.createSession(project_id, "/repo", "a-model");
-        const message_id = try db.appendMessage(session_id, 0, "assistant", "a message", null, 0);
+        const message_id = try db.appendMessage(session_id, 0, "assistant", "a message", null, 0, null);
         _ = try db.appendToolCall(message_id, 0, "call_0", "read", "{}", "ok", "short", 5, null);
         try db.appendBlob(message_id, 1, "image", "a pasted screenshot");
         try db.appendBlob(message_id, 0, "tool_result", "the whole of a long result");
@@ -1185,17 +1496,81 @@ fn searchFixture(dir: *std.testing.TmpDir) !struct { db: Database, project_id: i
     const project_id = try db.resolveProject("/repo", "git", "repo");
     const session_id = try db.createSession(project_id, "/repo", "a-model");
 
-    _ = try db.appendMessage(session_id, 0, "user", "how do I cancel a turn?", null, 0);
-    _ = try db.appendMessage(session_id, 1, "assistant", "Press esc to CANCEL it.", null, 0);
-    _ = try db.appendMessage(session_id, 2, "user", "what about 100% of the time", null, 0);
-    _ = try db.appendMessage(session_id, 3, "user", "a line\nwith a needle in it\nand more", null, 0);
+    _ = try db.appendMessage(session_id, 0, "user", "how do I cancel a turn?", null, 0, null);
+    _ = try db.appendMessage(session_id, 1, "assistant", "Press esc to CANCEL it.", null, 0, null);
+    _ = try db.appendMessage(session_id, 2, "user", "what about 100% of the time", null, 0, null);
+    _ = try db.appendMessage(session_id, 3, "user", "a line\nwith a needle in it\nand more", null, 0, null);
 
     // A second project, to prove a search does not reach across them.
     const other = try db.resolveProject("/elsewhere", "git", "elsewhere");
     const other_session = try db.createSession(other, "/elsewhere", "a-model");
-    _ = try db.appendMessage(other_session, 0, "user", "cancel this too", null, 0);
+    _ = try db.appendMessage(other_session, 0, "user", "cancel this too", null, 0, null);
 
     return .{ .db = db, .project_id = project_id };
+}
+
+test "the database and its WAL files are the owner's alone, even once others could read them" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+    const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], "private.db" });
+    defer testing.allocator.free(db_path);
+
+    const modeOf = struct {
+        fn run(path: []const u8) !std.posix.mode_t {
+            const stat = try std.Io.Dir.cwd().statFile(testing.io, path, .{});
+            return stat.permissions.toMode() & 0o777;
+        }
+    }.run;
+    const wal = try std.fmt.allocPrint(testing.allocator, "{s}-wal", .{db_path});
+    defer testing.allocator.free(wal);
+    {
+        var db = try init(testing.allocator, testing.io, db_path);
+        defer db.deinit();
+        _ = try db.resolveProject("/repo", "git", "repo");
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(db_path));
+        try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(wal));
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, db_path, .fromMode(0o644), .{});
+        try std.Io.Dir.cwd().setFilePermissions(testing.io, wal, .fromMode(0o644), .{});
+    }
+    var reopened = try init(testing.allocator, testing.io, db_path);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(db_path));
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), try modeOf(wal));
+}
+
+test "two processes opening a new database at once both get it, migrated once" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(testing.io, &buf);
+
+    for (0..10) |round| {
+        var name: [16]u8 = undefined;
+        const db_path = try std.fs.path.join(testing.allocator, &.{ buf[0..n], try std.fmt.bufPrint(&name, "{d}.db", .{round}) });
+        defer testing.allocator.free(db_path);
+
+        const Opener = struct {
+            path: []const u8,
+            failed: ?anyerror = null,
+
+            fn run(self: *@This()) void {
+                var db = init(testing.allocator, testing.io, self.path) catch |err| {
+                    self.failed = err;
+                    return;
+                };
+                db.deinit();
+            }
+        };
+        var openers = [_]Opener{ .{ .path = db_path }, .{ .path = db_path } };
+        var threads: [openers.len]std.Thread = undefined;
+        for (&openers, &threads) |*opener, *thread| thread.* = try std.Thread.spawn(.{}, Opener.run, .{opener});
+        for (threads) |thread| thread.join();
+        for (openers) |opener| try testing.expectEqual(null, opener.failed);
+    }
 }
 
 test "a search finds messages whatever their case, within the project" {
@@ -1303,6 +1678,23 @@ test "shedding drops stored payloads but keeps the transcript" {
     try testing.expectEqual(@as(i64, 2), try countOf(&db, "SELECT count(*) FROM tool_call"));
 }
 
+test "shedding drops the file checkpoints of old sessions" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var db = try agedFixture(&tmp, &.{ 1, 100 });
+    defer db.deinit();
+    try db.saveCheckpoint(1, 0, "/repo/a.txt", "what a.txt held");
+    try db.saveCheckpoint(2, 0, "/repo/b.txt", "what b.txt held");
+    try db.saveCheckpoint(2, 0, "/repo/new.txt", null);
+
+    const done = try db.prune(.{ .shed_after_days = 30 }, db.nowMs());
+    try testing.expectEqual(@as(u64, 2 + 2), done.blobs_dropped);
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT count(*) FROM checkpoint"));
+    try testing.expectEqual(@as(i64, 1), try countOf(&db, "SELECT session_id FROM checkpoint"));
+}
+
 test "shedding keeps a pasted image however old the session is" {
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
@@ -1379,7 +1771,7 @@ test "a subagent transcript stays out of every listing" {
     var db = &fixture.db;
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
-    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
+    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0, null);
     const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "done", null, 0, null);
 
     const child = try db.createSubagentSession(
@@ -1389,7 +1781,7 @@ test "a subagent transcript stays out of every listing" {
         parent,
         call,
     );
-    _ = try db.appendMessage(child, 0, "user", "how do I cancel a turn?", null, 0);
+    _ = try db.appendMessage(child, 0, "user", "how do I cancel a turn?", null, 0, null);
 
     const listed = try db.listSessions(testing.allocator, fixture.project_id, 20);
     defer {
@@ -1420,10 +1812,10 @@ test "pruning leaves a live session's subagent transcript alone" {
     var db = &fixture.db;
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
-    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
+    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0, null);
     const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4, null);
     const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
-    _ = try db.appendMessage(child, 0, "user", "find it", null, 0);
+    _ = try db.appendMessage(child, 0, "user", "find it", null, 0, null);
 
     // Written once and never touched, so it looks older than its live parent.
     try db.conn.exec("UPDATE session SET updated_at = ? WHERE id = ?", .{ @as(i64, 0), child });
@@ -1444,10 +1836,10 @@ test "a subagent's blobs are shed with its parent, not before" {
     var db = &fixture.db;
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
-    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
+    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0, null);
     const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "ok", "done", 4, null);
     const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
-    const child_message = try db.appendMessage(child, 0, "assistant", "found it", null, 8);
+    const child_message = try db.appendMessage(child, 0, "assistant", "found it", null, 8, null);
     try db.appendBlob(child_message, 0, "reasoning", "a long think");
 
     // Old on its own clock, which stops the moment the run lands.
@@ -1472,10 +1864,10 @@ test "deleting a session takes its subagent transcripts with it" {
     var db = &fixture.db;
 
     const parent = try db.latestSession(fixture.project_id) orelse unreachable;
-    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0);
+    const message = try db.appendMessage(parent, 4, "assistant", "", null, 0, null);
     const call = try db.appendToolCall(message, 0, "call_0", "task", "{}", "done", null, 0, null);
     const child = try db.createSubagentSession(fixture.project_id, "/repo", "a-model", parent, call);
-    _ = try db.appendMessage(child, 0, "user", "find it", null, 0);
+    _ = try db.appendMessage(child, 0, "user", "find it", null, 0, null);
 
     try db.deleteSession(parent);
     try testing.expect(try db.subagentSession(call) == null);
@@ -1524,6 +1916,7 @@ test "an older database is brought forward, keeping what it held" {
         var db: Database = .{
             .conn = try zqlite.open(db_path, zqlite.OpenFlags.Create | zqlite.OpenFlags.ReadWrite | zqlite.OpenFlags.NoMutex),
             .io = testing.io,
+            .allocator = testing.allocator,
         };
         defer db.deinit();
 
@@ -1592,7 +1985,7 @@ test "project, session, message and approval round-trip" {
 
     const session_id = try db.createSession(project_id, "/repo/src", "qwen3");
 
-    const msg_id = try db.appendMessage(session_id, 0, "user", "hello", null, 0);
+    const msg_id = try db.appendMessage(session_id, 0, "user", "hello", null, 0, null);
     try db.appendBlob(msg_id, 0, "reasoning", "thinking hard");
     _ = try db.appendToolCall(msg_id, 0, "call_1", "read", "{\"path\":\"x\"}", "ok", "contents", 8, null);
 
@@ -1600,20 +1993,33 @@ test "project, session, message and approval round-trip" {
     try std.testing.expectEqual(@as(?i64, 12345), try db.lastRead(session_id, "/repo/x"));
     try std.testing.expectEqual(@as(?i64, null), try db.lastRead(session_id, "/repo/y"));
 
-    try db.addApproval(project_id, "bash", "git status");
-    try std.testing.expect(try db.isApproved(project_id, "bash", "git status"));
-    try std.testing.expect(!try db.isApproved(project_id, "bash", "rm -rf"));
-    try std.testing.expect(!try db.isApproved(project_id, "read", "git status"));
-
-    try db.addApproval(project_id, "bash", "grep *");
-    try std.testing.expect(try db.isApproved(project_id, "bash", "grep"));
-    try std.testing.expect(!try db.isApproved(project_id, "bash", "rm -rf"));
-    try db.addApproval(project_id, "bash", "xargs*");
-    try std.testing.expect(!try db.isApproved(project_id, "bash", "xargs"));
-    try std.testing.expect(try db.isApproved(project_id, "bash", "xargs*"));
-
+    try db.addApproval(project_id, "bash", "git status *");
+    try db.addApproval(project_id, "bash", "git status *");
+    try db.addApproval(project_id, "write", "*");
+    try db.addApproval(project_id, "bash", "cargo build *");
     const other = try db.resolveProject("/other", "git", "other");
-    try std.testing.expect(!try db.isApproved(other, "bash", "git status"));
+    try db.addApproval(other, "bash", "rm -rf build");
+
+    try expectApprovals(&db, project_id, &.{ "bash cargo build *", "bash git status *", "write *" });
+    try db.removeApproval(project_id, "bash", "git status *");
+    try db.removeApproval(project_id, "bash", "never stored");
+    try expectApprovals(&db, project_id, &.{ "bash cargo build *", "write *" });
+    try expectApprovals(&db, other, &.{"bash rm -rf build"});
+}
+
+fn expectApprovals(db: *Database, project_id: i64, wanted: []const []const u8) !void {
+    const allocator = std.testing.allocator;
+    const stored = try db.approvals(project_id, allocator);
+    defer {
+        for (stored) |approval| approval.deinit(allocator);
+        allocator.free(stored);
+    }
+    try std.testing.expectEqual(wanted.len, stored.len);
+    for (wanted, stored) |want, approval| {
+        const got = try std.fmt.allocPrint(allocator, "{s} {s}", .{ approval.tool, approval.pattern });
+        defer allocator.free(got);
+        try std.testing.expectEqualStrings(want, got);
+    }
 }
 
 test "loadMessages pages older messages back with tool calls and reasoning" {
@@ -1631,11 +2037,11 @@ test "loadMessages pages older messages back with tool calls and reasoning" {
     const project_id = try db.resolveProject("/repo", "git", "repo");
     const session_id = try db.createSession(project_id, "/repo", "qwen3");
 
-    _ = try db.appendMessage(session_id, 0, "user", "hello", null, 0);
-    const m1 = try db.appendMessage(session_id, 1, "assistant", "let me look", 42, 8);
+    _ = try db.appendMessage(session_id, 0, "user", "hello", null, 0, null);
+    const m1 = try db.appendMessage(session_id, 1, "assistant", "let me look", 42, 8, null);
     try db.appendBlob(m1, 0, "reasoning", "thinking");
     _ = try db.appendToolCall(m1, 0, "call_1", "list", "{\"path\":\".\"}", "ok", "a\nb", 3, null);
-    _ = try db.appendMessage(session_id, 2, "tool", "a\nb", null, 0);
+    _ = try db.appendMessage(session_id, 2, "tool", "a\nb", null, 0, null);
 
     const loaded = try db.loadMessages(std.testing.allocator, session_id, 2, 10);
     defer {
@@ -1656,6 +2062,38 @@ test "loadMessages pages older messages back with tool calls and reasoning" {
     try std.testing.expectEqualStrings("hello", loaded[1].text);
 }
 
+test "a tool result loads with the call it answers, one stored without it by order" {
+    var db = try init(std.testing.allocator, std.testing.io, ":memory:");
+    defer db.deinit();
+    const project_id = try db.resolveProject("/repo", "git", "repo");
+    const session_id = try db.createSession(project_id, "/repo", "qwen3");
+
+    const first = try db.appendMessage(session_id, 0, "assistant", "", null, 0, null);
+    _ = try db.appendToolCall(first, 0, "call_a", "read", "{}", "ok", "a", 1, null);
+    _ = try db.appendMessage(session_id, 1, "tool", "a", null, 0, .{ .call_id = "call_stored", .tool_name = "grep" });
+
+    const second = try db.appendMessage(session_id, 2, "assistant", "", null, 0, null);
+    _ = try db.appendToolCall(second, 0, "call_b", "bash", "{}", "pending", null, 0, null);
+    _ = try db.appendToolCall(second, 1, "call_c", "list", "{}", "ok", "c", 1, null);
+    _ = try db.appendToolCall(second, 2, "call_d", "write", "{}", "rejected", "no", 2, null);
+    _ = try db.appendMessage(session_id, 3, "assistant", "a note mid-turn", null, 0, null);
+    _ = try db.appendMessage(session_id, 4, "tool", "c", null, 0, null);
+    _ = try db.appendMessage(session_id, 5, "tool", "no", null, 0, null);
+
+    const loaded = try db.loadMessages(std.testing.allocator, session_id, std.math.maxInt(i64), 10);
+    defer {
+        for (loaded) |*msg| msg.deinit(std.testing.allocator);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqualStrings("call_d", loaded[0].tool_call_id.?);
+    try std.testing.expectEqualStrings("write", loaded[0].tool_name.?);
+    try std.testing.expectEqualStrings("call_c", loaded[1].tool_call_id.?);
+    try std.testing.expectEqualStrings("list", loaded[1].tool_name.?);
+    try std.testing.expectEqualStrings("call_stored", loaded[4].tool_call_id.?);
+    try std.testing.expectEqualStrings("grep", loaded[4].tool_name.?);
+}
+
 test "long reasoning and tool results load as previews then full bodies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1674,7 +2112,7 @@ test "long reasoning and tool results load as previews then full bodies" {
     const reasoning = "r" ** (Conversation.preview_bytes + 100);
     const result = "x" ** (Conversation.preview_bytes + 200);
 
-    const m = try db.appendMessage(session_id, 0, "assistant", "done", 10, reasoning.len);
+    const m = try db.appendMessage(session_id, 0, "assistant", "done", 10, reasoning.len, null);
     try db.appendBlob(m, 0, "reasoning", reasoning);
     _ = try db.appendToolCall(m, 0, "c", "bash", "{}", "ok", result, result.len, null);
     try db.appendBlob(m, 0, "tool_result", result);
@@ -1722,11 +2160,16 @@ test "sessions get a handle, and are found by it" {
 
     try std.testing.expectEqual(session_id, (try db.findSession(project_id, handle)).?);
     try std.testing.expect(try db.findSession(project_id, "ses_00000000") == null);
+    try std.testing.expectEqual(session_id, (try db.sessionByHandle(handle)).?);
+    try std.testing.expect(try db.sessionByHandle("ses_00000000") == null);
+    const cwd = try db.sessionCwd(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectEqualStrings("/tmp/project", cwd);
 
     try std.testing.expectEqual(@as(usize, 0), (try db.listSessions(std.testing.allocator, project_id, 10)).len);
     try std.testing.expect(try db.latestSession(project_id) == null);
 
-    _ = try db.appendMessage(session_id, 0, "user", "hello", null, 0);
+    _ = try db.appendMessage(session_id, 0, "user", "hello", null, 0, null);
     try db.setSessionTitle(session_id, "first steps");
 
     const sessions = try db.listSessions(std.testing.allocator, project_id, 10);
@@ -1758,7 +2201,7 @@ test "deleting a session takes its messages, blobs, attachments and tool calls w
     const project_id = try db.resolveProject("/tmp/project", "git", "project");
     const session_id = try db.createSession(project_id, "/tmp/project", "qwen3");
 
-    const message_id = try db.appendMessage(session_id, 0, "assistant", "hi", 12, 4);
+    const message_id = try db.appendMessage(session_id, 0, "assistant", "hi", 12, 4, null);
     try db.appendBlob(message_id, 0, "reasoning", "a long thought");
     _ = try db.appendToolCall(message_id, 0, "1", "bash", "{}", "ok", "output", 6, null);
     try db.appendAttachment(message_id, 0, "/p/.agents/skills/release/SKILL.md", "tag, then push");
@@ -1867,11 +2310,11 @@ test "what a message carried comes back with it" {
     const project_id = try db.resolveProject("/tmp/project", "git", "project");
     const session_id = try db.createSession(project_id, "/tmp/project", "qwen3");
 
-    const message_id = try db.appendMessage(session_id, 0, "user", "/release 2.1", null, 0);
+    const message_id = try db.appendMessage(session_id, 0, "user", "/release 2.1", null, 0, null);
     try db.appendAttachment(message_id, 0, "/p/.agents/skills/release/SKILL.md", "tag, then push");
     try db.appendAttachment(message_id, 1, "src/main.zig", "const std = @import(\"std\");");
 
-    const plain = try db.appendMessage(session_id, 1, "user", "no files here", null, 0);
+    const plain = try db.appendMessage(session_id, 1, "user", "no files here", null, 0, null);
 
     const loaded = try db.loadMessages(std.testing.allocator, session_id, 10, 10);
     defer {
@@ -1912,7 +2355,7 @@ test "a long attachment comes back as a preview, and in full when asked for" {
 
     const project_id = try db.resolveProject("/tmp/project", "git", "project");
     const session_id = try db.createSession(project_id, "/tmp/project", "qwen3");
-    const message_id = try db.appendMessage(session_id, 0, "user", "/big", null, 0);
+    const message_id = try db.appendMessage(session_id, 0, "user", "/big", null, 0, null);
     try db.appendAttachment(message_id, 0, "big/SKILL.md", body);
 
     const loaded = try db.loadAttachments(std.testing.allocator, message_id);
@@ -1989,7 +2432,7 @@ test "a call's duration survives a round trip" {
 
     const project = try db.resolveProject("/repo", "git", "repo");
     const session = try db.createSession(project, "/repo", "model");
-    const message = try db.appendMessage(session, 0, "assistant", "", null, 0);
+    const message = try db.appendMessage(session, 0, "assistant", "", null, 0, null);
     _ = try db.appendToolCall(message, 0, "c0", "read", "{}", "ok", "out", 3, 250);
     _ = try db.appendToolCall(message, 1, "c1", "edit", "{}", "rejected", null, 0, null);
 
@@ -2028,7 +2471,7 @@ test "a provider's replay record comes back whole on resume, and is shed with ol
     const session_id = try db.createSession(project_id, "/repo", "gpt-test");
     const record = "{\"provider\":\"chatgpt\",\"items\":[" ++ ("{\"type\":\"reasoning\"}," ** 400) ++ "{}]}";
 
-    const m = try db.appendMessage(session_id, 0, "assistant", "done", null, 0);
+    const m = try db.appendMessage(session_id, 0, "assistant", "done", null, 0, null);
     try db.appendBlob(m, 0, provider_state_blob, record);
 
     const loaded = try db.loadMessages(std.testing.allocator, session_id, 1, 10);
@@ -2041,4 +2484,37 @@ test "a provider's replay record comes back whole on resume, and is shed with ol
     try db.conn.exec("UPDATE session SET updated_at = 0 WHERE id = ?", .{session_id});
     _ = try db.prune(.{ .shed_after_days = 1 }, db.nowMs());
     try std.testing.expectEqual(@as(i64, 0), try countOf(&db, "SELECT count(*) FROM blob WHERE kind = '" ++ provider_state_blob ++ "'"));
+}
+
+test "recent sessions come from every project, and only those with anything in them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(std.testing.io, &buf);
+    const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/r.db", .{buf[0..n]});
+    defer std.testing.allocator.free(db_path);
+    var db = try init(std.testing.allocator, std.testing.io, db_path);
+    defer db.deinit();
+
+    const api = try db.createSession(try db.resolveProject("/src/api", "git", "api"), "/src/api", "qwen3");
+    const web = try db.createSession(try db.resolveProject("/src/web", "git", "web"), "/src/web/app", "qwen3");
+    _ = try db.createSession(try db.resolveProject("/src/web", "git", "web"), "/src/web", "qwen3");
+    _ = try db.appendMessage(api, 0, "user", "hello", null, 0, null);
+    _ = try db.appendMessage(web, 0, "user", "hi", null, 0, null);
+    _ = try db.appendMessage(web, 1, "assistant", "hello", null, 0, null);
+
+    const recent = try db.recentSessions(std.testing.allocator, 10);
+    defer {
+        for (recent) |info| info.deinit(std.testing.allocator);
+        std.testing.allocator.free(recent);
+    }
+    try std.testing.expectEqual(@as(usize, 2), recent.len);
+    for (recent) |info| {
+        if (std.mem.eql(u8, info.cwd, "/src/web/app")) {
+            try std.testing.expectEqual(@as(u64, 2), info.messages);
+        } else {
+            try std.testing.expectEqualStrings("/src/api", info.cwd);
+            try std.testing.expectEqual(@as(u64, 1), info.messages);
+        }
+    }
 }

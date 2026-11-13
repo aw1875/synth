@@ -175,6 +175,82 @@ pub const Message = struct {
         };
     }
 
+    /// A deep copy owning every string, `seq` included.
+    pub fn clone(self: Message, allocator: std.mem.Allocator) !Message {
+        var owned: Message = .{
+            .seq = self.seq,
+            .role = self.role,
+            .text = try allocator.dupe(u8, self.text),
+            .thinking_ms = self.thinking_ms,
+            .thinking_bytes = if (self.thinking_bytes > 0) self.thinking_bytes else (if (self.thinking) |t| t.len else 0),
+        };
+        errdefer owned.deinit(allocator);
+
+        if (self.thinking) |thinking| owned.thinking = try allocator.dupe(u8, thinking);
+        if (self.provider_state) |state| owned.provider_state = try allocator.dupe(u8, state);
+        if (self.tool_name) |name| owned.tool_name = try allocator.dupe(u8, name);
+        if (self.tool_call_id) |id| owned.tool_call_id = try allocator.dupe(u8, id);
+
+        if (self.tool_calls.len > 0) {
+            const calls = try allocator.alloc(ToolCall, self.tool_calls.len);
+            var built: usize = 0;
+            errdefer {
+                for (calls[0..built]) |*call| call.deinit(allocator);
+                allocator.free(calls);
+            }
+
+            for (self.tool_calls, calls) |call, *out| {
+                out.* = .{
+                    .id = try allocator.dupe(u8, call.id),
+                    .name = try allocator.dupe(u8, call.name),
+                    .arguments = try allocator.dupe(u8, call.arguments),
+                    .status = call.status,
+                    .result = if (call.result) |result| try allocator.dupe(u8, result) else null,
+                    .result_bytes = call.result_bytes,
+                    .elapsed_ms = call.elapsed_ms,
+                    .started_ms = call.started_ms,
+                };
+                built += 1;
+            }
+            owned.tool_calls = calls;
+        }
+
+        if (self.attachments.len > 0) {
+            const copies = try allocator.alloc(Attachment, self.attachments.len);
+            var built: usize = 0;
+            errdefer {
+                for (copies[0..built]) |*a| a.deinit(allocator);
+                allocator.free(copies);
+            }
+
+            for (self.attachments, copies) |attachment, *out| {
+                out.* = .{
+                    .path = try allocator.dupe(u8, attachment.path),
+                    .content = try allocator.dupe(u8, attachment.content),
+                    .content_bytes = attachment.content_bytes,
+                };
+                built += 1;
+            }
+            owned.attachments = copies;
+        }
+
+        if (self.images.len > 0) {
+            const copies = try allocator.alloc([]const u8, self.images.len);
+            var built: usize = 0;
+            errdefer {
+                for (copies[0..built]) |image| allocator.free(image);
+                allocator.free(copies);
+            }
+
+            for (self.images, copies) |image, *out| {
+                out.* = try allocator.dupe(u8, image);
+                built += 1;
+            }
+            owned.images = copies;
+        }
+        return owned;
+    }
+
     pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         if (self.thinking) |thinking| allocator.free(thinking);
@@ -285,81 +361,35 @@ pub fn addToolResult(
 /// Copy `msg`'s borrowed strings into the conversation and append it. The
 /// returned pointer is invalidated by the next append.
 pub fn append(self: *Conversation, msg: Message) !*Message {
-    var owned: Message = .{
-        .seq = self.next_seq,
-        .role = msg.role,
-        .text = try self.allocator.dupe(u8, msg.text),
-        .thinking_ms = msg.thinking_ms,
-        .thinking_bytes = if (msg.thinking_bytes > 0) msg.thinking_bytes else (if (msg.thinking) |t| t.len else 0),
-    };
-    self.next_seq += 1;
+    var owned = try msg.clone(self.allocator);
     errdefer owned.deinit(self.allocator);
-
-    if (msg.thinking) |thinking| owned.thinking = try self.allocator.dupe(u8, thinking);
-    if (msg.provider_state) |state| owned.provider_state = try self.allocator.dupe(u8, state);
-    if (msg.tool_name) |name| owned.tool_name = try self.allocator.dupe(u8, name);
-    if (msg.tool_call_id) |id| owned.tool_call_id = try self.allocator.dupe(u8, id);
-
-    if (msg.tool_calls.len > 0) {
-        const calls = try self.allocator.alloc(ToolCall, msg.tool_calls.len);
-        var built: usize = 0;
-        errdefer {
-            for (calls[0..built]) |*call| call.deinit(self.allocator);
-            self.allocator.free(calls);
-        }
-
-        for (msg.tool_calls, calls) |call, *out| {
-            out.* = .{
-                .id = try self.allocator.dupe(u8, call.id),
-                .name = try self.allocator.dupe(u8, call.name),
-                .arguments = try self.allocator.dupe(u8, call.arguments),
-                .status = call.status,
-                .result = if (call.result) |result| try self.allocator.dupe(u8, result) else null,
-                .result_bytes = call.result_bytes,
-                .elapsed_ms = call.elapsed_ms,
-                .started_ms = call.started_ms,
-            };
-            built += 1;
-        }
-        owned.tool_calls = calls;
-    }
-
-    if (msg.attachments.len > 0) {
-        const copies = try self.allocator.alloc(Attachment, msg.attachments.len);
-        var built: usize = 0;
-        errdefer {
-            for (copies[0..built]) |*a| a.deinit(self.allocator);
-            self.allocator.free(copies);
-        }
-
-        for (msg.attachments, copies) |attachment, *out| {
-            out.* = .{
-                .path = try self.allocator.dupe(u8, attachment.path),
-                .content = try self.allocator.dupe(u8, attachment.content),
-            };
-            built += 1;
-        }
-        owned.attachments = copies;
-    }
-
-    if (msg.images.len > 0) {
-        const copies = try self.allocator.alloc([]const u8, msg.images.len);
-        var built: usize = 0;
-        errdefer {
-            for (copies[0..built]) |image| self.allocator.free(image);
-            self.allocator.free(copies);
-        }
-
-        for (msg.images, copies) |image, *out| {
-            out.* = try self.allocator.dupe(u8, image);
-            built += 1;
-        }
-        owned.images = copies;
-    }
+    owned.seq = self.next_seq;
+    self.next_seq += 1;
 
     try self.messages.append(self.allocator, owned);
     self.trim();
     return &self.messages.items[self.messages.items.len - 1];
+}
+
+/// Take over a message numbered elsewhere, keeping its `seq`: a mirror of
+/// another process's transcript keeps that process's numbers. Ownership of
+/// every string passes here.
+pub fn adoptMessage(self: *Conversation, msg: Message) !void {
+    try self.messages.append(self.allocator, msg);
+    self.next_seq = @max(self.next_seq, msg.seq + 1);
+    self.trim();
+}
+
+/// The message numbered `seq`, if it is in memory.
+pub fn find(self: *Conversation, seq: u64) ?*Message {
+    var at = self.messages.items.len;
+    while (at > 0) {
+        at -= 1;
+        const msg = &self.messages.items[at];
+        if (msg.seq == seq) return msg;
+        if (msg.seq < seq) return null;
+    }
+    return null;
 }
 
 /// Drop the oldest messages until the in-memory count is within `max_messages`.
@@ -704,4 +734,24 @@ test "a call keeps how long it took, and only once it has run" {
     var refused: ToolCall = .{ .id = "", .name = "", .arguments = "" };
     refused.settle(.rejected, 9_000);
     try testing.expect(refused.elapsed_ms == null);
+}
+
+test "an adopted message keeps its number, and the next append follows it" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    convo.max_messages = 2;
+
+    for ([_]u64{ 7, 9, 12 }) |seq| {
+        try convo.adoptMessage(try (Message{ .seq = seq, .role = .user, .text = "hi" }).clone(testing.allocator));
+    }
+    try testing.expectEqual(@as(usize, 2), convo.messages.items.len);
+    try testing.expectEqual(@as(u64, 1), convo.dropped);
+    try testing.expectEqual(@as(?u64, 9), convo.firstSeq());
+    try testing.expect(convo.find(12) != null);
+    try testing.expect(convo.find(7) == null);
+    try testing.expect(convo.find(10) == null);
+
+    const next = try convo.append(.{ .role = .assistant, .text = "hello" });
+    try testing.expectEqual(@as(u64, 13), next.seq);
 }

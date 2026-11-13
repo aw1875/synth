@@ -11,6 +11,7 @@ const Auth = @import("core/auth.zig");
 const chatgpt_auth = @import("provider/chatgpt_auth.zig");
 const Config = @import("core/config.zig");
 const Database = @import("core/database.zig");
+const McpStore = @import("core/mcp_store.zig");
 const humanize = @import("core/humanize.zig");
 const Project = @import("core/project.zig");
 const skill = @import("core/skill.zig");
@@ -282,7 +283,15 @@ fn removeSession(ctx: *Context, out: *std.Io.Writer, handle: []const u8) !void {
         try out.print("no session {s} in {s}\n", .{ handle, ctx.project.name() });
         return;
     };
-    try ctx.db.deleteSession(id);
+    const lock = ctx.db.lockSession(handle) catch |err| switch (err) {
+        error.SessionHeld => {
+            try out.print("{s} is running; quit it first\n", .{handle});
+            return;
+        },
+        else => return err,
+    };
+    defer lock.release(ctx.io);
+    try ctx.db.deleteLockedSession(id, handle);
     try out.print("deleted {s}\n", .{handle});
 }
 
@@ -347,6 +356,7 @@ pub fn models(init_process: std.process.Init) !void {
         .model = active.model,
         .api_key = active.api_key,
         .chatgpt = chatgpt,
+        .copilot_integration_id = ctx.config.copilot_integration_id,
     });
     defer backend.deinit();
 
@@ -408,8 +418,8 @@ test "elapsed time reads in the roughest useful unit" {
 
 /// `mcp list`, `mcp auth`, `mcp logout`, `mcp enable`, `mcp disable`.
 ///
-/// No database and no project: an MCP server is configured for the machine,
-/// not for a directory, so none of this needs to know where it was run.
+/// No project: an MCP server is configured for the machine, not for a
+/// directory, so none of this needs to know where it was run.
 pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
     const allocator = init_process.gpa;
     const io = init_process.io;
@@ -427,8 +437,10 @@ pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
 
     const path = try Config.defaultMcpAuthPath(allocator, init_process.environ_map);
     defer allocator.free(path);
+    const kept = try McpStore.open(allocator, io, config.database_path, path);
+    defer kept.close();
 
-    var store = mcp.Auth.load(allocator, io, path) catch mcp.Auth.init(allocator);
+    var store = try kept.load();
     defer store.deinit();
 
     var buffer: [8192]u8 = undefined;
@@ -437,20 +449,20 @@ pub fn mcp_command(init_process: std.process.Init, sub: cli.Command.Mcp) !void {
     defer out.flush() catch {};
 
     switch (sub) {
-        .list => try listServers(&store, servers, out),
-        .auth => |name| try authServer(allocator, io, &store, servers, name, path, out),
+        .list => try listServers(io, &store, servers, out),
+        .auth => |name| try authServer(allocator, io, &store, servers, name, out),
         .debug => |name| try debugServer(allocator, io, &store, servers, name, out),
         .logout => |name| {
             store.forget(name);
-            try store.save(io, path);
+            try store.save(name);
             try out.print("Forgot credentials for {s}.\n", .{name});
         },
-        .enable => |name| try toggleServer(io, &store, name, true, path, out),
-        .disable => |name| try toggleServer(io, &store, name, false, path, out),
+        .enable => |name| try toggleServer(&store, name, true, out),
+        .disable => |name| try toggleServer(&store, name, false, out),
     }
 }
 
-fn listServers(store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io.Writer) !void {
+fn listServers(io: std.Io, store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io.Writer) !void {
     if (servers.len == 0) {
         try out.print("No MCP servers configured. Add an \"mcp\" block to your config.\n", .{});
         return;
@@ -467,28 +479,28 @@ fn listServers(store: *mcp.Auth, servers: []const mcp_tools.Server, out: *std.Io
             .http => |http| {
                 try out.print("  {s}remote{s}  {s}\n", .{ dim, reset, http.url });
 
-                const entry = store.getForUrl(server.name, http.url);
-                const signed_in = if (entry) |e| e.tokens != null else false;
-                try out.print("  {s}auth{s}    {s}\n", .{
-                    dim,
-                    reset,
-                    if (signed_in) "signed in" else "not signed in",
-                });
+                try out.print("  {s}auth{s}    {s}\n", .{ dim, reset, signInState(io, store.getForUrl(server.name, http.url)) });
             },
         }
     }
 }
 
+/// A token that has run out still counts while there is a refresh token to
+/// renew it with; whether the server honours that one is only known by asking.
+fn signInState(io: std.Io, entry: ?mcp.Auth.Entry) []const u8 {
+    const tokens = (entry orelse return "not signed in").tokens orelse return "not signed in";
+    if (tokens.refresh_token == null and mcp.flow.expired(io, tokens.expires_at)) return "expired, sign in again";
+    return "signed in";
+}
+
 fn toggleServer(
-    io: std.Io,
     store: *mcp.Auth,
     name: []const u8,
     enabled: bool,
-    path: []const u8,
     out: *std.Io.Writer,
 ) !void {
     try store.setEnabled(name, enabled);
-    try store.save(io, path);
+    try store.save(name);
     try out.print("{s} is now {s}.\n", .{ name, if (enabled) "enabled" else "disabled" });
 }
 
@@ -498,7 +510,6 @@ fn authServer(
     store: *mcp.Auth,
     servers: []const mcp_tools.Server,
     name: []const u8,
-    path: []const u8,
     out: *std.Io.Writer,
 ) !void {
     const found = for (servers) |server| {
@@ -533,7 +544,7 @@ fn authServer(
         return err;
     };
 
-    try store.save(io, path);
+    try store.save(name);
     try out.print("Signed in to {s}.\n", .{name});
 }
 
@@ -643,11 +654,7 @@ fn debugServer(
         reset,
         if (entry) |e| e.redirect_uri orelse "none stored" else "none stored",
     });
-    try out.print("  {s}tokens{s}     {s}\n", .{
-        dim,
-        reset,
-        if (entry) |e| if (e.tokens != null) "stored" else "none" else "none",
-    });
+    try out.print("  {s}auth{s}       {s}\n", .{ dim, reset, signInState(io, entry) });
     try out.flush();
 
     try probeInitialize(allocator, io, store, name, http.url, http.headers, arena, out);
@@ -674,7 +681,10 @@ fn probeInitialize(
         .name = name,
         .server_url = url,
         .client_name = pkg.name,
-    }) catch null;
+    }) catch |err| failed: {
+        try out.print("\n  {s}refresh{s}    failed: {s}\n", .{ dim, reset, @errorName(err) });
+        break :failed null;
+    };
 
     const authorization = if (token) |value|
         try std.fmt.allocPrint(arena, "Bearer {s}", .{value})

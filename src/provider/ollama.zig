@@ -7,6 +7,7 @@ const pkg = @import("pkg");
 
 const Conversation = @import("../core/conversation.zig");
 const Provider = @import("provider.zig");
+const log_file = @import("log_file.zig");
 const retry = @import("retry.zig");
 const window = @import("window.zig");
 
@@ -814,14 +815,8 @@ fn log(
         reply.text,
         reply.tool_calls.len,
     });
-
-    const existing = std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(1024 * 1024)) catch "";
-
-    var combined: std.Io.Writer.Allocating = .init(arena);
-    try combined.writer.writeAll(existing);
-    try combined.writer.writeAll(out.written());
-
-    try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = combined.written() });
+    try log_file.writeUsage(&out.writer, reply.usage);
+    try log_file.append(self.io, path, out.written());
 }
 
 /// The text a message is sent as: its own, plus inlined `@mention` files, plus

@@ -315,7 +315,8 @@ fn indexOf(paths: []const []const u8, wanted: []const u8) ?usize {
 
 /// `git init` plus a commit-less index. Returns false when there is no git to
 /// run, which is a skipped test rather than a failed one.
-fn initRepo(root: []const u8) !bool {
+/// Make `root` a git repository, for tests. False when there is no git to ask.
+pub fn initRepo(root: []const u8) !bool {
     var dir = std.Io.Dir.cwd().openDir(testing.io, root, .{}) catch return false;
     defer dir.close(testing.io);
 

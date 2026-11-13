@@ -66,6 +66,38 @@ pub const Server = struct {
     };
 
     pub const EnvPair = struct { name: []const u8, value: []const u8 };
+
+    pub fn dupe(self: Server, arena: std.mem.Allocator) !Server {
+        return .{
+            .name = try arena.dupe(u8, self.name),
+            .enabled = self.enabled,
+            .transport = switch (self.transport) {
+                .stdio => |stdio| .{ .stdio = .{
+                    .command = try arena.dupe(u8, stdio.command),
+                    .args = try dupeStrings(arena, stdio.args),
+                    .env = try dupePairs(EnvPair, arena, stdio.env),
+                    .cwd = if (stdio.cwd) |cwd| try arena.dupe(u8, cwd) else null,
+                } },
+                .http => |http| .{ .http = .{
+                    .url = try arena.dupe(u8, http.url),
+                    .headers = try dupePairs(std.http.Header, arena, http.headers),
+                    .scopes = try dupeStrings(arena, http.scopes),
+                } },
+            },
+        };
+    }
+
+    fn dupeStrings(arena: std.mem.Allocator, strings: []const []const u8) ![]const []const u8 {
+        const out = try arena.alloc([]const u8, strings.len);
+        for (strings, out) |string, *copy| copy.* = try arena.dupe(u8, string);
+        return out;
+    }
+
+    fn dupePairs(comptime Pair: type, arena: std.mem.Allocator, pairs: []const Pair) ![]const Pair {
+        const out = try arena.alloc(Pair, pairs.len);
+        for (pairs, out) |pair, *copy| copy.* = .{ .name = try arena.dupe(u8, pair.name), .value = try arena.dupe(u8, pair.value) };
+        return out;
+    }
 };
 
 /// What to tell someone about a server that would not start.
@@ -87,6 +119,16 @@ fn reasonFor(err: anyerror) []const u8 {
 pub const Failure = struct {
     server: []const u8,
     reason: []const u8,
+};
+
+/// Where a configured server stands.
+pub const Status = struct {
+    name: []const u8,
+    state: State,
+    /// Why it failed, for `.failed`.
+    reason: []const u8 = "",
+
+    pub const State = enum { off, connecting, connected, failed };
 };
 
 /// The connected servers and the tools they contributed.
@@ -288,6 +330,32 @@ pub const Host = struct {
                 self.recordFailure(server.name, reasonFor(err)) catch {};
             };
         }
+    }
+
+    /// Whether a server is wanted: configured on, and not turned off since.
+    pub fn wants(self: *const Host, server: Server) bool {
+        const store = self.auth orelse return server.enabled;
+        return server.enabled and store.isEnabled(server.name);
+    }
+
+    pub fn statusOf(self: *const Host, server: Server) Status {
+        if (!self.wants(server)) return .{ .name = server.name, .state = .off };
+        if (self.find(server.name)) |connection| {
+            return .{ .name = server.name, .state = if (connection.installed) .connected else .connecting };
+        }
+        for (self.failures.items) |failure| {
+            if (std.mem.eql(u8, failure.server, server.name)) {
+                return .{ .name = server.name, .state = .failed, .reason = failure.reason };
+            }
+        }
+        return .{ .name = server.name, .state = .connecting };
+    }
+
+    /// Every configured server's status, borrowing this host's strings.
+    pub fn statuses(self: *const Host, allocator: std.mem.Allocator) ![]Status {
+        const out = try allocator.alloc(Status, self.servers.len);
+        for (self.servers, out) |server, *status| status.* = self.statusOf(server);
+        return out;
     }
 
     /// The connection for `name`, or null when it is not up.

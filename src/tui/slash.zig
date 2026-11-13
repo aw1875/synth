@@ -28,8 +28,7 @@ pub const Command = struct {
     is_skill: bool = false,
     /// Only offered while signed in to ChatGPT.
     needs_chatgpt: bool = false,
-    /// Enter runs it only once its whole name is typed: `/c` must not clear a
-    /// session.
+    needs_oauth: bool = false,
     is_destructive: bool = false,
 };
 
@@ -55,11 +54,15 @@ pub const commands: []const Command = &.{
     .{ .name = "model", .description = "switch the model this session runs on", .argument = optional_name },
     .{ .name = "effort", .description = "set how hard the model thinks, where it has levels", .argument = .{ .optional = "level" } },
     .{ .name = "sessions", .description = "switch to another session" },
+    .{ .name = "detach", .description = "leave this session running, to come back to later" },
     .{ .name = "providers", .description = "connect a provider, or switch to another" },
-    .{ .name = "logout", .description = "sign out of ChatGPT", .needs_chatgpt = true, .is_destructive = true },
+    .{ .name = "logout", .description = "sign out of Copilot or ChatGPT", .needs_oauth = true, .is_destructive = true },
     .{ .name = "usage", .description = "manage how much of your ChatGPT plan synth may use", .needs_chatgpt = true },
     .{ .name = "agent", .description = "switch mode: build, plan or review", .argument = optional_name },
     .{ .name = "mcp", .description = "turn MCP servers on and off" },
+    .{ .name = "approvals", .description = "who decides calls: ask you, auto (a model judges), or all", .argument = .{ .optional = "ask|auto|all" } },
+    .{ .name = "rewind", .description = "put back files as they were before an earlier prompt" },
+    .{ .name = "permissions", .description = "see, edit and remove what is always allowed here" },
     .{ .name = "skills", .description = "list the skills on offer, and where they came from" },
     .{ .name = "theme", .description = "change the color theme", .argument = optional_name },
     .{ .name = "rename", .description = "name this session", .argument = optional_name },
@@ -74,6 +77,7 @@ skills: []const skill.Skill = &.{},
 /// Set by the owner before each `update`; hides the ChatGPT-only commands
 /// while there is no ChatGPT sign-in for them to act on.
 chatgpt_signed_in: bool = false,
+copilot_signed_in: bool = false,
 
 /// Indices into everything on offer, matching what has been typed, best first.
 matches: std.ArrayList(usize) = .empty,
@@ -167,7 +171,8 @@ fn filter(self: *Slash, query: []const u8) !void {
 }
 
 fn isOffered(self: *const Slash, command: Command) bool {
-    return !command.needs_chatgpt or self.chatgpt_signed_in;
+    if (command.needs_chatgpt and !self.chatgpt_signed_in) return false;
+    return !command.needs_oauth or self.chatgpt_signed_in or self.copilot_signed_in;
 }
 
 pub fn moveSelection(self: *Slash, delta: i32) void {
