@@ -1,43 +1,46 @@
 import argparse
-import base64
 import hashlib
-import json
-import os
-import subprocess
+import re
 from pathlib import Path
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("version")
-    parser.add_argument("tag")
-    parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--archives", type=Path, default=Path("release"))
     args = parser.parse_args()
+    version = args.version
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        parser.error("version must be a stable release version (X.Y.Z)")
 
     root = Path(__file__).resolve().parents[2]
     formula = root / "Formula/synth.rb"
-    asset_version = "dev" if args.tag == "dev" else args.version
+    current = re.search(r'^  version "([0-9]+\.[0-9]+\.[0-9]+)"$', formula.read_text(), re.MULTILINE)
+    if current and tuple(map(int, current[1].split("."))) > tuple(map(int, version.split("."))):
+        print(f"Homebrew already points to newer release {current[1]}")
+        return
+
     checksums = {}
     for target in ("aarch64-macos", "x86_64-linux-musl"):
-        archive = root / "release" / f"synth-{asset_version}-{target}.tar.gz"
+        archive = args.archives / f"synth-{version}-{target}.tar.gz"
         checksums[target] = hashlib.sha256(archive.read_bytes()).hexdigest()
 
-    base_url = f"https://github.com/aw1875/synth/releases/download/{args.tag}"
+    base_url = f"https://github.com/aw1875/synth/releases/download/v{version}"
     updated = f'''class Synth < Formula
   desc "Terminal coding agent for local and hosted models"
   homepage "https://github.com/aw1875/synth"
-  version "{args.version}"
+  version "{version}"
   license "MIT"
 
   if OS.mac?
     depends_on arch: :arm64
 
-    url "{base_url}/synth-{asset_version}-aarch64-macos.tar.gz"
+    url "{base_url}/synth-{version}-aarch64-macos.tar.gz"
     sha256 "{checksums["aarch64-macos"]}"
   else
     depends_on arch: :x86_64
 
-    url "{base_url}/synth-{asset_version}-x86_64-linux-musl.tar.gz"
+    url "{base_url}/synth-{version}-x86_64-linux-musl.tar.gz"
     sha256 "{checksums["x86_64-linux-musl"]}"
   end
 
@@ -52,27 +55,6 @@ def main():
 end
 '''
     formula.write_text(updated)
-    if not args.publish:
-        return
-
-    endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/contents/Formula/synth.rb"
-    current = json.loads(
-        subprocess.check_output(["gh", "api", f"{endpoint}?ref=master"])
-    )
-    if base64.b64decode(current["content"]).decode() == updated:
-        return
-    payload = {
-        "message": f"chore(homebrew): update synth to {args.version}",
-        "content": base64.b64encode(updated.encode()).decode(),
-        "sha": current["sha"],
-        "branch": "master",
-    }
-    subprocess.run(
-        ["gh", "api", "--method", "PUT", endpoint, "--input", "-"],
-        input=json.dumps(payload).encode(),
-        stdout=subprocess.DEVNULL,
-        check=True,
-    )
 
 
 if __name__ == "__main__":
