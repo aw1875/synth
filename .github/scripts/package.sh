@@ -19,4 +19,6 @@ for triple in "${targets[@]}"; do
   tar -C "zig-out/$triple" -czf "release/synth-${version}-${triple}.tar.gz" synth
 done
 
+(cd release && sha256sum -- *.tar.gz > SHA256SUMS)
+
 ls -l release
