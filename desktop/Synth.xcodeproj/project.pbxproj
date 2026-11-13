@@ -111,7 +111,7 @@
 				GENERATE_INFOPLIST_FILE = "YES";
 				INFOPLIST_KEY_CFBundleDisplayName = "Synth";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				MARKETING_VERSION = "0.2.1";
+				MARKETING_VERSION = "0.3.0";
 				CURRENT_PROJECT_VERSION = "1";
 				PRODUCT_NAME = "Synth";
 				PRODUCT_BUNDLE_IDENTIFIER = "sh.getsynth.desktop";
@@ -130,7 +130,7 @@
 				GENERATE_INFOPLIST_FILE = "YES";
 				INFOPLIST_KEY_CFBundleDisplayName = "Synth";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
-				MARKETING_VERSION = "0.2.1";
+				MARKETING_VERSION = "0.3.0";
 				CURRENT_PROJECT_VERSION = "1";
 				PRODUCT_NAME = "Synth";
 				PRODUCT_BUNDLE_IDENTIFIER = "sh.getsynth.desktop";
