@@ -239,6 +239,7 @@ pub const SignIn = struct {
     url: []const u8,
     /// Where the browser is sent back to, on the agent's machine.
     port: u16,
+    user_code: []const u8 = "",
 };
 
 /// A provider in the catalog, as the agent has it.

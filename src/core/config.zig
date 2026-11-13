@@ -95,6 +95,7 @@ api_key: ?[]const u8 = null,
 /// settings.
 openai_host: []const u8 = "",
 openai_api_key: ?[]const u8 = null,
+copilot_integration_id: []const u8 = "copilot-sdk",
 /// Brave Search key for `web_search`, from the `web` block or `BRAVE_API_KEY`.
 /// Without one the tool reads DuckDuckGo's HTML results page instead, which
 /// needs no key but is throttled after a handful of searches.
@@ -313,6 +314,7 @@ fn applyFile(self: *Config, io: std.Io, path: []const u8) !void {
 
 fn applyEnv(self: *Config, env: *std.process.Environ.Map) !void {
     if (env.get("SYNTH_PROVIDER")) |name| self.provider_override = name;
+    if (env.get("SYNTH_COPILOT_INTEGRATION_ID")) |value| self.copilot_integration_id = value;
     if (env.get("SYNTH_DB")) |value| self.database_path = value;
     if (env.get("OLLAMA_HOST")) |value| self.host_override = value;
     if (env.get("OLLAMA_MODEL")) |value| self.model_override = value;
@@ -328,6 +330,18 @@ fn applyEnv(self: *Config, env: *std.process.Environ.Map) !void {
     if (env.get("OLLAMA_THINK")) |value| {
         self.think = !std.mem.eql(u8, value, "0") and !std.mem.eql(u8, value, "false");
     }
+}
+
+test "Copilot integration profile defaults and environment override" {
+    var config: Config = .{ .arena = .init(std.testing.allocator) };
+    defer config.deinit();
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try config.applyEnv(&env);
+    try std.testing.expectEqualStrings("copilot-sdk", config.copilot_integration_id);
+    try env.put("SYNTH_COPILOT_INTEGRATION_ID", "my-product-agent");
+    try config.applyEnv(&env);
+    try std.testing.expectEqualStrings("my-product-agent", config.copilot_integration_id);
 }
 
 test "defaults survive a missing config file" {

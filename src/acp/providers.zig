@@ -134,6 +134,7 @@ pub fn offered(self: *const Providers, arena: std.mem.Allocator, db: *Database, 
             .label = entry.label,
             .api_key = self.auth.key(entry.id),
             .chatgpt = self.chatgpt,
+            .copilot_integration_id = self.backend.options.copilot_integration_id,
         });
         defer backend.deinit();
         backend.start() catch continue;
