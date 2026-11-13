@@ -3,3 +3,4 @@
 __pycache__/
 DerivedData/
 xcuserdata/
+!/App/Assets.xcassets/**/Contents.json
