@@ -60,6 +60,11 @@ test "tool results belong to the originating exchange rather than a reused id" {
     try testing.expect(toolResult(&next_turn, "0") == null);
 }
 
+pub fn providerText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(text)) return text;
+    return std.fmt.allocPrint(arena, "{f}", .{std.unicode.fmtUtf8(text)});
+}
+
 pub fn contextTokens(convo: *const Conversation, with_images: bool) usize {
     var tokens: usize = 0;
     for (convo.messages.items[summaryFloor(convo.messages.items)..]) |msg| {

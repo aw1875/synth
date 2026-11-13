@@ -16,12 +16,12 @@ extension SynthClient {
     public func thinking(sequence: UInt64, in sessionID: String) async throws -> String {
         try requireConnected()
         let request = Synth.MessageBody(sessionID: sessionID, sequence: sequence)
-        return try await call("_synth/load_thinking", request, as: String.self)
+        return try await call("_synth/load_thinking", request, as: WireText.self).wrappedValue
     }
 
     public func toolResult(sequence: UInt64, call index: Int, in sessionID: String) async throws -> String {
         try requireConnected()
         let request = Synth.MessageBody(sessionID: sessionID, sequence: sequence, call: index)
-        return try await call("_synth/load_tool_result", request, as: String.self)
+        return try await call("_synth/load_tool_result", request, as: WireText.self).wrappedValue
     }
 }

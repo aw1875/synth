@@ -33,6 +33,9 @@ identified by `seq` within its session. `_synth/stream` adds text and reasoning
 to a request number. Show the stream when that number matches the latest
 `_synth/status` request. A finalized assistant message supersedes its stream.
 `_synth/notice` carries a user-visible message. Every event names its session.
+The engine can encode text payloads containing invalid UTF-8 as arrays of byte
+values. The desktop client displays those payloads with replacement characters
+where needed. The original bytes stay in the engine's data.
 
 The router can host multiple sessions on the same connection. Replies can
 arrive out of order. An incompatible attached endpoint can reject its

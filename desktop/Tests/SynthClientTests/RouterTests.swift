@@ -99,6 +99,7 @@ private func runScenario(fixture: Fixture, client: SynthClient, guest: SynthClie
 
     try await verifyConfiguration(in: first, client: client)
     try await verifyApprovals(fixture: fixture, client: client, first: first, second: second)
+    try await verifyByteOutput(fixture, client: client, session: second)
 
     let choice = turn("ask fixture choice", session: first, client: client)
     let question = try await interaction(in: first, from: client)
@@ -114,14 +115,7 @@ private func runScenario(fixture: Fixture, client: SynthClient, guest: SynthClie
     #expect(messages.contains { $0.role == "tool" && $0.text.contains("Blue") })
     #expect(await client.sessions[first]?.stream == nil)
 
-    try await guest.connect()
-    _ = try await guest.loadSession(first, cwd: fixture.first.path)
-    let shared = turn("shared fixture question", session: first, client: client)
-    let hostQuestion = try await interaction(in: first, from: client)
-    let guestQuestion = try await interaction(in: first, from: guest)
-    try await guest.answer(guestQuestion.id, fields: ["answer": "the guest answered"])
-    #expect(try await shared.value.stopReason == "end_turn")
-    _ = try await wait { await client.interactions[hostQuestion.id] == nil ? true : nil }
+    try await verifySharedQuestion(fixture, client: client, guest: guest, session: first)
 
     let cancelled = turn("cancel fixture question", session: second, client: client)
     let pending = try await interaction(in: second, from: client)
@@ -139,6 +133,7 @@ private func runScenario(fixture: Fixture, client: SynthClient, guest: SynthClie
     #expect(reloaded.contains { $0.text.contains("the guest answered") })
     #expect(reloaded.contains { $0.role == "assistant" && $0.text == "Fixture complete: still attached" })
     #expect(await client.interactions.isEmpty)
+    try await checkByteOutput(client, session: second)
 }
 
 private func verifyApprovals(
@@ -201,4 +196,33 @@ private func verifyHistory(_ fixture: Fixture, client: SynthClient, first: Strin
     let alias = fixture.root.appending(path: "Project Alias")
     try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.first)
     #expect(try await client.listSessions(cwd: alias.path).sessions.map(\.sessionId) == [first])
+}
+
+private func verifyByteOutput(_ fixture: Fixture, client: SynthClient, session: String) async throws {
+    let bytes = Data([0x61, 0xD1, 0x62, 0x0A])
+    try bytes.write(to: fixture.second.appending(path: "legacy.txt"))
+    #expect(try await client.prompt("read fixture bytes", in: session).stopReason == "end_turn")
+    try await checkByteOutput(client, session: session)
+}
+
+private func checkByteOutput(_ client: SynthClient, session: String) async throws {
+    let messages = await client.sessions[session]?.messages ?? []
+    let message = try #require(messages.first { $0.toolCalls.contains { $0.name == "read" } })
+    let index = try #require(message.toolCalls.firstIndex { $0.name == "read" })
+    #expect(message.toolCalls[index].result?.contains("a�b") == true)
+    let full = try await client.toolResult(sequence: message.seq, call: index, in: session)
+    #expect(full.contains("a�b"))
+}
+
+private func verifySharedQuestion(
+    _ fixture: Fixture, client: SynthClient, guest: SynthClient, session: String
+) async throws {
+    try await guest.connect()
+    _ = try await guest.loadSession(session, cwd: fixture.first.path)
+    let shared = turn("shared fixture question", session: session, client: client)
+    let hostQuestion = try await interaction(in: session, from: client)
+    let guestQuestion = try await interaction(in: session, from: guest)
+    try await guest.answer(guestQuestion.id, fields: ["answer": "the guest answered"])
+    #expect(try await shared.value.stopReason == "end_turn")
+    _ = try await wait { await client.interactions[hostQuestion.id] == nil ? true : nil }
 }

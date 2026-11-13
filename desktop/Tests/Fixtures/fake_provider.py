@@ -50,6 +50,7 @@ class Handler(BaseHTTPRequestHandler):
                     {"path": "denied.txt", "content": "denied"},
                 ),
                 "always allow fixture command": ("bash", {"command": "printf fixture"}),
+                "read fixture bytes": ("read", {"path": "legacy.txt"}),
                 "ask fixture choice": (
                     "ask_user",
                     {"question": "Choose a color", "options": ["Blue", "Green"]},

@@ -211,8 +211,9 @@ public enum Synth {
     public struct Message: Decodable, Equatable, Identifiable, Sendable {
         public let seq: UInt64
         public let role: String
-        public let text: String
-        public let thinking: String?
+        @WireText public var text: String
+        private let thinkingText: WireText?
+        public var thinking: String? { thinkingText?.wrappedValue }
         public let thinkingMilliseconds: UInt64?
         public let thinkingBytes: UInt64
         public let toolCalls: [ToolCall]
@@ -226,7 +227,7 @@ public enum Synth {
             case seq
             case role
             case text
-            case thinking
+            case thinkingText = "thinking"
             case thinkingMilliseconds = "thinking_ms"
             case thinkingBytes = "thinking_bytes"
             case toolCalls = "tool_calls"
@@ -237,8 +238,8 @@ public enum Synth {
     }
 
     public struct Attachment: Decodable, Equatable, Sendable {
-        public let path: String
-        public let content: String
+        @WireText public var path: String
+        @WireText public var content: String
         public let contentBytes: UInt64
 
         private enum CodingKeys: String, CodingKey {
@@ -251,9 +252,10 @@ public enum Synth {
     public struct ToolCall: Decodable, Equatable, Sendable {
         public let id: String
         public let name: String
-        public let arguments: String
+        @WireText public var arguments: String
         public let status: String
-        public let result: String?
+        private let resultText: WireText?
+        public var result: String? { resultText?.wrappedValue }
         public let resultBytes: UInt64
         public let elapsedMilliseconds: UInt64?
 
@@ -262,7 +264,7 @@ public enum Synth {
             case name
             case arguments
             case status
-            case result
+            case resultText = "result"
             case resultBytes = "result_bytes"
             case elapsedMilliseconds = "elapsed_ms"
         }
@@ -270,8 +272,8 @@ public enum Synth {
 
     public struct Stream: Decodable, Equatable, Sendable {
         public let request: UInt64
-        public var thinking: String
-        public var text: String
+        @WireText public var thinking: String
+        @WireText public var text: String
         public var closed: Bool
     }
 
@@ -292,6 +294,6 @@ public enum Synth {
 
     public struct Notice: Decodable, Equatable, Sendable {
         public let sessionId: String
-        public let text: String
+        @WireText public var text: String
     }
 }
