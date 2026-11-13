@@ -83,6 +83,7 @@ jobs:
           make_latest: true
           draft: false
           fail_on_unmatched_files: true
+          overwrite_files: false
           body: |
             ## Changes
 
@@ -98,8 +99,69 @@ jobs:
             ```
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # NOTE: Disabling temporarily until we can fix the CI issues
-      # - name: Update Homebrew formula
-      #   env:
-      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      #   run: python3 .github/scripts/update-homebrew.py "${{ steps.vars.outputs.version }}" "$GITHUB_REF_NAME" --publish
+  homebrew:
+    name: Propose Homebrew update
+    needs: release
+    if: github.repository == 'aw1875/synth'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out master
+        uses: actions/checkout@v7
+        with:
+          ref: refs/heads/master
+          fetch-depth: 0
+
+      - name: Open Homebrew update PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          branch="chore/update-homebrew-$tag"
+          formula="Formula/synth.rb"
+          archives=$(mktemp -d)
+
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$archives" \
+            --pattern "synth-$version-aarch64-macos.tar.gz" \
+            --pattern "synth-$version-x86_64-linux-musl.tar.gz"
+          python3 .github/scripts/update-homebrew.py "$version" --archives "$archives"
+          if git diff --quiet -- "$formula"; then
+            exit 0
+          fi
+
+          existing_branch=$(git ls-remote --heads origin "refs/heads/$branch")
+          if [ -n "$existing_branch" ]; then
+            git fetch origin "refs/heads/$branch"
+            if [ "$(git diff --name-only HEAD...FETCH_HEAD)" != "$formula" ] ||
+              ! git show "FETCH_HEAD:$formula" | cmp -s - "$formula"; then
+              echo "::error::$branch already exists with different changes"
+              exit 1
+            fi
+          else
+            git switch -c "$branch"
+            git add -- "$formula"
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "chore(homebrew): update synth to $version"
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+
+          pr=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+            -f base=master -f "head=$GITHUB_REPOSITORY_OWNER:$branch" -f state=open \
+            --jq '.[0].html_url // empty')
+          if [ -n "$pr" ]; then
+            echo "$pr"
+            exit 0
+          fi
+
+          gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" \
+            --title "chore(homebrew): update synth to $version" --body-file - <<EOF
+          Update the Homebrew formula to [$tag](https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag).
+          The SHA-256 checksums come from the published macOS arm64 and Linux x86-64 archives.
+          EOF

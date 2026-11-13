@@ -87,3 +87,8 @@ usually the fastest way to see what a provider actually sent.
 
 House style lives in [AGENTS.md](../AGENTS.md): self-explaining code, comments
 only for what the code cannot say.
+
+## Homebrew release updates
+
+The stable release workflow downloads the published archives and opens a
+formula-only PR from `chore/update-homebrew-vX.Y.Z`. This will be done automatically, no code changes are required as part of the PR.
