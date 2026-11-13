@@ -8,6 +8,17 @@ MCP servers and skills.
 > Early. It works and it is used daily, but there is no stable release yet and
 > things move.
 
+## Install
+
+```sh
+curl -fsSL https://getsynth.sh/install | sh
+```
+
+That installs the latest release to `~/.local/bin`, for macOS on Apple silicon
+or Linux on x86-64 or arm64. Pass a version to pin one (`sh -s 0.2.0`), or `dev`
+for the newest build of `master`. `SYNTH_INSTALL_DIR` puts it somewhere else.
+The [script](install.sh) checks the download against the release's checksums.
+
 ## Install with Homebrew
 
 ```sh
@@ -43,7 +54,7 @@ brew upgrade aw1875/synth/synth
 zig build              # build synth
 zig build run          # build and launch the TUI
 zig build test         # the test suite, offline and network-free, ~10s
-zig build release      # macOS arm64 and Linux x86-64 into zig-out/<triple>
+zig build release      # macOS arm64 and Linux x86-64/arm64 into zig-out/<triple>
 ```
 
 The musl build is static and runs anywhere. There is nothing to install: the
