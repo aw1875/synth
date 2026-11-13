@@ -437,7 +437,7 @@ fn get(self: *OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]u8 
     var request = try self.client.request(.GET, uri, .{
         .headers = self.requestHeaders(false),
         .extra_headers = self.extra_headers,
-        .redirect_behavior = .not_allowed,
+        .redirect_behavior = .unhandled,
         .keep_alive = false,
     });
     defer request.deinit();
@@ -445,6 +445,7 @@ fn get(self: *OpenAIProvider, arena: std.mem.Allocator, path: []const u8) ![]u8 
 
     var redirect_buffer: [4096]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
+    try self.refuseRedirect(response.head);
 
     const transfer = try arena.alloc(u8, 64 * 1024);
     const reader = response.reader(transfer);
@@ -488,7 +489,7 @@ fn respond(
         var request = try self.client.request(.POST, uri, .{
             .headers = self.requestHeaders(true),
             .extra_headers = self.extra_headers,
-            .redirect_behavior = .not_allowed,
+            .redirect_behavior = .unhandled,
             .keep_alive = false,
         });
         defer {
@@ -500,6 +501,7 @@ fn respond(
 
         var redirect_buffer: [4096]u8 = undefined;
         var response = try request.receiveHead(&redirect_buffer);
+        try self.refuseRedirect(response.head);
 
         // Read before the body reader is built, which invalidates the head.
         const sse = streamed(response.head.content_type);
@@ -1085,6 +1087,19 @@ fn log(self: *OpenAIProvider, arena: std.mem.Allocator, body: []const u8, reply:
     try log_file.append(self.io, path, out.written());
 }
 
+/// A redirect is reported rather than followed: the client carries
+/// `Headers.authorization` and the extra headers to wherever one leads, and
+/// `privileged_headers`, which it would strip, it never sends at all.
+fn refuseRedirect(self: *OpenAIProvider, head: std.http.Client.Response.Head) error{Redirected}!void {
+    if (head.status.class() != .redirect) return;
+    self.clearRejection();
+    self.rejection = std.fmt.allocPrint(self.allocator, "{d} to {s}", .{
+        @intFromEnum(head.status),
+        headerValue(head, "location") orelse "nowhere it named",
+    }) catch null;
+    return error.Redirected;
+}
+
 /// Keep what the server said about a rejected request, reduced to the sentence
 /// it wrote rather than the envelope it wrote it in.
 fn captureRejection(self: *OpenAIProvider, status: std.http.Status, body: []const u8) void {
@@ -1186,6 +1201,11 @@ pub fn describeError(
                 advice(why),
             });
         },
+        error.Redirected => return std.fmt.allocPrint(
+            allocator,
+            "{s} at {s} redirected the request ({s}). Redirects are not followed, so the key never reaches another server: set the host to where it points.",
+            .{ self.label, self.host, self.rejection orelse "no location" },
+        ),
         error.TlsInitializationFailed, error.CertificateBundleLoadFailure => return std.fmt.allocPrint(
             allocator,
             "TLS to {s} failed. If this is a local server, use `http://` rather than `https://`.",
@@ -1651,6 +1671,69 @@ test "a server that rejects `stream_options` gets the same request without it" {
     const quiet = try backend.buildRequest(arena, &convo, .{ .system = "brief" });
     try testing.expect(std.mem.indexOf(u8, quiet, "stream_options") == null);
     try testing.expect(std.mem.indexOf(u8, quiet, "\"stream\":true") != null);
+}
+
+/// Answers one request with a redirect to `location`.
+const RedirectingServer = struct {
+    server: std.Io.net.Server,
+    thread: std.Thread = undefined,
+    location: []const u8,
+    host_buffer: [32]u8 = undefined,
+
+    fn start(self: *RedirectingServer) ![]const u8 {
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return std.fmt.bufPrint(&self.host_buffer, "http://127.0.0.1:{d}", .{self.server.socket.address.getPort()});
+    }
+
+    fn stop(self: *RedirectingServer) void {
+        self.thread.join();
+        self.server.deinit(testing.io);
+    }
+
+    fn serve(self: *RedirectingServer) !void {
+        const io = testing.io;
+        const stream = try self.server.accept(io);
+        defer stream.close(io);
+
+        var in_buffer: [4096]u8 = undefined;
+        var in = stream.reader(io, &in_buffer);
+        while (try in.interface.takeDelimiter('\n')) |line| {
+            if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+        }
+
+        var out_buffer: [1024]u8 = undefined;
+        var out = stream.writer(io, &out_buffer);
+        try out.interface.print("HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{self.location});
+        try out.interface.flush();
+    }
+};
+
+test "a redirect is reported with where it leads, never followed with the key" {
+    const loopback: std.Io.net.IpAddress = try .parseIp4("127.0.0.1", 0);
+    var server: RedirectingServer = .{
+        .server = try loopback.listen(testing.io, .{}),
+        .location = "https://elsewhere.example/v1/models",
+    };
+    const host = try server.start();
+
+    var backend: OpenAIProvider = .{
+        .allocator = testing.allocator,
+        .io = testing.io,
+        .host = host,
+        .model = "local-model",
+        .api_key = "secret",
+    };
+    try backend.startWithoutProbe();
+    defer backend.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.Redirected, backend.get(arena, "/models"));
+    server.stop();
+
+    const said = try backend.describeError(error.Redirected, arena);
+    try testing.expect(std.mem.indexOf(u8, said, "301 to https://elsewhere.example/v1/models") != null);
 }
 
 /// A sink that reports the turn as given up on, for the retry tests.
