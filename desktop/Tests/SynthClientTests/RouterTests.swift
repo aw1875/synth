@@ -134,6 +134,17 @@ private func runScenario(fixture: Fixture, client: SynthClient, guest: SynthClie
     #expect(reloaded.contains { $0.role == "assistant" && $0.text == "Fixture complete: still attached" })
     #expect(await client.interactions.isEmpty)
     try await checkByteOutput(client, session: second)
+    try await verifyDeletion(fixture, client: client, keep: first, remove: second)
+}
+
+private func verifyDeletion(_ fixture: Fixture, client: SynthClient, keep: String, remove: String) async throws {
+    try await client.closeSession(remove)
+    let empty = try #require(try await client.newSession(cwd: fixture.second.path).sessionId)
+    try await client.deleteSession(remove)
+    #expect(try await client.listSessions(cwd: fixture.second.path).sessions.isEmpty)
+    #expect(try await client.prompt("kept after deletion", in: keep).stopReason == "end_turn")
+    try await client.deleteSession(empty)
+    #expect(await client.sessions[empty] == nil)
 }
 
 private func verifyApprovals(

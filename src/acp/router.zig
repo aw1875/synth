@@ -206,7 +206,8 @@ fn endFor(self: *Router, arena: std.mem.Allocator, method: []const u8, params: ?
     }
     if (eql(u8, method, protocol.method.session_delete)) {
         const handle = (try rpc.parse(protocol.SessionId, arena, params)).sessionId;
-        return self.hosting(handle) orelse self.anyEnd();
+        if (self.hosting(handle) orelse self.spare()) |end| return end;
+        return self.start(null, true);
     }
     if (stringOf(fieldOf(params, "sessionId"))) |handle| {
         return self.hosting(handle) orelse error.UnknownSession;

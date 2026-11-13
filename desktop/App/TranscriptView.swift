@@ -38,14 +38,6 @@ struct TranscriptView: View {
                         Button("Load Earlier Messages") { Task { await model.loadOlder() } }
                             .disabled(model.loadingHistory.contains(sessionID))
                     }
-                    if messages.isEmpty && stream == nil && interactions.isEmpty {
-                        ContentUnavailableView(
-                            "Start a conversation",
-                            systemImage: "bubble.left.and.text.bubble.right",
-                            description: Text("Ask about your project or describe a change.")
-                        )
-                        .padding(.vertical, 30)
-                    }
                     ForEach(messages) { message in
                         TranscriptRow(message: message, sessionID: sessionID, model: model)
                             .id(TranscriptAnchor.message(message.seq))
@@ -58,12 +50,7 @@ struct TranscriptView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
-                    ForEach(notices.indices, id: \.self) { index in
-                        Label(notices[index], systemImage: "info.circle")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                    }
+                    TranscriptNotices(notices: notices)
                     ForEach(interactions) { interaction in
                         InteractionCard(interaction: interaction, model: model)
                     }
@@ -105,9 +92,24 @@ struct TranscriptView: View {
                         followsConversation = true
                     }
                     .buttonStyle(.bordered)
+                    .labelStyle(.iconOnly)
+                    .help("Jump to Latest")
                     .padding()
                 }
             }
+        }
+    }
+}
+
+struct TranscriptNotices: View {
+    let notices: [String]
+
+    var body: some View {
+        ForEach(notices.indices, id: \.self) { index in
+            Label(notices[index], systemImage: "info.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
         }
     }
 }
@@ -124,9 +126,10 @@ private struct TranscriptRow: View {
                 Text("You").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 Text(message.text).textSelection(.enabled)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(13)
             .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+            .frame(maxWidth: 490, alignment: .trailing)
+            .frame(maxWidth: .infinity, alignment: .trailing)
         case "assistant":
             assistant
         case "summary":

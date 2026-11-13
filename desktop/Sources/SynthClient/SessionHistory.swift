@@ -1,6 +1,18 @@
 import SynthProtocol
 
 extension SynthClient {
+    public func closeSession(_ sessionID: String) async throws {
+        try requireConnected()
+        _ = try await call("session/close", ACP.SessionRef(sessionID), as: ACP.Empty.self)
+        forgetSession(sessionID)
+    }
+
+    public func deleteSession(_ sessionID: String) async throws {
+        try requireConnected()
+        _ = try await call("session/delete", ACP.SessionRef(sessionID), as: ACP.Empty.self)
+        forgetSession(sessionID)
+    }
+
     public func rename(_ title: String, in sessionID: String) async throws {
         try requireConnected()
         let request = Synth.Rename(sessionID: sessionID, title: title)

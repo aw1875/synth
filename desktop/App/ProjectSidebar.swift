@@ -2,48 +2,78 @@ import SwiftUI
 
 struct ProjectSidebar: View {
     let model: ConversationModel
+    @State private var collapsedProjects: Set<URL> = []
 
     var body: some View {
         List {
+            Section {
+                Button("New Conversation", systemImage: "square.and.pencil") {
+                    Task { await model.open() }
+                }
+                Button("Open Project…", systemImage: "folder.badge.plus", action: model.chooseProject)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!model.canSwitch)
             ForEach(model.groups) { group in
                 Section {
-                    ForEach(model.rows(for: group)) { row in
-                        conversation(row, in: group)
-                    }
-                    if group.loading {
-                        ProgressView().controlSize(.small)
-                    } else if let error = group.failure {
-                        Text(error).font(.caption).foregroundStyle(.secondary)
-                        Button("Retry") { Task { await model.loadGroup(group.folder, refresh: true) } }
-                    } else if group.cursor != nil {
-                        Button("More Conversations") { Task { await model.loadGroup(group.folder, refresh: false) } }
-                    }
+                    if group.folder.map(collapsedProjects.contains) != true { rows(in: group) }
                 } header: {
                     HStack {
                         if let folder = group.folder {
-                            Text(folder.lastPathComponent).help(folder.path).lineLimit(1)
+                            projectHeading(folder)
+                            Spacer()
+                            Button("New Project Conversation", systemImage: "plus") {
+                                collapsedProjects.remove(folder)
+                                Task { await model.open(in: folder) }
+                            }
+                            .font(.body.weight(.semibold))
+                            .labelStyle(.iconOnly)
+                            .buttonStyle(.borderless)
+                            .padding(.trailing, 8)
+                            .disabled(!model.canSwitch)
                         } else {
                             Text("Conversations")
                         }
-                        Spacer()
-                        Button("New Conversation", systemImage: "plus") {
-                            Task { await model.open(in: group.folder) }
-                        }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(.borderless)
-                        .disabled(!model.canSwitch)
                     }
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .textCase(nil)
                 }
             }
         }
         .listStyle(.sidebar)
         .navigationSplitViewColumnWidth(min: 200, ideal: 235, max: 340)
-        .safeAreaInset(edge: .bottom) {
-            Button("Open Project…", systemImage: "folder.badge.plus", action: model.chooseProject)
-                .buttonStyle(.borderless)
-                .disabled(!model.canSwitch)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(12)
+    }
+
+    private func projectHeading(_ folder: URL) -> some View {
+        let collapsed = collapsedProjects.contains(folder)
+        return Button {
+            if collapsed { collapsedProjects.remove(folder) } else { collapsedProjects.insert(folder) }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .frame(width: 9)
+                Text(folder.lastPathComponent).lineLimit(1)
+            }
+        }
+        .buttonStyle(.plain)
+        .help(folder.path)
+        .accessibilityValue(collapsed ? "Collapsed" : "Expanded")
+    }
+
+    @ViewBuilder
+    private func rows(in group: ConversationGroup) -> some View {
+        ForEach(model.rows(for: group)) { row in
+            conversation(row, in: group)
+        }
+        if group.loading {
+            ProgressView().controlSize(.small)
+        } else if let error = group.failure {
+            Text(error).font(.caption).foregroundStyle(.secondary)
+            Button("Retry") { Task { await model.loadGroup(group.folder, refresh: true) } }
+        } else if group.cursor != nil {
+            Button("More Conversations") { Task { await model.loadGroup(group.folder, refresh: false) } }
         }
     }
 

@@ -104,8 +104,8 @@ extension ConversationModel {
         }
     }
 
-    func rename(_ title: String) async {
-        guard let sessionID, let client else { return }
+    func rename(_ title: String, in sessionID: String) async {
+        guard canConfigure, self.sessionID == sessionID, let client else { return }
         let folder = project
         do {
             try await client.rename(title, in: sessionID)
@@ -114,6 +114,35 @@ extension ConversationModel {
         } catch {
             if self.sessionID == sessionID { self.error = error.localizedDescription }
         }
+    }
+
+    func refreshHistory() async {
+        await loadGroup(project, refresh: true)
+    }
+
+    func deleteConversation(_ identifier: String) async -> Bool {
+        guard canDelete, sessionID == identifier, let client else { return false }
+        let folder = project
+        isOpening = true
+        defer { isOpening = false }
+        do {
+            try await client.deleteSession(identifier)
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
+        for index in groups.indices {
+            groups[index].sessions.removeAll { $0.id == identifier }
+        }
+        openedSessions.removeValue(forKey: identifier)
+        historyBySession.removeValue(forKey: identifier)
+        drafts.removeValue(forKey: identifier)
+        failures.removeValue(forKey: identifier)
+        completed.remove(identifier)
+        clearSelection()
+        await refresh(from: client)
+        await loadGroup(folder, refresh: true)
+        return true
     }
 
     func fullThinking(_ message: Synth.Message, in sessionID: String) async throws -> String {
@@ -125,6 +154,27 @@ extension ConversationModel {
         guard let client else { return "" }
         return try await client.toolResult(sequence: sequence, call: index, in: sessionID)
     }
+}
+
+struct OpenedConversation: Identifiable {
+    let id: String
+    let folder: URL?
+    let cwd: String
+    let modes: [ACP.Mode]
+}
+
+struct ConversationSelection {
+    let folder: URL?
+    let sessionID: String?
+}
+
+struct ConversationGroup: Identifiable {
+    let folder: URL?
+    var sessions: [ACP.SessionInfo] = []
+    var cursor: String?
+    var loading = false
+    var failure: String?
+    var id: URL? { folder }
 }
 
 struct ConversationRow: Identifiable {

@@ -67,6 +67,7 @@ final class ConversationModel {
         sessionID != nil && connection == .connected && !busy && !isOpening &&
             !isUpdatingConfiguration && !isFetchingModels && state?.failure == nil
     }
+    var canDelete: Bool { canSwitch && connection == .connected && sessionID != nil && !busy }
     var loadingModels: Bool { isFetchingModels || (state?.models?.pending ?? 0) > 0 }
 
     func chooseProject() {
@@ -153,10 +154,6 @@ final class ConversationModel {
         modelError = nil
         modelsRequested = false
         persist()
-    }
-
-    func refreshHistory() async {
-        await loadGroup(project, refresh: true)
     }
 
     func reconnect() async {
@@ -271,10 +268,18 @@ final class ConversationModel {
             drafts[sessionID] = drafts.removeValue(forKey: previous)
         }
     }
-
 }
 
 extension ConversationModel {
+    func clearSelection() {
+        project = nil
+        sessionID = nil
+        pendingSelection = nil
+        modes = []
+        error = nil
+        persist()
+    }
+
     func send() async {
         guard canSend, let client, let sessionID else { return }
         let text = draft
@@ -312,28 +317,6 @@ extension ConversationModel {
             if self.sessionID == sessionID { self.error = error.localizedDescription }
         }
     }
-
-}
-
-struct OpenedConversation: Identifiable {
-    let id: String
-    let folder: URL?
-    let cwd: String
-    let modes: [ACP.Mode]
-}
-
-struct ConversationSelection {
-    let folder: URL?
-    let sessionID: String?
-}
-
-struct ConversationGroup: Identifiable {
-    let folder: URL?
-    var sessions: [ACP.SessionInfo] = []
-    var cursor: String?
-    var loading = false
-    var failure: String?
-    var id: URL? { folder }
 }
 
 extension ConversationModel {

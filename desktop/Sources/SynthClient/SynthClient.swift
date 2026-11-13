@@ -158,9 +158,7 @@ extension SynthClient {
         return try await call("session/list", ACP.List(cwd: cwd, cursor: cursor), as: ACP.SessionList.self)
     }
 
-    public func closeSession(_ sessionID: String) async throws {
-        try requireConnected()
-        _ = try await call("session/close", ACP.SessionRef(sessionID), as: ACP.Empty.self)
+    func forgetSession(_ sessionID: String) {
         workingDirectories.removeValue(forKey: sessionID)
         sessions.removeValue(forKey: sessionID)
         modelUpdates.removeValue(forKey: sessionID)
