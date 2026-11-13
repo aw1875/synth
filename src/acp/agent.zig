@@ -17,6 +17,7 @@ const rpc = @import("rpc.zig");
 const protocol = @import("protocol.zig");
 const synth = @import("synth.zig");
 const Providers = @import("providers.zig");
+const ModelListing = @import("model_listing.zig");
 const sockets = @import("sockets.zig");
 const updates = @import("updates.zig");
 const Config = @import("../core/config.zig");
@@ -914,6 +915,7 @@ fn describe(err: anyerror) []const u8 {
         error.FileNotFound => "no such directory",
         error.NotDir => "not a directory",
         error.ModelFixed => "this provider has only the one model",
+        error.UnknownModel, error.UnknownCopilotModel => "no such model from this provider",
         error.Busy => "finish the turn first",
         error.UnknownSkill => "no such skill",
         error.UnknownConfigOption => "no such setting",
@@ -1389,6 +1391,9 @@ const Session = struct {
     /// opens the session.
     offered_store: ?std.heap.ArenaAllocator = null,
     offered: []const synth.Offered = &.{},
+    model_cached: [catalog.all.len]?*ModelListing = .{null} ** catalog.all.len,
+    model_jobs: [catalog.all.len]?*ModelListing = .{null} ** catalog.all.len,
+    model_recent: u32 = 5,
 
     const Place = struct { seq: u64, call: usize };
 
@@ -1449,6 +1454,11 @@ const Session = struct {
         }
         self.restoreEffort();
         self.stack.loop.handoff = .{ .files = self.files(), .terminal = self.terminal() };
+        if (options.source == .providers) {
+            var arena_state: std.heap.ArenaAllocator = .init(allocator);
+            defer arena_state.deinit();
+            self.startListings(arena_state.allocator()) catch {};
+        }
         return self;
     }
 
@@ -1566,12 +1576,15 @@ const Session = struct {
         self.told_text.deinit(self.allocator);
         self.told.deinit(self.allocator);
         self.forgetModels();
+        for (self.model_jobs) |job| if (job) |listing| listing.abandon();
+        for (self.model_cached) |cached| if (cached) |listing| listing.destroy();
         self.allocator.free(self.handle);
         self.allocator.free(self.cwd);
         self.allocator.destroy(self);
     }
 
     fn busy(self: *Session) bool {
+        for (self.model_jobs) |job| if (job != null) return true;
         return self.stack.loop.isBusy() or self.stack.runner.busy() or self.sign_in != null or
             self.sign_out != null or self.stack.mcp_host.connecting();
     }
@@ -1585,9 +1598,24 @@ const Session = struct {
     /// filling, and start the next turn from whatever was typed while the
     /// last one ran.
     fn step(self: *Session) void {
+        self.finishListings();
         const loop = &self.stack.loop;
         if (self.providerSource()) |providers| {
-            if (providers.checkModel()) loop.syncProvider();
+            if (providers.model_unchecked) {
+                const previous = self.allocator.dupe(u8, loop.provider.model) catch null;
+                defer if (previous) |name| self.allocator.free(name);
+                if (providers.checkModel()) {
+                    loop.syncProvider();
+                    if (previous) |name| {
+                        if (!std.mem.eql(u8, name, loop.provider.model)) {
+                            loop.setModel(loop.provider.model) catch {};
+                            self.restoreEffort();
+                            self.rememberModel();
+                            self.notice(.info, "{s} no longer offers {s}; using {s}", .{ loop.provider.name, name, loop.provider.model });
+                        }
+                    }
+                }
+            }
         } else |_| {}
         _ = self.stack.runner.poll() catch |err| self.notice(.@"error", "Subagent failed: {s}", .{@errorName(err)});
         _ = loop.poll() catch |err| self.notice(.@"error", "The turn failed: {s}", .{@errorName(err)});
@@ -1757,6 +1785,7 @@ const Session = struct {
             return self.chooseEffort(request.value);
         }
         if (!std.mem.eql(u8, request.configId, protocol.config_model)) return error.UnknownConfigOption;
+        if (loop.isBusy()) return error.Busy;
 
         const extra: synth.SetModel = if (request._meta) |meta| meta.synth orelse .{} else .{};
         const by_editor = request._meta == null and self.agent.options.source == .providers;
@@ -1764,7 +1793,6 @@ const Session = struct {
         const provider_id = self.providerId();
         const switching = if (chosen.provider) |wanted| !std.mem.eql(u8, wanted, provider_id) else false;
         if (switching) {
-            if (loop.isBusy()) return error.Busy;
             try self.useProvider(catalog.find(chosen.provider.?) orelse return error.UnknownProvider, null, null);
         }
         try loop.switchModel(chosen.model);
@@ -2325,9 +2353,73 @@ const Session = struct {
     }
 
     fn models(self: *Session, arena: std.mem.Allocator, recent: u32) !synth.Models {
+        if (self.agent.options.source == .providers) {
+            self.model_recent = recent;
+            try self.startListings(arena);
+            return self.cachedModels(arena);
+        }
         const offered = try self.offeredModels(arena);
         const project_id = self.stack.loop.project_id orelse return .{ .offered = offered };
         return .{ .offered = offered, .recent = try self.agent.options.db.recentModels(arena, project_id, recent) };
+    }
+
+    fn startListings(self: *Session, arena: std.mem.Allocator) !void {
+        const providers = self.agent.options.source.providers;
+        for (catalog.all, 0..) |entry, i| {
+            if (!entry.ready(providers.auth, providers.chatgpt) or self.model_jobs[i] != null) continue;
+            self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, .{
+                .host = try Providers.hostOf(arena, self.agent.options.db, entry),
+                .api_key = providers.auth.key(entry.id),
+                .chatgpt = providers.chatgpt,
+                .copilot_integration_id = providers.backend.options.copilot_integration_id,
+            });
+        }
+    }
+
+    fn cachedModels(self: *Session, arena: std.mem.Allocator) !synth.Models {
+        const providers = self.agent.options.source.providers;
+        const db = self.agent.options.db;
+        var offered: std.ArrayList(synth.Offered) = .empty;
+        var pending: usize = 0;
+        for (catalog.all, 0..) |entry, i| {
+            if (self.model_jobs[i] != null) pending += 1;
+            if (!entry.ready(providers.auth, providers.chatgpt)) continue;
+            const cached = self.model_cached[i] orelse continue;
+            if (!std.mem.eql(u8, cached.reach.host, try Providers.hostOf(arena, db, entry))) continue;
+            for (cached.models orelse &.{}) |model| {
+                const remembered = db.rememberedEffort(arena, entry.id, model.name) catch "";
+                try offered.append(arena, .{
+                    .name = model.name,
+                    .provider = entry.label,
+                    .provider_id = entry.id,
+                    .efforts = model.efforts.levels,
+                    .effort = model.efforts.pick(remembered),
+                });
+            }
+        }
+        const project_id = self.stack.loop.project_id orelse return .{ .offered = offered.items, .pending = pending };
+        return .{ .offered = offered.items, .recent = try db.recentModels(arena, project_id, self.model_recent), .pending = pending };
+    }
+
+    fn finishListings(self: *Session) void {
+        if (self.agent.options.source != .providers) return;
+        var changed = false;
+        for (&self.model_jobs, 0..) |*slot, i| {
+            const job = slot.* orelse continue;
+            if (!job.isFinished()) continue;
+            job.join();
+            slot.* = null;
+            if (job.models) |_| {
+                if (self.model_cached[i]) |old| old.destroy();
+                self.model_cached[i] = job;
+            } else job.destroy();
+            changed = true;
+        }
+        if (!changed) return;
+        var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
+        defer arena_state.deinit();
+        const listed = self.cachedModels(arena_state.allocator()) catch return;
+        self.agent.notifyAll(.synth, synth.method.models_updated, synth.ModelsUpdate{ .sessionId = self.handle, .models = listed });
     }
 
     /// Every connected provider's models, each provider asked in turn.
@@ -3368,7 +3460,7 @@ test "a model and its effort are chosen through config options, and remembered" 
     try testing.expectEqualStrings("high", models.offered[0].effort);
 
     const missing = try client.request(protocol.method.session_set_config_option, protocol.SetConfigOption{ .sessionId = session, .configId = protocol.config_model, .value = "missing" });
-    try testing.expectEqualStrings("UnknownModel", (try client.expectError(missing)).message);
+    try testing.expectEqualStrings("no such model from this provider", (try client.expectError(missing)).message);
 }
 
 test "a client without synth's extension is offered every model once the session opens" {

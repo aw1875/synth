@@ -589,7 +589,7 @@ pub fn acceptCommand(self: *Model) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
     defer arena_state.deinit();
 
-    const completion = try self.slash.completion(arena_state.allocator()) orelse return;
+    const completion = try self.slash.completion(arena_state.allocator(), self.input.text.items) orelse return;
     self.input.clear();
     try self.input.insertText(completion);
     self.slash.close();
@@ -832,6 +832,8 @@ pub fn switchSession(self: *Model, chosen: Database.SessionInfo) !void {
         try self.mirror.switchTo(chosen.public_id);
     }
     self.input.clear();
+    self.mentions.close();
+    self.slash.close();
     self.held.clear();
 }
 
@@ -983,6 +985,7 @@ pub fn handleInterrupt(self: *Model, ctx: *vxfw.EventContext) !void {
     if (self.input.text.items.len > 0) {
         self.input.clear();
         self.mentions.close();
+        self.slash.close();
         self.endRecall();
         if (self.mirror.pendingSteering().len == 0) self.held.clear();
         return ctx.consumeAndRedraw();
@@ -1021,6 +1024,18 @@ pub fn afterDecision(self: *Model, ctx: *vxfw.EventContext) !void {
 pub fn refreshMentions(self: *Model) !void {
     self.mentions.update(self.input.text.items, self.input.cursor) catch {};
     if (self.mentions.isCompleting() and self.mentions.stale(self.io)) try self.mirror.listFiles();
+}
+
+pub fn followDraft(self: *Model) !void {
+    try self.refreshMentions();
+    try self.refreshSlash();
+}
+
+fn refreshSlash(self: *Model) !void {
+    self.slash.chatgpt_signed_in = self.mirror.status.chatgpt_signed_in;
+    self.slash.copilot_signed_in = std.mem.eql(u8, self.mirror.status.provider_id, @import("../provider/catalog.zig").copilot_id) and
+        !self.mirror.status.provider_missing;
+    try self.slash.update(self.input.text.items, self.input.cursor);
 }
 
 /// Replace the partial `@token` under the cursor with the selected path.

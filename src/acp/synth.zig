@@ -47,6 +47,7 @@ pub const method = struct {
     pub const toggle_mcp = "_synth/toggle_mcp";
     pub const files = "_synth/files";
     pub const models = "_synth/models";
+    pub const models_updated = "_synth/models_updated";
     pub const load_tool_result = "_synth/load_tool_result";
     pub const load_attachment = "_synth/load_attachment";
     pub const load_thinking = "_synth/load_thinking";
@@ -321,6 +322,12 @@ pub const Models = struct {
     offered: []const Offered = &.{},
     /// Models this project has used, most recently first.
     recent: []const []const u8 = &.{},
+    pending: usize = 0,
+};
+
+pub const ModelsUpdate = struct {
+    sessionId: []const u8,
+    models: Models,
 };
 
 /// A message matching a search, in the session's project.

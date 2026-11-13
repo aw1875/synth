@@ -46,7 +46,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/search")) {
+    if (isCommand(line, "/search")) {
         try searchTranscripts(self, ctx, std.mem.trim(u8, line["/search".len..], " "));
         return true;
     }
@@ -56,13 +56,12 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
     }
     if (std.mem.eql(u8, line, "/compact")) {
         if (try offerProvidersInstead(self)) return true;
+        if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
         try self.startCompaction(ctx);
         return true;
     }
     if (std.mem.eql(u8, line, "/clear")) {
-        if (!try self.clearSession()) {
-            try self.notification.show(ctx, .info, "Finish the turn first");
-        }
+        if (!try self.clearSession()) return refuseCommand(self, ctx, line);
         ctx.redraw = true;
         return true;
     }
@@ -75,7 +74,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/agent")) {
+    if (isCommand(line, "/agent")) {
         const name = std.mem.trim(u8, line["/agent".len..], " ");
         if (name.len > 0) {
             try switchAgent(self, ctx, agents.findOrDefault(name).id);
@@ -84,7 +83,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         }
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/theme")) {
+    if (isCommand(line, "/theme")) {
         const name = std.mem.trim(u8, line["/theme".len..], " ");
         if (name.len > 0) {
             keepTheme(self, themes.findOrDefault(name).id);
@@ -94,7 +93,7 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/approvals")) {
+    if (isCommand(line, "/approvals")) {
         const name = std.mem.trim(u8, line["/approvals".len..], " ");
         if (name.len == 0) {
             try self.notification.showFmt(ctx, .info, "Approvals: {s}. /approvals ask, auto or all to change", .{@tagName(self.mirror.status.approval_mode)});
@@ -156,18 +155,19 @@ pub fn runCommand(self: *Model, ctx: *vxfw.EventContext, value: []const u8) !boo
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/model")) {
+    if (isCommand(line, "/model")) {
         if (try offerProvidersInstead(self)) return true;
+        if (self.mirror.isBusy()) return refuseCommand(self, ctx, line);
         const name = std.mem.trim(u8, line["/model".len..], " ");
         if (name.len > 0) {
-            switchModel(self, name) catch {};
+            try self.mirror.switchTypedModel(name);
         } else {
             try showModels(self);
         }
         ctx.redraw = true;
         return true;
     }
-    if (std.mem.startsWith(u8, line, "/rename")) {
+    if (isCommand(line, "/rename")) {
         const name = std.mem.trim(u8, line["/rename".len..], " ");
         if (name.len > 0) {
             self.mirror.rename(name) catch {};
@@ -190,9 +190,7 @@ fn runSkill(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
     if (skill.findIn(self.skillsOffered(), skill.idOf(line)) == null) return false;
 
     if (self.mirror.isBusy()) {
-        try self.notification.show(ctx, .info, "Finish the turn first");
-        ctx.redraw = true;
-        return true;
+        return refuseCommand(self, ctx, line);
     }
     if (try offerProvidersInstead(self)) return true;
     try self.remember(line);
@@ -242,7 +240,9 @@ pub fn showAnswer(self: *Model, ctx: *vxfw.EventContext, answer: Mirror.Answer) 
                 .efforts = offered.efforts,
                 .effort = offered.effort,
             };
-            try self.models.show(entries, offer.models.recent, self.mirror.status.model);
+            try self.models.refill(entries, offer.models.recent);
+            self.models.asking = offer.models.pending;
+            ctx.redraw = true;
         },
         .subagent => |transcript| try self.receiveSubagent(transcript.seq, transcript.call, transcript.live, transcript.messages),
         .checkpoints => |listed| {
@@ -392,6 +392,7 @@ pub fn showProviders(self: *Model) !void {
 /// starts will be waiting, so the dialog stays up for it.
 pub fn connectProvider(self: *Model, result: Connect.Result) !bool {
     try self.mirror.connectProvider(result.id, result.host, result.key);
+    self.models.clear();
     return catalog.findOrDefault(result.id).key != .oauth or self.connect.isConnected(result.id);
 }
 
@@ -440,6 +441,7 @@ pub fn followSignIn(self: *Model) !void {
 /// thread and says how it went.
 fn signOutOfChatGPT(self: *Model) !void {
     try self.mirror.signOut();
+    self.models.clear();
 }
 
 /// Open ChatGPT's usage page, where the plan's and synth's limits are set.
@@ -459,8 +461,14 @@ pub fn note(self: *Model, comptime fmt: []const u8, args: anytype) !void {
 /// Whether `line` is `command` alone or followed by an argument, so `/effortx`
 /// is not read as `/effort x`.
 fn isCommand(line: []const u8, command: []const u8) bool {
-    if (!std.mem.startsWith(u8, line, command)) return false;
-    return line.len == command.len or line[command.len] == ' ';
+    const typed = line[0..Slash.commandWordEnd(line)];
+    return std.mem.eql(u8, typed, command);
+}
+
+test "slash commands match the whole name" {
+    try std.testing.expect(isCommand("/model gpt-5", "/model"));
+    try std.testing.expect(!isCommand("/models", "/model"));
+    try std.testing.expect(!isCommand("/approvalsx", "/approvals"));
 }
 
 /// Nothing usable answers the session: none was chosen, or the ChatGPT
@@ -482,7 +490,24 @@ pub fn offerProvidersInstead(self: *Model) !bool {
 pub fn showModels(self: *Model) !void {
     if (try offerProvidersInstead(self)) return;
     if (!self.mirror.status.switchable) return;
+    try self.models.reopen(self.mirror.status.model);
     try self.mirror.listModels(ModelPicker.max_recent);
+}
+
+pub fn refuseMidTurn(self: *Model, ctx: *vxfw.EventContext) !bool {
+    if (!self.mirror.isBusy()) return false;
+    try self.notification.show(ctx, .info, "Finish the turn first");
+    return true;
+}
+
+fn refuseCommand(self: *Model, ctx: *vxfw.EventContext, line: []const u8) !bool {
+    if (self.input.text.items.len == 0) {
+        try self.input.insertText(line);
+        try self.followDraft();
+    }
+    try self.notification.show(ctx, .info, "Finish the turn first");
+    ctx.redraw = true;
+    return true;
 }
 
 /// `/effort` alone opens the picker; with a level, sets it. Answers in a
@@ -526,12 +551,6 @@ pub fn setEffort(self: *Model, ctx: *vxfw.EventContext, level: []const u8) !void
 pub fn switchTo(self: *Model, entry: ModelPicker.Entry) !void {
     const provider_id = if (entry.provider_id.len > 0) entry.provider_id else null;
     try self.mirror.switchModel(entry.name, if (entry.effort_changed) entry.effort else null, provider_id);
-}
-
-/// Point the session at another of its provider's models. The status says
-/// what it landed on.
-pub fn switchModel(self: *Model, name: []const u8) !void {
-    try self.mirror.switchModel(name, null, null);
 }
 
 pub fn toggleMcpServer(self: *Model, ctx: *vxfw.EventContext) !void {

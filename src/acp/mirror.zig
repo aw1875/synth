@@ -63,6 +63,8 @@ content: Thought.Stream,
 
 /// What the agent said for the person to read, oldest first. Owned.
 notices: std.ArrayList([]u8) = .empty,
+failed_draft: ?[]u8 = null,
+models_failed: bool = false,
 /// Answers to requests the TUI is waiting to show, oldest first. Owned.
 answers: std.ArrayList(Answer) = .empty,
 /// A snapshot replaced the transcript since the TUI last asked.
@@ -103,6 +105,7 @@ const Early = union(enum) {
 const Awaited = union(enum) {
     /// A request, named for the notice should it fail.
     command: []const u8,
+    typed_model: []u8,
     /// A prompt, answered once its turn is over.
     prompt,
     tool_result: struct { seq: u64, call: u32 },
@@ -387,7 +390,11 @@ fn forgetConnection(self: *Mirror) void {
         if (inbound != self.lost) inbound.destroy();
     }
     var waited = self.waiting.valueIterator();
-    while (waited.next()) |awaited| if (awaited.* == .search) self.allocator.free(awaited.search);
+    while (waited.next()) |awaited| switch (awaited.*) {
+        .search => |query| self.allocator.free(query),
+        .typed_model => |draft| self.allocator.free(draft),
+        else => {},
+    };
     self.waiting.clearRetainingCapacity();
     self.forgetAsked();
     self.forgetEarly();
@@ -470,8 +477,13 @@ fn destroy(self: *Mirror) void {
     for (self.answers.items) |unshown| unshown.deinit(self.allocator);
     self.answers.deinit(self.allocator);
     var awaited = self.waiting.valueIterator();
-    while (awaited.next()) |entry| if (entry.* == .search) self.allocator.free(entry.search);
+    while (awaited.next()) |entry| switch (entry.*) {
+        .search => |query| self.allocator.free(query),
+        .typed_model => |draft| self.allocator.free(draft),
+        else => {},
+    };
     self.waiting.deinit(self.allocator);
+    if (self.failed_draft) |draft| self.allocator.free(draft);
     self.thinking.deinit();
     self.content.deinit();
     self.todos.deinit();
@@ -578,6 +590,14 @@ fn apply(self: *Mirror, message: rpc.Message) !void {
     if (eql(u8, method, m.updated)) return self.applyMessage((try rpc.parse(synth.Appended, arena, message.params)).message, true);
     if (eql(u8, method, m.stream)) return self.applyStream((try rpc.parse(synth.StreamUpdate, arena, message.params)).stream);
     if (eql(u8, method, m.status)) return self.keepStatus((try rpc.parse(synth.StatusUpdate, arena, message.params)).status);
+    if (eql(u8, method, m.models_updated)) {
+        try self.answers.ensureUnusedCapacity(self.allocator, 1);
+        var kept: std.heap.ArenaAllocator = .init(self.allocator);
+        errdefer kept.deinit();
+        const update = try rpc.parse(synth.ModelsUpdate, kept.allocator(), message.params);
+        self.answers.appendAssumeCapacity(.{ .models = .{ .arena = kept, .models = update.models } });
+        return;
+    }
     if (eql(u8, method, m.notice)) return self.say("{s}", .{(try rpc.parse(synth.Notice, arena, message.params)).text});
     if (message.id) |id| if (self.connection) |connection| {
         try connection.fail(id, rpc.code.method_not_found, "this client does not take that request");
@@ -815,13 +835,23 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         .string => return,
     };
     const awaited = (self.waiting.fetchRemove(number) orelse return).value;
-    defer if (awaited == .search) self.allocator.free(awaited.search);
+    defer switch (awaited) {
+        .search => |query| self.allocator.free(query),
+        .typed_model => |draft| self.allocator.free(draft),
+        else => {},
+    };
     if (message.err) |err| {
+        if (awaited == .models) self.models_failed = true;
+        if (awaited == .typed_model) {
+            if (self.failed_draft) |draft| self.allocator.free(draft);
+            self.failed_draft = try self.allocator.dupe(u8, awaited.typed_model);
+        }
         if (awaited == .history) self.paging = false;
         // A turn that failed has said so in the transcript already.
         if (awaited == .prompt and self.status.outcome == .failed) return;
         const what = switch (awaited) {
             .command => |name| name,
+            .typed_model => "Switching model",
             .prompt => "Sending the prompt",
             .tool_result => "loading a tool result",
             .attachment => "loading an attachment",
@@ -850,7 +880,7 @@ fn answered(self: *Mirror, id: rpc.Id, message: rpc.Message) !void {
         else => {},
     }
     switch (awaited) {
-        .command, .prompt => {},
+        .command, .typed_model, .prompt => {},
         .tool_result => |at| {
             const text = try rpc.parse([]const u8, arena, result);
             const msg = self.conversation.find(at.seq) orelse return;
@@ -1148,6 +1178,16 @@ pub fn takeNotice(self: *Mirror) ?[]u8 {
     return self.notices.orderedRemove(0);
 }
 
+pub fn takeFailedDraft(self: *Mirror) ?[]u8 {
+    defer self.failed_draft = null;
+    return self.failed_draft;
+}
+
+pub fn takeModelsFailed(self: *Mirror) bool {
+    defer self.models_failed = false;
+    return self.models_failed;
+}
+
 /// Start a turn, or steer the one running.
 pub fn submit(self: *Mirror, prompt: []const u8, extras: Loop.Extras) !void {
     var arena_state: std.heap.ArenaAllocator = .init(self.allocator);
@@ -1237,12 +1277,22 @@ pub fn useAgent(self: *Mirror, id: []const u8) !void {
 /// Switch the agent's model, to run at `effort`, or at the level last chosen
 /// for it when that is null.
 pub fn switchModel(self: *Mirror, model: []const u8, effort: ?[]const u8, provider_id: ?[]const u8) !void {
+    try self.requestModel(model, effort, provider_id, .{ .command = "Switching model" });
+}
+
+pub fn switchTypedModel(self: *Mirror, model: []const u8) !void {
+    const draft = try std.fmt.allocPrint(self.allocator, "/model {s}", .{model});
+    errdefer self.allocator.free(draft);
+    try self.requestModel(model, null, null, .{ .typed_model = draft });
+}
+
+fn requestModel(self: *Mirror, model: []const u8, effort: ?[]const u8, provider_id: ?[]const u8, awaited: Awaited) !void {
     try self.send(protocol.method.session_set_config_option, protocol.SetConfigOption{
         .sessionId = self.status.handle,
         .configId = protocol.config_model,
         .value = model,
         ._meta = .{ .synth = .{ .effort = effort, .provider = provider_id } },
-    }, .{ .command = "Switching model" });
+    }, awaited);
 }
 
 /// Ask what providers the agent knows. They land on a later poll.
@@ -1813,6 +1863,10 @@ fn runsHigh(mirror: *Mirror) bool {
     return std.mem.eql(u8, mirror.provider.effort, "high");
 }
 
+fn hasFailedDraft(mirror: *Mirror) bool {
+    return mirror.failed_draft != null;
+}
+
 test "a mirror switches model and effort, and lists the agent's models" {
     const fixture = try Agent.Fixture.create();
     defer fixture.destroy();
@@ -1834,6 +1888,13 @@ test "a mirror switches model and effort, and lists the agent's models" {
     const listed = try pollForAnswer(mirror);
     defer listed.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 2), listed.models.models.offered.len);
+
+    try mirror.switchTypedModel("missing");
+    try pollUntil(mirror, hasFailedDraft);
+    const draft = mirror.takeFailedDraft().?;
+    defer testing.allocator.free(draft);
+    try testing.expectEqualStrings("/model missing", draft);
+    try testing.expectEqualStrings("bigger", mirror.provider.model);
 }
 
 test "a mirror lists its session's project files" {

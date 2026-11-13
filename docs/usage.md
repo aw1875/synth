@@ -4,8 +4,8 @@
 
 | key | what it does |
 | --- | --- |
-| `enter` | send, or steer the turn already running |
-| `tab` | cycle mode: build, plan, review |
+| `enter` | send, steer the turn already running, or run the highlighted `/` command |
+| `tab` | cycle mode: build, plan, review; in the `/` menu, complete the command |
 | `esc` | cancel the turn, reject a pending call, or close what is open |
 | `ctrl+o` / `ctrl+p` / `ctrl+s` | model / provider / session |
 | `ctrl+r` | rename this session |
@@ -14,6 +14,9 @@
 | `ctrl+v` | paste an image |
 | `ctrl+c` | clear the draft, interrupt a turn, then quit |
 | `ctrl+z` | suspend to the shell |
+
+In the `/` menu, Enter completes a skill, a command missing a required argument,
+or a partial `/clear`, `/compact`, `/prune`, or `/logout`. Tab always completes.
 
 `/help` lists the slash commands. `@path` pulls a file into the prompt - an
 image comes along as a picture, and a name with spaces is written
