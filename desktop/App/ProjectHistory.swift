@@ -2,6 +2,19 @@ import Foundation
 import SynthProtocol
 
 extension ConversationModel {
+    var messages: [Synth.Message] { olderMessages + (state?.messages ?? []) }
+    var hasOlderMessages: Bool { (state?.dropped ?? 0) > UInt64(olderMessages.count) }
+
+    private var olderMessages: [Synth.Message] {
+        guard let sessionID, let first = state?.messages.first?.seq else { return [] }
+        return historyBySession[sessionID, default: []].filter { $0.seq < first }
+    }
+
+    static func isMissingSession(_ error: any Error) -> Bool {
+        guard let rpc = error as? RPCError else { return false }
+        return rpc.code == -32603 && rpc.message == "no such session"
+    }
+
     func restore() async {
         guard !didRestore else { return }
         didRestore = true

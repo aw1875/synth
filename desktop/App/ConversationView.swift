@@ -179,7 +179,7 @@ struct ConversationView: View {
         if let failure = connectionFailure {
             banner(failure, actionTitle: "Reconnect") { await model.reconnect() }
         } else if model.state?.status?.providerMissing == true {
-            banner("Set up a provider by running synth in Terminal.", actionTitle: "Retry") {
+            banner(model.error ?? "Set up a provider by running synth in Terminal.", actionTitle: "Retry") {
                 await model.retryProvider()
             }
         } else if let error = model.error {

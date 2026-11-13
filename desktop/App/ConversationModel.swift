@@ -41,13 +41,6 @@ final class ConversationModel {
     private var submitting: Int { sessionID.flatMap { submissions[$0] } ?? 0 }
     private var stopRequested: Bool { sessionID.map(stopping.contains) ?? false }
     var anyBusy: Bool { submissions.values.contains { $0 > 0 } || activity.values.contains(where: \.busy) }
-    var recentSessions: [ACP.SessionInfo] { groups.first(where: { $0.folder == project })?.sessions ?? [] }
-    var olderMessages: [Synth.Message] {
-        guard let sessionID, let first = state?.messages.first?.seq else { return [] }
-        return historyBySession[sessionID, default: []].filter { $0.seq < first }
-    }
-    var hasOlderMessages: Bool { (state?.dropped ?? 0) > UInt64(olderMessages.count) }
-    var messages: [Synth.Message] { olderMessages + (state?.messages ?? []) }
     var error: String?
 
     var busy: Bool {
@@ -111,7 +104,7 @@ final class ConversationModel {
             await loadGroup(folder, refresh: true)
         } catch {
             self.error = error.localizedDescription
-            if let rpcError = error as? RPCError, rpcError.message == "no such session" {
+            if Self.isMissingSession(error) {
                 pendingSelection = ConversationSelection(folder: folder, sessionID: nil)
             }
         }
@@ -193,17 +186,7 @@ final class ConversationModel {
         if let client {
             engine = client
         } else {
-            let executable = Bundle.main.bundleURL.appending(path: "Contents/Helpers/synth")
-            guard FileManager.default.isExecutableFile(atPath: executable.path) else {
-                throw SynthClient.Failure.invalidResponse("the bundled Synth engine is missing")
-            }
-            let environment = await LoginEnvironment.load()
-            guard !isShuttingDown else { throw SynthClient.Failure.disconnected }
-            engine = SynthClient(
-                executable: executable,
-                directory: FileManager.default.homeDirectoryForCurrentUser,
-                environment: environment
-            )
+            engine = try await makeClient()
             client = engine
             observe(engine)
         }
@@ -249,28 +232,60 @@ final class ConversationModel {
         observing?.cancel()
         await client?.disconnect()
     }
-
-    func retryProvider() async {
-        guard canSwitch, !anyBusy, let client else { return }
-        isOpening = true
-        await client.disconnect()
-        self.client = nil
-        observing?.cancel()
-        observing = nil
-        let previous = sessionID
-        let stored = recentSessions.first { $0.id == previous }
-        if let previous, stored == nil {
-            openedSessions.removeValue(forKey: previous)
-        }
-        isOpening = false
-        await open(in: project, stored: stored)
-        if let previous, let sessionID, previous != sessionID {
-            drafts[sessionID] = drafts.removeValue(forKey: previous)
-        }
-    }
 }
 
 extension ConversationModel {
+    private func makeClient() async throws -> SynthClient {
+        let executable = Bundle.main.bundleURL.appending(path: "Contents/Helpers/synth")
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw SynthClient.Failure.invalidResponse("the bundled Synth engine is missing")
+        }
+        let environment = await LoginEnvironment.load()
+        guard !isShuttingDown else { throw SynthClient.Failure.disconnected }
+        return SynthClient(
+            executable: executable,
+            directory: FileManager.default.homeDirectoryForCurrentUser,
+            environment: environment
+        )
+    }
+
+    func retryProvider() async {
+        guard canSwitch, !anyBusy, let client, let previous = sessionID else { return }
+        let folder = project
+        let wasEmpty = messages.isEmpty && state?.dropped == 0
+        isOpening = true
+        error = nil
+        defer { isOpening = false }
+        var replacement: SynthClient?
+        do {
+            let engine = try await makeClient()
+            replacement = engine
+            await client.disconnect()
+            guard !isShuttingDown else { throw SynthClient.Failure.disconnected }
+            try await engine.connect()
+            let opened: OpenedConversation
+            do {
+                opened = try await obtainSession(previous, in: folder, stored: nil, client: engine)
+            } catch where wasEmpty && Self.isMissingSession(error) {
+                opened = try await obtainSession(nil, in: folder, stored: nil, client: engine)
+            }
+            guard !isShuttingDown else { throw SynthClient.Failure.disconnected }
+            if opened.id != previous {
+                openedSessions.removeValue(forKey: previous)
+                drafts[opened.id] = drafts.removeValue(forKey: previous)
+            }
+            observing?.cancel()
+            self.client = engine
+            select(opened)
+            await refresh(from: engine)
+            observe(engine)
+            await loadGroup(folder, refresh: true)
+        } catch {
+            await replacement?.disconnect()
+            self.error = error.localizedDescription
+        }
+    }
+
     func clearSelection() {
         project = nil
         sessionID = nil
