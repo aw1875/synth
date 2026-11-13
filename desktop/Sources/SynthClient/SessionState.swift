@@ -4,6 +4,7 @@ public struct SessionState: Sendable {
     public private(set) var status: Synth.Status?
     public private(set) var messages: [Synth.Message] = []
     public private(set) var dropped: UInt64 = 0
+    public private(set) var models: Synth.Models?
     public private(set) var notices: [String] = []
     public internal(set) var failure: String?
     private var streaming: Synth.Stream?
@@ -45,6 +46,10 @@ public struct SessionState: Sendable {
         if streaming?.request != status.request { streaming = nil }
     }
 
+    mutating func update(_ models: Synth.Models) {
+        self.models = models
+    }
+
     mutating func notice(_ text: String) {
         notices.append(text)
         if notices.count > 50 { notices.removeFirst() }
@@ -52,6 +57,7 @@ public struct SessionState: Sendable {
 
     mutating func disconnect(_ message: String?) {
         streaming = nil
+        models = nil
         failure = message
     }
 }

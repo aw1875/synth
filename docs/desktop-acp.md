@@ -20,6 +20,9 @@ are in flight.
 | `session/list` | Optional `cwd` for the project. Currently returns up to 50 persisted sessions and no next cursor. Empty sessions are not persisted in the list. |
 | `session/prompt` | `sessionId` and `prompt`, an array of content blocks. The Swift client sends `{"type":"text","text":"…"}`. A second prompt during a busy turn is steering. Prompt replies arrive when the turn settles. |
 | `session/cancel` | Notification with `sessionId`. Stops the turn. |
+| `session/set_mode` | `sessionId` and a `modeId` from the open or load reply. |
+| `session/set_config_option` | `sessionId`, `configId` of `model` or `effort`, and `value`. For a model from the catalog, include `_meta.synth.provider` with its provider ID. |
+| `_synth/models` | `sessionId`. Returns cached offers and a count of pending provider lookups. The engine sends `_synth/models_updated` as lookups finish. |
 | `$/cancel_request` | Notification with `requestId`. Withdraws an individual request. Withdrawing a prompt request leaves the turn running. |
 
 Subscribe before opening a session. `_synth/snapshot` may arrive before the

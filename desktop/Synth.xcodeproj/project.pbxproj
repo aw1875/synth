@@ -1,0 +1,241 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+		000000000000000000000001 = {
+			isa = "XCLocalSwiftPackageReference";
+			relativePath = ".";
+		};
+		000000000000000000000002 = {
+			isa = "XCRemoteSwiftPackageReference";
+			repositoryURL = "https://github.com/gonzalezreal/textual.git";
+			requirement = {
+				kind = "exactVersion";
+				version = "0.5.0";
+			};
+		};
+		000000000000000000000003 = {
+			isa = "XCSwiftPackageProductDependency";
+			package = "000000000000000000000001";
+			productName = "SynthClient";
+		};
+		000000000000000000000004 = {
+			isa = "PBXBuildFile";
+			productRef = "000000000000000000000003";
+		};
+		000000000000000000000005 = {
+			isa = "XCSwiftPackageProductDependency";
+			package = "000000000000000000000001";
+			productName = "SynthProtocol";
+		};
+		000000000000000000000006 = {
+			isa = "PBXBuildFile";
+			productRef = "000000000000000000000005";
+		};
+		000000000000000000000007 = {
+			isa = "XCSwiftPackageProductDependency";
+			package = "000000000000000000000002";
+			productName = "Textual";
+		};
+		000000000000000000000008 = {
+			isa = "PBXBuildFile";
+			productRef = "000000000000000000000007";
+		};
+		000000000000000000000009 = {
+			isa = "PBXFileReference";
+			explicitFileType = "wrapper.application";
+			path = "Synth.app";
+			sourceTree = "BUILT_PRODUCTS_DIR";
+		};
+		00000000000000000000000A = {
+			isa = "PBXGroup";
+			children = (
+				"000000000000000000000009",
+			);
+			name = "Products";
+			sourceTree = "<group>";
+		};
+		00000000000000000000000B = {
+			isa = "PBXFileSystemSynchronizedRootGroup";
+			path = "App";
+			sourceTree = "<group>";
+		};
+		00000000000000000000000C = {
+			isa = "PBXGroup";
+			children = (
+				"00000000000000000000000B",
+				"00000000000000000000000A",
+			);
+			sourceTree = "<group>";
+		};
+		00000000000000000000000D = {
+			isa = "XCBuildConfiguration";
+			buildSettings = {
+				ARCHS = "arm64";
+				MACOSX_DEPLOYMENT_TARGET = "26.0";
+				SDKROOT = "macosx";
+				SWIFT_VERSION = "6.0";
+			};
+			name = "Debug";
+		};
+		00000000000000000000000E = {
+			isa = "XCBuildConfiguration";
+			buildSettings = {
+				ARCHS = "arm64";
+				MACOSX_DEPLOYMENT_TARGET = "26.0";
+				SDKROOT = "macosx";
+				SWIFT_VERSION = "6.0";
+			};
+			name = "Release";
+		};
+		00000000000000000000000F = {
+			isa = "XCConfigurationList";
+			buildConfigurations = (
+				"00000000000000000000000D",
+				"00000000000000000000000E",
+			);
+			defaultConfigurationName = "Release";
+		};
+		000000000000000000000010 = {
+			isa = "XCBuildConfiguration";
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = "Manual";
+				ALWAYS_SEARCH_USER_PATHS = "NO";
+				ENABLE_APP_SANDBOX = "NO";
+				GENERATE_INFOPLIST_FILE = "YES";
+				INFOPLIST_KEY_CFBundleDisplayName = "Synth";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				MARKETING_VERSION = "0.2.1";
+				CURRENT_PROJECT_VERSION = "1";
+				PRODUCT_NAME = "Synth";
+				PRODUCT_BUNDLE_IDENTIFIER = "sh.getsynth.desktop";
+				SYNTH_ENGINE = "$(SRCROOT)/../zig-out/bin/synth";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = "Debug";
+		};
+		000000000000000000000011 = {
+			isa = "XCBuildConfiguration";
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = "Manual";
+				ALWAYS_SEARCH_USER_PATHS = "NO";
+				ENABLE_APP_SANDBOX = "NO";
+				GENERATE_INFOPLIST_FILE = "YES";
+				INFOPLIST_KEY_CFBundleDisplayName = "Synth";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				MARKETING_VERSION = "0.2.1";
+				CURRENT_PROJECT_VERSION = "1";
+				PRODUCT_NAME = "Synth";
+				PRODUCT_BUNDLE_IDENTIFIER = "sh.getsynth.desktop";
+				SYNTH_ENGINE = "$(SRCROOT)/../zig-out/bin/synth";
+				SWIFT_COMPILATION_MODE = "wholemodule";
+			};
+			name = "Release";
+		};
+		000000000000000000000012 = {
+			isa = "XCConfigurationList";
+			buildConfigurations = (
+				"000000000000000000000010",
+				"000000000000000000000011",
+			);
+			defaultConfigurationName = "Release";
+		};
+		000000000000000000000013 = {
+			isa = "PBXSourcesBuildPhase";
+			files = (
+			);
+			buildActionMask = 2147483647;
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000014 = {
+			isa = "PBXFrameworksBuildPhase";
+			files = (
+				"000000000000000000000004",
+				"000000000000000000000006",
+				"000000000000000000000008",
+			);
+			buildActionMask = 2147483647;
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000015 = {
+			isa = "PBXResourcesBuildPhase";
+			files = (
+			);
+			buildActionMask = 2147483647;
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000016 = {
+			isa = "PBXShellScriptBuildPhase";
+			files = (
+			);
+			name = "Embed Synth engine";
+			shellPath = "/bin/sh";
+			shellScript = "set -eu\nif [ ! -x \"$SYNTH_ENGINE\" ]; then\n    echo \"error: Build the ReleaseSafe engine with desktop/Scripts/build-app.sh or set SYNTH_ENGINE.\"\n    exit 1\nfi\ndestination=\"$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers\"\nmkdir -p \"$destination\"\ninstall -m 755 \"$SYNTH_ENGINE\" \"$destination/synth\"\ncodesign --force --sign - \"$destination/synth\"\n";
+			inputPaths = (
+				"$(SYNTH_ENGINE)",
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/synth",
+			);
+			buildActionMask = 2147483647;
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		000000000000000000000017 = {
+			isa = "PBXNativeTarget";
+			buildConfigurationList = "000000000000000000000012";
+			buildPhases = (
+				"000000000000000000000013",
+				"000000000000000000000014",
+				"000000000000000000000015",
+				"000000000000000000000016",
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				"00000000000000000000000B",
+			);
+			name = "Synth";
+			packageProductDependencies = (
+				"000000000000000000000003",
+				"000000000000000000000005",
+				"000000000000000000000007",
+			);
+			productName = "Synth";
+			productReference = "000000000000000000000009";
+			productType = "com.apple.product-type.application";
+		};
+		000000000000000000000018 = {
+			isa = "PBXProject";
+			attributes = {
+				LastUpgradeCheck = "2620";
+			};
+			buildConfigurationList = "00000000000000000000000F";
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = "en";
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				"en",
+				"Base",
+			);
+			mainGroup = "00000000000000000000000C";
+			packageReferences = (
+				"000000000000000000000001",
+				"000000000000000000000002",
+			);
+			productRefGroup = "00000000000000000000000A";
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				"000000000000000000000017",
+			);
+		};
+	};
+	rootObject = "000000000000000000000018";
+}

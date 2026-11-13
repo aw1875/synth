@@ -97,6 +97,7 @@ private func runScenario(fixture: Fixture, client: SynthClient, guest: SynthClie
     let expectedDirectory = URL(fileURLWithPath: fixture.first.path, isDirectory: true).resolvingSymlinksInPath()
     #expect(actualDirectory.path == expectedDirectory.path)
 
+    try await verifyConfiguration(in: first, client: client)
     try await verifyApprovals(fixture: fixture, client: client, first: first, second: second)
 
     let choice = turn("ask fixture choice", session: first, client: client)
@@ -127,8 +128,7 @@ private func runScenario(fixture: Fixture, client: SynthClient, guest: SynthClie
     try await client.cancelTurn(in: second)
     #expect(try await cancelled.value.stopReason == "cancelled")
     _ = try await wait { await client.interactions[pending.id] == nil ? true : nil }
-    let listed = try await client.listSessions().sessions
-    #expect(Set(listed.map(\.sessionId)) == [first, second])
+    try await verifyHistory(fixture, client: client, first: first, second: second)
     await client.disconnect()
 
     #expect(try await guest.prompt("still attached", in: first).stopReason == "end_turn")
@@ -173,4 +173,26 @@ private func verifyApprovals(
     let alwaysOption = try #require(command.options.first { $0.kind == "allow_always" })
     try await client.decide(alwaysRequest.id, optionID: alwaysOption.optionId)
     #expect(try await always.value.stopReason == "end_turn")
+}
+
+private func verifyConfiguration(in sessionID: String, client: SynthClient) async throws {
+    try await client.fetchModels(in: sessionID)
+    let models = try await wait {
+        await client.sessions[sessionID]?.models.flatMap { $0.pending == 0 ? $0.offered : nil }
+    }
+    let model = try #require(models.first { $0.providerID == "openai-compat" && $0.name == "gpt-fixture-alt" })
+    try await client.setModel(model, in: sessionID)
+    _ = try await wait { await client.sessions[sessionID]?.status?.model == model.name ? true : nil }
+    try await client.setMode("plan", in: sessionID)
+    _ = try await wait { await client.sessions[sessionID]?.status?.agent == "plan" ? true : nil }
+    try await client.setMode("build", in: sessionID)
+    _ = try await wait { await client.sessions[sessionID]?.status?.agent == "build" ? true : nil }
+}
+
+private func verifyHistory(_ fixture: Fixture, client: SynthClient, first: String, second: String) async throws {
+    let listed = try await client.listSessions().sessions
+    #expect(Set(listed.map(\.sessionId)) == [first, second])
+    let alias = fixture.root.appending(path: "Project Alias")
+    try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: fixture.first)
+    #expect(try await client.listSessions(cwd: alias.path).sessions.map(\.sessionId) == [first])
 }

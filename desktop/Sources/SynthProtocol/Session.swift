@@ -64,7 +64,7 @@ public enum ACP {
         }
     }
 
-    public struct Mode: Decodable, Equatable, Sendable {
+    public struct Mode: Decodable, Equatable, Identifiable, Sendable {
         public let id: String
         public let name: String
         public let description: String?

@@ -1,8 +1,32 @@
-# Synth macOS client foundation
+# Synth for macOS
 
-The Synth desktop client targets macOS 26 or later. Its Swift package
-communicates with the Zig engine through a single `synth acp` subprocess. See [the wire contract](../docs/desktop-acp.md)
+The Synth desktop client communicates with the Zig engine through a single
+`synth acp` subprocess. See [the wire contract](../docs/desktop-acp.md)
 for the method and lifecycle details.
+
+## Build and run
+
+The app supports Apple Silicon Macs running macOS 26 or later. Building it
+requires Xcode 26 or later, Zig 0.16, and network access to resolve the Swift
+packages on the first build.
+
+From the repository root:
+
+```sh
+desktop/Scripts/build-app.sh
+```
+
+Open `desktop/DerivedData/Build/Products/Release/Synth.app` in Finder. The
+app bundles the engine and uses the same Synth configuration and credentials
+as the terminal client. If you need to configure a provider, run `synth` in
+Terminal first. For Xcode builds, set the `SYNTH_ENGINE` build setting to a
+ReleaseSafe executable built from this checkout.
+
+Choose a project folder to start chatting. Use **Conversations** in the toolbar
+to reopen a saved chat from the current project. Press **Command–Return** to
+send or steer, or click **Stop** to cancel the current turn.
+
+## Development
 
 From the repository root, build and run the offline tests:
 

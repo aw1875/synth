@@ -7,12 +7,13 @@ public actor SynthClient {
     private let directory: URL?
     private let environment: [String: String]?
     private var transport: ProcessTransport?
-    private var generation = UUID()
+    var generation = UUID()
     private var nextID: Int64 = 1
     private var pending: [RequestID: CheckedContinuation<JSONValue, any Error>] = [:]
     private var workingDirectories: [String: String] = [:]
     private var subscribers: [UUID: AsyncStream<Void>.Continuation] = [:]
     private var diagnosticBytes = Data()
+    var modelUpdates: [String: UInt64] = [:]
 
     public private(set) var connectionState: ConnectionState = .disconnected
     public private(set) var sessions: [String: SessionState] = [:]
@@ -158,6 +159,16 @@ extension SynthClient {
         return try await call("session/list", ACP.List(cwd: cwd, cursor: cursor), as: ACP.SessionList.self)
     }
 
+    public func closeSession(_ sessionID: String) async throws {
+        try requireConnected()
+        _ = try await call("session/close", ACP.SessionRef(sessionID), as: ACP.Empty.self)
+        workingDirectories.removeValue(forKey: sessionID)
+        sessions.removeValue(forKey: sessionID)
+        modelUpdates.removeValue(forKey: sessionID)
+        interactions = interactions.filter { $0.value.sessionID != sessionID }
+        changed()
+    }
+
     public func prompt(_ text: String, in sessionID: String) async throws -> ACP.Prompted {
         try requireConnected()
         do {
@@ -206,11 +217,11 @@ extension SynthClient {
         try await resolve(id, with: ["action": "decline"])
     }
 
-    private func requireConnected() throws {
+    func requireConnected() throws {
         guard connectionState == .connected else { throw Failure.disconnected }
     }
 
-    private func call<Result: Decodable>(
+    func call<Result: Decodable>(
         _ method: String, _ params: some Encodable, as type: Result.Type
     ) async throws -> Result {
         guard let transport else { throw Failure.disconnected }
@@ -329,12 +340,23 @@ extension SynthClient {
         case "_synth/status":
             let event = try envelope.parameters(Synth.StatusUpdate.self)
             sessions[event.sessionId, default: .init()].update(event.status)
+        case "_synth/models_updated":
+            let event = try envelope.parameters(Synth.ModelsUpdate.self)
+            modelUpdates[event.sessionId, default: 0] += 1
+            sessions[event.sessionId, default: .init()].update(event.models)
         case "_synth/notice":
             let event = try envelope.parameters(Synth.Notice.self)
             sessions[event.sessionId, default: .init()].notice(event.text)
         default:
             return
         }
+        changed()
+    }
+
+    func acceptModels(_ models: Synth.Models, sessionID: String, generation: UUID, revision: UInt64) {
+        guard generation == self.generation, connectionState == .connected,
+              revision == modelUpdates[sessionID, default: 0] else { return }
+        sessions[sessionID, default: .init()].update(models)
         changed()
     }
 

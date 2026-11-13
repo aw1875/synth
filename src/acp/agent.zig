@@ -862,7 +862,11 @@ fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSe
         return .{ .sessions = out };
     };
 
-    var project = try Project.detect(self.allocator, self.io, cwd);
+    const resolved = std.Io.Dir.cwd().realPathFileAlloc(self.io, cwd, arena) catch |err| switch (err) {
+        error.FileNotFound => cwd,
+        else => return err,
+    };
+    var project = try Project.detect(self.allocator, self.io, resolved);
     defer project.deinit(self.allocator);
     const project_id = try db.resolveProject(project.root, "git", project.name());
     const stored = try db.listSessions(arena, project_id, listed_sessions);
@@ -2366,14 +2370,21 @@ const Session = struct {
     fn startListings(self: *Session, arena: std.mem.Allocator) !void {
         const providers = self.agent.options.source.providers;
         for (catalog.all, 0..) |entry, i| {
-            if (!entry.ready(providers.auth, providers.chatgpt) or self.model_jobs[i] != null) continue;
-            self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, .{
-                .host = try Providers.hostOf(arena, self.agent.options.db, entry),
-                .api_key = providers.auth.key(entry.id),
-                .chatgpt = providers.chatgpt,
-                .copilot_integration_id = providers.backend.options.copilot_integration_id,
-            });
+            if (self.model_jobs[i] != null) continue;
+            const reach = (try self.modelListingReach(arena, providers, entry)) orelse continue;
+            self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, reach);
         }
+    }
+
+    fn modelListingReach(self: *Session, arena: std.mem.Allocator, providers: *Providers, entry: catalog.Entry) !?ModelListing.Reach {
+        const active = std.mem.eql(u8, entry.id, providers.active_id) and !providers.isMissing();
+        if (!active and !entry.ready(providers.auth, providers.chatgpt)) return null;
+        return .{
+            .host = if (active) providers.backend.currentHost() else try Providers.hostOf(arena, self.agent.options.db, entry),
+            .api_key = if (active) providers.backend.currentKey() else providers.auth.key(entry.id),
+            .chatgpt = providers.chatgpt,
+            .copilot_integration_id = providers.backend.options.copilot_integration_id,
+        };
     }
 
     fn cachedModels(self: *Session, arena: std.mem.Allocator) !synth.Models {
@@ -2383,9 +2394,9 @@ const Session = struct {
         var pending: usize = 0;
         for (catalog.all, 0..) |entry, i| {
             if (self.model_jobs[i] != null) pending += 1;
-            if (!entry.ready(providers.auth, providers.chatgpt)) continue;
+            const reach = (try self.modelListingReach(arena, providers, entry)) orelse continue;
             const cached = self.model_cached[i] orelse continue;
-            if (!std.mem.eql(u8, cached.reach.host, try Providers.hostOf(arena, db, entry))) continue;
+            if (!std.mem.eql(u8, cached.reach.host, reach.host)) continue;
             for (cached.models orelse &.{}) |model| {
                 const remembered = db.rememberedEffort(arena, entry.id, model.name) catch "";
                 try offered.append(arena, .{

@@ -82,6 +82,7 @@ provider.
 - [MCP](docs/mcp.md): servers in `config.json`, auth, `/mcp`
 - [Hooks](docs/hooks.md): running commands on lifecycle events, with examples
 - [Skills](docs/skills.md): writing and finding them
+- [Synth for macOS](desktop/README.md): build and run the native desktop client
 
 Working on the code? Read [the contributing guide](docs/contributing.md)
 and [AGENTS.md](AGENTS.md) first.

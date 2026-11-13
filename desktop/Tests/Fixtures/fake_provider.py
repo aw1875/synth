@@ -22,7 +22,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/models":
-            self.send_body(b'{"data":[{"id":"gpt-fixture"}]}', "application/json")
+            self.send_body(b'{"data":[{"id":"gpt-fixture"},{"id":"gpt-fixture-alt"}]}', "application/json")
         else:
             self.send_error(404)
 
