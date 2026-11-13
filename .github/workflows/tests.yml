@@ -2,8 +2,14 @@ name: Run Tests
 on:
   push:
     branches: [master]
+    paths: &zig
+      - "**.zig"
+      - "**.zig.zon"
+      - "src/**"
+      - ".github/workflows/tests.yml"
   pull_request:
     branches: [master]
+    paths: *zig
 
 permissions:
   contents: read

@@ -28,6 +28,19 @@ fn append(arena: std.mem.Allocator, messages: *std.ArrayList(Message), role: []c
     try messages.items[messages.items.len - 1].content.append(arena, block);
 }
 
+const ephemeral = .{ .type = "ephemeral" };
+
+/// The Messages API caches only up to blocks marked `cache_control`, up to
+/// four per request: one on the system prompt covers the tools ahead of it,
+/// and this one on the newest message lets the next request read everything
+/// before it. A turn's instruction goes after the mark, since the next request
+/// does not repeat it.
+fn markCacheBreakpoint(arena: std.mem.Allocator, messages: []Message) !void {
+    if (messages.len == 0) return;
+    const blocks = messages[messages.len - 1].content.items;
+    try blocks[blocks.len - 1].object.put(arena, "cache_control", try object(arena, ephemeral));
+}
+
 pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversation, turn: Provider.Turn) ![]u8 {
     const kept = try window.completeMessages(convo, arena, window.requestBudgetForOutput(options.context_limit, turn, @max(@as(u32, 1), options.max_output_tokens)), options.vision);
     var messages: std.ArrayList(Message) = .empty;
@@ -55,6 +68,7 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
             try append(arena, &messages, "user", try object(arena, .{ .type = "tool_result", .tool_use_id = call.id, .content = result }));
         }
     }
+    try markCacheBreakpoint(arena, messages.items);
     if (turn.instruction.len > 0) try append(arena, &messages, "user", try object(arena, .{ .type = "text", .text = turn.instruction }));
 
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -62,7 +76,12 @@ pub fn buildRequest(options: Options, arena: std.mem.Allocator, convo: *Conversa
     try w.writeAll("{\"model\":");
     try std.json.Stringify.value(options.model, .{}, w);
     try w.print(",\"stream\":true,\"max_tokens\":{d},\"system\":", .{@max(@as(u32, 1), options.max_output_tokens)});
-    try std.json.Stringify.value(try window.systemText(arena, turn.system, kept, 0), .{}, w);
+    const system = try window.systemText(arena, turn.system, kept, 0);
+    if (system.len > 0) {
+        try std.json.Stringify.value(.{.{ .type = "text", .text = system, .cache_control = ephemeral }}, .{}, w);
+    } else {
+        try std.json.Stringify.value(system, .{}, w);
+    }
     try w.writeAll(",\"messages\":[");
     for (messages.items, 0..) |msg, i| {
         if (i > 0) try w.writeByte(',');
@@ -295,6 +314,31 @@ test "Messages requests pair tool batches with their results and translate schem
     try testing.expectEqualStrings("contents of a", results[0].object.get("content").?.string);
     try testing.expectEqualStrings("aborted", results[1].object.get("content").?.string);
     try testing.expect(value.object.get("tools").?.array.items[0].object.contains("input_schema"));
+}
+
+test "Messages marks the system prompt and the newest message for caching, not the instruction" {
+    const testing = std.testing;
+    var convo: Conversation = .init(testing.allocator);
+    defer convo.deinit();
+    try convo.add(.user, "first");
+    _ = try convo.append(.{ .role = .assistant, .text = "reply" });
+    try convo.add(.user, "second");
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const body = try buildRequest(.{ .model = "claude-org" }, arena.allocator(), &convo, .{ .system = "s", .instruction = "summarise" });
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+
+    const system = value.object.get("system").?.array.items;
+    try testing.expectEqualStrings("ephemeral", system[0].object.get("cache_control").?.object.get("type").?.string);
+
+    var marked: std.ArrayList([]const u8) = .empty;
+    for (value.object.get("messages").?.array.items) |message| {
+        for (message.object.get("content").?.array.items) |block| {
+            if (block.object.contains("cache_control")) try marked.append(arena.allocator(), block.object.get("text").?.string);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), marked.items.len);
+    try testing.expectEqualStrings("second", marked.items[0]);
 }
 
 test "Messages keeps reused call ids paired with their own results" {
