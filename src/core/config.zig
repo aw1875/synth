@@ -196,7 +196,7 @@ pub fn deinit(self: *Config) void {
 
 /// The config file written for a first run.
 const starter_file = .{
-    .@"$schema" = "https://raw.githubusercontent.com/aw1875/synth/master/config.schema.json",
+    .@"$schema" = "https://getsynth.sh/config.schema.json",
     .think = true,
 };
 
