@@ -244,6 +244,7 @@ pub fn typeErasedEventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: v
             }
             if (!self.mirror.isBusy()) self.quit_confirm.reset();
             ringIfFinished(self);
+            reportStatus(self);
             if (self.mirror.isBusy()) {
                 self.thinking.stream = self.mirror.thoughts();
                 self.thinking.label = self.mirror.label();
@@ -579,6 +580,16 @@ fn ringIfFinished(self: *Model) void {
 
     const said = if (self.mirror.outcome()) |outcome| outcome.label() else "done";
     bell.ring(app, self.environ, said);
+}
+
+/// Tell the terminal when what the session is doing changes. Unlike the bell,
+/// focus does not matter: the terminal decides what a report shows.
+fn reportStatus(self: *Model) void {
+    const now = self.currentStatus();
+    if (now.eql(self.reported)) return;
+    self.reported = now;
+    const app = self.app orelse return;
+    bell.report(app, self.environ, now);
 }
 
 /// Compose the draft in `$EDITOR`, and take back what was written.

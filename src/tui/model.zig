@@ -24,6 +24,7 @@ const widget_pool = @import("widget_pool.zig");
 const test_model = @import("test_model.zig");
 const Approval = @import("approval.zig");
 const AttachmentCard = @import("attachment_card.zig");
+const Status = @import("bell.zig").Status;
 const Attachments = @import("attachments.zig");
 const Connect = @import("connect.zig");
 const diff = @import("diff.zig");
@@ -262,6 +263,10 @@ focused: ?bool = null,
 /// Turns already announced, so a finished one rings once and a compaction
 /// settling back to idle rings not at all.
 rung_for: usize = 0,
+/// The status last reported to the terminal, so each change goes out once.
+/// Nothing sent reads as idle, which is why a session with no turn yet says
+/// nothing at all.
+reported: Status = .{ .state = .idle },
 
 /// Rows the transcript is scrolled back from the newest message. Zero pins the
 /// view to the bottom, which is where it returns whenever a message arrives.
@@ -633,6 +638,23 @@ pub fn startTurn(self: *Model, ctx: *vxfw.EventContext, prompt: []const u8) !voi
 
     try self.beginTurn(ctx, prompt, try self.heldFor(arena, prompt));
     self.held.consume(prompt);
+}
+
+/// What the session is doing, as the terminal's status report says it.
+pub fn currentStatus(self: *const Model) Status {
+    return switch (self.mirror.state()) {
+        .awaiting_approval => .{ .state = .blocked, .kind = .permission },
+        .awaiting_answer => .{ .state = .blocked, .kind = .question },
+        .idle => {
+            const outcome = self.mirror.outcome() orelse return .{ .state = .idle };
+            return switch (outcome) {
+                .done => .{ .state = .done },
+                .cancelled => .{ .state = .idle },
+                .failed, .halted => .{ .state = .@"error", .msg = outcome.label() },
+            };
+        },
+        else => .{ .state = .working },
+    };
 }
 
 /// Steer the running turn with `prompt` and what it holds. False when no
@@ -1316,6 +1338,52 @@ fn awaitingApproval(model: *Model) bool {
 
 fn finishedOne(model: *Model) bool {
     return model.mirror.finishedTurns() == 1 and !model.mirror.isBusy();
+}
+
+test "the reported status follows what the session is doing" {
+    const testing = std.testing;
+    var model: Model = undefined;
+    try test_model.offline(&model);
+    defer model.deinit();
+
+    const cases = [_]struct { state: AgentLoop.State, outcome: ?AgentLoop.Outcome = null, want: Status }{
+        .{ .state = .idle, .want = .{ .state = .idle } },
+        .{ .state = .awaiting_approval, .want = .{ .state = .blocked, .kind = .permission } },
+        .{ .state = .awaiting_answer, .want = .{ .state = .blocked, .kind = .question } },
+        .{ .state = .thinking, .want = .{ .state = .working } },
+        .{ .state = .running_tools, .want = .{ .state = .working } },
+        .{ .state = .classifying, .want = .{ .state = .working } },
+        .{ .state = .compacting, .want = .{ .state = .working } },
+        .{ .state = .cancelling, .want = .{ .state = .working } },
+        .{ .state = .idle, .outcome = .done, .want = .{ .state = .done } },
+        .{ .state = .idle, .outcome = .cancelled, .want = .{ .state = .idle } },
+        .{ .state = .idle, .outcome = .failed, .want = .{ .state = .@"error", .msg = "failed" } },
+        .{ .state = .idle, .outcome = .halted, .want = .{ .state = .@"error", .msg = "stopped" } },
+        // The outcome of the last turn says nothing while the next one runs.
+        .{ .state = .awaiting_approval, .outcome = .done, .want = .{ .state = .blocked, .kind = .permission } },
+    };
+    for (cases) |case| {
+        model.mirror.status.state = case.state;
+        model.mirror.status.outcome = case.outcome;
+        try testing.expect(case.want.eql(model.currentStatus()));
+    }
+}
+
+test "steering a turn leaves its reported status alone" {
+    const testing = std.testing;
+    const served = try test_model.Served.create();
+    defer served.destroy();
+    const model = served.model;
+    try testing.expect(model.currentStatus().eql(.{ .state = .idle }));
+
+    try model.mirror.submit("make a note", .{});
+    try served.pollUntil(awaitingApproval);
+    const blocked: Status = .{ .state = .blocked, .kind = .permission };
+    try testing.expect(model.currentStatus().eql(blocked));
+
+    try testing.expect(try model.steerTurn("and keep this"));
+    _ = try model.mirror.poll();
+    try testing.expect(model.currentStatus().eql(blocked));
 }
 
 test "a cleared session forgets the subagent the old one was showing" {
