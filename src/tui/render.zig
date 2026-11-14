@@ -30,6 +30,7 @@ const theme = @import("theme.zig");
 const themes = @import("themes.zig");
 const ThoughtView = @import("thought_view.zig");
 const w = @import("widgets.zig");
+const welcome = @import("welcome.zig");
 
 pub fn typeErasedDrawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) !vxfw.Surface {
     const self: *Model = @ptrCast(@alignCast(ptr));
@@ -100,7 +101,10 @@ pub fn draw(self: *Model, ctx: vxfw.DrawContext) !vxfw.Surface {
 
         if (try drawTranscript(self, ctx, column_w, body_h -| Model.block_gap)) |transcript| {
             try children.append(ctx.arena, .{
-                .origin = .{ .row = title_h, .col = Model.gutter },
+                .origin = .{
+                    .row = @intCast(title_h + (body_h -| Model.block_gap -| transcript.size.height) / 2),
+                    .col = @intCast(Model.gutter + (column_w -| transcript.size.width) / 2),
+                },
                 .surface = transcript,
             });
         }
@@ -540,7 +544,11 @@ pub fn drawTranscript(
     const messages = self.shown().messages.items;
     const pending: usize = if (self.mirror.isBusy() and
         self.mirror.state() != .awaiting_approval) 1 else 0;
-    if (height == 0 or messages.len + pending + self.mirror.pendingSteering().len == 0) return null;
+    if (height == 0) return null;
+    if (messages.len + pending + self.mirror.pendingSteering().len == 0) {
+        if (self.viewing != null) return null;
+        return welcome.draw(ctx, self.plainWidget(), width, height);
+    }
 
     const constraints = ctx.withConstraints(
         .{ .width = width },
@@ -2101,5 +2109,57 @@ test "the rail can be sent away, and takes its click targets with it" {
     try testing.expectEqual(@as(u16, 0), model.plan_bottom);
     for (root.children) |child| {
         try testing.expect(child.origin.col < @as(i17, @intCast(size.width - Model.sidebar_width)));
+    }
+}
+
+test "an empty session welcomes the user until the first message" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    try chromeFixture(&model, &userdata, null);
+    defer model.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 80, .height = 24 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    const fresh = (try drawTranscript(&model, ctx, 80, 20)).?;
+    try std.testing.expect(std.mem.indexOf(u8, try rowText(ctx.arena, fresh, 1), "Welcome to") != null);
+    _ = try model.conversation.append(.{ .role = .user, .text = "hello" });
+    const started = (try drawTranscript(&model, ctx, 80, 20)).?;
+    try std.testing.expect(started.children.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), fresh.children.len);
+}
+
+test "the welcome panel is centered in the conversation area" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var userdata: u8 = 0;
+    var model: Model = undefined;
+    try chromeFixture(&model, &userdata, null);
+    defer model.deinit();
+    const ctx: vxfw.DrawContext = .{
+        .arena = arena.allocator(),
+        .min = .{},
+        .max = .{ .width = 120, .height = 40 },
+        .cell_size = .{ .width = 10, .height = 20 },
+    };
+    for ([_]bool{ true, false }) |sidebar_open| {
+        model.sidebar_open = sidebar_open;
+        const root = try draw(&model, ctx);
+        const main_width = model.sidebar_col;
+        const bottom = root.children[0];
+        var found = false;
+        for (root.children) |child| {
+            if (child.surface.buffer.len == 0 or child.surface.size.height < 2) continue;
+            if (std.mem.indexOf(u8, try rowText(ctx.arena, child.surface, 1), "Welcome to") == null) continue;
+            found = true;
+            try std.testing.expectEqual(@as(i17, @intCast((main_width - child.surface.size.width) / 2)), child.origin.col);
+            const body_height = @as(u16, @intCast(bottom.origin.row)) - 2 - Model.block_gap;
+            try std.testing.expectEqual(@as(i17, @intCast(2 + (body_height - child.surface.size.height) / 2)), child.origin.row);
+        }
+        try std.testing.expect(found);
     }
 }
