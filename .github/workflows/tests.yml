@@ -2,14 +2,16 @@ name: Run Tests
 on:
   push:
     branches: [master]
-    paths: &zig
+    paths: &build_paths
       - "**.zig"
       - "**.zig.zon"
       - "src/**"
+      - "desktop/**"
+      - "!desktop/**/*.md"
       - ".github/workflows/tests.yml"
   pull_request:
     branches: [master]
-    paths: *zig
+    paths: *build_paths
 
 permissions:
   contents: read
@@ -34,3 +36,31 @@ jobs:
 
       - name: Run Tests
         run: zig build test
+
+  desktop:
+    runs-on: macos-26
+    name: Build and Test macOS App
+    timeout-minutes: 20
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Desktop Build Tools
+        run: |
+          command -v xcodegen >/dev/null || brew install xcodegen
+          command -v swiftlint >/dev/null || brew install swiftlint
+
+      - name: Lint Swift
+        working-directory: desktop
+        run: swiftlint lint --strict
+
+      - name: Build App
+        run: desktop/Scripts/build-app.sh
+
+      - name: Test with Bundled Engine
+        run: python3 desktop/Tests/Fixtures/fake_provider.py desktop/DerivedData/Build/Products/Release/Synth.app/Contents/Helpers/synth

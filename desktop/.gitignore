@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+__pycache__/
+DerivedData/
+xcuserdata/
+/Synth.xcodeproj/
+/Info.plist
+/SynthVersion.xcconfig
+!/Assets.xcassets/**/Contents.json

@@ -1104,10 +1104,11 @@ pub fn messageContent(
     msg: Conversation.Message,
     supports_vision: bool,
 ) ![]const u8 {
-    const text = if (msg.attachments.len > 0)
+    const raw = if (msg.attachments.len > 0)
         try inlineAttachments(arena, msg)
     else
         msg.text;
+    const text = try window.providerText(arena, raw);
 
     if (supports_vision or msg.images.len == 0) return text;
 

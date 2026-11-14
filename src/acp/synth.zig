@@ -36,6 +36,7 @@ pub const method = struct {
     pub const status = "_synth/status";
     /// Something to tell the person: a hook refused a prompt, a command failed.
     pub const notice = "_synth/notice";
+    pub const session_stopped = "_synth/session_stopped";
 
     /// Client to agent.
     pub const compact = "_synth/compact";

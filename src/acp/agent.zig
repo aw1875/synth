@@ -849,32 +849,50 @@ fn answered(self: *Agent, connection: *Connection, message: rpc.Message) void {
 /// `cwd`, or every project's when it names none.
 fn listSessions(self: *Agent, arena: std.mem.Allocator, request: protocol.ListSessions) !protocol.SessionList {
     const db = self.options.db;
-    const cwd = request.cwd orelse {
-        const recent = try db.recentSessions(arena, listed_sessions);
-        const out = try arena.alloc(protocol.SessionInfo, recent.len);
-        for (recent, out) |info, *listed| listed.* = .{
-            .sessionId = info.public_id,
-            .cwd = info.cwd,
-            .title = if (info.title.len > 0) info.title else null,
-            .updatedAt = try isoTime(arena, info.updated_at),
-            ._meta = .{ .synth = .{ .messages = info.messages, .updated_at = info.updated_at, .live = db.isSessionHeld(info.public_id) } },
+    const project_id: ?i64 = if (request.cwd) |cwd| blk: {
+        const resolved = std.Io.Dir.cwd().realPathFileAlloc(self.io, cwd, arena) catch |err| switch (err) {
+            error.FileNotFound => cwd,
+            else => return err,
         };
-        return .{ .sessions = out };
-    };
-
-    var project = try Project.detect(self.allocator, self.io, cwd);
-    defer project.deinit(self.allocator);
-    const project_id = try db.resolveProject(project.root, "git", project.name());
-    const stored = try db.listSessions(arena, project_id, listed_sessions);
-    const out = try arena.alloc(protocol.SessionInfo, stored.len);
-    for (stored, out) |info, *listed| listed.* = .{
+        var project = try Project.detect(self.allocator, self.io, resolved);
+        defer project.deinit(self.allocator);
+        break :blk (try db.projectByRoot(project.root)) orelse return .{ .sessions = &.{} };
+    } else null;
+    const before = if (request.cursor) |cursor| try parseSessionCursor(arena, cursor, project_id) else null;
+    const rows = try db.pageSessions(arena, project_id, before, listed_sessions + 1);
+    const count = @min(rows.len, listed_sessions);
+    const out = try arena.alloc(protocol.SessionInfo, count);
+    for (rows[0..count], out) |info, *listed| listed.* = .{
         .sessionId = info.public_id,
-        .cwd = try arena.dupe(u8, cwd),
+        .cwd = info.cwd,
         .title = if (info.title.len > 0) info.title else null,
         .updatedAt = try isoTime(arena, info.updated_at),
         ._meta = .{ .synth = .{ .messages = info.messages, .updated_at = info.updated_at, .live = db.isSessionHeld(info.public_id) } },
     };
-    return .{ .sessions = out };
+    return .{
+        .sessions = out,
+        .nextCursor = if (rows.len > count) try sessionCursor(arena, project_id, rows[count - 1]) else null,
+    };
+}
+
+fn sessionCursor(arena: std.mem.Allocator, project_id: ?i64, row: Database.RecentSession) ![]const u8 {
+    const raw = try std.fmt.allocPrint(arena, "1:{d}:{d}:{s}", .{ project_id orelse 0, row.updated_at, row.public_id });
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    return encoder.encode(try arena.alloc(u8, encoder.calcSize(raw.len)), raw);
+}
+
+fn parseSessionCursor(arena: std.mem.Allocator, cursor: []const u8, project_id: ?i64) !?Database.SessionCursor {
+    if (cursor.len > 128) return error.InvalidParams;
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const raw = try arena.alloc(u8, decoder.calcSizeForSlice(cursor) catch return error.InvalidParams);
+    decoder.decode(raw, cursor) catch return error.InvalidParams;
+    var parts = std.mem.splitScalar(u8, raw, ':');
+    if (!std.mem.eql(u8, parts.next() orelse "", "1")) return error.InvalidParams;
+    const scope = std.fmt.parseInt(i64, parts.next() orelse "", 10) catch return error.InvalidParams;
+    const updated = std.fmt.parseInt(i64, parts.next() orelse "", 10) catch return error.InvalidParams;
+    const handle = parts.next() orelse return error.InvalidParams;
+    if (scope != (project_id orelse 0) or handle.len == 0 or parts.next() != null) return error.InvalidParams;
+    return .{ .updated_at = updated, .public_id = handle };
 }
 
 fn projectRelative(root: []const u8, path: []const u8) []const u8 {
@@ -2366,14 +2384,21 @@ const Session = struct {
     fn startListings(self: *Session, arena: std.mem.Allocator) !void {
         const providers = self.agent.options.source.providers;
         for (catalog.all, 0..) |entry, i| {
-            if (!entry.ready(providers.auth, providers.chatgpt) or self.model_jobs[i] != null) continue;
-            self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, .{
-                .host = try Providers.hostOf(arena, self.agent.options.db, entry),
-                .api_key = providers.auth.key(entry.id),
-                .chatgpt = providers.chatgpt,
-                .copilot_integration_id = providers.backend.options.copilot_integration_id,
-            });
+            if (self.model_jobs[i] != null) continue;
+            const reach = (try self.modelListingReach(arena, providers, entry)) orelse continue;
+            self.model_jobs[i] = try ModelListing.start(self.allocator, self.agent.io, entry, reach);
         }
+    }
+
+    fn modelListingReach(self: *Session, arena: std.mem.Allocator, providers: *Providers, entry: catalog.Entry) !?ModelListing.Reach {
+        const active = std.mem.eql(u8, entry.id, providers.active_id) and !providers.isMissing();
+        if (!active and !entry.ready(providers.auth, providers.chatgpt)) return null;
+        return .{
+            .host = if (active) providers.backend.currentHost() else try Providers.hostOf(arena, self.agent.options.db, entry),
+            .api_key = if (active) providers.backend.currentKey() else providers.auth.key(entry.id),
+            .chatgpt = providers.chatgpt,
+            .copilot_integration_id = providers.backend.options.copilot_integration_id,
+        };
     }
 
     fn cachedModels(self: *Session, arena: std.mem.Allocator) !synth.Models {
@@ -2383,9 +2408,9 @@ const Session = struct {
         var pending: usize = 0;
         for (catalog.all, 0..) |entry, i| {
             if (self.model_jobs[i] != null) pending += 1;
-            if (!entry.ready(providers.auth, providers.chatgpt)) continue;
+            const reach = (try self.modelListingReach(arena, providers, entry)) orelse continue;
             const cached = self.model_cached[i] orelse continue;
-            if (!std.mem.eql(u8, cached.reach.host, try Providers.hostOf(arena, db, entry))) continue;
+            if (!std.mem.eql(u8, cached.reach.host, reach.host)) continue;
             for (cached.models orelse &.{}) |model| {
                 const remembered = db.rememberedEffort(arena, entry.id, model.name) catch "";
                 try offered.append(arena, .{
@@ -3669,4 +3694,46 @@ test "a session outlives a client cut off, and ends once the last one leaves" {
     const kept = try second.request(synth.method.rename, synth.Rename{ .sessionId = handle, .title = "still here" });
     _ = try second.expectResult(kept);
     second.leave(handle);
+}
+
+test "session list cursors page through equal timestamps and stay within their project" {
+    const fixture = try Fixture.create();
+    defer fixture.destroy();
+    const db = &fixture.db;
+    const home = try std.Io.Dir.cwd().realPathFileAlloc(testing.io, fixture.project, fixture.arena.allocator());
+    const project = try db.resolveProject(home, "git", "fixture");
+    const other = try db.resolveProject("/other", "git", "other");
+    for (0..53) |_| {
+        const id = try db.createSession(project, home, "fixture");
+        _ = try db.appendMessage(id, 1, "user", "saved", null, 0, null);
+    }
+    const outside = try db.createSession(other, "/other", "fixture");
+    _ = try db.appendMessage(outside, 1, "user", "other", null, 0, null);
+    try db.conn.execNoArgs("UPDATE session SET updated_at = 1234");
+
+    const client = try fixture.connect();
+    defer client.close();
+    try client.initialize(true);
+    const arena = client.arena.allocator();
+    const scope = protocol.ListSessions{ .cwd = home };
+    const first = try client.request(protocol.method.session_list, scope);
+    const page = try rpc.parse(protocol.SessionList, arena, try client.expectResult(first));
+    try testing.expectEqual(@as(usize, 50), page.sessions.len);
+    const cursor = page.nextCursor.?;
+    const next = try client.request(protocol.method.session_list, protocol.ListSessions{ .cwd = home, .cursor = cursor });
+    const tail = try rpc.parse(protocol.SessionList, arena, try client.expectResult(next));
+    try testing.expectEqual(@as(usize, 3), tail.sessions.len);
+    try testing.expect(tail.nextCursor == null);
+    for (tail.sessions) |row| {
+        try testing.expectEqualStrings(home, row.cwd);
+        try testing.expect(std.mem.order(u8, page.sessions[49].sessionId, row.sessionId) == .gt);
+    }
+
+    const wrong_scope = try client.request(protocol.method.session_list, protocol.ListSessions{ .cursor = cursor });
+    try testing.expectEqual(rpc.code.invalid_params, (try client.expectError(wrong_scope)).code);
+    const all = try client.request(protocol.method.session_list, protocol.ListSessions{});
+    const global = try rpc.parse(protocol.SessionList, arena, try client.expectResult(all));
+    const remaining = try client.request(protocol.method.session_list, protocol.ListSessions{ .cursor = global.nextCursor.? });
+    const global_tail = try rpc.parse(protocol.SessionList, arena, try client.expectResult(remaining));
+    try testing.expectEqual(@as(usize, 4), global_tail.sessions.len);
 }

@@ -99,6 +99,9 @@ const End = struct {
     /// The id of the `initialize` the router sent it, owned, whose answer
     /// the client does not see.
     swallow: ?[]u8 = null,
+    greeting_version: u32 = protocol.version,
+    greeting_synth: ?u32 = null,
+    greeting_error: ?[]u8 = null,
     thread: std.Thread = undefined,
     writer: std.Io.File.Writer = undefined,
     buffer: [64 * 1024]u8 = undefined,
@@ -192,12 +195,10 @@ fn route(self: *Router, line: []const u8) !void {
 fn endFor(self: *Router, arena: std.mem.Allocator, method: []const u8, params: ?std.json.Value) !*End {
     const eql = std.mem.eql;
     if (eql(u8, method, protocol.method.initialize)) {
-        const first = self.ends.items.len == 0;
-        const end = if (first) try self.start(null, false) else try self.anyEnd();
         const kept = try std.json.Stringify.valueAlloc(self.allocator, params orelse .null, .{});
         if (self.hello) |old| self.allocator.free(old);
         self.hello = kept;
-        return end;
+        return if (self.ends.items.len == 0) self.start(null, false) else self.anyEnd();
     }
     if (eql(u8, method, protocol.method.session_new)) return self.forNew();
     if (eql(u8, method, protocol.method.session_load) or eql(u8, method, protocol.method.session_resume)) {
@@ -205,7 +206,8 @@ fn endFor(self: *Router, arena: std.mem.Allocator, method: []const u8, params: ?
     }
     if (eql(u8, method, protocol.method.session_delete)) {
         const handle = (try rpc.parse(protocol.SessionId, arena, params)).sessionId;
-        return self.hosting(handle) orelse self.anyEnd();
+        if (self.hosting(handle) orelse self.spare()) |end| return end;
+        return self.start(null, true);
     }
     if (stringOf(fieldOf(params, "sessionId"))) |handle| {
         return self.hosting(handle) orelse error.UnknownSession;
@@ -309,7 +311,13 @@ fn start(self: *Router, given: ?Pipe, hello_again: bool) !*End {
     end.writer = pipe.input.writerStreaming(self.io, &end.buffer);
     errdefer self.drop(end);
 
-    if (hello_again) if (self.hello) |hello| try self.greet(end, hello);
+    if (self.hello) |hello| {
+        const params = try std.json.parseFromSlice(std.json.Value, self.allocator, hello, .{});
+        defer params.deinit();
+        end.greeting_version = greetingVersion(fieldOf(params.value, "protocolVersion")) orelse protocol.version;
+        end.greeting_synth = synthVersion(params.value);
+        if (hello_again) try self.greet(end, params.value);
+    }
     {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -324,7 +332,7 @@ fn start(self: *Router, given: ?Pipe, hello_again: bool) !*End {
     return end;
 }
 
-fn greet(self: *Router, end: *End, hello: []const u8) !void {
+fn greet(self: *Router, end: *End, params: std.json.Value) !void {
     const id = blk: {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -332,9 +340,7 @@ fn greet(self: *Router, end: *End, hello: []const u8) !void {
         break :blk try std.fmt.allocPrint(self.allocator, "_synth/router/{d}", .{self.next_id});
     };
     end.swallow = id;
-    const params = try std.json.parseFromSlice(std.json.Value, self.allocator, hello, .{});
-    defer params.deinit();
-    try rpc.request(&end.writer.interface, .{ .string = id }, protocol.method.initialize, params.value);
+    try rpc.request(&end.writer.interface, .{ .string = id }, protocol.method.initialize, params);
     try end.writer.interface.flush();
 }
 
@@ -410,6 +416,7 @@ fn drop(self: *Router, end: *End) void {
     closePipe(self.io, &end.pipe);
     if (end.handle) |handle| self.allocator.free(handle);
     if (end.swallow) |id| self.allocator.free(id);
+    if (end.greeting_error) |err| self.allocator.free(err);
     self.allocator.destroy(end);
 }
 
@@ -570,6 +577,9 @@ fn pump(end: *End) void {
     end.gone = true;
     self.mutex.unlock(self.io);
     self.failPending(end);
+    if (!self.options.exclusive and end.greeting_synth != null) {
+        if (end.handle) |handle| self.toClient(Stopped{ .session = handle });
+    }
     if (!self.options.exclusive) return;
     self.client_mutex.lockUncancelable(self.io);
     defer self.client_mutex.unlock(self.io);
@@ -578,11 +588,21 @@ fn pump(end: *End) void {
     self.client_out.close(self.io);
 }
 
+const Stopped = struct {
+    session: []const u8,
+
+    fn write(self: Stopped, writer: *std.Io.Writer) !void {
+        try rpc.notify(writer, synth.method.session_stopped, protocol.SessionId{ .sessionId = self.session });
+    }
+};
+
 /// `line` as the client is to see it: an end's request renumbered, the
 /// answer to a greeting dropped (empty), the rest as it is. Answers that
 /// open or close a session say which session the end now hosts.
 fn outbound(self: *Router, arena: std.mem.Allocator, end: *End, line: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, line, "\"id\"") == null and std.mem.indexOf(u8, line, protocol.method.cancel_request) == null) return line;
+    if (std.mem.indexOf(u8, line, "\"id\"") == null and std.mem.indexOf(u8, line, protocol.method.cancel_request) == null) {
+        return if (end.greeting_error != null) "" else line;
+    }
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return line;
     if (parsed != .object) return line;
     var message = parsed;
@@ -590,6 +610,7 @@ fn outbound(self: *Router, arena: std.mem.Allocator, end: *End, line: []const u8
     const id = message.object.get("id");
 
     if (method) |name| {
+        if (end.greeting_error != null) return "";
         if (id) |asking| {
             const original = try self.allocator.dupe(u8, try std.json.Stringify.valueAlloc(arena, asking, .{}));
             errdefer self.allocator.free(original);
@@ -615,10 +636,39 @@ fn outbound(self: *Router, arena: std.mem.Allocator, end: *End, line: []const u8
     if (end.swallow) |swallowed| if (answered == .string and std.mem.eql(u8, answered.string, swallowed)) {
         self.allocator.free(swallowed);
         end.swallow = null;
+        if (message.object.get("error")) |failure| {
+            end.greeting_error = try std.json.Stringify.valueAlloc(self.allocator, failure, .{});
+        } else if (!compatibleGreeting(end, message.object.get("result"))) {
+            end.greeting_error = try std.json.Stringify.valueAlloc(self.allocator, .{
+                .code = rpc.code.invalid_params,
+                .message = "the session's agent speaks a different ACP or Synth extension version; reopen it with a compatible Synth binary",
+            }, .{});
+        }
         return "";
     };
+    if (end.greeting_error) |failure| {
+        _ = message.object.swapRemove("result");
+        try message.object.put(arena, "error", try std.json.parseFromSliceLeaky(std.json.Value, arena, failure, .{}));
+        self.settle(end, key, message);
+        return std.json.Stringify.valueAlloc(arena, message, .{});
+    }
     self.settle(end, key, message);
     return line;
+}
+
+fn greetingVersion(value: ?std.json.Value) ?u32 {
+    const given = value orelse return null;
+    return if (given == .integer) std.math.cast(u32, given.integer) else null;
+}
+
+fn synthVersion(value: ?std.json.Value) ?u32 {
+    return greetingVersion(fieldOf(fieldOf(fieldOf(value, "_meta"), "synth"), "protocol"));
+}
+
+fn compatibleGreeting(end: *const End, result: ?std.json.Value) bool {
+    const expected = end.greeting_synth orelse return true;
+    return greetingVersion(fieldOf(result, "protocolVersion")) == end.greeting_version and
+        synthVersion(result) == expected;
 }
 
 /// The id the client was shown for `end`'s request `original`, forgotten
@@ -652,7 +702,7 @@ fn settle(self: *Router, end: *End, key: []const u8, message: std.json.Value) vo
             if (failed) {
                 if (end.handle) |handle| self.allocator.free(handle);
                 end.handle = null;
-                if (end.attached) dismiss(end);
+                if (end.attached or end.greeting_error != null) dismiss(end);
                 return;
             }
             const opened = stringOf(fieldOf(message.object.get("result"), "sessionId")) orelse return;
@@ -967,4 +1017,55 @@ test "sessions opened on one connection each get a child, and answers find their
 
     _ = try client.open(project);
     try testing.expectEqual(2, children.items.len);
+}
+
+test "a failed routed handshake preserves the agent's error on session load" {
+    const arena = testing.allocator;
+    var router: Router = .init(arena, testing.io, undefined, undefined, null, undefined, .{});
+    defer router.deinit();
+
+    var end: End = .{ .router = &router, .pipe = undefined, .attached = true, .opening = true };
+    end.handle = try arena.dupe(u8, "ses_elsewhere");
+    end.swallow = try arena.dupe(u8, "hello");
+    defer if (end.handle) |handle| arena.free(handle);
+    defer if (end.swallow) |id| arena.free(id);
+    defer if (end.greeting_error) |failure| arena.free(failure);
+
+    var memory: std.heap.ArenaAllocator = .init(arena);
+    defer memory.deinit();
+    const temporary = memory.allocator();
+    try router.expect(temporary, .{ .integer = 42 }, &end, protocol.method.session_load);
+    const greeting = try router.outbound(temporary, &end,
+        \\{"jsonrpc":"2.0","id":"hello","error":{"code":-32602,"message":"Synth extension version mismatch"}}
+    );
+    try testing.expectEqualStrings("", greeting);
+    const routed = try router.outbound(temporary, &end,
+        \\{"jsonrpc":"2.0","id":42,"error":{"code":-32600,"message":"initialize first"}}
+    );
+    const reply = try std.json.parseFromSliceLeaky(std.json.Value, temporary, routed, .{});
+    const failure = reply.object.get("error");
+    try testing.expectEqual(@as(i64, -32602), fieldOf(failure, "code").?.integer);
+    try testing.expectEqualStrings("Synth extension version mismatch", stringOf(fieldOf(failure, "message")).?);
+    try testing.expect(end.retired.load(.acquire));
+}
+
+test "the first routed session reports a stopped engine without closing the router" {
+    var rig: Rig = .{};
+    try rig.start(null, .{});
+    defer rig.stop();
+    const client = rig.client;
+    try client.initialize(true);
+    const project = rig.children.fixtures.items[0].project;
+    const session = (try client.open(project)).sessionId;
+
+    rig.router.mutex.lockUncancelable(testing.io);
+    const first = rig.router.ends.items[0];
+    _ = std.posix.system.shutdown(first.pipe.input.handle, std.posix.SHUT.RDWR);
+    rig.router.mutex.unlock(testing.io);
+
+    const event = try client.awaitMethod(synth.method.session_stopped);
+    const params = try rpc.parse(protocol.SessionId, client.arena.allocator(), event.params);
+    try testing.expectEqualStrings(session, params.sessionId);
+    const replacement = try client.open(project);
+    try testing.expect(!std.mem.eql(u8, session, replacement.sessionId));
 }

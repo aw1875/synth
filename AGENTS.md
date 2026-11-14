@@ -84,6 +84,7 @@ sprinkles comments over otherwise readable code will be rejected.
 ## Development notes
 
 - Run `zig fmt` on changed files before committing
+- Run `(cd desktop && swiftlint lint --strict)` when changing Swift code
 - Commit messages follow Conventional Commits with a scope, as in the log:
   `feat(tui): ...`, `fix(tools): ...`
 - Do not use shortcuts or workarounds. Always prefer clean and idiomatic

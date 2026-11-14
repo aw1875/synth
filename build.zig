@@ -53,6 +53,19 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_mcp_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    const fixtures = b.addExecutable(.{
+        .name = "acp-fixtures",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/acp_fixtures.zig"),
+            .target = b.graph.host,
+            .imports = &.{.{ .name = "mcp", .module = b.dependency("mcp", .{
+                .target = b.graph.host,
+                .optimize = .Debug,
+            }).module("mcp") }},
+        }),
+    });
+    b.step("acp-fixtures", "Print desktop ACP fixtures").dependOn(&b.addRunArtifact(fixtures).step);
+
     const release_step = b.step("release", "Build every target into zig-out/<triple>");
     for (targets) |query| {
         const cross = binary(b, b.resolveTargetQuery(query), .ReleaseSafe, options);

@@ -176,7 +176,7 @@ pub fn currentHost(self: *Backend) []const u8 {
     };
 }
 
-fn currentKey(self: *Backend) ?[]const u8 {
+pub fn currentKey(self: *Backend) ?[]const u8 {
     return switch (self.client) {
         .ollama => |*client| client.api_key,
         .openai => |*client| client.api_key,
