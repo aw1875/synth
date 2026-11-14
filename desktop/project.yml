@@ -1,0 +1,89 @@
+name: Synth
+options:
+  defaultConfig: Release
+  settingPresets: none
+  xcodeVersion: "26.2"
+  preGenCommand: sh Scripts/generate-version-config.sh
+
+configFiles:
+  Debug: SynthVersion.xcconfig
+  Release: SynthVersion.xcconfig
+
+packages:
+  SynthDesktop:
+    path: .
+  Textual:
+    url: https://github.com/gonzalezreal/textual.git
+    exactVersion: "0.5.0"
+
+targets:
+  Synth:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+    dependencies:
+      - package: SynthDesktop
+        product: SynthClient
+      - package: SynthDesktop
+        product: SynthProtocol
+      - package: Textual
+        product: Textual
+    settings:
+      base:
+        ARCHS: arm64
+        SDKROOT: macosx
+        SWIFT_VERSION: "6.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        ALWAYS_SEARCH_USER_PATHS: "NO"
+        ENABLE_APP_SANDBOX: "NO"
+        GENERATE_INFOPLIST_FILE: "NO"
+        CURRENT_PROJECT_VERSION: "1"
+        PRODUCT_NAME: Synth
+        PRODUCT_BUNDLE_IDENTIFIER: sh.getsynth.desktop
+        SYNTH_ENGINE: $(SRCROOT)/../zig-out/bin/synth
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          SWIFT_COMPILATION_MODE: wholemodule
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Synth
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
+    postBuildScripts:
+      - name: Embed Synth engine
+        inputFiles:
+          - $(SYNTH_ENGINE)
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/synth
+        script: |
+          set -eu
+          if [ ! -x "$SYNTH_ENGINE" ]; then
+              echo "error: Build the ReleaseSafe engine with desktop/Scripts/build-app.sh or set SYNTH_ENGINE."
+              exit 1
+          fi
+          destination="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers"
+          mkdir -p "$destination"
+          install -m 755 "$SYNTH_ENGINE" "$destination/synth"
+          codesign --force --sign - "$destination/synth"
+
+schemes:
+  Synth:
+    build:
+      targets:
+        Synth: all
+    run:
+      config: Debug
+    analyze:
+      config: Debug
+    archive:
+      config: Release

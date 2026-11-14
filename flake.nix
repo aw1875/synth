@@ -41,7 +41,10 @@
         }
         // pkgs.lib.optionalAttrs (system == "aarch64-darwin") {
           desktop = pkgs.mkShellNoCC {
-            packages = synthTools ++ [ pkgs.swiftlint ];
+            packages = synthTools ++ [
+              pkgs.swiftlint
+              pkgs.xcodegen
+            ];
           };
         };
       }

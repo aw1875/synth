@@ -7,7 +7,7 @@ for the method and lifecycle details.
 ## Build and run
 
 The app supports Apple Silicon Macs running macOS 26 or later. Building it
-requires Xcode 26 or later, Zig 0.16, and network access to resolve the Swift
+requires Xcode 26 or later, XcodeGen, Zig 0.16, and network access to resolve the Swift
 packages on the first build.
 
 From the repository root:
@@ -16,14 +16,19 @@ From the repository root:
 desktop/Scripts/build-app.sh
 ```
 
-On Apple Silicon, `nix develop .#desktop` provides Zig, ZLS, and SwiftLint.
+On Apple Silicon, `nix develop .#desktop` provides Zig, ZLS, SwiftLint, and XcodeGen.
 Install and select Xcode separately so the build can use its macOS SDK.
 
 Open `desktop/DerivedData/Build/Products/Release/Synth.app` in Finder. The
 app bundles the engine and uses the same Synth configuration and credentials
 as the terminal client. If you need to configure a provider, run `synth` in
-Terminal first. For Xcode builds, set the `SYNTH_ENGINE` build setting to a
-ReleaseSafe executable built from this checkout.
+Terminal first.
+
+To build in Xcode, run `xcodegen` in `desktop/` before opening the generated
+`Synth.xcodeproj`. Build a ReleaseSafe engine at `zig-out/bin/synth` or set
+the `SYNTH_ENGINE` build setting to one built from this checkout. Run
+`xcodegen` again after changing `project.yml` or the version in `build.zig.zon`.
+The generated project reads its marketing version from `build.zig.zon`.
 
 Choose **New Conversation** to chat without opening a project. Standalone
 chats use `~/Library/Application Support/Synth/Conversations` as their working

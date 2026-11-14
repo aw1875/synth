@@ -6,6 +6,8 @@ repo=$(dirname "$desktop")
 derived_data=${SYNTH_DERIVED_DATA:-"$desktop/DerivedData"}
 zig=${ZIG:-zig}
 
+xcodegen generate --spec "$desktop/project.yml"
+
 mkdir -p "$derived_data"
 derived_data=$(CDPATH='' cd -- "$derived_data" && pwd)
 engine_prefix="$derived_data/engine"
