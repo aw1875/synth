@@ -28,7 +28,10 @@ To build in Xcode, run `xcodegen` in `desktop/` before opening the generated
 `Synth.xcodeproj`. Build a ReleaseSafe engine at `zig-out/bin/synth` or set
 the `SYNTH_ENGINE` build setting to one built from this checkout. Run
 `xcodegen` again after changing `project.yml` or the version in `build.zig.zon`.
-The generated project reads its marketing version from `build.zig.zon`.
+Xcode picks up new Swift files in `App/` automatically. The generated project
+reads its marketing version from `build.zig.zon`.
+If an earlier generation left an `App/Info.plist`, remove that generated file
+before rebuilding. XcodeGen now writes `Info.plist` in `desktop/`.
 
 Choose **New Conversation** to chat without opening a project. Standalone
 chats use `~/Library/Application Support/Synth/Conversations` as their working

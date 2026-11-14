@@ -23,8 +23,9 @@ targets:
     deploymentTarget: "26.0"
     sources:
       - path: App
-        excludes:
-          - Info.plist
+        type: syncedFolder
+      - path: Assets.xcassets
+        buildPhase: resources
     dependencies:
       - package: SynthDesktop
         product: SynthClient
@@ -53,7 +54,7 @@ targets:
         Release:
           SWIFT_COMPILATION_MODE: wholemodule
     info:
-      path: App/Info.plist
+      path: Info.plist
       properties:
         CFBundleDisplayName: Synth
         CFBundleShortVersionString: $(MARKETING_VERSION)

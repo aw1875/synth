@@ -4,6 +4,6 @@ __pycache__/
 DerivedData/
 xcuserdata/
 /Synth.xcodeproj/
-/App/Info.plist
+/Info.plist
 /SynthVersion.xcconfig
-!/App/Assets.xcassets/**/Contents.json
+!/Assets.xcassets/**/Contents.json
